@@ -3,6 +3,9 @@
  * pg_attribute_encoding.h
  *	  some where to stash column level ENCODING () clauses
  *
+ * GPDB_90_MERGE_FIXME: pg_attribute now has an attoptions field. We should
+ * get rid of this table, and start using pg_attribute.attoptions instead.
+ *
  * Portions Copyright (c) EMC, 2011
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  *
@@ -16,19 +19,22 @@
 #define PG_ATTRIBUTE_ENCODING_H
 
 #include "catalog/genbki.h"
+#include "utils/rel.h"
 
 /* ----------------
  *		pg_attribute_encoding definition.  cpp turns this into
  *		typedef struct FormData_pg_attribute_encoding
  * ----------------
  */
-#define AttributeEncodingRelationId	3231
+#define AttributeEncodingRelationId	6231
 
-CATALOG(pg_attribute_encoding,3231) BKI_WITHOUT_OIDS
+CATALOG(pg_attribute_encoding,6231) BKI_WITHOUT_OIDS
 {
 	Oid		attrelid;		
-	int2	attnum;			
+	int16	attnum;			
+#ifdef CATALOG_VARLEN			/* variable-length fields start here */
 	text	attoptions[1];	
+#endif
 } FormData_pg_attribute_encoding;
 
 /* GPDB added foreign key definitions for gpcheckcat. */
@@ -59,6 +65,5 @@ extern void AddRelationAttributeEncodings(Relation rel, List *attr_encodings);
 extern void RemoveAttributeEncodingsByRelid(Oid relid);
 extern void cloneAttributeEncoding(Oid oldrelid, Oid newrelid, AttrNumber max_attno);
 extern Datum *get_rel_attoptions(Oid relid, AttrNumber max_attno);
-extern void AddDefaultRelationAttributeOptions(Relation rel, List *options);
 
 #endif   /* PG_ATTRIBUTE_ENCODING_H */

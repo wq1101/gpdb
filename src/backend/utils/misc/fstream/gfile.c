@@ -32,6 +32,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/file.h>   /* for flock */
+#include <unistd.h>
 
 #ifdef WIN32
 #include <io.h>
@@ -517,7 +518,7 @@ subprocess_open_failed(int* response_code, const char** response_string, char* r
 {
 	*response_code   = 500;
 	*response_string = reason;
-	gfile_printf_then_putc_newline(*response_string);
+	gfile_printf_then_putc_newline("%s", *response_string);
 	return 1;
 }
 
@@ -890,7 +891,7 @@ int gfile_open(gfile_t* fd, const char* fpath, int flags, int* response_code, co
 		return 1;
 	}
 
-#ifndef WIN32
+#if !defined(WIN32) && !defined(_AIX)
 	if (!is_win_pipe && (flags == GFILE_OPEN_FOR_READ))
 	{
 		/* Restrict only one reader session for each PIPE */

@@ -1,3 +1,11 @@
+/*
+ * contrib/intarray/_intbig_gist.c
+ */
+#include "postgres.h"
+
+#include "access/gist.h"
+#include "access/stratnum.h"
+
 #include "_int.h"
 
 #define GETENTRY(vec,pos) ((GISTTYPE *) DatumGetPointer((vec)->vector[(pos)].key))
@@ -11,14 +19,6 @@ PG_FUNCTION_INFO_V1(g_intbig_penalty);
 PG_FUNCTION_INFO_V1(g_intbig_picksplit);
 PG_FUNCTION_INFO_V1(g_intbig_union);
 PG_FUNCTION_INFO_V1(g_intbig_same);
-
-Datum		g_intbig_consistent(PG_FUNCTION_ARGS);
-Datum		g_intbig_compress(PG_FUNCTION_ARGS);
-Datum		g_intbig_decompress(PG_FUNCTION_ARGS);
-Datum		g_intbig_penalty(PG_FUNCTION_ARGS);
-Datum		g_intbig_picksplit(PG_FUNCTION_ARGS);
-Datum		g_intbig_union(PG_FUNCTION_ARGS);
-Datum		g_intbig_same(PG_FUNCTION_ARGS);
 
 /* Number of one-bits in an unsigned byte */
 static const uint8 number_of_ones[256] = {
@@ -41,11 +41,7 @@ static const uint8 number_of_ones[256] = {
 };
 
 PG_FUNCTION_INFO_V1(_intbig_in);
-Datum		_intbig_in(PG_FUNCTION_ARGS);
-
 PG_FUNCTION_INFO_V1(_intbig_out);
-Datum		_intbig_out(PG_FUNCTION_ARGS);
-
 
 Datum
 _intbig_in(PG_FUNCTION_ARGS)
@@ -70,10 +66,10 @@ _intbig_out(PG_FUNCTION_ARGS)
 ** intbig functions
 *********************************************************************/
 static bool
-_intbig_overlap(GISTTYPE * a, ArrayType *b)
+_intbig_overlap(GISTTYPE *a, ArrayType *b)
 {
 	int			num = ARRNELEMS(b);
-	int4	   *ptr = ARRPTR(b);
+	int32	   *ptr = ARRPTR(b);
 
 	CHECKARRVALID(b);
 
@@ -88,10 +84,10 @@ _intbig_overlap(GISTTYPE * a, ArrayType *b)
 }
 
 static bool
-_intbig_contains(GISTTYPE * a, ArrayType *b)
+_intbig_contains(GISTTYPE *a, ArrayType *b)
 {
 	int			num = ARRNELEMS(b);
-	int4	   *ptr = ARRPTR(b);
+	int32	   *ptr = ARRPTR(b);
 
 	CHECKARRVALID(b);
 
@@ -120,7 +116,7 @@ g_intbig_same(PG_FUNCTION_ARGS)
 		*result = false;
 	else
 	{
-		int4		i;
+		int32		i;
 		BITVECP		sa = GETSIGN(a),
 					sb = GETSIGN(b);
 
@@ -146,7 +142,7 @@ g_intbig_compress(PG_FUNCTION_ARGS)
 	{
 		GISTENTRY  *retval;
 		ArrayType  *in = DatumGetArrayTypeP(entry->key);
-		int4	   *ptr;
+		int32	   *ptr;
 		int			num;
 		GISTTYPE   *res = (GISTTYPE *) palloc0(CALCGTSIZE(0));
 
@@ -208,10 +204,10 @@ g_intbig_compress(PG_FUNCTION_ARGS)
 }
 
 
-static int4
+static int32
 sizebitvec(BITVECP sign)
 {
-	int4		size = 0,
+	int32		size = 0,
 				i;
 
 	LOOPBYTE
@@ -235,7 +231,7 @@ hemdistsign(BITVECP a, BITVECP b)
 }
 
 static int
-hemdist(GISTTYPE * a, GISTTYPE * b)
+hemdist(GISTTYPE *a, GISTTYPE *b)
 {
 	if (ISALLTRUE(a))
 	{
@@ -256,10 +252,10 @@ g_intbig_decompress(PG_FUNCTION_ARGS)
 	PG_RETURN_DATUM(PG_GETARG_DATUM(0));
 }
 
-static int4
-unionkey(BITVECP sbase, GISTTYPE * add)
+static int32
+unionkey(BITVECP sbase, GISTTYPE *add)
 {
-	int4		i;
+	int32		i;
 	BITVECP		sadd = GETSIGN(add);
 
 	if (ISALLTRUE(add))
@@ -275,9 +271,9 @@ g_intbig_union(PG_FUNCTION_ARGS)
 	GistEntryVector *entryvec = (GistEntryVector *) PG_GETARG_POINTER(0);
 	int		   *size = (int *) PG_GETARG_POINTER(1);
 	BITVEC		base;
-	int4		i,
+	int32		i,
 				len;
-	int4		flag = 0;
+	int32		flag = 0;
 	GISTTYPE   *result;
 
 	MemSet((void *) base, 0, sizeof(BITVEC));
@@ -318,13 +314,13 @@ g_intbig_penalty(PG_FUNCTION_ARGS)
 typedef struct
 {
 	OffsetNumber pos;
-	int4		cost;
+	int32		cost;
 } SPLITCOST;
 
 static int
 comparecost(const void *a, const void *b)
 {
-	return ((SPLITCOST *) a)->cost - ((SPLITCOST *) b)->cost;
+	return ((const SPLITCOST *) a)->cost - ((const SPLITCOST *) b)->cost;
 }
 
 
@@ -339,11 +335,11 @@ g_intbig_picksplit(PG_FUNCTION_ARGS)
 			   *datum_r;
 	BITVECP		union_l,
 				union_r;
-	int4		size_alpha,
+	int32		size_alpha,
 				size_beta;
-	int4		size_waste,
+	int32		size_waste,
 				waste = -1;
-	int4		nbytes;
+	int32		nbytes;
 	OffsetNumber seed_1 = 0,
 				seed_2 = 0;
 	OffsetNumber *left,
@@ -496,9 +492,15 @@ Datum
 g_intbig_consistent(PG_FUNCTION_ARGS)
 {
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
-	ArrayType  *query = (ArrayType *) PG_GETARG_ARRAYTYPE_P(1);
+	ArrayType  *query = PG_GETARG_ARRAYTYPE_P(1);
 	StrategyNumber strategy = (StrategyNumber) PG_GETARG_UINT16(2);
+
+	/* Oid		subtype = PG_GETARG_OID(3); */
+	bool	   *recheck = (bool *) PG_GETARG_POINTER(4);
 	bool		retval;
+
+	/* All cases served by this function are inexact */
+	*recheck = true;
 
 	if (ISALLTRUE(DatumGetPointer(entry->key)))
 		PG_RETURN_BOOL(true);
@@ -524,7 +526,7 @@ g_intbig_consistent(PG_FUNCTION_ARGS)
 			{
 				int			i,
 							num = ARRNELEMS(query);
-				int4	   *ptr = ARRPTR(query);
+				int32	   *ptr = ARRPTR(query);
 				BITVEC		qp;
 				BITVECP		dq,
 							de;
@@ -563,7 +565,7 @@ g_intbig_consistent(PG_FUNCTION_ARGS)
 			{
 				int			i,
 							num = ARRNELEMS(query);
-				int4	   *ptr = ARRPTR(query);
+				int32	   *ptr = ARRPTR(query);
 				BITVEC		qp;
 				BITVECP		dq,
 							de;

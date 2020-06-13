@@ -1,11 +1,16 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/commit.sgml,v 1.20 2006/09/16 00:30:17 momjian Exp $
+doc/src/sgml/ref/commit.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-COMMIT">
+ <indexterm zone="sql-commit">
+  <primary>COMMIT</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="SQL-COMMIT-TITLE">COMMIT</refentrytitle>
+  <refentrytitle>COMMIT</refentrytitle>
+  <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
 
@@ -14,16 +19,12 @@ PostgreSQL documentation
   <refpurpose>commit the current transaction</refpurpose>
  </refnamediv>
 
- <indexterm zone="sql-commit">
-  <primary>COMMIT</primary>
- </indexterm>
-
  <refsynopsisdiv>
 <synopsis>
 COMMIT [ WORK | TRANSACTION ]
 </synopsis>
  </refsynopsisdiv>
-  
+
  <refsect1>
   <title>Description</title>
 
@@ -33,7 +34,7 @@ COMMIT [ WORK | TRANSACTION ]
    and are guaranteed to be durable if a crash occurs.
   </para>
  </refsect1>
-  
+
  <refsect1>
   <title>Parameters</title>
 
@@ -54,7 +55,7 @@ COMMIT [ WORK | TRANSACTION ]
   <title>Notes</title>
 
   <para>
-   Use <xref linkend="SQL-ROLLBACK" endterm="SQL-ROLLBACK-TITLE"> to
+   Use <xref linkend="SQL-ROLLBACK"> to
    abort a transaction.
   </para>
 
@@ -71,13 +72,12 @@ COMMIT [ WORK | TRANSACTION ]
    To commit the current transaction and make all changes permanent:
 <programlisting>
 COMMIT;
-</programlisting>
-  </para>
+</programlisting></para>
  </refsect1>
 
  <refsect1>
   <title>Compatibility</title>
-  
+
   <para>
    The SQL standard only specifies the two forms
    <literal>COMMIT</literal> and <literal>COMMIT
@@ -89,8 +89,8 @@ COMMIT;
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-begin" endterm="sql-begin-title"></member>
-   <member><xref linkend="sql-rollback" endterm="sql-rollback-title"></member>
+   <member><xref linkend="sql-begin"></member>
+   <member><xref linkend="sql-rollback"></member>
   </simplelist>
  </refsect1>
 </refentry>

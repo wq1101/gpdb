@@ -1,0 +1,111 @@
+-- t0r is the reference table to provide the data distribution info.
+DROP TABLE IF EXISTS t0p;
+DROP
+CREATE TABLE t0p (id int, val int);
+CREATE
+INSERT INTO t0p (id, val) SELECT i, i FROM generate_series(1, 100) i;
+INSERT 100
+
+DROP TABLE IF EXISTS t0r;
+DROP
+CREATE TABLE t0r (id int, val int, segid int) DISTRIBUTED REPLICATED;
+CREATE
+INSERT INTO t0r (id, val, segid) SELECT id, val, gp_segment_id from t0p;
+INSERT 100
+
+-- GDD tests rely on the data distribution, but depends on the number of
+-- the segments the distribution might be different.
+-- so we provide this helper function to return the nth id on a segment.
+-- * `seg` is the segment id, starts from 0;
+-- * `idx` is the index on the segment, starts from 1;
+CREATE OR REPLACE FUNCTION segid(seg int, idx int) RETURNS int AS $$ SELECT id FROM t0r WHERE segid=$1 ORDER BY id LIMIT 1 OFFSET ($2-1) $$ LANGUAGE sql;
+CREATE
+
+-- In some of the testcases the execution order of two background queries
+-- must be enforced not only on master but also on segments, for example
+-- in below case the order of 10 and 20 on segments results in different
+-- waiting relations:
+--
+--     30: UPDATE t SET val=val WHERE id=1;
+--     10&: UPDATE t SET val=val WHERE val=1;
+--     20&: UPDATE t SET val=val WHERE val=1;
+--
+-- There is no perfect way to ensure this.  The '&' command in the isolation2
+-- framework only ensures that the QD is being blocked, but this might not be
+-- true on segments.  In fact on slow machines this exception occurs quite
+-- offen on heave load. (e.g. when multiple testcases are executed in parallel)
+--
+-- So we provide this barrier function to ensure the execution order.
+-- It's implemented with sleep now, but should at least work.
+CREATE OR REPLACE FUNCTION barrier() RETURNS void AS $$ SELECT pg_sleep(4) $$ LANGUAGE sql;
+CREATE
+
+-- verify the function
+-- Data distribution is sensitive to the underlying hash algorithm, we need each
+-- segment has enough tuples for test, 10 should be enough.
+SELECT segid(0,10) is not null;
+ ?column? 
+----------
+ t        
+(1 row)
+SELECT segid(1,10) is not null;
+ ?column? 
+----------
+ t        
+(1 row)
+SELECT segid(2,10) is not null;
+ ?column? 
+----------
+ t        
+(1 row)
+
+--enable GDD
+-- start_ignore
+! gpconfig -c gp_enable_global_deadlock_detector -v on;
+20200424:15:49:54:048653 gpconfig:zlv:gpadmin-[INFO]:-completed successfully with parameters '-c gp_enable_global_deadlock_detector -v on'
+
+! gpconfig -c gp_global_deadlock_detector_period -v 5;
+20200424:15:49:56:049353 gpconfig:zlv:gpadmin-[INFO]:-completed successfully with parameters '-c gp_global_deadlock_detector_period -v 5'
+
+! gpstop -rai;
+20200424:15:49:56:050055 gpstop:zlv:gpadmin-[INFO]:-Starting gpstop with args: -rai
+20200424:15:49:56:050055 gpstop:zlv:gpadmin-[INFO]:-Gathering information and validating the environment...
+20200424:15:49:56:050055 gpstop:zlv:gpadmin-[INFO]:-Obtaining Greenplum Master catalog information
+20200424:15:49:56:050055 gpstop:zlv:gpadmin-[INFO]:-Obtaining Segment details from master...
+20200424:15:49:56:050055 gpstop:zlv:gpadmin-[INFO]:-Greenplum Version: 'postgres (Greenplum Database) 7.0.0-alpha.0+dev.6778.g000faed10b build dev'
+20200424:15:49:56:050055 gpstop:zlv:gpadmin-[INFO]:-Commencing Master instance shutdown with mode='immediate'
+20200424:15:49:56:050055 gpstop:zlv:gpadmin-[INFO]:-Master segment instance directory=/home/gpadmin/workspace/gpdb/gpAux/gpdemo/datadirs/qddir/demoDataDir-1
+20200424:15:49:56:050055 gpstop:zlv:gpadmin-[INFO]:-Attempting forceful termination of any leftover master process
+20200424:15:49:56:050055 gpstop:zlv:gpadmin-[INFO]:-Terminating processes for segment /home/gpadmin/workspace/gpdb/gpAux/gpdemo/datadirs/qddir/demoDataDir-1
+20200424:15:49:56:050055 gpstop:zlv:gpadmin-[INFO]:-Stopping master standby host zlv mode=immediate
+20200424:15:49:58:050055 gpstop:zlv:gpadmin-[INFO]:-Successfully shutdown standby process on zlv
+20200424:15:49:58:050055 gpstop:zlv:gpadmin-[INFO]:-Targeting dbid [2, 5, 3, 6, 4, 7] for shutdown
+20200424:15:49:58:050055 gpstop:zlv:gpadmin-[INFO]:-Commencing parallel primary segment instance shutdown, please wait...
+20200424:15:49:58:050055 gpstop:zlv:gpadmin-[INFO]:-0.00% of jobs completed
+20200424:15:49:59:050055 gpstop:zlv:gpadmin-[INFO]:-100.00% of jobs completed
+20200424:15:49:59:050055 gpstop:zlv:gpadmin-[INFO]:-Commencing parallel mirror segment instance shutdown, please wait...
+20200424:15:49:59:050055 gpstop:zlv:gpadmin-[INFO]:-0.00% of jobs completed
+20200424:15:50:00:050055 gpstop:zlv:gpadmin-[INFO]:-100.00% of jobs completed
+20200424:15:50:00:050055 gpstop:zlv:gpadmin-[INFO]:-----------------------------------------------------
+20200424:15:50:00:050055 gpstop:zlv:gpadmin-[INFO]:-   Segments stopped successfully      = 6
+20200424:15:50:00:050055 gpstop:zlv:gpadmin-[INFO]:-   Segments with errors during stop   = 0
+20200424:15:50:00:050055 gpstop:zlv:gpadmin-[INFO]:-----------------------------------------------------
+20200424:15:50:00:050055 gpstop:zlv:gpadmin-[INFO]:-Successfully shutdown 6 of 6 segment instances 
+20200424:15:50:00:050055 gpstop:zlv:gpadmin-[INFO]:-Database successfully shutdown with no errors reported
+20200424:15:50:00:050055 gpstop:zlv:gpadmin-[INFO]:-Cleaning up leftover shared memory
+20200424:15:50:01:050055 gpstop:zlv:gpadmin-[INFO]:-Restarting System...
+
+-- end_ignore
+
+-- Start new session on master to make sure it has fully completed
+-- recovery and up and running again.
+1: SHOW gp_enable_global_deadlock_detector;
+ gp_enable_global_deadlock_detector 
+------------------------------------
+ on                                 
+(1 row)
+1: SHOW gp_global_deadlock_detector_period;
+ gp_global_deadlock_detector_period 
+------------------------------------
+ 5s                                 
+(1 row)

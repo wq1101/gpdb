@@ -1,9 +1,0 @@
-bin/explain.pl
-bin/gpcheckmirrorseg.pl
-bin/gpfaultinjector
-bin/gptorment.pl
-bin/lib/gpgetconfig.py
-bin/pgbench
-bin/run_operator_tests.pl
-lib/python/gppylib/programs/clsInjectFault.py
-sbin/gprepairmirrorseg.py

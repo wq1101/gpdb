@@ -3,12 +3,12 @@
  * globals.c
  *	  global variable declarations
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/init/globals.c,v 1.105 2008/02/17 02:09:29 tgl Exp $
+ *	  src/backend/utils/init/globals.c
  *
  * NOTES
  *	  Globals used all over the place should be declared here and not
@@ -18,13 +18,14 @@
  */
 #include "postgres.h"
 
-#include "pgtime.h"
+#include "libpq/libpq-be.h"
 #include "libpq/pqcomm.h"
 #include "miscadmin.h"
 #include "storage/backendid.h"
+#include "postmaster/postmaster.h"
 
 
-ProtocolVersion FrontendProtocol = PG_PROTOCOL_LATEST;
+ProtocolVersion FrontendProtocol;
 
 volatile bool InterruptPending = false;
 volatile bool QueryCancelPending = false;
@@ -32,19 +33,30 @@ volatile bool QueryCancelCleanup = false;
 volatile bool QueryFinishPending = false;
 volatile bool ProcDiePending = false;
 volatile bool ClientConnectionLost = false;
-volatile bool ImmediateInterruptOK = false;
-volatile bool ImmediateDieOK = false;
-volatile bool TermSignalReceived = false;
-
-// Make these signed integers (instead of uint32) to detect garbage negative values.
+volatile bool IdleInTransactionSessionTimeoutPending = false;
+volatile sig_atomic_t ConfigReloadPending = false;
+/*
+ * GPDB: Make these signed integers (instead of uint32) to detect garbage
+ * negative values.
+ */
 volatile int32 InterruptHoldoffCount = 0;
+volatile int32 QueryCancelHoldoffCount = 0;
 volatile int32 CritSectionCount = 0;
 
 int			MyProcPid;
 pg_time_t	MyStartTime;
 struct Port *MyProcPort;
 long		MyCancelKey;
-int			MyPMChildSlot = -1;
+int			MyPMChildSlot;
+
+/*
+ * MyLatch points to the latch that should be used for signal handling by the
+ * current process. It will either point to a process local latch if the
+ * current process does not have a PGPROC entry in that moment, or to
+ * PGPROC->procLatch if it has. Thus it can always be used in signal handlers,
+ * without checking for its existence.
+ */
+struct Latch *MyLatch;
 
 /*
  * DataDir is the absolute path to the top level of the PGDATA directory tree.
@@ -66,6 +78,8 @@ char		postgres_exec_path[MAXPGPATH];		/* full path to backend */
 #endif
 
 BackendId	MyBackendId = InvalidBackendId;
+
+BackendId	ParallelMasterBackendId = InvalidBackendId;
 
 Oid			MyDatabaseId = InvalidOid;
 
@@ -93,18 +107,23 @@ pid_t		PostmasterPid = 0;
 bool		IsPostmasterEnvironment = false;
 bool		IsUnderPostmaster = false;
 bool		IsBinaryUpgrade = false;
+bool		IsBackgroundWorker = false;
+
+/* Greenplum seeds the creation of a segment from a copy of the master segment
+ * directory.  However, the first time the segment starts up small adjustments
+ * need to be made to complete the transformation to a segment directory, and
+ * these changes will be triggered by this global.
+ */
+bool		ConvertMasterDataDirToSegment = false;
 
 bool		ExitOnAnyError = false;
 
 int			DateStyle = USE_ISO_DATES;
 int			DateOrder = DATEORDER_MDY;
 int			IntervalStyle = INTSTYLE_POSTGRES;
-bool		HasCTZSet = false;
-int			CTimeZone = 0;
 
 bool		enableFsync = true;
-bool		allowSystemTableModsDDL = false;
-bool		allowSystemTableModsDML = false;
+bool		allowSystemTableMods = false;
 int			planner_work_mem = 32768;
 int			work_mem = 32768;
 int			statement_mem = 256000;
@@ -115,17 +134,18 @@ int			max_statement_mem = 2048000;
  */
 int			gp_vmem_limit_per_query = 0;
 int			maintenance_work_mem = 65536;
+int			replacement_sort_tuples = 150000;
 
 /*
- * Primary determinants of sizes of shared-memory structures.  MaxBackends is
- * MaxConnections + autovacuum_max_workers (it is computed by the GUC assign
- * hook):
+ * Primary determinants of sizes of shared-memory structures.
+ *
+ * MaxBackends is computed by PostmasterMain after modules have had a chance to
+ * register background workers.
  */
 int			NBuffers = 4096;
-int			MaxBackends = 200;
 int			MaxConnections = 90;
-
-int			gp_workfile_max_entries = 8192; /* Number of unique entries we can hold in the workfile directory */
+int			max_worker_processes = 8 + MaxPMAuxProc;
+int			MaxBackends = 0;
 
 int			VacuumCostPageHit = 1;		/* GUC parameters for vacuum */
 int			VacuumCostPageMiss = 10;
@@ -133,13 +153,12 @@ int			VacuumCostPageDirty = 20;
 int			VacuumCostLimit = 200;
 int			VacuumCostDelay = 0;
 
+int			VacuumPageHit = 0;
+int			VacuumPageMiss = 0;
+int			VacuumPageDirty = 0;
+
 int			VacuumCostBalance = 0;		/* working state for vacuum */
 bool		VacuumCostActive = false;
-
-int			GinFuzzySearchLimit = 0;
-
-/* gpperfmon port number */
-int 	gpperfmon_port = 8888;
 
 /* for pljava */
 char*	pljava_vmoptions = NULL;
@@ -151,10 +170,5 @@ bool	pljava_classpath_insecure = false;
 
 
 /* Memory protection GUCs*/
-#ifdef __darwin__
-int gp_vmem_protect_limit = 0; 
-#else
 int gp_vmem_protect_limit = 8192;
-#endif
 int gp_vmem_protect_gang_cache_limit = 500;
-

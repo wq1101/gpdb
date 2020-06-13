@@ -3,21 +3,26 @@
  * to_tsany.c
  *		to_ts* function definitions
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/tsearch/to_tsany.c,v 1.8.2.1 2008/03/07 15:29:27 teodor Exp $
+ *	  src/backend/tsearch/to_tsany.c
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
-#include "catalog/namespace.h"
 #include "tsearch/ts_cache.h"
 #include "tsearch/ts_utils.h"
 #include "utils/builtins.h"
-#include "utils/syscache.h"
+
+
+typedef struct MorphOpaque
+{
+	Oid			cfg_id;
+	int			qoperator;		/* query operator */
+} MorphOpaque;
 
 
 Datum
@@ -32,27 +37,26 @@ get_current_ts_config(PG_FUNCTION_ARGS)
 static int
 compareWORD(const void *a, const void *b)
 {
-	if (((ParsedWord *) a)->len == ((ParsedWord *) b)->len)
+	int			res;
+
+	res = tsCompareString(
+			   ((const ParsedWord *) a)->word, ((const ParsedWord *) a)->len,
+			   ((const ParsedWord *) b)->word, ((const ParsedWord *) b)->len,
+						  false);
+
+	if (res == 0)
 	{
-		int			res = strncmp(
-								  ((ParsedWord *) a)->word,
-								  ((ParsedWord *) b)->word,
-								  ((ParsedWord *) b)->len);
+		if (((const ParsedWord *) a)->pos.pos == ((const ParsedWord *) b)->pos.pos)
+			return 0;
 
-		if (res == 0)
-		{
-			if (((ParsedWord *) a)->pos.pos == ((ParsedWord *) b)->pos.pos)
-				return 0;
-
-			return (((ParsedWord *) a)->pos.pos > ((ParsedWord *) b)->pos.pos) ? 1 : -1;
-		}
-		return res;
+		res = (((const ParsedWord *) a)->pos.pos > ((const ParsedWord *) b)->pos.pos) ? 1 : -1;
 	}
-	return (((ParsedWord *) a)->len > ((ParsedWord *) b)->len) ? 1 : -1;
+
+	return res;
 }
 
 static int
-uniqueWORD(ParsedWord *a, int4 l)
+uniqueWORD(ParsedWord *a, int32 l)
 {
 	ParsedWord *ptr,
 			   *res;
@@ -163,7 +167,7 @@ make_tsvector(ParsedText *prs)
 	if (lenstr > MAXSTRPOS)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("string is too long for tsvector")));
+				 errmsg("string is too long for tsvector (%d bytes, max %d bytes)", lenstr, MAXSTRPOS)));
 
 	totallen = CALCDATASIZE(prs->curwords, lenstr);
 	in = (TSVector) palloc0(totallen);
@@ -265,58 +269,85 @@ to_tsvector(PG_FUNCTION_ARGS)
  * to the stack.
  *
  * All words belonging to the same variant are pushed as an ANDed list,
- * and different variants are ORred together.
+ * and different variants are ORed together.
  */
 static void
-pushval_morph(Datum opaque, TSQueryParserState state, char *strval, int lenval, int2 weight)
+pushval_morph(Datum opaque, TSQueryParserState state, char *strval, int lenval, int16 weight, bool prefix)
 {
-	int4		count = 0;
+	int32		count = 0;
 	ParsedText	prs;
 	uint32		variant,
-				pos,
+				pos = 0,
 				cntvar = 0,
 				cntpos = 0,
 				cnt = 0;
-	Oid			cfg_id = DatumGetObjectId(opaque);		/* the input is actually
-														 * an Oid, not a pointer */
+	MorphOpaque *data = (MorphOpaque *) DatumGetPointer(opaque);
 
 	prs.lenwords = 4;
 	prs.curwords = 0;
 	prs.pos = 0;
 	prs.words = (ParsedWord *) palloc(sizeof(ParsedWord) * prs.lenwords);
 
-	parsetext(cfg_id, &prs, strval, lenval);
+	parsetext(data->cfg_id, &prs, strval, lenval);
 
 	if (prs.curwords > 0)
 	{
-
 		while (count < prs.curwords)
 		{
+			/*
+			 * Were any stop words removed? If so, fill empty positions with
+			 * placeholders linked by an appropriate operator.
+			 */
+			if (pos > 0 && pos + 1 < prs.words[count].pos.pos)
+			{
+				while (pos + 1 < prs.words[count].pos.pos)
+				{
+					/* put placeholders for each missing stop word */
+					pushStop(state);
+					if (cntpos)
+						pushOperator(state, data->qoperator, 1);
+					cntpos++;
+					pos++;
+				}
+			}
+
+			/* save current word's position */
 			pos = prs.words[count].pos.pos;
+
+			/* Go through all variants obtained from this token */
 			cntvar = 0;
 			while (count < prs.curwords && pos == prs.words[count].pos.pos)
 			{
 				variant = prs.words[count].nvariant;
 
+				/* Push all words belonging to the same variant */
 				cnt = 0;
-				while (count < prs.curwords && pos == prs.words[count].pos.pos && variant == prs.words[count].nvariant)
+				while (count < prs.curwords &&
+					   pos == prs.words[count].pos.pos &&
+					   variant == prs.words[count].nvariant)
 				{
-
-					pushValue(state, prs.words[count].word, prs.words[count].len, weight);
+					pushValue(state,
+							  prs.words[count].word,
+							  prs.words[count].len,
+							  weight,
+						  ((prs.words[count].flags & TSL_PREFIX) || prefix));
 					pfree(prs.words[count].word);
 					if (cnt)
-						pushOperator(state, OP_AND);
+						pushOperator(state, OP_AND, 0);
 					cnt++;
 					count++;
 				}
 
 				if (cntvar)
-					pushOperator(state, OP_OR);
+					pushOperator(state, OP_OR, 0);
 				cntvar++;
 			}
 
 			if (cntpos)
-				pushOperator(state, OP_AND);
+			{
+				/* distance may be useful */
+				pushOperator(state, data->qoperator, 1);
+			}
 
 			cntpos++;
 		}
@@ -331,43 +362,18 @@ pushval_morph(Datum opaque, TSQueryParserState state, char *strval, int lenval, 
 Datum
 to_tsquery_byid(PG_FUNCTION_ARGS)
 {
-	Oid			cfgid = PG_GETARG_OID(0);
 	text	   *in = PG_GETARG_TEXT_P(1);
 	TSQuery		query;
-	QueryItem  *res;
-	int4		len;
+	MorphOpaque data;
 
-	query = parse_tsquery(TextPGetCString(in), pushval_morph, ObjectIdGetDatum(cfgid), false);
+	data.cfg_id = PG_GETARG_OID(0);
+	data.qoperator = OP_AND;
 
-	if (query->size == 0)
-		PG_RETURN_TSQUERY(query);
+	query = parse_tsquery(text_to_cstring(in),
+						  pushval_morph,
+						  PointerGetDatum(&data),
+						  false);
 
-	/* clean out any stopword placeholders from the tree */
-	res = clean_fakeval(GETQUERY(query), &len);
-	if (!res)
-	{
-		SET_VARSIZE(query, HDRSIZETQ);
-		query->size = 0;
-		PG_RETURN_POINTER(query);
-	}
-	memcpy((void *) GETQUERY(query), (void *) res, len * sizeof(QueryItem));
-
-	/*
-	 * Removing the stopword placeholders might've resulted in fewer
-	 * QueryItems. If so, move the operands up accordingly.
-	 */
-	if ( len != query->size ) {
-		char 		*oldoperand = GETOPERAND(query);
-		int4 lenoperand = VARSIZE(query) - (oldoperand - (char*)query);
-
-		Assert( len < query->size );
-
-		query->size = len;
-		memmove((void *) GETOPERAND(query), oldoperand, VARSIZE(query) - (oldoperand - (char*)query) );
-		SET_VARSIZE(query, COMPUTESIZE( len, lenoperand )); 
-	}
-
-	pfree(res);
 	PG_RETURN_TSQUERY(query);
 }
 
@@ -386,38 +392,18 @@ to_tsquery(PG_FUNCTION_ARGS)
 Datum
 plainto_tsquery_byid(PG_FUNCTION_ARGS)
 {
-	Oid			cfgid = PG_GETARG_OID(0);
 	text	   *in = PG_GETARG_TEXT_P(1);
 	TSQuery		query;
-	QueryItem  *res;
-	int4		len;
+	MorphOpaque data;
 
-	query = parse_tsquery(TextPGetCString(in), pushval_morph, ObjectIdGetDatum(cfgid), true);
+	data.cfg_id = PG_GETARG_OID(0);
+	data.qoperator = OP_AND;
 
-	if (query->size == 0)
-		PG_RETURN_TSQUERY(query);
+	query = parse_tsquery(text_to_cstring(in),
+						  pushval_morph,
+						  PointerGetDatum(&data),
+						  true);
 
-	res = clean_fakeval(GETQUERY(query), &len);
-	if (!res)
-	{
-		SET_VARSIZE(query, HDRSIZETQ);
-		query->size = 0;
-		PG_RETURN_POINTER(query);
-	}
-	memcpy((void *) GETQUERY(query), (void *) res, len * sizeof(QueryItem));
-
-	if ( len != query->size ) {
-		char 		*oldoperand = GETOPERAND(query);
-		int4 lenoperand = VARSIZE(query) - (oldoperand - (char*)query);
-
-		Assert( len < query->size );
-
-		query->size = len;
-		memcpy((void *) GETOPERAND(query), oldoperand, lenoperand );
-		SET_VARSIZE(query, COMPUTESIZE( len, lenoperand )); 
-	}
-
-	pfree(res);
 	PG_RETURN_POINTER(query);
 }
 
@@ -429,6 +415,37 @@ plainto_tsquery(PG_FUNCTION_ARGS)
 
 	cfgId = getTSCurrentConfig(true);
 	PG_RETURN_DATUM(DirectFunctionCall2(plainto_tsquery_byid,
+										ObjectIdGetDatum(cfgId),
+										PointerGetDatum(in)));
+}
+
+
+Datum
+phraseto_tsquery_byid(PG_FUNCTION_ARGS)
+{
+	text	   *in = PG_GETARG_TEXT_P(1);
+	TSQuery		query;
+	MorphOpaque data;
+
+	data.cfg_id = PG_GETARG_OID(0);
+	data.qoperator = OP_PHRASE;
+
+	query = parse_tsquery(text_to_cstring(in),
+						  pushval_morph,
+						  PointerGetDatum(&data),
+						  true);
+
+	PG_RETURN_TSQUERY(query);
+}
+
+Datum
+phraseto_tsquery(PG_FUNCTION_ARGS)
+{
+	text	   *in = PG_GETARG_TEXT_P(0);
+	Oid			cfgId;
+
+	cfgId = getTSCurrentConfig(true);
+	PG_RETURN_DATUM(DirectFunctionCall2(phraseto_tsquery_byid,
 										ObjectIdGetDatum(cfgId),
 										PointerGetDatum(in)));
 }

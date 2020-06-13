@@ -2,7 +2,7 @@
 #
 # Makefile for the bootstrap module
 #
-# $PostgreSQL: pgsql/src/backend/bootstrap/Makefile,v 1.36 2008/02/19 10:30:07 petere Exp $
+# src/backend/bootstrap/Makefile
 #
 #-------------------------------------------------------------------------
 
@@ -10,30 +10,14 @@ subdir = src/backend/bootstrap
 top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
-override CPPFLAGS := -I$(srcdir) $(CPPFLAGS)
+override CPPFLAGS := -I. -I$(srcdir) $(CPPFLAGS)
 
-OBJS= bootparse.o bootstrap.o 
+OBJS= bootparse.o bootstrap.o
 
 include $(top_srcdir)/src/backend/common.mk
 
-
 # bootscanner is compiled as part of bootparse
-bootparse.o: $(srcdir)/bootscanner.c
-
-$(srcdir)/bootparse.c: bootparse.y
-ifdef BISON
-	$(BISON) $(BISONFLAGS) -o $@ $<
-else
-	@$(missing) bison $< $@
-endif
-
-$(srcdir)/bootscanner.c: bootscanner.l
-ifdef FLEX
-	$(FLEX) $(FLEXFLAGS) -o'$@' $<
-else
-	@$(missing) flex $< $@
-endif
-
+bootparse.o: bootscanner.c
 
 # bootparse.c and bootscanner.c are in the distribution tarball, so
 # they are not cleaned here.

@@ -20,9 +20,11 @@
 #include "access/genam.h"
 #include "access/tupdesc.h"
 #include "access/bitmap.h"
+#include "access/relscan.h"
 #include "storage/lmgr.h"
 #include "parser/parse_oper.h"
 #include "utils/lsyscache.h"
+#include "utils/snapmgr.h"
 
 typedef struct ItemPos
 {
@@ -60,7 +62,7 @@ _bitmap_first(IndexScanDesc scan, ScanDirection dir)
  * _bitmap_next() -- return the next tuple that satisfies a given scan.
  */
 bool
-_bitmap_next(IndexScanDesc scan, ScanDirection dir  __attribute__((unused)))
+_bitmap_next(IndexScanDesc scan, ScanDirection dir  pg_attribute_unused())
 {
 	BMScanOpaque	so;
 	BMScanPosition	scanPos;
@@ -132,7 +134,7 @@ _bitmap_firstbatchwords(IndexScanDesc scan,
  */
 bool
 _bitmap_nextbatchwords(IndexScanDesc scan,
-					   ScanDirection dir  __attribute__((unused)))
+					   ScanDirection dir  pg_attribute_unused())
 {
 	BMScanOpaque	so;
 
@@ -269,15 +271,10 @@ read_words(Relation rel, Buffer lovBuffer, OffsetNumber lovOffset,
 				  BlockNumber *nextBlockNoP, BM_HRL_WORD *headerWords, 
 				  BM_HRL_WORD *words, uint32 *numOfWordsP, bool *readLastWords)
 {
-	MIRROREDLOCK_BUFMGR_DECLARE;
-
 	if (BlockNumberIsValid(*nextBlockNoP))
 	{
 		Buffer bitmapBuffer;
-		
-		// -------- MirroredLock ----------
-		MIRROREDLOCK_BUFMGR_LOCK;
-		
+
 		bitmapBuffer = _bitmap_getbuf(rel, *nextBlockNoP, BM_READ);
 
 		Page			bitmapPage;
@@ -297,9 +294,6 @@ read_words(Relation rel, Buffer lovBuffer, OffsetNumber lovOffset,
 		*nextBlockNoP = bo->bm_bitmap_next;
 
 		_bitmap_relbuf(bitmapBuffer);
-		
-		MIRROREDLOCK_BUFMGR_UNLOCK;
-		// -------- MirroredLock ----------
 		
 		*readLastWords = false;
 
@@ -342,10 +336,7 @@ read_words(Relation rel, Buffer lovBuffer, OffsetNumber lovOffset,
 	{
 		BMLOVItem	lovItem;
 		Page		lovPage;
-		
-		// -------- MirroredLock ----------
-		MIRROREDLOCK_BUFMGR_LOCK;
-		
+
 		LockBuffer(lovBuffer, BM_READ);
 
 		lovPage = BufferGetPage(lovBuffer);
@@ -369,10 +360,7 @@ read_words(Relation rel, Buffer lovBuffer, OffsetNumber lovOffset,
 		}
 
 		LockBuffer(lovBuffer, BUFFER_LOCK_UNLOCK);
-		
-		MIRROREDLOCK_BUFMGR_UNLOCK;
-		// -------- MirroredLock ----------
-		
+
 		*readLastWords = true;
 	}
 }
@@ -382,10 +370,8 @@ read_words(Relation rel, Buffer lovBuffer, OffsetNumber lovOffset,
  * index predicate.
  */
 void
-_bitmap_findbitmaps(IndexScanDesc scan, ScanDirection dir  __attribute__((unused)))
+_bitmap_findbitmaps(IndexScanDesc scan, ScanDirection dir  pg_attribute_unused())
 {
-	MIRROREDLOCK_BUFMGR_DECLARE;
-
 	BMScanOpaque			so;
 	BMScanPosition			scanPos;
 	Buffer					metabuf;
@@ -417,10 +403,7 @@ _bitmap_findbitmaps(IndexScanDesc scan, ScanDirection dir  __attribute__((unused
 			return;
 		}
 	}
-	
-	// -------- MirroredLock ----------
-	MIRROREDLOCK_BUFMGR_LOCK;
-	
+
 	metabuf = _bitmap_getbuf(scan->indexRelation, BM_METAPAGE, BM_READ);
 	metapage = _bitmap_get_metapage_data(scan->indexRelation, metabuf);
 
@@ -450,7 +433,8 @@ _bitmap_findbitmaps(IndexScanDesc scan, ScanDirection dir  __attribute__((unused
 								   scan->keyData[keyNo].sk_flags,
 								   scan->keyData[keyNo].sk_attno,
 								   scan->keyData[keyNo].sk_strategy,
-								   scan->keyData[keyNo].sk_subtype, 
+								   scan->keyData[keyNo].sk_subtype,
+								   scan->keyData[keyNo].sk_collation,
 								   scan->keyData[keyNo].sk_func.fn_oid,
 								   scan->keyData[keyNo].sk_argument);
 		}
@@ -470,8 +454,9 @@ _bitmap_findbitmaps(IndexScanDesc scan, ScanDirection dir  __attribute__((unused
 			scanPos->nvec++;
 		}
 
-		scanDesc = index_beginscan(lovHeap, lovIndex, ActiveSnapshot,
-								   scan->numberOfKeys, scanKeys);
+		scanDesc = index_beginscan(lovHeap, lovIndex, GetActiveSnapshot(),
+								   scan->numberOfKeys, 0);
+		index_rescan(scanDesc, scanKeys, scan->numberOfKeys, NULL, 0);
 
 		/*
 		 * finds all lov items for this scan through lovHeap and lovIndex.
@@ -523,10 +508,7 @@ _bitmap_findbitmaps(IndexScanDesc scan, ScanDirection dir  __attribute__((unused
 	}
 
 	_bitmap_relbuf(metabuf);
-	
-	MIRROREDLOCK_BUFMGR_UNLOCK;
-	// -------- MirroredLock ----------
-	
+
 	if (scanPos->nvec == 0)
 	{
 		scanPos->done = true;
@@ -557,15 +539,10 @@ static void
 init_scanpos(IndexScanDesc scan, BMVector bmScanPos, BlockNumber lovBlock,
 			 OffsetNumber lovOffset)
 {
-	MIRROREDLOCK_BUFMGR_DECLARE;
-
 	Page 					lovPage;
 	BMLOVItem				lovItem;
 
 	bmScanPos->bm_lovOffset = lovOffset;
-	
-	// -------- MirroredLock ----------
-	MIRROREDLOCK_BUFMGR_LOCK;
 	
 	bmScanPos->bm_lovBuffer = _bitmap_getbuf(scan->indexRelation, lovBlock, 
 										     BM_READ);
@@ -582,8 +559,4 @@ init_scanpos(IndexScanDesc scan, BMVector bmScanPos, BlockNumber lovBlock,
 							CurrentMemoryContext);	
 
 	LockBuffer(bmScanPos->bm_lovBuffer, BUFFER_LOCK_UNLOCK);
-	
-	MIRROREDLOCK_BUFMGR_UNLOCK;
-	// -------- MirroredLock ----------
-	
 }

@@ -4,7 +4,8 @@
  *	  This file contains definitions for structures and
  *	  externs for functions used by frontend postgres applications.
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/interfaces/libpq/libpq-fe.h
@@ -55,9 +56,9 @@ typedef enum
 	 * be used for user feedback or similar purposes.
 	 */
 	CONNECTION_STARTED,			/* Waiting for connection to be made.  */
-	CONNECTION_MADE,			/* Connection OK; waiting to send.	   */
+	CONNECTION_MADE,			/* Connection OK; waiting to send.     */
 	CONNECTION_AWAITING_RESPONSE,		/* Waiting for a response from the
-										 * postmaster.		  */
+										 * postmaster.        */
 	CONNECTION_AUTH_OK,			/* Received authentication; waiting for
 								 * backend startup. */
 	CONNECTION_SETENV,			/* Negotiating environment. */
@@ -112,11 +113,31 @@ typedef enum
 
 typedef enum
 {
+	PQSHOW_CONTEXT_NEVER,		/* never show CONTEXT field */
+	PQSHOW_CONTEXT_ERRORS,		/* show CONTEXT for errors only (default) */
+	PQSHOW_CONTEXT_ALWAYS		/* always show CONTEXT field */
+} PGContextVisibility;
+
+/*
+ * PGPing - The ordering of this enum should not be altered because the
+ * values are exposed externally via pg_isready.
+ */
+
+typedef enum
+{
 	PQPING_OK,					/* server is accepting connections */
 	PQPING_REJECT,				/* server is alive but rejecting connections */
 	PQPING_NO_RESPONSE,			/* could not establish connection */
 	PQPING_NO_ATTEMPT,			/* connection not attempted (bad params) */
-	PQPING_MIRROR_OR_QUIESCENT	/* server is in mirror or quiescent */
+
+	/*
+	 * GPDB-specific additions, starting at 64 to avoid collisions with
+	 * upstream. (This is only somewhat arbitrary; values above 255 would
+	 * increase the size of the PGPing type, but values above 125 would also
+	 * conflict with Bash-specific signal codes. We take roughly half of what's
+	 * left.)
+	 */
+	PQPING_MIRROR_READY = 64,	/* mirror completed startup sequence */
 } PGPing;
 
 /* PGconn encapsulates a connection to the backend.
@@ -196,6 +217,10 @@ typedef struct _PQconninfoOption
 								 * hide value "D"  Debug option - don't show
 								 * by default */
 	int			dispsize;		/* Field size in characters for dialog	*/
+#ifndef FRONTEND  /* modules other than backend have this macro */
+	off_t		connofs;		/* Offset into PGconn struct, -1 if not there
+								 * (Greenplum specified) */
+#endif
 } PQconninfoOption;
 
 /* ----------------
@@ -289,6 +314,9 @@ extern void PQfreeCancel(PGcancel *cancel);
 /* issue a cancel request */
 extern int	PQcancel(PGcancel *cancel, char *errbuf, int errbufsize);
 
+/* issue a finsh request */
+extern int	PQrequestFinish(PGcancel *cancel, char *errbuf, int errbufsize);
+
 /* backwards compatible version of PQcancel; not thread-safe */
 extern int	PQrequestCancel(PGconn *conn);
 
@@ -314,6 +342,12 @@ extern int	PQconnectionUsedPassword(const PGconn *conn);
 extern int	PQclientEncoding(const PGconn *conn);
 extern int	PQsetClientEncoding(PGconn *conn, const char *encoding);
 
+/* SSL information functions */
+extern int	PQsslInUse(PGconn *conn);
+extern void *PQsslStruct(PGconn *conn, const char *struct_name);
+extern const char *PQsslAttribute(PGconn *conn, const char *attribute_name);
+extern const char *const * PQsslAttributeNames(PGconn *conn);
+
 /* Get the OpenSSL structure associated with a connection. Returns NULL for
  * unencrypted connections or if any other TLS library is in use. */
 extern void *PQgetssl(PGconn *conn);
@@ -326,6 +360,10 @@ extern void PQinitOpenSSL(int do_ssl, int do_crypto);
 
 /* Set verbosity for PQerrorMessage and PQresultErrorMessage */
 extern PGVerbosity PQsetErrorVerbosity(PGconn *conn, PGVerbosity verbosity);
+
+/* Set CONTEXT visibility for PQerrorMessage and PQresultErrorMessage */
+extern PGContextVisibility PQsetErrorContextVisibility(PGconn *conn,
+							PGContextVisibility show_context);
 
 /* Enable/disable tracing */
 extern void PQtrace(PGconn *conn, FILE *debug_port);
@@ -442,6 +480,9 @@ extern PGresult *PQfn(PGconn *conn,
 extern ExecStatusType PQresultStatus(const PGresult *res);
 extern char *PQresStatus(ExecStatusType status);
 extern char *PQresultErrorMessage(const PGresult *res);
+extern char *PQresultVerboseErrorMessage(const PGresult *res,
+							PGVerbosity verbosity,
+							PGContextVisibility show_context);
 extern char *PQresultErrorField(const PGresult *res, int fieldcode);
 extern int	PQntuples(const PGresult *res);
 extern int	PQnfields(const PGresult *res);
@@ -511,24 +552,21 @@ extern unsigned char *PQescapeBytea(const unsigned char *from, size_t from_lengt
 
 /* === in fe-print.c === */
 
-extern void
-PQprint(FILE *fout,				/* output stream */
+extern void PQprint(FILE *fout,				/* output stream */
 		const PGresult *res,
 		const PQprintOpt *ps);	/* option structure */
 
 /*
  * really old printing routines
  */
-extern void
-PQdisplayTuples(const PGresult *res,
+extern void PQdisplayTuples(const PGresult *res,
 				FILE *fp,		/* where to send the output */
 				int fillAlign,	/* pad the fields with spaces */
 				const char *fieldSep,	/* field separator */
 				int printHeader,	/* display headers? */
 				int quiet);
 
-extern void
-PQprintTuples(const PGresult *res,
+extern void PQprintTuples(const PGresult *res,
 			  FILE *fout,		/* output stream */
 			  int printAttName, /* print attribute names */
 			  int terseOutput,	/* delimiter bars */
@@ -543,10 +581,13 @@ extern int	lo_close(PGconn *conn, int fd);
 extern int	lo_read(PGconn *conn, int fd, char *buf, size_t len);
 extern int	lo_write(PGconn *conn, int fd, const char *buf, size_t len);
 extern int	lo_lseek(PGconn *conn, int fd, int offset, int whence);
+extern pg_int64 lo_lseek64(PGconn *conn, int fd, pg_int64 offset, int whence);
 extern Oid	lo_creat(PGconn *conn, int mode);
 extern Oid	lo_create(PGconn *conn, Oid lobjId);
 extern int	lo_tell(PGconn *conn, int fd);
+extern pg_int64 lo_tell64(PGconn *conn, int fd);
 extern int	lo_truncate(PGconn *conn, int fd, size_t len);
+extern int	lo_truncate64(PGconn *conn, int fd, pg_int64 len);
 extern int	lo_unlink(PGconn *conn, Oid lobjId);
 extern Oid	lo_import(PGconn *conn, const char *filename);
 extern Oid	lo_import_with_oid(PGconn *conn, const char *filename, Oid lobjId);

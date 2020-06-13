@@ -97,7 +97,7 @@ from generate_series(0, 99) i;
 alter table vactst drop column b;
 vacuum analyze vactst;
 alter table vactst drop column i;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 vacuum analyze vactst;
 drop table vactst;
 -- vacuum analyze a table whose index has pg_statistic stats
@@ -141,14 +141,14 @@ show vacuum_freeze_min_age;
 
 select relname from pg_class where relname like 'ao_age_test%'
 order by relname;
-        relname         
-------------------------
+          relname           
+----------------------------
  ao_age_test
  ao_age_test_1_prt_b1
+ ao_age_test_1_prt_b1_i_idx
  ao_age_test_1_prt_b2
+ ao_age_test_1_prt_b2_i_idx
  ao_age_test_i
- ao_age_test_i_1_prt_b1
- ao_age_test_i_1_prt_b2
 (6 rows)
 
 vacuum ao_age_test;
@@ -274,5 +274,87 @@ insert into ao_t1 select i, i from generate_series(1, 10000) i;
 update ao_t1 set b = b + 1;
 vacuum full ao_t1;
 drop table ao_t1;
-vacuum full gp_persistent_relation_node;
-WARNING:  skipping "gp_persistent_relation_node" --- cannot vacuum indexes, views, external tables, or special system tables
+-- superuser must be able to vacuum analyze the table
+CREATE ROLE r_priv_test;
+NOTICE:  resource queue required -- using default resource queue "pg_default"
+CREATE SCHEMA s_priv_test;
+CREATE TABLE s_priv_test.t_priv_table(a INT);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'a' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+INSERT INTO s_priv_test.t_priv_table SELECT i FROM generate_series(1, 10)i;
+ALTER TABLE s_priv_test.t_priv_table OWNER TO r_priv_test;
+VACUUM ANALYZE s_priv_test.t_priv_table;
+DROP SCHEMA s_priv_test CASCADE;
+NOTICE:  drop cascades to table s_priv_test.t_priv_table
+DROP ROLE r_priv_test;
+-- Check how reltuples/relpages are updated on a partitioned table, on
+-- VACUUM and ANALYZE.
+set gp_autostats_mode='none';
+CREATE TABLE vacuum_gp_pt (a int, b int) DISTRIBUTED BY (a) PARTITION BY range (b) (END(5), START(5));
+INSERT INTO vacuum_gp_pt SELECT 0, 6 FROM generate_series(1, 12);
+SELECT relname, reltuples, relpages FROM pg_catalog.pg_class WHERE relname like 'vacuum_gp_pt%';
+       relname        | reltuples | relpages 
+----------------------+-----------+----------
+ vacuum_gp_pt         |         0 |        0
+ vacuum_gp_pt_1_prt_1 |         0 |        0
+ vacuum_gp_pt_1_prt_2 |         0 |        0
+(3 rows)
+
+ANALYZE vacuum_gp_pt;
+SELECT relname, reltuples, relpages FROM pg_catalog.pg_class WHERE relname like 'vacuum_gp_pt%';
+       relname        | reltuples | relpages 
+----------------------+-----------+----------
+ vacuum_gp_pt         |         0 |        0
+ vacuum_gp_pt_1_prt_1 |         0 |        1
+ vacuum_gp_pt_1_prt_2 |        12 |        1
+(3 rows)
+
+VACUUM vacuum_gp_pt;
+SELECT relname, reltuples, relpages FROM pg_catalog.pg_class WHERE relname like 'vacuum_gp_pt%';
+       relname        | reltuples | relpages 
+----------------------+-----------+----------
+ vacuum_gp_pt         |         0 |        1
+ vacuum_gp_pt_1_prt_1 |         0 |        1
+ vacuum_gp_pt_1_prt_2 |        12 |        1
+(3 rows)
+
+VACUUM ANALYZE vacuum_gp_pt;
+SELECT relname, reltuples, relpages FROM pg_catalog.pg_class WHERE relname like 'vacuum_gp_pt%';
+       relname        | reltuples | relpages 
+----------------------+-----------+----------
+ vacuum_gp_pt         |         0 |        1
+ vacuum_gp_pt_1_prt_1 |         0 |        1
+ vacuum_gp_pt_1_prt_2 |        12 |        1
+(3 rows)
+
+reset gp_autostats_mode;
+-- Check forbidden relkind for vacuum is correctly skipped
+CREATE SEQUENCE s_serial START 100;
+VACUUM (ANALYZE, VERBOSE) s_serial;
+WARNING:  skipping "s_serial" --- cannot vacuum non-tables, external tables, foreign tables or special system tables
+DROP SEQUENCE s_serial;
+VACUUM gp_toolkit.__gp_log_master_ext;
+WARNING:  skipping "__gp_log_master_ext" --- cannot vacuum non-tables, external tables, foreign tables or special system tables
+-- Vacuum related access control tests (Issue: https://github.com/greenplum-db/gpdb/issues/9001)
+-- Given a non-super-user role
+CREATE ROLE non_super_user_vacuum;
+-- And a heap table with auxiliary relations under the pg_toast namespace.
+CREATE TABLE vac_acl_heap(i int, j text);
+-- And an AO table with auxiliary relations under the pg_aoseg namespace.
+CREATE TABLE vac_acl_ao(i int, j text) with (appendonly=true);
+-- And an AOCS table with auxiliary relations under the pg_aocsseg namespace.
+CREATE TABLE vac_acl_aocs(i int, j text) with (appendonly=true, orientation=column);
+-- And all the tables belong to the non-super-user role.
+ALTER TABLE vac_acl_heap OWNER TO non_super_user_vacuum;
+ALTER TABLE vac_acl_ao OWNER TO non_super_user_vacuum;
+ALTER TABLE vac_acl_aocs OWNER TO non_super_user_vacuum;
+-- We can vacuum each table as the non-super-user
+SET ROLE TO non_super_user_vacuum;
+VACUUM vac_acl_heap;
+VACUUM vac_acl_ao;
+VACUUM vac_acl_aocs;
+\c
+DROP TABLE vac_acl_heap;
+DROP TABLE vac_acl_ao;
+DROP TABLE vac_acl_aocs;
+DROP ROLE non_super_user_vacuum;

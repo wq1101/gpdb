@@ -3,12 +3,14 @@ import imp
 
 from gp_unittest import *
 from mock import *
-from gparray import GpDB, GpArray
+from gparray import Segment, GpArray
 from gppylib.db.dbconn import DbURL
 from gppylib.db import catalog
 from gppylib.gplog import *
 from gppylib.system.configurationInterface import GpConfigurationProvider
 from gppylib.system.environment import GpMasterEnvironment
+import io
+import sys
 
 class GpExpand(GpTestCase):
     def setUp(self):
@@ -19,6 +21,7 @@ class GpExpand(GpTestCase):
         #   self.subject = gpexpand
         gpexpand_file = os.path.abspath(os.path.dirname(__file__) + "/../../../gpexpand")
         self.subject = imp.load_source('gpexpand', gpexpand_file)
+        self.old_sys_argv = sys.argv
         sys.argv = []  # We need to do this otherwise, the parser will read the command line as the default arguments.
         self.options, self.args, self.parser = self.subject.parseargs()
 
@@ -31,7 +34,7 @@ class GpExpand(GpTestCase):
         self.apply_patches([
             patch('gpexpand.GpArray.initFromCatalog', return_value=self.gparray),
             patch('__builtin__.open', mock_open(), create=True),
-            patch('gpexpand.PgControlData', return_value=Mock()),
+            patch('__builtin__.raw_input'),
             patch('gpexpand.copy.deepcopy', return_value=Mock()),
             patch('gpexpand.dbconn.execSQL', return_value=FakeCursor()),
             patch('gpexpand.GpExpandStatus', return_value=Mock()),
@@ -48,6 +51,7 @@ class GpExpand(GpTestCase):
             patch('gpexpand.get_default_logger', return_value=self.subject.logger),
             patch('gpexpand.HeapChecksum'),
         ])
+        self.raw_input_mock = self.get_mock_from_apply_patch("raw_input")
         self.getConfigProviderFunctionMock = self.get_mock_from_apply_patch("getConfigurationProvider")
         self.gpMasterEnvironmentMock = self.get_mock_from_apply_patch("GpMasterEnvironment")
         self.previous_master_data_directory = os.getenv('MASTER_DATA_DIRECTORY', '')
@@ -64,15 +68,8 @@ class GpExpand(GpTestCase):
 
     def tearDown(self):
         os.environ['MASTER_DATA_DIRECTORY'] = self.previous_master_data_directory
+        sys.argv = self.old_sys_argv
         super(GpExpand, self).tearDown()
-
-    def test_PrepFileSpaces_issues_correct_postgres_command(self):
-        prep_file_spaces = self.subject.PrepFileSpaces("name", [""], [""], "foo", 1, 1)
-
-        self.assertIn("--gp_contentid=", prep_file_spaces.cmdStr)
-        self.assertIn("--gp_num_contents_in_cluster=", prep_file_spaces.cmdStr)
-        self.assertIn("--gp_dbid=", prep_file_spaces.cmdStr)
-
 
     # @patch('gpexpand.PgControlData.return_value.get_value', side_effect=[1, 1, 0])
     def test_validate_heap_checksums_aborts_when_cluster_inconsistent(self):
@@ -112,17 +109,39 @@ class GpExpand(GpTestCase):
         self.subject.logger.error.assert_called_with("gpexpand failed: Invalid input file: No expansion "
                                                                   "segments defined \n\nExiting...")
 
+    #
+    # unit tests for interview_setup()
+    #
+    def test_user_aborts(self):
+        self.raw_input_mock.return_value = "N"
+        with self.assertRaises(SystemExit):
+            self.subject.interview_setup(self.gparray, self.options)
+        self.subject.logger.info.assert_any_call("User Aborted. Exiting...")
+
+    def test_nonstandard_gpArray_user_aborts(self):
+        self.raw_input_mock.side_effect = ["Y", "N"]
+        self.gparray.isStandardArray = Mock(return_value=(False, ""))
+        with patch('sys.stdout', new=io.BytesIO()) as mock_stdout:
+            with self.assertRaises(SystemExit):
+                self.subject.interview_setup(self.gparray, self.options)
+            self.assertIn('The current system appears to be non-standard.', mock_stdout.getvalue())
+
+        self.subject.logger.info.assert_any_call("User Aborted. Exiting...")
+    #
+    # end tests for interview_setup()
+    #
+
     def createGpArrayWith2Primary2Mirrors(self):
-        self.master = GpDB.initFromString(
-            "1|-1|p|p|s|u|mdw|mdw|5432|None|/data/master||/data/master/base/10899,/data/master/base/1,/data/master/base/10898,/data/master/base/25780,/data/master/base/34782")
-        self.primary0 = GpDB.initFromString(
-            "2|0|p|p|s|u|aspen|sdw1|40000|41000|/Users/pivotal/workspace/gpdb/gpAux/gpdemo/datadirs/qddir/demoDataDir-1||/data/primary0/base/10899,/data/primary0/base/1,/data/primary0/base/10898,/data/primary0/base/25780,/data/primary0/base/34782")
-        self.primary1 = GpDB.initFromString(
-            "3|1|p|p|s|u|sdw2|sdw2|40001|41001|/data/primary1||/data/primary1/base/10899,/data/primary1/base/1,/data/primary1/base/10898,/data/primary1/base/25780,/data/primary1/base/34782")
-        self.mirror0 = GpDB.initFromString(
-            "4|0|m|m|s|u|sdw2|sdw2|50000|51000|/data/mirror0||/data/mirror0/base/10899,/data/mirror0/base/1,/data/mirror0/base/10898,/data/mirror0/base/25780,/data/mirror0/base/34782")
-        self.mirror1 = GpDB.initFromString(
-            "5|1|m|m|s|u|sdw1|sdw1|50001|51001|/data/mirror1||/data/mirror1/base/10899,/data/mirror1/base/1,/data/mirror1/base/10898,/data/mirror1/base/25780,/data/mirror1/base/34782")
+        self.master = Segment.initFromString(
+            "1|-1|p|p|s|u|mdw|mdw|5432|/data/master")
+        self.primary0 = Segment.initFromString(
+            "2|0|p|p|s|u|aspen|sdw1|40000|/Users/pivotal/workspace/gpdb/gpAux/gpdemo/datadirs/qddir/demoDataDir-1")
+        self.primary1 = Segment.initFromString(
+            "3|1|p|p|s|u|sdw2|sdw2|40001|/data/primary1")
+        self.mirror0 = Segment.initFromString(
+            "4|0|m|m|s|u|sdw2|sdw2|50000|/data/mirror0")
+        self.mirror1 = Segment.initFromString(
+            "5|1|m|m|s|u|sdw1|sdw1|50001|/data/mirror1")
         return GpArray([self.master, self.primary0, self.primary1, self.mirror0, self.mirror1])
 
 if __name__ == '__main__':

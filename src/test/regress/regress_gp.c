@@ -22,12 +22,19 @@
 #include <math.h>
 #include <unistd.h>
 
+#include "libpq-fe.h"
 #include "pgstat.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "access/xlog.h"
+#include "access/xloginsert.h"
+#include "catalog/catalog.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_type.h"
 #include "cdb/memquota.h"
+#include "cdb/cdbdisp_query.h"
+#include "cdb/cdbdispatchresult.h"
+#include "cdb/cdbfts.h"
 #include "cdb/cdbgang.h"
 #include "cdb/cdbvars.h"
 #include "cdb/ml_ipc.h"
@@ -37,6 +44,8 @@
 #include "executor/spi.h"
 #include "port/atomics.h"
 #include "parser/parse_expr.h"
+#include "storage/bufmgr.h"
+#include "storage/buf_internals.h"
 #include "libpq/auth.h"
 #include "libpq/hba.h"
 #include "utils/builtins.h"
@@ -44,6 +53,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/resource_manager.h"
+#include "utils/timestamp.h"
 
 /* table_functions test */
 extern Datum multiset_example(PG_FUNCTION_ARGS);
@@ -83,11 +93,25 @@ extern Datum assign_new_record(PG_FUNCTION_ARGS);
 extern Datum udf_setenv(PG_FUNCTION_ARGS);
 extern Datum udf_unsetenv(PG_FUNCTION_ARGS);
 
-/* Aut Constraints */
+/* Auth Constraints */
 extern Datum check_auth_time_constraints(PG_FUNCTION_ARGS);
 
-/* Create function */
-extern Datum checkRelationAfterInvalidation(PG_FUNCTION_ARGS);
+/* XID wraparound */
+extern Datum test_consume_xids(PG_FUNCTION_ARGS);
+extern Datum gp_execute_on_server(PG_FUNCTION_ARGS);
+
+/* Check shared buffer cache for a database Oid */
+extern Datum check_shared_buffer_cache_for_dboid(PG_FUNCTION_ARGS);
+
+/* oid wraparound tests */
+extern Datum gp_set_next_oid(PG_FUNCTION_ARGS);
+extern Datum gp_get_next_oid(PG_FUNCTION_ARGS);
+
+/* Broken output function, for testing */
+extern Datum broken_int4out(PG_FUNCTION_ARGS);
+
+/* fts tests */
+extern Datum gp_fts_probe_stats(PG_FUNCTION_ARGS);
 
 /* Triggers */
 
@@ -108,6 +132,7 @@ extern Datum check_foreign_key(PG_FUNCTION_ARGS);
 extern Datum autoinc(PG_FUNCTION_ARGS);
 static EPlan *find_plan(char *ident, EPlan ** eplan, int *nplans);
 
+extern Datum trigger_udf_return_new_oid(PG_FUNCTION_ARGS);
 
 
 PG_FUNCTION_INFO_V1(multiset_scalar_null);
@@ -493,7 +518,7 @@ hasGangsExist(PG_FUNCTION_ARGS)
 {
 	if (Gp_role != GP_ROLE_DISPATCH)
 		elog(ERROR, "hasGangsExist can only be executed on master");
-	if (GangsExist())
+	if (cdbcomponent_qesExist())
 		PG_RETURN_BOOL(true);
 	PG_RETURN_BOOL(false);
 }
@@ -828,7 +853,8 @@ describe(PG_FUNCTION_ARGS)
 		elog(ERROR, "invalid invocation of describe");
 
 	fexpr = (FuncExpr*) PG_GETARG_POINTER(0);
-	Insist(IsA(fexpr, FuncExpr));   /* Assert we got what we expected */
+	if (!IsA(fexpr, FuncExpr))
+		ereport(ERROR, (errmsg("invalid parameters for describe")));
 
 	/* Build a result tuple descriptor */
 	tupdesc = CreateTemplateTupleDesc(3, false);
@@ -837,6 +863,49 @@ describe(PG_FUNCTION_ARGS)
 	TupleDescInitEntry(tupdesc, (AttrNumber) 3, "sessionnum", INT4OID, -1, 0);
 
 	PG_RETURN_POINTER(tupdesc);
+}
+
+PG_FUNCTION_INFO_V1(gp_fts_probe_stats);
+Datum
+gp_fts_probe_stats(PG_FUNCTION_ARGS)
+{
+	Assert(GpIdentity.dbid == MASTER_DBID);
+
+	TupleDesc	tupdesc;
+	int32		start_count = 0;
+	int32		done_count = 0;
+	uint8		status_version = 0;
+
+	SpinLockAcquire(&ftsProbeInfo->lock);
+	start_count = ftsProbeInfo->start_count;
+	done_count    = ftsProbeInfo->done_count;
+	status_version = ftsProbeInfo->status_version;
+	SpinLockRelease(&ftsProbeInfo->lock);
+
+	/* Build a result tuple descriptor */
+	tupdesc = CreateTemplateTupleDesc(3, false);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 1, "start_count", INT4OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 2, "end_count", INT4OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 3, "status_version", INT2OID, -1, 0);
+
+	tupdesc = BlessTupleDesc(tupdesc);
+
+	{
+		Datum values[3];
+		bool nulls[3];
+		HeapTuple tuple;
+		Datum result;
+		MemSet(values, 0, sizeof(values));
+		MemSet(nulls, false, sizeof(nulls));
+
+		values[0] = Int32GetDatum(start_count);
+		values[1] = Int32GetDatum(done_count);
+		values[2] = UInt8GetDatum(status_version);
+
+		tuple = heap_form_tuple(tupdesc, values, nulls);
+		result = HeapTupleGetDatum(tuple);
+		PG_RETURN_DATUM(result);
+	}
 }
 
 PG_FUNCTION_INFO_V1(project);
@@ -877,9 +946,12 @@ project(PG_FUNCTION_ARGS)
 	tuple       = AnyTable_GetNextTuple(scan);
 
 	/* Based on what the describe callback should have setup */
-	Insist(position > 0 && position <= in_tupdesc->natts);
-	Insist(out_tupdesc->natts == 1);
-	Insist(out_tupdesc->attrs[0]->atttypid == in_tupdesc->attrs[position-1]->atttypid);
+	if (position <= 0 || position > in_tupdesc->natts)
+		ereport(ERROR, (errmsg("invalid position provided")));
+	if (out_tupdesc->natts != 1)
+		ereport(ERROR, (errmsg("only one expected tuple is allowed")));
+	if (out_tupdesc->attrs[0]->atttypid != in_tupdesc->attrs[position-1]->atttypid)
+		ereport(ERROR, (errmsg("input and output types do not match")));
 
 	/* check for end of scan */
 	if (tuple == NULL)
@@ -932,7 +1004,8 @@ project_describe(PG_FUNCTION_ARGS)
 		elog(ERROR, "invalid invocation of project_describe");
 
 	fexpr = (FuncExpr*) PG_GETARG_POINTER(0);
-	Insist(IsA(fexpr, FuncExpr));   /* Assert we got what we expected */
+	if (!IsA(fexpr, FuncExpr))
+		ereport(ERROR, (errmsg("invalid parameters for project_describe")));
 
 	/*
 	 * We should know the type information of the arguments of our calling
@@ -957,16 +1030,22 @@ project_describe(PG_FUNCTION_ARGS)
 	 *   - second argument "text"
 	 * --------
 	 */
-	Insist(numargs == 2);
-	Insist(argtypes[0] == ANYTABLEOID);
-	Insist(argtypes[1] == INT4OID);
+	if (numargs != 2)
+		ereport(ERROR, (errmsg("invalid argument number"),
+				errdetail("Two arguments need to be provided to the function")));
+	if (argtypes[0] != ANYTABLEOID)
+		ereport(ERROR, (errmsg("first argument is not a table OID")));
+	if (argtypes[1] != INT4OID)
+		ereport(ERROR, (errmsg("second argument is not a integer OID")));
 
 	/* Now get the tuple descriptor for the ANYTABLE we received */
 	texpr = (TableValueExpr*) linitial(fargs);
-	Insist(IsA(texpr, TableValueExpr));  /* double check that cast */
+	if (!IsA(texpr, TableValueExpr))
+		ereport(ERROR, (errmsg("function argument is not a table")));
 
 	qexpr = (Query*) texpr->subquery;
-	Insist(IsA(qexpr, Query));
+	if (!IsA(qexpr, Query))
+		ereport(ERROR, (errmsg("subquery is not a Query object")));
 
 	tdesc = ExecCleanTypeFromTL(qexpr->targetList, false);
 
@@ -1071,7 +1150,8 @@ userdata_describe(PG_FUNCTION_ARGS)
 		elog(ERROR, "invalid invocation of userdata_describe");
 
 	fexpr = (FuncExpr*) PG_GETARG_POINTER(0);
-	Insist(IsA(fexpr, FuncExpr));   /* Assert we got what we expected */
+	if (!IsA(fexpr, FuncExpr))
+		ereport(ERROR, (errmsg("invalid parameters for userdata_describe")));
 
 	/* Build a result tuple descriptor */
 	tupdesc = CreateTemplateTupleDesc(1, false);
@@ -1099,44 +1179,7 @@ check_auth_time_constraints(PG_FUNCTION_ARGS)
 	char		   *rolname = PG_GETARG_CSTRING(0);
 	TimestampTz 	timestamp = PG_GETARG_TIMESTAMPTZ(1);
 
-	/*
-	 * For the sake of unit testing, we must ensure that the role information
-	 * is accessible to the backend process. This function call will ensure the
-	 * role information is reloaded. This is a moot point for the traditional
-	 * auth. checking where this data already resides in the PostmasterContext.
-	 * For more information, see force_load_role().
-	 */
-	force_load_role();
-	PG_RETURN_BOOL(check_auth_time_constraints_internal(rolname, timestamp));
-}
-
-/*
- * Check if Relation has the valid information after cache invalidation.
- */
-PG_FUNCTION_INFO_V1(checkRelationAfterInvalidation);
-Datum
-checkRelationAfterInvalidation(PG_FUNCTION_ARGS)
-{
-	Relation relation;
-	struct RelationNodeInfo nodeinfo;
-
-	/* The relation is arbitrary.  Any "unnailed" relation is ok */
-	relation = relation_open(LanguageRelationId, AccessShareLock);
-	RelationFetchGpRelationNodeForXLog(relation);
-	memcpy(&nodeinfo,
-		   &relation->rd_segfile0_relationnodeinfo,
-		   sizeof(struct RelationNodeInfo));
-
-	/* Invalidation messages should not blow persistent table info */
-	RelationCacheInvalidate();
-	if (memcmp(&nodeinfo,
-			   &relation->rd_segfile0_relationnodeinfo,
-			   sizeof(struct RelationNodeInfo)) != 0)
-		elog(ERROR, "node info does not match");
-
-	relation_close(relation, AccessShareLock);
-
-	PG_RETURN_BOOL(true);
+	PG_RETURN_BOOL(check_auth_time_constraints_internal(rolname, timestamp) == STATUS_OK);
 }
 
 /*
@@ -1149,8 +1192,6 @@ PG_FUNCTION_INFO_V1(hasBackendsExist);
 Datum
 hasBackendsExist(PG_FUNCTION_ARGS)
 {
-	const char *walreceiver = "walreceiver";
-
 	int beid;
 	int32 result;
 	int timeout = PG_GETARG_INT32(0);
@@ -1168,9 +1209,8 @@ hasBackendsExist(PG_FUNCTION_ARGS)
 		for (beid = 1; beid <= tot_backends; beid++)
 		{
 			PgBackendStatus *beentry = pgstat_fetch_stat_beentry(beid);
-			if (beentry && beentry->st_procpid >0 && beentry->st_procpid != pid
-					&& strncmp(walreceiver, beentry->st_appname, strlen(walreceiver)) /* exclude the WALREP process*/
-				)
+			if (beentry && beentry->st_procpid >0 && beentry->st_procpid != pid &&
+				beentry->st_session_id == gp_session_id)
 				result++;
 		}
 		if (result == 0 || timeout == 0)
@@ -1902,4 +1942,217 @@ find_plan(char *ident, EPlan ** eplan, int *nplans)
 	(*nplans)++;
 
 	return (newp);
+}
+
+
+/*
+ * trigger_udf_return_new_oid
+ *
+ * A helper function to assign a specific OID to a tuple on INSERT.
+ */
+PG_FUNCTION_INFO_V1(trigger_udf_return_new_oid);
+Datum
+trigger_udf_return_new_oid(PG_FUNCTION_ARGS)
+{
+	TriggerData *trigdata = (TriggerData *) fcinfo->context;
+	Trigger    *trigger;
+	char	  **args;
+	HeapTuple	input_tuple;
+	HeapTuple	ret_tuple;
+	Oid			new_oid;
+
+	if (!CALLED_AS_TRIGGER(fcinfo))
+		elog(ERROR, "not fired by trigger manager");
+	if (!TRIGGER_FIRED_FOR_ROW(trigdata->tg_event))
+		elog(ERROR, "cannot process STATEMENT events");
+	if (!TRIGGER_FIRED_BEFORE(trigdata->tg_event))
+		elog(ERROR, "must be fired before event");
+
+	if (!TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))
+		elog(ERROR, "trigger_udf_return_new_oid() called for a non-INSERT");
+
+	/*
+	 * Get the argument. (Trigger functions receive their arguments
+	 * differently than normal functions.)
+	 */
+	trigger = trigdata->tg_trigger;
+	if (trigger->tgnargs != 1)
+		elog(ERROR, "trigger_udf_return_new_oid called with invalid number of arguments (%d, expected 1)",
+			 trigger->tgnargs);
+	args = trigger->tgargs;
+	new_oid = DatumGetObjectId(DirectFunctionCall1(oidin,
+												   CStringGetDatum(args[0])));
+
+	elog(NOTICE, "trigger_udf_return_new_oid assigned OID %u to the new tuple", new_oid);
+
+	input_tuple = trigdata->tg_trigtuple;
+	ret_tuple = heap_copytuple(input_tuple);
+	HeapTupleSetOid(ret_tuple, new_oid);
+
+	return PointerGetDatum(ret_tuple);
+}
+
+
+/*
+ * test_consume_xids(int4), for rapidly consuming XIDs, to test wraparound.
+ *
+ * Used by the 'autovacuum-template0' test.
+ */
+PG_FUNCTION_INFO_V1(test_consume_xids);
+Datum
+test_consume_xids(PG_FUNCTION_ARGS)
+{
+	int32		nxids = PG_GETARG_INT32(0);
+	TransactionId topxid;
+	TransactionId xid;
+	TransactionId targetxid;
+
+	/* make sure we have a top-XID first */
+	topxid = GetCurrentTransactionId();
+
+	xid = ReadNewTransactionId();
+
+	targetxid = xid + nxids;
+	while (targetxid < FirstNormalTransactionId)
+		targetxid++;
+
+	while (TransactionIdPrecedes(xid, targetxid))
+	{
+		elog(DEBUG1, "xid: %u", xid);
+		xid = GetNewTransactionId(true);
+	}
+
+	PG_RETURN_VOID();
+}
+
+/*
+ * Function to execute a DML/DDL command on segment with specified content id.
+ * To use:
+ *
+ * CREATE FUNCTION gp_execute_on_server(content int, query text) returns text
+ * language C as '$libdir/regress.so', 'gp_execute_on_server';
+ */
+PG_FUNCTION_INFO_V1(gp_execute_on_server);
+Datum
+gp_execute_on_server(PG_FUNCTION_ARGS)
+{
+	int32		content = PG_GETARG_INT32(0);
+	char	   *query = TextDatumGetCString(PG_GETARG_TEXT_PP(1));
+	CdbPgResults cdb_pgresults;
+	StringInfoData result_str;
+
+	if (!IS_QUERY_DISPATCHER())
+		elog(ERROR, "cannot use gp_execute_on_server() when not in QD mode");
+
+	CdbDispatchCommandToSegments(query,
+								 DF_CANCEL_ON_ERROR | DF_WITH_SNAPSHOT,
+								 list_make1_int(content),
+								 &cdb_pgresults);
+
+	/*
+	 * Collect the results.
+	 *
+	 * All the result fields are appended to a string, with minimal
+	 * formatting. That's not very pretty, but is good enough for
+	 * regression tests.
+	 */
+	initStringInfo(&result_str);
+	for (int resultno = 0; resultno < cdb_pgresults.numResults; resultno++)
+	{
+		struct pg_result *pgresult = cdb_pgresults.pg_results[resultno];
+
+		if (PQresultStatus(pgresult) != PGRES_TUPLES_OK &&
+			PQresultStatus(pgresult) != PGRES_COMMAND_OK)
+		{
+			cdbdisp_clearCdbPgResults(&cdb_pgresults);
+			elog(ERROR, "execution failed with status %d", PQresultStatus(pgresult));
+		}
+
+		for (int rowno = 0; rowno < PQntuples(pgresult); rowno++)
+		{
+			if (rowno > 0)
+				appendStringInfoString(&result_str, "\n");
+			for (int colno = 0; colno < PQnfields(pgresult); colno++)
+			{
+				if (colno > 0)
+					appendStringInfoString(&result_str, " ");
+				appendStringInfoString(&result_str, PQgetvalue(pgresult, rowno, colno));
+			}
+		}
+	}
+
+	cdbdisp_clearCdbPgResults(&cdb_pgresults);
+	PG_RETURN_TEXT_P(CStringGetTextDatum(result_str.data));
+}
+
+/*
+ * Check if the shared buffer cache contains any pages that have the specified
+ * database OID in their buffer tag. Return true if an entry is found, else
+ * return false.
+ */
+PG_FUNCTION_INFO_V1(check_shared_buffer_cache_for_dboid);
+Datum
+check_shared_buffer_cache_for_dboid(PG_FUNCTION_ARGS)
+{
+	Oid databaseOid = PG_GETARG_OID(0);
+	int i;
+
+	for (i = 0; i < NBuffers; i++)
+	{
+		volatile BufferDesc *bufHdr = GetBufferDescriptor(i);
+
+		if (bufHdr->tag.rnode.dbNode == databaseOid)
+			PG_RETURN_BOOL(true);
+	}
+
+	PG_RETURN_BOOL(false);
+}
+
+PG_FUNCTION_INFO_V1(gp_set_next_oid);
+Datum
+gp_set_next_oid(PG_FUNCTION_ARGS)
+{
+	Oid new_oid = PG_GETARG_OID(0);
+
+	LWLockAcquire(OidGenLock, LW_EXCLUSIVE);
+
+	ShmemVariableCache->nextOid = new_oid;
+
+	LWLockRelease(OidGenLock);
+
+	PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(gp_get_next_oid);
+Datum
+gp_get_next_oid(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_OID(ShmemVariableCache->nextOid);
+}
+
+/*
+ * This is like int4out, but throws an error on '1234'.
+ *
+ * Used in the error handling test in 'gpcopy'.
+ */
+PG_FUNCTION_INFO_V1(broken_int4out);
+Datum
+broken_int4out(PG_FUNCTION_ARGS)
+{
+	int32		arg = PG_GETARG_INT32(0);
+
+	if (arg == 1234)
+		ereport(ERROR,
+				(errcode(ERRCODE_FAULT_INJECT),
+				 errmsg("testing failure in output function"),
+				 errdetail("The trigger value was 1234")));
+
+	return DirectFunctionCall1(int4out, Int32GetDatum(arg));
+}
+
+PG_FUNCTION_INFO_V1(get_tablespace_version_directory_name);
+Datum
+get_tablespace_version_directory_name(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_TEXT_P(CStringGetTextDatum(GP_TABLESPACE_VERSION_DIRECTORY));
 }

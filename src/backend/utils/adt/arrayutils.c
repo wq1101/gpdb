@@ -3,12 +3,12 @@
  * arrayutils.c
  *	  This file contains some support routines required for array functions.
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/adt/arrayutils.c,v 1.26 2008/01/01 19:45:52 momjian Exp $
+ *	  src/backend/utils/adt/arrayutils.c
  *
  *-------------------------------------------------------------------------
  */
@@ -193,7 +193,7 @@ mda_next_tuple(int n, int *curr, const int *span)
 
 /*
  * ArrayGetIntegerTypmods: verify that argument is a 1-D cstring array,
- * and get the contents converted to integers.	Returns a palloc'd array
+ * and get the contents converted to integers.  Returns a palloc'd array
  * and places the length at *n.
  */
 int32 *
@@ -213,7 +213,7 @@ ArrayGetIntegerTypmods(ArrayType *arr, int *n)
 				(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
 				 errmsg("typmod array must be one-dimensional")));
 
-	if (ARR_HASNULL(arr))
+	if (array_contains_nulls(arr))
 		ereport(ERROR,
 				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
 				 errmsg("typmod array must not contain nulls")));

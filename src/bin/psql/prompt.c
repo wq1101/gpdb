@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2010, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2016, PostgreSQL Global Development Group
  *
  * src/bin/psql/prompt.c
  */
@@ -34,6 +34,7 @@
  * %M - database server "hostname.domainname", "[local]" for AF_UNIX
  *		sockets, "[local:/dir/name]" if not default
  * %m - like %M, but hostname only (before first dot), or always "[local]"
+ * %p - backend pid
  * %> - database server port number
  * %n - database user name
  * %/ - current database
@@ -44,6 +45,7 @@
  *		in prompt2 -, *, ', or ";
  *		in prompt3 nothing
  * %x - transaction status: empty, *, !, ? (unknown or no connection)
+ * %l - The line number inside the current statement, starting from 1.
  * %? - the error code of the last query (not yet implemented)
  * %% - a percent sign
  *
@@ -160,6 +162,16 @@ get_prompt(promptStatus_t status)
 					if (pset.db)
 						strlcpy(buf, session_username(), sizeof(buf));
 					break;
+					/* backend pid */
+				case 'p':
+					if (pset.db)
+					{
+						int			pid = PQbackendPID(pset.db);
+
+						if (pid)
+							snprintf(buf, sizeof(buf), "%d", pid);
+					}
+					break;
 
 				case '0':
 				case '1':
@@ -227,6 +239,10 @@ get_prompt(promptStatus_t status)
 								buf[0] = '?';
 								break;
 						}
+					break;
+
+				case 'l':
+					snprintf(buf, sizeof(buf), UINT64_FORMAT, pset.stmt_lineno);
 					break;
 
 				case '?':

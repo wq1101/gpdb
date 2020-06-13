@@ -1,11 +1,16 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/create_role.sgml,v 1.10 2007/11/07 12:24:23 petere Exp $
+doc/src/sgml/ref/create_role.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-CREATEROLE">
+ <indexterm zone="sql-createrole">
+  <primary>CREATE ROLE</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="sql-createrole-title">CREATE ROLE</refentrytitle>
+  <refentrytitle>CREATE ROLE</refentrytitle>
+  <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
 
@@ -14,14 +19,12 @@ PostgreSQL documentation
   <refpurpose>define a new database role</refpurpose>
  </refnamediv>
 
- <indexterm zone="sql-createrole">
-  <primary>CREATE ROLE</primary>
- </indexterm>
-
  <refsynopsisdiv>
 <synopsis>
-CREATE ROLE name [[WITH] option [ ... ]]
-where option can be:
+CREATE ROLE <replaceable class="PARAMETER">name</replaceable> [ [ WITH ] <replaceable class="PARAMETER">option</replaceable> [ ... ] ]
+
+<phrase>where <replaceable class="PARAMETER">option</replaceable> can be:</phrase>
+
       SUPERUSER | NOSUPERUSER
     | CREATEDB | NOCREATEDB
     | CREATEROLE | NOCREATEROLE
@@ -29,16 +32,22 @@ where option can be:
       [ ( attribute='value'[, ...] ) ]
            where attributes and values are:
            type='readable'|'writable'
-           protocol='gpfdist'|'http'|'gphdfs'
+           protocol='gpfdist'|'http'
     | INHERIT | NOINHERIT
     | LOGIN | NOLOGIN
-    | CONNECTION LIMIT connlimit
-    | [ ENCRYPTED | UNENCRYPTED ] PASSWORD 'password'
-    | VALID UNTIL 'timestamp' 
-    | IN ROLE rolename [, ...]
-    | ROLE rolename [, ...]
-    | ADMIN rolename [, ...]
+    | REPLICATION | NOREPLICATION
+    | BYPASSRLS | NOBYPASSRLS
+    | CONNECTION LIMIT <replaceable class="PARAMETER">connlimit</replaceable>
+    | [ ENCRYPTED | UNENCRYPTED ] PASSWORD '<replaceable class="PARAMETER">password</replaceable>'
+    | VALID UNTIL '<replaceable class="PARAMETER">timestamp</replaceable>'
+    | IN ROLE <replaceable class="PARAMETER">role_name</replaceable> [, ...]
+    | IN GROUP <replaceable class="PARAMETER">role_name</replaceable> [, ...]
+    | ROLE <replaceable class="PARAMETER">role_name</replaceable> [, ...]
+    | ADMIN <replaceable class="PARAMETER">role_name</replaceable> [, ...]
+    | USER <replaceable class="PARAMETER">role_name</replaceable> [, ...]
+    | SYSID <replaceable class="PARAMETER">uid</replaceable>
     | RESOURCE QUEUE queue_name
+    | RESOURCE GROUP group_name
 </synopsis>
  </refsynopsisdiv>
 
@@ -122,19 +131,6 @@ where option can be:
      </varlistentry>
 
      <varlistentry>
-      <term><literal>CREATEUSER</literal></term>
-      <term><literal>NOCREATEUSER</literal></term>
-      <listitem>
-       <para>
-        These clauses are an obsolete, but still accepted, spelling of
-        <literal>SUPERUSER</literal> and <literal>NOSUPERUSER</literal>.
-        Note that they are <emphasis>not</> equivalent to
-        <literal>CREATEROLE</literal> as one might naively expect!
-       </para>
-      </listitem>
-     </varlistentry>
-
-     <varlistentry>
       <term><literal>INHERIT</literal></term>
       <term><literal>NOINHERIT</literal></term>
       <listitem>
@@ -168,7 +164,38 @@ where option can be:
         If not specified,
         <literal>NOLOGIN</literal> is the default, except when
         <command>CREATE ROLE</> is invoked through its alternative spelling
-        <command>CREATE USER</>.
+        <xref linkend="sql-createuser">.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><literal>REPLICATION</literal></term>
+      <term><literal>NOREPLICATION</literal></term>
+      <listitem>
+       <para>
+        These clauses determine whether a role is allowed to initiate
+        streaming replication or put the system in and out of backup mode.
+        A role having the <literal>REPLICATION</> attribute is a very
+        highly privileged role, and should only be used on roles actually
+        used for replication. If not specified,
+        <literal>NOREPLICATION</literal> is the default.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><literal>BYPASSRLS</literal></term>
+      <term><literal>NOBYPASSRLS</literal></term>
+      <listitem>
+       <para>
+        These clauses determine whether a role bypasses every row-level
+        security (RLS) policy.  <literal>NOBYPASSRLS</literal> is the default.
+        Note that pg_dump will set <literal>row_security</literal> to
+        <literal>OFF</literal> by default, to ensure all contents of a table are
+        dumped out.  If the user running pg_dump does not have appropriate
+        permissions, an error will be returned.  The superuser and owner of the
+        table being dumped always bypass RLS.
        </para>
       </listitem>
      </varlistentry>
@@ -215,12 +242,6 @@ where option can be:
         password string).  This allows reloading of encrypted
         passwords during dump/restore.
        </para>
-
-       <para>
-        Note that older clients might lack support for the MD5
-        authentication mechanism that is needed to work with passwords
-        that are stored encrypted.
-       </para>
       </listitem>
      </varlistentry>
 
@@ -236,7 +257,7 @@ where option can be:
      </varlistentry>
 
      <varlistentry>
-      <term><literal>IN ROLE</> <replaceable class="parameter">rolename</replaceable></term>
+      <term><literal>IN ROLE</> <replaceable class="parameter">role_name</replaceable></term>
       <listitem>
        <para>
         The <literal>IN ROLE</literal> clause lists one or more existing
@@ -248,17 +269,16 @@ where option can be:
      </varlistentry>
 
      <varlistentry>
-      <term><literal>IN GROUP</> <replaceable class="parameter">rolename</replaceable></term>
+      <term><literal>IN GROUP</> <replaceable class="parameter">role_name</replaceable></term>
       <listitem>
-       <para>
-        <literal>IN GROUP</literal> is an obsolete spelling of
+       <para><literal>IN GROUP</literal> is an obsolete spelling of
         <literal>IN ROLE</>.
        </para>
       </listitem>
      </varlistentry>
 
      <varlistentry>
-      <term><literal>ROLE</> <replaceable class="parameter">rolename</replaceable></term>
+      <term><literal>ROLE</> <replaceable class="parameter">role_name</replaceable></term>
       <listitem>
        <para>
         The <literal>ROLE</literal> clause lists one or more existing
@@ -269,7 +289,7 @@ where option can be:
      </varlistentry>
 
      <varlistentry>
-      <term><literal>ADMIN</> <replaceable class="parameter">rolename</replaceable></term>
+      <term><literal>ADMIN</> <replaceable class="parameter">role_name</replaceable></term>
       <listitem>
        <para>
         The <literal>ADMIN</literal> clause is like <literal>ROLE</literal>,
@@ -281,7 +301,7 @@ where option can be:
      </varlistentry>
 
      <varlistentry>
-      <term><literal>USER</> <replaceable class="parameter">rolename</replaceable></term>
+      <term><literal>USER</> <replaceable class="parameter">role_name</replaceable></term>
       <listitem>
        <para>
         The <literal>USER</literal> clause is an obsolete spelling of
@@ -301,25 +321,54 @@ where option can be:
      </varlistentry>
 
      <varlistentry>
-      <term><literal>RESOURCE QUEUE</> <replaceable class="parameter">queuename</replaceable></term>
+      <term><literal>RESOURCE GROUP</> <replaceable class="parameter">group_name</replaceable></term>
+      <listitem>
+       <para>
+        The name of the resource group to assign to the new role. The
+        role will be subject to the concurrent transaction, memory, and
+        CPU limits configured for the resource group. You can assign a
+        single resource group to one or more roles.
+       </para>
+       <para>
+        If you do not specify a resource group for a new role, the role
+        is automatically assigned the default resource group for the role's
+        capability, <literal>admin_group</literal> for <literal>SUPERUSER</literal> roles, <literal>default_group</literal> for 
+        non-admin roles.
+       </para>
+       <para>
+        You can assign the <literal>admin_group</literal> resource group to any role having
+        the <literal>SUPERUSER</literal> attribute.
+       </para>
+       <para>
+        You can assign the <literal>default_group</literal> resource group to any role.
+       </para>
+       <para>
+        See <xref linkend="sql-createresourcegroup" 
+        endterm="sql-createresourcegroup-title"> for more information.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><literal>RESOURCE QUEUE</> <replaceable class="parameter">queue_name</replaceable></term>
       <listitem>
        <para>
         The <literal>RESOURCE QUEUE</literal> that this role is in.
-		See <xref linkend="sql-createresourcequeue" 
+        See <xref linkend="sql-createresourcequeue" 
         endterm="sql-createresourcequeue-title"> for more information.
        </para>
       </listitem>
      </varlistentry>
     </variablelist>
- </refsect1> 
+ </refsect1>
 
  <refsect1>
   <title>Notes</title>
 
   <para>
-   Use <xref linkend="SQL-ALTERROLE" endterm="SQL-ALTERROLE-title"> to
-   change the attributes of a role, and <xref linkend="SQL-DROPROLE"
-   endterm="SQL-DROPROLE-title"> to remove a role.  All the attributes
+   Use <xref linkend="SQL-ALTERROLE"> to
+   change the attributes of a role, and <xref linkend="SQL-DROPROLE">
+   to remove a role.  All the attributes
    specified by <command>CREATE ROLE</> can be modified by later
    <command>ALTER ROLE</> commands.
   </para>
@@ -327,8 +376,8 @@ where option can be:
   <para>
    The preferred way to add and remove members of roles that are being
    used as groups is to use
-   <xref linkend="SQL-GRANT" endterm="SQL-GRANT-title"> and
-   <xref linkend="SQL-REVOKE" endterm="SQL-REVOKE-title">.
+   <xref linkend="SQL-GRANT"> and
+   <xref linkend="SQL-REVOKE">.
   </para>
 
   <para>
@@ -346,7 +395,7 @@ where option can be:
    a member of a role with <literal>CREATEDB</> privilege does not immediately
    grant the ability to create databases, even if <literal>INHERIT</> is set;
    it would be necessary to become that role via
-   <xref linkend="SQL-SET-ROLE" endterm="SQL-SET-ROLE-title"> before
+   <xref linkend="SQL-SET-ROLE"> before
    creating a database.
   </para>
 
@@ -373,7 +422,7 @@ where option can be:
 
   <para>
    <productname>PostgreSQL</productname> includes a program <xref
-   linkend="APP-CREATEUSER" endterm="APP-CREATEUSER-title"> that has
+   linkend="APP-CREATEUSER"> that has
    the same functionality as <command>CREATE ROLE</command> (in fact,
    it calls this command) but can be run from the command shell.
   </para>
@@ -390,9 +439,9 @@ where option can be:
    with this command.  The password will be transmitted to the server
    in cleartext, and it might also be logged in the client's command
    history or the server log.  The command <xref
-   linkend="APP-CREATEUSER" endterm="APP-CREATEUSER-title">, however, transmits
-   the password encrypted.  Also, <xref linkend="app-psql"
-   endterm="app-psql-title"> contains a command
+   linkend="APP-CREATEUSER">, however, transmits
+   the password encrypted.  Also, <xref linkend="app-psql">
+   contains a command
    <command>\password</command> that can be used to safely change the
    password later.
   </para>
@@ -427,14 +476,13 @@ CREATE ROLE miriam WITH LOGIN PASSWORD 'jw8s0F4' VALID UNTIL '2005-01-01';
 </programlisting>
   </para>
 
-  <para> 
+  <para>
    Create a role that can create databases and manage roles:
 <programlisting>
 CREATE ROLE admin WITH CREATEDB CREATEROLE;
-</programlisting>
-  </para>
+</programlisting></para>
  </refsect1>
- 
+
  <refsect1>
   <title>Compatibility</title>
 
@@ -442,13 +490,13 @@ CREATE ROLE admin WITH CREATEDB CREATEROLE;
    The <command>CREATE ROLE</command> statement is in the SQL standard,
    but the standard only requires the syntax
 <synopsis>
-CREATE ROLE <replaceable class="PARAMETER">name</> [ WITH ADMIN <replaceable class="PARAMETER">rolename</> ]
+CREATE ROLE <replaceable class="PARAMETER">name</> [ WITH ADMIN <replaceable class="PARAMETER">role_name</> ]
 </synopsis>
    Multiple initial administrators, and all the other options of
    <command>CREATE ROLE</command>, are
    <productname>PostgreSQL</productname> extensions.
   </para>
-  
+
   <para>
    The SQL standard defines the concepts of users and roles, but it
    regards them as distinct concepts and leaves all commands defining
@@ -469,11 +517,11 @@ CREATE ROLE <replaceable class="PARAMETER">name</> [ WITH ADMIN <replaceable cla
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-set-role" endterm="sql-set-role-title"></member>
-   <member><xref linkend="sql-alterrole" endterm="sql-alterrole-title"></member>
-   <member><xref linkend="sql-droprole" endterm="sql-droprole-title"></member>
-   <member><xref linkend="sql-grant" endterm="sql-grant-title"></member>
-   <member><xref linkend="sql-revoke" endterm="sql-revoke-title"></member>
+   <member><xref linkend="sql-set-role"></member>
+   <member><xref linkend="sql-alterrole"></member>
+   <member><xref linkend="sql-droprole"></member>
+   <member><xref linkend="sql-grant"></member>
+   <member><xref linkend="sql-revoke"></member>
    <member><xref linkend="app-createuser"></member>
   </simplelist>
  </refsect1>

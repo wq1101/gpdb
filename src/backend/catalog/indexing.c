@@ -4,21 +4,22 @@
  *	  This file contains routines to support indexes defined on system
  *	  catalogs.
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/catalog/indexing.c,v 1.116 2008/01/01 19:45:48 momjian Exp $
+ *	  src/backend/catalog/indexing.c
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
-#include "access/genam.h"
+#include "access/htup_details.h"
 #include "catalog/index.h"
 #include "catalog/indexing.h"
 #include "executor/executor.h"
+#include "utils/rel.h"
 
 
 /*
@@ -30,7 +31,8 @@
  * In the current implementation, we share code for opening/closing the
  * indexes with execUtils.c.  But we do not use ExecInsertIndexTuples,
  * because we don't want to create an EState.  This implies that we
- * do not support partial or expressional indexes on system catalogs.
+ * do not support partial or expressional indexes on system catalogs,
+ * nor can we support generalized exclusion constraints.
  * This could be fixed with localized changes here if we wanted to pay
  * the extra overhead of building an EState.
  */
@@ -44,7 +46,7 @@ CatalogOpenIndexes(Relation heapRel)
 	resultRelInfo->ri_RelationDesc = heapRel;
 	resultRelInfo->ri_TrigDesc = NULL;	/* we don't fire triggers */
 
-	ExecOpenIndices(resultRelInfo);
+	ExecOpenIndices(resultRelInfo, false);
 
 	return resultRelInfo;
 }
@@ -94,7 +96,7 @@ CatalogIndexInsert(CatalogIndexState indstate, HeapTuple heapTuple)
 
 	/* Need a slot to hold the tuple being examined */
 	slot = MakeSingleTupleTableSlot(RelationGetDescr(heapRelation));
-	ExecStoreGenericTuple(heapTuple, slot, false);
+	ExecStoreHeapTuple(heapTuple, slot, InvalidBuffer, false);
 
 	/*
 	 * for each index, form and insert the index tuple
@@ -111,10 +113,12 @@ CatalogIndexInsert(CatalogIndexState indstate, HeapTuple heapTuple)
 
 		/*
 		 * Expressional and partial indexes on system catalogs are not
-		 * supported
+		 * supported, nor exclusion constraints, nor deferred uniqueness
 		 */
 		Assert(indexInfo->ii_Expressions == NIL);
 		Assert(indexInfo->ii_Predicate == NIL);
+		Assert(indexInfo->ii_ExclusionOps == NULL);
+		Assert(relationDescs[i]->rd_index->indimmediate);
 
 		/*
 		 * FormIndexDatum fills in its values and isnull parameters with the
@@ -134,7 +138,8 @@ CatalogIndexInsert(CatalogIndexState indstate, HeapTuple heapTuple)
 					 isnull,	/* is-null flags */
 					 &(heapTuple->t_self),		/* tid of heap tuple */
 					 heapRelation,
-					 relationDescs[i]->rd_index->indisunique);
+					 relationDescs[i]->rd_index->indisunique ?
+					 UNIQUE_CHECK_YES : UNIQUE_CHECK_NO);
 	}
 
 	ExecDropSingleTupleTableSlot(slot);
@@ -144,7 +149,7 @@ CatalogIndexInsert(CatalogIndexState indstate, HeapTuple heapTuple)
  * CatalogUpdateIndexes - do all the indexing work for a new catalog tuple
  *
  * This is a convenience routine for the common case where we only need
- * to insert or update a single tuple in a system catalog.	Avoid using it for
+ * to insert or update a single tuple in a system catalog.  Avoid using it for
  * multiple tuples, since opening the indexes and building the index info
  * structures is moderately expensive.
  */

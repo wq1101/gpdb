@@ -26,7 +26,7 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $PostgreSQL: pgsql/contrib/pgcrypto/px-crypt.c,v 1.15 2005/10/15 02:49:06 momjian Exp $
+ * contrib/pgcrypto/px-crypt.c
  */
 
 #include "postgres.h"
@@ -42,7 +42,7 @@ run_crypt_des(const char *psw, const char *salt,
 	char	   *res;
 
 	res = px_crypt_des(psw, salt);
-	if (strlen(res) > len - 1)
+	if (res == NULL || strlen(res) > len - 1)
 		return NULL;
 	strcpy(buf, res);
 	return buf;
@@ -96,7 +96,7 @@ px_crypt(const char *psw, const char *salt, char *buf, unsigned len)
 	{
 		if (!c->id_len)
 			break;
-		if (!strncmp(salt, c->id, c->id_len))
+		if (strncmp(salt, c->id, c->id_len) == 0)
 			break;
 	}
 
@@ -153,7 +153,7 @@ px_gen_salt(const char *salt_type, char *buf, int rounds)
 			return PXE_BAD_SALT_ROUNDS;
 	}
 
-	res = px_get_pseudo_random_bytes((uint8 *) rbuf, g->input_len);
+	res = px_get_random_bytes((uint8 *) rbuf, g->input_len);
 	if (res < 0)
 		return res;
 

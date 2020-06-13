@@ -1,18 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE topic
   PUBLIC "-//OASIS//DTD DITA Composite//EN" "ditabase.dtd">
-
 <topic id="topic1" xml:lang="en">
   <title>System Tables</title>
   <body>
     <ul>
-      <li id="eu150153">gp_configuration (Deprecated. See <xref
-        href="./gp_segment_configuration.xml#topic1" type="topic" format="dita"/>.)</li>
       <li id="eu150554">
         <xref href="./gp_configuration_history.xml#topic1" type="topic" format="dita"/>
-      </li>
-      <li id="eu150176">
-        <xref href="gp_db_interfaces.xml" type="topic" format="dita"/>
       </li>
       <li id="eu150300">
         <xref href="./gp_distribution_policy.xml#topic1" type="topic" format="dita"/>
@@ -20,35 +14,14 @@
       <li id="eu150308">
         <xref href="./gp_fastsequence.xml#topic1" type="topic" format="dita"/>
       </li>
-      <li id="eu150471">
-        <xref href="./gp_fault_strategy.xml#topic1" type="topic" format="dita"/>
-      </li>
       <li id="eu150472">
         <xref href="./gp_global_sequence.xml#topic1" type="topic" format="dita"/>
       </li>
       <li id="eu150476">
         <xref href="./gp_id.xml#topic1" type="topic" format="dita"/>
       </li>
-      <li id="eu150180">
-        <xref href="./gp_interfaces.xml#topic1" type="topic" format="dita"/>
-      </li>
-      <li id="eu152757">gp_master_mirroring (Deprecated. See <xref
-        href="./pg_stat_replication.xml#topic1" type="topic" format="dita"/>.)</li>
-      <li id="eu150169">
-        <xref href="./gp_persistent_database_node.xml#topic1" type="topic" format="dita"/>
-      </li>
-      <li id="eu150359">
-        <xref href="./gp_persistent_filespace_node.xml#topic1" type="topic" format="dita"/>
-      </li>
-      <li id="eu150344">
-        <xref href="./gp_persistent_relation_node.xml#topic1" type="topic" format="dita"/>
-      </li>
-      <li id="eu150345">
-        <xref href="./gp_persistent_tablespace_node.xml#topic1" type="topic" format="dita"/>
-      </li>
-      <li id="eu150346">
-        <xref href="./gp_relation_node.xml#topic1" type="topic" format="dita"/>
-      </li>
+      <li>
+        <xref href="./gp_stat_replication.xml#topic1" type="topic" format="dita"/></li>
       <li id="eu150031">
         <xref href="./gp_segment_configuration.xml#topic1" type="topic" format="dita"/>
       </li>
@@ -105,6 +78,9 @@
       <li id="eu149898">
         <xref href="./pg_database.xml#topic1" type="topic" format="dita"/>
       </li>
+      <li id="eu1498999">
+        <xref href="./pg_db_role_setting.xml#topic1" type="topic" format="dita"/>
+      </li>
       <li id="eu149902">
         <xref href="./pg_depend.xml#topic1" type="topic" format="dita"/>
       </li>
@@ -114,15 +90,15 @@
       <li id="eu150510">
         <xref href="./pg_exttable.xml#topic1" type="topic" format="dita"/>
       </li>
-      <li id="eu150511">
-        <xref href="./pg_filespace.xml#topic1" type="topic" format="dita"/>
+      <li id="eu150585">
+        <xref href="./pg_foreign_data_wrapper.xml#topic1" type="topic" format="dita"/>
       </li>
-      <li id="eu150515">
-        <xref href="./pg_filespace_entry.xml#topic1" type="topic" format="dita"/>
+      <li id="eu150589">
+        <xref href="./pg_foreign_server.xml#topic1" type="topic" format="dita"/>
       </li>
-      <li id="eu150585">pg_foreign_data_wrapper (not supported)</li>
-      <li id="eu150589">pg_foreign_server (not supported)</li>
-      <li id="eu150593">pg_foreign_table (not supported)</li>
+      <li id="eu150593">
+        <xref href="./pg_foreign_table.xml#topic1" type="topic" format="dita"/>
+      </li>
       <li id="eu149914">
         <xref href="./pg_index.xml#topic1" type="topic" format="dita"/>
       </li>
@@ -146,6 +122,9 @@
       </li>
       <li id="eu150406">
         <xref href="./pg_operator.xml#topic1" type="topic" format="dita"/>
+      </li>
+      <li id="eu149938f">
+        <xref href="./pg_opfamily.xml#topic1" type="topic" format="dita"/>
       </li>
       <li id="eu150051">
         <xref href="./pg_partition.xml#topic1" type="topic" format="dita"/>
@@ -189,6 +168,7 @@
       <li id="eu150417">
         <xref href="./pg_stat_last_shoperation.xml#topic1" type="topic" format="dita"/>
       </li>
+      <li><xref href="./pg_stat_replication.xml#topic1" type="topic" format="dita"/></li>
       <li id="eu149970">
         <xref href="./pg_statistic.xml#topic1" type="topic" format="dita"/>
       </li>
@@ -201,9 +181,8 @@
       <li id="eu151117">
         <xref href="./pg_type.xml#topic1" type="topic" format="dita"/>
       </li>
-      <li id="eu151122">pg_user_mapping (not supported)</li>
-      <li id="eu149986">
-        <xref href="./pg_window.xml#topic1" type="topic" format="dita"/>
+      <li id="eu151122">
+        <xref href="./pg_user_mapping.xml#topic1" type="topic" format="dita"/>
       </li>
     </ul>
   </body>

@@ -1,10 +1,4 @@
---
--- first, define the datatype.  Turn off echoing so that expected file
--- does not depend on contents of _int.sql.
---
-SET client_min_messages = warning;
-\set ECHO none
-RESET client_min_messages;
+CREATE EXTENSION intarray;
 SELECT intset(1234);
  intset 
 --------
@@ -373,7 +367,10 @@ SELECT '1&(2&(4&(5|!6)))'::query_int;
 (1 row)
 
 CREATE TABLE test__int( a int[] );
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'a' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
 \copy test__int from 'data/test__int.data'
+ANALYZE test__int;
 SELECT count(*) from test__int WHERE a && '{23,50}';
  count 
 -------
@@ -522,4 +519,52 @@ SELECT count(*) from test__int WHERE a @@ '(20&23)|(50&68)';
 (1 row)
 
 DROP INDEX text_idx;
+CREATE INDEX text_idx on test__int using gin ( a gin__int_ops );
+SELECT count(*) from test__int WHERE a && '{23,50}';
+ count 
+-------
+   403
+(1 row)
+
+SELECT count(*) from test__int WHERE a @@ '23|50';
+ count 
+-------
+   403
+(1 row)
+
+SELECT count(*) from test__int WHERE a @> '{23,50}';
+ count 
+-------
+    12
+(1 row)
+
+SELECT count(*) from test__int WHERE a @@ '23&50';
+ count 
+-------
+    12
+(1 row)
+
+SELECT count(*) from test__int WHERE a @> '{20,23}';
+ count 
+-------
+    12
+(1 row)
+
+SELECT count(*) from test__int WHERE a @@ '50&68';
+ count 
+-------
+     9
+(1 row)
+
+SELECT count(*) from test__int WHERE a @> '{20,23}' or a @> '{50,68}';
+ count 
+-------
+    21
+(1 row)
+
+SELECT count(*) from test__int WHERE a @@ '(20&23)|(50&68)';
+ count 
+-------
+    21
+(1 row)
 

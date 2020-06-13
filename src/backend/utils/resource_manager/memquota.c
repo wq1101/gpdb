@@ -53,6 +53,7 @@ typedef struct PolicyAutoContext
 /**
  * Forward declarations.
  */
+static void autoIncOpMemForResGroup(uint64 *opMemKB, int numOps);
 static bool PolicyAutoPrelimWalker(Node *node, PolicyAutoContext *context);
 static bool	PolicyAutoAssignWalker(Node *node, PolicyAutoContext *context);
 static bool IsAggMemoryIntensive(Agg *agg);
@@ -109,42 +110,94 @@ typedef struct PolicyEagerFreeContext
 	PlannedStmt *plannedStmt; /* pointer to the planned statement */
 } PolicyEagerFreeContext;
 
+/*
+ * Does the expression contain any ordered or DISTINCT aggregates?
+ */
+static bool
+contain_ordered_aggs_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, Aggref))
+	{
+		Aggref	   *aggref = (Aggref *) node;
+
+		if (aggref->aggorder || aggref->aggdistinct)
+			return true;
+	}
+	return expression_tree_walker(node, contain_ordered_aggs_walker, context);
+}
+
+/*
+ * Automatically increase operator memory buffer in resource group mode.
+ *
+ * In resource group if the operator memory buffer is too small for the
+ * operators we still allow the query to execute by temporarily increasing the
+ * buffer size, each operator will be assigned 100KB memory no matter it is
+ * memory intensive or not.  The query can execute as long as there is enough
+ * resource group shared memory, the performance might not be best as 100KB is
+ * rather small for memory intensive operators.  If there is no enought shared
+ * memory it will run into OOM error on operators.
+ *
+ * @param opMemKB the original operator memory buffer size, will be in-place
+ *        updated if not large enough
+ * @param numOps the number of operators, both memory intensive and
+ *        non-intensive
+ */
+static void
+autoIncOpMemForResGroup(uint64 *opMemKB, int numOps)
+{
+	uint64		perOpMemKB;		/* per-operator buffer size */
+	uint64		minOpMemKB;		/* minimal buffer size for all the operators */
+
+	/* Only adjust operator memory buffer for resource group */
+	if (!IsResGroupEnabled())
+		return;
+
+	/*
+	 * The buffer reserved for a memory intensive operator is the same as
+	 * non-intensive ones, by default it is 100KB
+	 */
+	perOpMemKB = *gp_resmanager_memory_policy_auto_fixed_mem;
+	minOpMemKB = perOpMemKB * numOps;
+
+	/* No need to change operator memory buffer if already large enough */
+	if (*opMemKB >= minOpMemKB)
+		return;
+
+	ereport(DEBUG2,
+			(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
+			 errmsg("No enough operator memory for current query."),
+			 errdetail("Current query contains %d operators, "
+					   "the minimal operator memory requirement is " INT64_FORMAT " KB, "
+					   "however there is only " INT64_FORMAT " KB reserved.  "
+					   "Temporarily increased the operator memory to execute the query.",
+					   numOps, minOpMemKB, *opMemKB),
+			 errhint("Consider increase memory_spill_ratio for better performance.")));
+
+	/* Adjust the buffer */
+	*opMemKB = minOpMemKB;
+}
+
 /**
  * Is an agg operator memory intensive? The following cases mean it is:
  * 1. If agg strategy is hashed
  * 2. If targetlist or qual contains a DQA
  * 3. If there is an ordered aggregated.
  */
-static bool IsAggMemoryIntensive(Agg *agg)
+static bool
+IsAggMemoryIntensive(Agg *agg)
 {
-	Assert(agg);
-
 	/* Case 1 */
 	if (agg->aggstrategy == AGG_HASHED)
-	{
 		return true;
-	}
 
-	AggClauseCounts aggInfo;
-
-	/* Zero it out */
-	MemSet(&aggInfo, 0, sizeof(aggInfo));
-
-	Plan *plan = (Plan *) &(agg->plan);
-	count_agg_clauses((Node *) plan->targetlist, &aggInfo);
-	count_agg_clauses((Node *) plan->qual, &aggInfo);
-
-	/* Case 2 */
-	if (aggInfo.numDistinctAggs >0)
-	{
+	/* Cases 2 & 3 */
+	if (contain_ordered_aggs_walker((Node *) agg->plan.targetlist, NULL))
 		return true;
-	}
-
-	/* Case 3 */
-	if (aggInfo.aggOrder != NIL )
-	{
+	if (contain_ordered_aggs_walker((Node *) agg->plan.qual, NULL))
 		return true;
-	}
 
 	return false;
 }
@@ -210,7 +263,7 @@ IsBlockingOperator(Node *node)
  * Is a result node memory intensive? It is if it contains function calls.
  */
 bool
-IsResultMemoryIntesive(Result *res)
+IsResultMemoryIntensive(Result *res)
 {
 
 	List *funcNodes = extract_nodes(NULL /* glob */,
@@ -245,7 +298,7 @@ IsMemoryIntensiveOperator(Node *node, PlannedStmt *stmt)
 		case T_ShareInputScan:
 		case T_Hash:
 		case T_BitmapIndexScan:
-		case T_Window:
+		case T_WindowAgg:
 		case T_TableFunctionScan:
 		case T_FunctionScan:
 			return true;
@@ -257,7 +310,7 @@ IsMemoryIntensiveOperator(Node *node, PlannedStmt *stmt)
 		case T_Result:
 			{
 				Result *res = (Result *) node;
-				return IsResultMemoryIntesive(res);
+				return IsResultMemoryIntensive(res);
 			}
 		default:
 			return false;
@@ -292,7 +345,6 @@ static bool PolicyAutoPrelimWalker(Node *node, PolicyAutoContext *context)
 		return false;
 	}
 
-	Assert(node);
 	Assert(context);
 	if (is_plan_node(node))
 	{
@@ -305,7 +357,7 @@ static bool PolicyAutoPrelimWalker(Node *node, PolicyAutoContext *context)
 			context->numNonMemIntensiveOperators++;
 		}
 	}
-	return plan_tree_walker(node, PolicyAutoPrelimWalker, context);
+	return plan_tree_walker(node, PolicyAutoPrelimWalker, context, true);
 }
 
 /**
@@ -322,7 +374,6 @@ static bool PolicyAutoAssignWalker(Node *node, PolicyAutoContext *context)
 		return false;
 	}
 
-	Assert(node);
 	Assert(context);
 
 	if (is_plan_node(node))
@@ -350,7 +401,7 @@ static bool PolicyAutoAssignWalker(Node *node, PolicyAutoContext *context)
 			elog(GP_RESMANAGER_MEMORY_LOG_LEVEL, "assigning plan node memory = %dKB", (int )planNode->operatorMemKB);
 		}
 	}
-	return plan_tree_walker(node, PolicyAutoAssignWalker, context);
+	return plan_tree_walker(node, PolicyAutoAssignWalker, context, true);
 }
 
 /**
@@ -360,69 +411,77 @@ static bool PolicyAutoAssignWalker(Node *node, PolicyAutoContext *context)
  */
 void PolicyAutoAssignOperatorMemoryKB(PlannedStmt *stmt, uint64 memAvailableBytes)
 {
-	 PolicyAutoContext ctx;
-	 exec_init_plan_tree_base(&ctx.base, stmt);
-	 ctx.queryMemKB = (uint64) (memAvailableBytes / 1024);
-	 ctx.numMemIntensiveOperators = 0;
-	 ctx.numNonMemIntensiveOperators = 0;
-	 ctx.plannedStmt = stmt;
+	PolicyAutoContext ctx;
+	exec_init_plan_tree_base(&ctx.base, stmt);
+	ctx.queryMemKB = (uint64) (memAvailableBytes / 1024);
+	ctx.numMemIntensiveOperators = 0;
+	ctx.numNonMemIntensiveOperators = 0;
+	ctx.plannedStmt = stmt;
 
 #ifdef USE_ASSERT_CHECKING
-	 bool result =
+	bool result =
 #endif
 			 PolicyAutoPrelimWalker((Node *) stmt->planTree, &ctx);
 
-	 Assert(!result);
-	 Assert(ctx.numMemIntensiveOperators + ctx.numNonMemIntensiveOperators > 0);
+	Assert(!result);
+	Assert(ctx.numMemIntensiveOperators + ctx.numNonMemIntensiveOperators > 0);
 
-	 if (ctx.queryMemKB <= ctx.numNonMemIntensiveOperators * (*gp_resmanager_memory_policy_auto_fixed_mem))
-	 {
-		 elog(ERROR, ERRMSG_GP_INSUFFICIENT_STATEMENT_MEMORY);
-	 }
+	/*
+	 * Make sure there is enough operator memory in resource group mode.
+	 */
+	autoIncOpMemForResGroup(&ctx.queryMemKB,
+							ctx.numNonMemIntensiveOperators +
+							ctx.numMemIntensiveOperators);
+
+	if (ctx.queryMemKB <= ctx.numNonMemIntensiveOperators * (*gp_resmanager_memory_policy_auto_fixed_mem))
+	{
+		elog(ERROR, ERRMSG_GP_INSUFFICIENT_STATEMENT_MEMORY);
+	}
 
 #ifdef USE_ASSERT_CHECKING
-	 result =
+	result =
 #endif
 			 PolicyAutoAssignWalker((Node *) stmt->planTree, &ctx);
 
-	 Assert(!result);
+	Assert(!result);
 }
 
-/**
- * What should be query mem such that memory intensive operators get a certain minimum amount of memory.
- * Return value is in KB.
+/*
+ * What should be query mem such that memory intensive operators get a certain
+ * minimum amount of memory.  Return value is in bytes.
  */
- uint64 PolicyAutoStatementMemForNoSpillKB(PlannedStmt *stmt, uint64 minOperatorMemKB)
- {
-	 Assert(stmt);
-	 Assert(minOperatorMemKB > 0);
+uint64
+PolicyAutoStatementMemForNoSpill(PlannedStmt *stmt, uint64 minOperatorMem)
+{
+	Assert(stmt);
+	Assert(minOperatorMem > 0);
 
-	 const uint64 nonMemIntenseOpMemKB = (uint64) (*gp_resmanager_memory_policy_auto_fixed_mem);
+	const uint64 nonMemIntenseOpMem = ((uint64) (*gp_resmanager_memory_policy_auto_fixed_mem) * 1024);
 
-	 PolicyAutoContext ctx;
-	 exec_init_plan_tree_base(&ctx.base, stmt);
-	 ctx.queryMemKB = (uint64) (stmt->query_mem / 1024);
-	 ctx.numMemIntensiveOperators = 0;
-	 ctx.numNonMemIntensiveOperators = 0;
-	 ctx.plannedStmt = stmt;
+	PolicyAutoContext ctx;
+	exec_init_plan_tree_base(&ctx.base, stmt);
+	ctx.queryMemKB = (uint64) (stmt->query_mem / 1024);
+	ctx.numMemIntensiveOperators = 0;
+	ctx.numNonMemIntensiveOperators = 0;
+	ctx.plannedStmt = stmt;
 
 #ifdef USE_ASSERT_CHECKING
-	 bool result =
+	bool result =
 #endif
-			 PolicyAutoPrelimWalker((Node *) stmt->planTree, &ctx);
+		PolicyAutoPrelimWalker((Node *) stmt->planTree, &ctx);
 
-	 Assert(!result);
-	 Assert(ctx.numMemIntensiveOperators + ctx.numNonMemIntensiveOperators > 0);
+	Assert(!result);
+	Assert(ctx.numMemIntensiveOperators + ctx.numNonMemIntensiveOperators > 0);
 
-	 /**
-	  * Right now, the inverse is straightforward.
-	  * TODO: Siva - employ binary search to find the right value.
-	  */
-	 uint64 requiredStatementMemKB = ctx.numNonMemIntensiveOperators * nonMemIntenseOpMemKB
-			 + ctx.numMemIntensiveOperators * minOperatorMemKB;
+	/*
+	 * Right now, the inverse is straightforward.
+	 * TODO: Siva - employ binary search to find the right value.
+	 */
+	uint64 requiredStatementMem = ctx.numNonMemIntensiveOperators * nonMemIntenseOpMem
+									+ ctx.numMemIntensiveOperators * minOperatorMem;
 
-	 return requiredStatementMemKB;
- }
+	return requiredStatementMem;
+}
 
 /*
  * CreateOperatorGroup
@@ -571,90 +630,6 @@ FindOperatorGroupForOperator(Node *node,
 	return groupNode;
 }
 
-#if 0
-/*
- * FindOperatorGroupForNode
- *    find the operator group for a given node.
- *
- * If this is during prelim walker phase, this function creates such a group
- * if it does not exist. Otherwise, this function finds such a group in
- * the group tree.
- *
- * This function also returns the parentGroupNode pointer, and a boolean
- * indicating if the given node is the first node in the group.
- */
-static OperatorGroupNode *
-FindOperatorGroupForNode(Node *node,
-						 PolicyEagerFreeContext *context,
-						 bool isPrelimWalker,
-						 OperatorGroupNode **parentGroupNodeP,
-						 bool *isFirstInGroupP)
-{
-	Assert(is_plan_node(node));
-
-	OperatorGroupNode *groupNode = context->groupNode;
-
-	if (context->groupNode == NULL)
-	{
-		if (isPrelimWalker)
-		{
-			Assert(context->groupTree == NULL);
-			context->groupTree = CreateOperatorGroupNode(context->nextGroupId, NULL);
-			groupNode = context->groupTree;
-
-			/* The memory limit for the first group is the query memory limit. */
-			groupNode->groupMemKB = context->queryMemKB;
-		}
-		else
-		{
-			Assert(context->groupTree != NULL);
-			groupNode = context->groupTree;
-			Assert(groupNode->groupMemKB > 0);
-		}
-
-		context->nextGroupId++;
-		*isFirstInGroupP = true;
-	}
-
-	/*
-	 * If this node is a blocking operator and this node does not contain an extParam,
-	 * it means that the current group ends, and a new group starts.
-	 */
-	if (!*isFirstInGroupP &&
-		IsRootOperatorInGroup(node))
-	{
-		Assert(context->groupNode != NULL);
-		if (isPrelimWalker)
-		{
-			groupNode = CreateOperatorGroupNode(context->nextGroupId, context->groupNode);
-			context->groupNode->childGroups = lappend(context->groupNode->childGroups, groupNode);
-		}
-		else
-		{
-			ListCell *lc = NULL;
-			OperatorGroupNode *childGroup = NULL;
-			foreach(lc, context->groupNode->childGroups)
-			{
-				childGroup = (OperatorGroupNode *)lfirst(lc);
-				if (childGroup->groupId == context->nextGroupId)
-				{
-					break;
-				}
-			}
-
-			Assert(childGroup != NULL);
-			groupNode = childGroup;
-		}
-
-		context->nextGroupId++;
-		*isFirstInGroupP = true;
-		*parentGroupNodeP = context->groupNode;
-	}
-
-	return groupNode;
-}
-#endif
-
 /*
  * ComputeAvgMemKBForMemIntenseOp
  *    Compute the average memory limit for each memory-intensive operators
@@ -770,7 +745,6 @@ PolicyEagerFreePrelimWalker(Node *node, PolicyEagerFreeContext *context)
 		return false;
 	}
 
-	Assert(node);
 	Assert(context);
 
 	OperatorGroupNode *parentGroupNode = NULL;
@@ -799,11 +773,11 @@ PolicyEagerFreePrelimWalker(Node *node, PolicyEagerFreeContext *context)
 		}
 	}
 
-	bool result = plan_tree_walker(node, PolicyEagerFreePrelimWalker, context);
+	bool result = plan_tree_walker(node, PolicyEagerFreePrelimWalker, context, true);
 	Assert(!result);
 
 	/*
-	 * If this node is the top nodoe in a group, at this point, we should have all info about
+	 * If this node is the top node in a group, at this point, we should have all info about
 	 * its child groups. We then calculate the maximum number of potential concurrently
 	 * active memory-intensive operators and non-memory-intensive operators in all
 	 * child groups.
@@ -849,7 +823,6 @@ PolicyEagerFreeAssignWalker(Node *node, PolicyEagerFreeContext *context)
 		return false;
 	}
 
-	Assert(node);
 	Assert(context);
 
 	const uint64 nonMemIntenseOpMemKB = (uint64)(*gp_resmanager_memory_policy_auto_fixed_mem);
@@ -905,7 +878,7 @@ PolicyEagerFreeAssignWalker(Node *node, PolicyEagerFreeContext *context)
 		}
 	}
 
-	bool result = plan_tree_walker(node, PolicyEagerFreeAssignWalker, context);
+	bool result = plan_tree_walker(node, PolicyEagerFreeAssignWalker, context, true);
 	Assert(!result);
 
 	/*
@@ -952,6 +925,15 @@ PolicyEagerFreeAssignOperatorMemoryKB(PlannedStmt *stmt, uint64 memAvailableByte
 	 */
 	ctx.groupNode = NULL;
 	ctx.nextGroupId = 0;
+
+	/*
+	 * Make sure there is enough operator memory in resource group mode.
+	 */
+	autoIncOpMemForResGroup(&ctx.groupTree->groupMemKB,
+							Max(ctx.groupTree->numNonMemIntenseOps,
+								ctx.groupTree->maxNumConcNonMemIntenseOps) +
+							Max(ctx.groupTree->numMemIntenseOps,
+								ctx.groupTree->maxNumConcMemIntenseOps));
 
 	/*
 	 * Check if memory exceeds the limit in the root group

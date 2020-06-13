@@ -1,5 +1,5 @@
 /*
- * $PostgreSQL: pgsql/src/test/examples/testlibpq3.c,v 1.16 2009/06/11 14:49:15 momjian Exp $
+ * src/test/examples/testlibpq3.c
  *
  *
  * testlibpq3.c
@@ -8,8 +8,9 @@
  * Before running this, populate a database with the following commands
  * (provided in src/test/examples/testlibpq3.sql):
  *
+ * CREATE SCHEMA testlibpq3;
+ * SET search_path = testlibpq3;
  * CREATE TABLE test1 (i int4, t text, b bytea);
- *
  * INSERT INTO test1 values (1, 'joe''s place', '\\000\\001\\002\\003\\004');
  * INSERT INTO test1 values (2, 'ho there', '\\004\\003\\002\\001\\000');
  *
@@ -25,8 +26,14 @@
  *	t = (8 bytes) 'ho there'
  *	b = (5 bytes) \004\003\002\001\000
  */
+
+#ifdef WIN32
+#include <windows.h>
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <sys/types.h>
 #include "libpq-fe.h"
@@ -134,6 +141,16 @@ main(int argc, char **argv)
 				PQerrorMessage(conn));
 		exit_nicely(conn);
 	}
+
+	/* Set always-secure search path, so malicous users can't take control. */
+	res = PQexec(conn, "SET search_path = testlibpq3");
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+	{
+		fprintf(stderr, "SET failed: %s", PQerrorMessage(conn));
+		PQclear(res);
+		exit_nicely(conn);
+	}
+	PQclear(res);
 
 	/*
 	 * The point of this program is to illustrate use of PQexecParams() with

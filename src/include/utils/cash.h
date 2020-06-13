@@ -1,4 +1,7 @@
 /*
+ * src/include/utils/cash.h
+ *
+ *
  * cash.h
  * Written by D'Arcy J.M. Cain
  *
@@ -12,6 +15,12 @@
 #include "fmgr.h"
 
 typedef int64 Cash;
+
+/* Cash is pass-by-reference if and only if int64 is */
+#define DatumGetCash(X)		((Cash) DatumGetInt64(X))
+#define CashGetDatum(X)		Int64GetDatum(X)
+#define PG_GETARG_CASH(n)	DatumGetCash(PG_GETARG_DATUM(n))
+#define PG_RETURN_CASH(x)	return CashGetDatum(x)
 
 extern Datum cash_in(PG_FUNCTION_ARGS);
 extern Datum cash_out(PG_FUNCTION_ARGS);
@@ -28,6 +37,7 @@ extern Datum cash_cmp(PG_FUNCTION_ARGS);
 
 extern Datum cash_pl(PG_FUNCTION_ARGS);
 extern Datum cash_mi(PG_FUNCTION_ARGS);
+extern Datum cash_div_cash(PG_FUNCTION_ARGS);
 
 extern Datum cash_mul_flt8(PG_FUNCTION_ARGS);
 extern Datum flt8_mul_cash(PG_FUNCTION_ARGS);
@@ -53,5 +63,11 @@ extern Datum cashlarger(PG_FUNCTION_ARGS);
 extern Datum cashsmaller(PG_FUNCTION_ARGS);
 
 extern Datum cash_words(PG_FUNCTION_ARGS);
+
+extern Datum cash_numeric(PG_FUNCTION_ARGS);
+extern Datum numeric_cash(PG_FUNCTION_ARGS);
+
+extern Datum int4_cash(PG_FUNCTION_ARGS);
+extern Datum int8_cash(PG_FUNCTION_ARGS);
 
 #endif   /* CASH_H */

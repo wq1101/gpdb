@@ -1,12 +1,4 @@
---
--- first, define the datatype.  Turn off echoing so that expected file
--- does not depend on contents of _int.sql.
---
-SET client_min_messages = warning;
-\set ECHO none
-\i _int.sql
-\set ECHO all
-RESET client_min_messages;
+CREATE EXTENSION intarray;
 
 SELECT intset(1234);
 SELECT icount('{1234234,234234}');
@@ -76,8 +68,8 @@ SELECT '1&(2&(4&(5|!6)))'::query_int;
 
 
 CREATE TABLE test__int( a int[] );
-
 \copy test__int from 'data/test__int.data'
+ANALYZE test__int;
 
 SELECT count(*) from test__int WHERE a && '{23,50}';
 SELECT count(*) from test__int WHERE a @@ '23|50';
@@ -112,3 +104,13 @@ SELECT count(*) from test__int WHERE a @> '{20,23}' or a @> '{50,68}';
 SELECT count(*) from test__int WHERE a @@ '(20&23)|(50&68)';
 
 DROP INDEX text_idx;
+CREATE INDEX text_idx on test__int using gin ( a gin__int_ops );
+
+SELECT count(*) from test__int WHERE a && '{23,50}';
+SELECT count(*) from test__int WHERE a @@ '23|50';
+SELECT count(*) from test__int WHERE a @> '{23,50}';
+SELECT count(*) from test__int WHERE a @@ '23&50';
+SELECT count(*) from test__int WHERE a @> '{20,23}';
+SELECT count(*) from test__int WHERE a @@ '50&68';
+SELECT count(*) from test__int WHERE a @> '{20,23}' or a @> '{50,68}';
+SELECT count(*) from test__int WHERE a @@ '(20&23)|(50&68)';

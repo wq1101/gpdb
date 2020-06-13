@@ -1,4 +1,4 @@
-/*	$PostgreSQL: pgsql/contrib/pgcrypto/sha1.h,v 1.9 2003/11/29 22:39:28 pgsql Exp $ */
+/*	contrib/pgcrypto/sha1.h */
 /*	   $KAME: sha1.h,v 1.4 2000/02/22 14:01:18 itojun Exp $    */
 
 /*
@@ -31,7 +31,7 @@
  */
 /*
  * FIPS pub 180-1: Secure Hash Algorithm (SHA-1)
- * based on: http://csrc.nist.gov/fips/fip180-1.txt
+ * based on: http://www.itl.nist.gov/fipspubs/fip180-1.htm
  * implemented by Jun-ichiro itojun Itoh <itojun@itojun.org>
  */
 
@@ -63,7 +63,7 @@ extern void sha1_pad(struct sha1_ctxt *);
 extern void sha1_loop(struct sha1_ctxt *, const uint8 *, size_t);
 extern void sha1_result(struct sha1_ctxt *, uint8 *);
 
-/* compatibilty with other SHA1 source codes */
+/* compatibility with other SHA1 source codes */
 typedef struct sha1_ctxt SHA1_CTX;
 
 #define SHA1Init(x)		sha1_init((x))

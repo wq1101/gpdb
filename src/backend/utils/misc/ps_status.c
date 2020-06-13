@@ -5,11 +5,11 @@
  * to contain some useful information. Mechanism differs wildly across
  * platforms.
  *
- * $PostgreSQL: pgsql/src/backend/utils/misc/ps_status.c,v 1.38.2.1 2010/05/27 19:19:50 tgl Exp $
+ * src/backend/utils/misc/ps_status.c
  *
  * Portions Copyright (c) 2005-2009, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Copyright (c) 2000-2009, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2016, PostgreSQL Global Development Group
  * various details abducted from various places
  *--------------------------------------------------------------------
  */
@@ -31,11 +31,12 @@
 #include "libpq/libpq.h"
 #include "miscadmin.h"
 #include "utils/ps_status.h"
+#include "utils/guc.h"
 
-#include "cdb/cdbvars.h"        /* Gp_role, Gp_segment, currentSliceId */
+#include "cdb/cdbvars.h"        /* Gp_role, GpIdentity.segindex, currentSliceId */
 
 extern char **environ;
-extern int PostPortNumber;
+extern int PostPortNumber; /* GPDB: Helps identify child processes */
 bool		update_process_title = true;
 
 
@@ -312,9 +313,18 @@ init_ps_display(const char *username, const char *dbname,
 #define PROGRAM_NAME_PREFIX "postgres: "
 #endif
 
-	snprintf(ps_buffer, ps_buffer_size,
-			 PROGRAM_NAME_PREFIX "%5d, %s %s %s ",
-			 PostPortNumber, username, dbname, host_info);
+	if (*cluster_name == '\0')
+	{
+		snprintf(ps_buffer, ps_buffer_size,
+				 PROGRAM_NAME_PREFIX "%5d, %s %s %s ",
+				 PostPortNumber, username, dbname, host_info);
+	}
+	else
+	{
+		snprintf(ps_buffer, ps_buffer_size,
+				 PROGRAM_NAME_PREFIX "%5d, %s: %s %s %s ",
+				 PostPortNumber, cluster_name, username, dbname, host_info);
+	}
 
 	ps_buffer_cur_len = ps_buffer_fixed_size = strlen(ps_buffer);
 	real_act_prefix_size = ps_buffer_fixed_size;
@@ -354,12 +364,13 @@ set_ps_display(const char *activity, bool force)
 
 	/* Add client session's global id. */
 	if (gp_session_id > 0 && ep - cp > 0)
+	{
 		cp += snprintf(cp, ep - cp, "con%d ", gp_session_id);
 
-	/* Which segment is accessed by this qExec? */
-	if (Gp_role == GP_ROLE_EXECUTE &&
-		Gp_segment >= -1 && ep - cp > 0)
-		cp += snprintf(cp, ep - cp, "seg%d ", Gp_segment);
+		/* Which segment is accessed by this qExec? */
+		if (Gp_role == GP_ROLE_EXECUTE && GpIdentity.segindex >= -1)
+			cp += snprintf(cp, ep - cp, "seg%d ", GpIdentity.segindex);
+	}
 
 	/* Add count of commands received from client session. */
 	if (gp_command_count > 0 && ep - cp > 0)
@@ -383,7 +394,7 @@ set_ps_display(const char *activity, bool force)
 
 	/* Append caller's activity string. */
 	strlcpy(ps_buffer + real_act_prefix_size, activity,
-		ps_buffer_size - real_act_prefix_size);
+			ps_buffer_size - real_act_prefix_size);
 
 	ps_buffer_cur_len = strlen(ps_buffer);
 
@@ -461,7 +472,7 @@ get_ps_display_from_position(size_t pos, int *displen)
 
 /*
  * Returns what's currently in the ps display, in case someone needs
- * it.	Note that only the activity part is returned.  On some platforms
+ * it.  Note that only the activity part is returned.  On some platforms
  * the string will not be null-terminated, so return the effective
  * length into *displen.
  */

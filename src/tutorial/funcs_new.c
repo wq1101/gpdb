@@ -1,4 +1,4 @@
-/* $PostgreSQL: pgsql/src/tutorial/funcs_new.c,v 1.13 2007/02/27 23:48:10 tgl Exp $ */
+/* src/tutorial/funcs_new.c */
 
 /******************************************************************************
   These are user-defined functions that can be bound to a Postgres backend
@@ -16,17 +16,7 @@
 #include "executor/executor.h"	/* for GetAttributeByName() */
 #include "utils/geo_decls.h"	/* for point type */
 
-
 PG_MODULE_MAGIC;
-
-/* These prototypes just prevent possible warnings from gcc. */
-
-Datum		add_one(PG_FUNCTION_ARGS);
-Datum		add_one_float8(PG_FUNCTION_ARGS);
-Datum		makepoint(PG_FUNCTION_ARGS);
-Datum		copytext(PG_FUNCTION_ARGS);
-Datum		concat_text(PG_FUNCTION_ARGS);
-Datum		c_overpaid(PG_FUNCTION_ARGS);
 
 
 /* By Value */

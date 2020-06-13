@@ -9,7 +9,7 @@
 """
 import os
 
-from gppylib.gparray import GpArray, GpDB, createSegmentRows, get_gparray_from_config
+from gppylib.gparray import GpArray, Segment, createSegmentRows, get_gparray_from_config
 from gppylib import gplog
 from gp_unittest import *
 from mock import patch, Mock
@@ -32,8 +32,6 @@ class GpArrayTestCase(GpTestCase):
         primary_portbase = 5000
         mirror_portbase = 6000
         interface_list = [1]
-        primary_replication_portbase = 7000
-        mirror_replication_portbase = 8000
         dir_prefix = 'gpseg'
 
         hostlist = ['host1']
@@ -43,21 +41,21 @@ class GpArrayTestCase(GpTestCase):
         #need to have enough hosts otherwise we get exceptions
         with self.assertRaises(Exception):
             createSegmentRows(hostlist, interface_list, primary_list, primary_portbase, mirror_type, 
-                              mirror_list, mirror_portbase, dir_prefix, primary_replication_portbase, mirror_replication_portbase)
+                              mirror_list, mirror_portbase, dir_prefix)
         primary_list.append('/db2')
         mirror_list.append('/mir2')
         with self.assertRaises(Exception):
             createSegmentRows(hostlist, interface_list, primary_list, primary_portbase, mirror_type, 
-                              mirror_list, mirror_portbase, dir_prefix, primary_replication_portbase, mirror_replication_portbase)
+                              mirror_list, mirror_portbase, dir_prefix)
         hostlist.append('host2')
         with self.assertRaises(Exception):
             createSegmentRows(hostlist, interface_list, primary_list, primary_portbase, mirror_type, 
-                              mirror_list, mirror_portbase, dir_prefix, primary_replication_portbase, mirror_replication_portbase)
+                              mirror_list, mirror_portbase, dir_prefix)
         
         #now we have enough
         hostlist.append('host3')
         self._validate_array(self._setup_gparray(hostlist, interface_list, primary_list, primary_portbase, mirror_type,
-                                                 mirror_list, mirror_portbase, dir_prefix, primary_replication_portbase, mirror_replication_portbase))
+                                                 mirror_list, mirror_portbase, dir_prefix))
         
         
         #enough
@@ -65,14 +63,14 @@ class GpArrayTestCase(GpTestCase):
         primary_list = ['/db1', '/db2']
         mirror_list = ['/mir1', '/mir2']
         self._validate_array(self._setup_gparray(hostlist, interface_list, primary_list, primary_portbase, mirror_type,
-                                                 mirror_list, mirror_portbase, dir_prefix, primary_replication_portbase, mirror_replication_portbase))
+                                                 mirror_list, mirror_portbase, dir_prefix))
 
         #typical thumper
         hostlist = ['sdw1', 'sdw2', 'sdw3', 'sdw4', 'sdw5']
         primary_list = ['/dbfast1', '/dbfast2', '/dbfast3', '/dbfast4']
         mirror_list = ['/dbfast1/mirror', '/dbfast2/mirror', '/dbfast3/mirror', '/dbfast4/mirror']
         self._validate_array(self._setup_gparray(hostlist, interface_list, primary_list, primary_portbase, mirror_type,
-                                                 mirror_list, mirror_portbase, dir_prefix, primary_replication_portbase, mirror_replication_portbase))
+                                                 mirror_list, mirror_portbase, dir_prefix))
 
         #typical Thor
         hostlist = ['sdw1', 'sdw2', 'sdw3', 'sdw4', 'sdw5', 'sdw6', 'sdw7', 'sdw8', 'sdw9']
@@ -80,7 +78,7 @@ class GpArrayTestCase(GpTestCase):
         mirror_list = ['/dbfast1/mirror', '/dbfast2/mirror', '/dbfast3/mirror', '/dbfast4/mirror',
                        '/dbfast5/mirror', '/dbfast6/mirror', '/dbfast7/mirror', '/dbfast8/mirror']
         self._validate_array(self._setup_gparray(hostlist, interface_list, primary_list, primary_portbase, mirror_type,
-                                                 mirror_list, mirror_portbase, dir_prefix, primary_replication_portbase, mirror_replication_portbase))
+                                                 mirror_list, mirror_portbase, dir_prefix))
 
 
     def test_groupmirror_layout(self):
@@ -89,8 +87,6 @@ class GpArrayTestCase(GpTestCase):
         primary_portbase = 5000
         mirror_portbase = 6000
         interface_list = [1]
-        primary_replication_portbase = 7000
-        mirror_replication_portbase = 8000
         dir_prefix = 'gpseg'
 
         hostlist = ['host1']
@@ -100,13 +96,13 @@ class GpArrayTestCase(GpTestCase):
         #not enough
         with self.assertRaises(Exception):
             createSegmentRows(hostlist, interface_list, primary_list, primary_portbase, mirror_type,
-                              mirror_list, mirror_portbase, dir_prefix, primary_replication_portbase, mirror_replication_portbase)
+                              mirror_list, mirror_portbase, dir_prefix)
 
         primary_list.append('/db2')
         mirror_list.append('/mir2')
         with self.assertRaises(Exception):
             createSegmentRows(hostlist, interface_list, primary_list, primary_portbase, mirror_type,
-                              mirror_list, mirror_portbase, dir_prefix, primary_replication_portbase, mirror_replication_portbase)
+                              mirror_list, mirror_portbase, dir_prefix)
         
         #enough
         hostlist = ['host1', 'host2']
@@ -118,7 +114,7 @@ class GpArrayTestCase(GpTestCase):
         primary_list = ['/dbfast1', '/dbfast2', '/dbfast3', '/dbfast4']
         mirror_list = ['/dbfast1/mirror', '/dbfast2/mirror', '/dbfast3/mirror', '/dbfast4/mirror']
         self._validate_array(self._setup_gparray(hostlist, interface_list, primary_list, primary_portbase, mirror_type,
-                                                 mirror_list, mirror_portbase, dir_prefix, primary_replication_portbase, mirror_replication_portbase))
+                                                 mirror_list, mirror_portbase, dir_prefix))
 
         #typical Thor
         hostlist = ['sdw1', 'sdw2', 'sdw3', 'sdw4', 'sdw5', 'sdw6', 'sdw7', 'sdw8', 'sdw9']
@@ -126,7 +122,7 @@ class GpArrayTestCase(GpTestCase):
         mirror_list = ['/dbfast1/mirror', '/dbfast2/mirror', '/dbfast3/mirror', '/dbfast4/mirror',
                        '/dbfast5/mirror', '/dbfast6/mirror', '/dbfast7/mirror', '/dbfast8/mirror']
         self._validate_array(self._setup_gparray(hostlist, interface_list, primary_list, primary_portbase, mirror_type,
-                                                 mirror_list, mirror_portbase, dir_prefix, primary_replication_portbase, mirror_replication_portbase))
+                                                 mirror_list, mirror_portbase, dir_prefix))
 
 
     def test_get_segment_list(self):
@@ -134,8 +130,6 @@ class GpArrayTestCase(GpTestCase):
         primary_portbase = 5000
         mirror_portbase = 6000
         interface_list = [1]
-        primary_replication_portbase = 7000
-        mirror_replication_portbase = 8000
         dir_prefix = 'gpseg'
 
         hostlist = ['sdw1', 'sdw2', 'sdw3', 'sdw4', 'sdw5']
@@ -143,7 +137,7 @@ class GpArrayTestCase(GpTestCase):
         mirror_list = ['/dbfast1/mirror', '/dbfast2/mirror', '/dbfast3/mirror', '/dbfast4/mirror']
 
         gparray = self._setup_gparray(hostlist, interface_list, primary_list, primary_portbase, mirror_type,
-                                      mirror_list, mirror_portbase, dir_prefix, primary_replication_portbase, mirror_replication_portbase)
+                                      mirror_list, mirror_portbase, dir_prefix)
         self._validate_array(gparray)
 
         # test without expansion segments
@@ -153,11 +147,11 @@ class GpArrayTestCase(GpTestCase):
         # test with expansion segments
         expansion_hosts = ['sdw6', 'sdw7']
         rows =  createSegmentRows(expansion_hosts, interface_list, primary_list, primary_portbase, mirror_type,
-                                  mirror_list, mirror_portbase, dir_prefix, primary_replication_portbase, mirror_replication_portbase)
+                                  mirror_list, mirror_portbase, dir_prefix)
         offset = len(hostlist) * len(primary_list) # need to continue numbering where the last createSegmentRows left off
         for row in rows:
             gparray.addExpansionSeg(row.content+offset, 'p' if convert_bool(row.isprimary) else 'm', row.dbid+offset,
-                                    'p' if convert_bool(row.isprimary) else 'm', row.host, row.address, row.port, row.fulldir, row.prPort)
+                                    'p' if convert_bool(row.isprimary) else 'm', row.host, row.address, row.port, row.fulldir)
         self._validate_get_segment_list(gparray, hostlist, expansion_hosts, primary_list)
 
 
@@ -184,8 +178,8 @@ class GpArrayTestCase(GpTestCase):
 
 #------------------------------- non-test helpers --------------------------------
     def _setup_gparray(self, hostlist, interface_list, primary_list, primary_portbase, mirror_type,
-                       mirror_list, mirror_portbase, dir_prefix, primary_replication_portbase, mirror_replication_portbase):
-        master = GpDB(content = -1,
+                       mirror_list, mirror_portbase, dir_prefix):
+        master = Segment(content = -1,
                     preferred_role = 'p',
                     dbid = 0,
                     role = 'p',
@@ -194,26 +188,24 @@ class GpArrayTestCase(GpTestCase):
                     hostname = 'masterhost',
                     address = 'masterhost-1',
                     port = 5432,
-                    datadir = '/masterdir',
-                    replicationPort = 5433)
+                    datadir = '/masterdir')
         allrows = []
         allrows.append(master)                 
         rows =  createSegmentRows(hostlist, interface_list, primary_list, primary_portbase, mirror_type,
-                                  mirror_list, mirror_portbase, dir_prefix, primary_replication_portbase, mirror_replication_portbase)
+                                  mirror_list, mirror_portbase, dir_prefix)
         
         
         for row in rows:
-            newrow = GpDB(content = row.content, 
-                          preferred_role = 'p' if convert_bool(row.isprimary) else 'm', 
+            newrow = Segment(content = row.content,
+                          preferred_role = 'p' if convert_bool(row.isprimary) else 'm',
                           dbid = row.dbid,
                           role = 'p' if convert_bool(row.isprimary) else 'm',
-                          mode = 's', 
-                          status = 'u', 
-                          hostname = row.host, 
-                          address = row.address, 
-                          port = row.port, 
-                          datadir = row.fulldir, 
-                          replicationPort = row.prPort) 
+                          mode = 's',
+                          status = 'u',
+                          hostname = row.host,
+                          address = row.address,
+                          port = row.port,
+                          datadir = row.fulldir)
             allrows.append(newrow)
         
         gparray = GpArray(allrows)
@@ -222,9 +214,9 @@ class GpArrayTestCase(GpTestCase):
     def _validate_array(self, gparray): 
         portdict = {}
         lastport = 0
-        for seg in gparray.segments:
+        for seg in gparray.segmentPairs:
             prim = seg.primaryDB            
-            mir = seg.mirrorDBs[0]
+            mir = seg.mirrorDB
             self.assertNotEqual(prim.hostname, mir.hostname)
             if prim.port not in portdict:
                 portdict[prim.port] = 1
@@ -257,7 +249,13 @@ class GpArrayTestCase(GpTestCase):
         actual = sorted(actual)
         for i in range(len(expected)):
             self.assertEquals(expected[i], actual[i])
-    
+
+    @patch('gppylib.db.dbconn.execSQL', return_value=[['PostgreSQL 8.3.23 (Greenplum Database 5.0.0 build dev) on x86_64-pc-linux-gnu, compiled by GCC gcc (GCC) 4.4.7 20120313 (Red Hat 4.4.7-17) compiled on Feb  9 2017 23:06:31']])
+    @patch('gppylib.db.dbconn.connect', autospec=True)
+    def test_initFromCatalog_mismatched_versions(self, mock_connect, mock_execSQL):
+        with self.assertRaisesRegexp(Exception, 'Cannot connect to GPDB version 5 from installed version 7'):
+            GpArray.initFromCatalog(None)
+
 def convert_bool(val):
     if val == 't':
         return True

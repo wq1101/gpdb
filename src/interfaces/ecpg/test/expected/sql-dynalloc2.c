@@ -52,7 +52,7 @@ struct sqlca_t
 	/* Element 0: set to 'W' if at least one other is 'W'	*/
 	/* 1: if 'W' at least one character string		*/
 	/* value was truncated when it was			*/
-	/* stored into a host variable.				*/
+	/* stored into a host variable.             */
 
 	/*
 	 * 2: if 'W' a (hopefully) non-fatal notice occurred
@@ -124,7 +124,7 @@ int main(void)
    /* exec sql whenever sqlerror  do sqlprint ( ) ; */
 #line 19 "dynalloc2.pgc"
 
-   { ECPGconnect(__LINE__, 0, "regress1" , NULL, NULL , NULL, 0); 
+   { ECPGconnect(__LINE__, 0, "ecpg1_regression" , NULL, NULL , NULL, 0); 
 #line 20 "dynalloc2.pgc"
 
 if (sqlca.sqlcode < 0) sqlprint ( );}
@@ -188,7 +188,7 @@ if (sqlca.sqlcode < 0) sqlprint ( );
 #line 32 "dynalloc2.pgc"
 
    { ECPGdo(__LINE__, 0, 1, NULL, 0, ECPGst_normal, "select * from test", ECPGt_EOIT, 
-	ECPGt_descriptor, "mydesc", 0L, 0L, 0L, 
+	ECPGt_descriptor, "mydesc", 1L, 1L, 1L, 
 	ECPGt_NO_INDICATOR, NULL , 0L, 0L, 0L, ECPGt_EORT);
 #line 33 "dynalloc2.pgc"
 
@@ -225,10 +225,10 @@ if (sqlca.sqlcode < 0) sqlprint ( );}
    for (i=0;i < sqlca.sqlerrd[2];++i)
    {
       if (ipointer1[i]) printf("NULL, ");
-      else printf("%d, ",ip1[i]); 
+      else printf("%d, ",ip1[i]);
 
       if (ipointer2[i]) printf("NULL, ");
-      else printf("'%s', ",cp2[i]); 
+      else printf("'%s', ",cp2[i]);
       printf("\n");
    }
    ECPGfree_auto_mem();

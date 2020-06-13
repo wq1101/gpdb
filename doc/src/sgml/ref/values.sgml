@@ -1,11 +1,16 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/values.sgml,v 1.4 2007/02/01 00:28:19 momjian Exp $
+doc/src/sgml/ref/values.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-VALUES">
+ <indexterm zone="sql-values">
+  <primary>VALUES</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="SQL-VALUES-TITLE">VALUES</refentrytitle>
+  <refentrytitle>VALUES</refentrytitle>
+  <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
 
@@ -14,16 +19,13 @@ PostgreSQL documentation
   <refpurpose>compute a set of rows</refpurpose>
  </refnamediv>
 
- <indexterm zone="sql-values">
-  <primary>VALUES</primary>
- </indexterm>
-
  <refsynopsisdiv>
 <synopsis>
 VALUES ( <replaceable class="PARAMETER">expression</replaceable> [, ...] ) [, ...]
     [ ORDER BY <replaceable class="parameter">sort_expression</replaceable> [ ASC | DESC | USING <replaceable class="parameter">operator</replaceable> ] [, ...] ]
     [ LIMIT { <replaceable class="parameter">count</replaceable> | ALL } ]
-    [ OFFSET <replaceable class="parameter">start</replaceable> ]
+    [ OFFSET <replaceable class="parameter">start</replaceable> [ ROW | ROWS ] ]
+    [ FETCH { FIRST | NEXT } [ <replaceable class="parameter">count</replaceable> ] { ROW | ROWS } ONLY ]
 </synopsis>
  </refsynopsisdiv>
 
@@ -48,8 +50,10 @@ VALUES ( <replaceable class="PARAMETER">expression</replaceable> [, ...] ) [, ..
   <para>
    Within larger commands, <command>VALUES</> is syntactically allowed
    anywhere that <command>SELECT</> is.  Because it is treated like a
-   <command>SELECT</> by the grammar, it is possible to use the <literal>ORDER
-   BY</>, <literal>LIMIT</>, and <literal>OFFSET</> clauses with a
+   <command>SELECT</> by the grammar, it is possible to use
+   the <literal>ORDER BY</>, <literal>LIMIT</> (or
+   equivalently <literal>FETCH FIRST</literal>),
+   and <literal>OFFSET</> clauses with a
    <command>VALUES</> command.
   </para>
  </refsect1>
@@ -111,7 +115,7 @@ VALUES ( <replaceable class="PARAMETER">expression</replaceable> [, ...] ) [, ..
     <listitem>
      <para>
       The number of rows to skip before starting to return rows.
-      For details see 
+      For details see
       <xref linkend="sql-limit" endterm="sql-limit-title">.
      </para>
     </listitem>
@@ -210,13 +214,13 @@ UPDATE employees SET salary = salary * v.increase
 <programlisting>
 SELECT * FROM machines
 WHERE ip_address IN (VALUES('192.168.0.1'::inet), ('192.168.0.10'), ('192.168.1.43'));
-</programlisting>
-  </para>
+</programlisting></para>
 
   <tip>
    <para>
     For simple <literal>IN</> tests, it's better to rely on the
-    list-of-scalars form of <literal>IN</> than to write a <command>VALUES</>
+    <link linkend="functions-comparisons-in-scalar">list-of-scalars</link>
+    form of <literal>IN</> than to write a <command>VALUES</>
     query as shown above.  The list of scalars method requires less writing
     and is often more efficient.
    </para>
@@ -226,10 +230,10 @@ WHERE ip_address IN (VALUES('192.168.0.1'::inet), ('192.168.0.10'), ('192.168.1.
  <refsect1>
   <title>Compatibility</title>
 
-  <para>
-   <command>VALUES</command> conforms to the SQL standard, except that
+  <para><command>VALUES</command> conforms to the SQL standard.
    <literal>LIMIT</literal> and <literal>OFFSET</literal> are
-   <productname>PostgreSQL</productname> extensions.
+   <productname>PostgreSQL</productname> extensions; see also
+   under <xref linkend="sql-select">.
   </para>
  </refsect1>
 
@@ -237,8 +241,8 @@ WHERE ip_address IN (VALUES('192.168.0.1'::inet), ('192.168.0.10'), ('192.168.1.
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-insert" endterm="sql-insert-title"></member>
-   <member><xref linkend="sql-select" endterm="sql-select-title"></member>
+   <member><xref linkend="sql-insert"></member>
+   <member><xref linkend="sql-select"></member>
   </simplelist>
  </refsect1>
 </refentry>

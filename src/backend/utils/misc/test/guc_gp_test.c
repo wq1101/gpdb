@@ -1,202 +1,115 @@
-/*
- * Unit tests for the functions in guc_gp.c.
- */
 #include <stdarg.h>
 #include <stddef.h>
 #include <setjmp.h>
-#include <stdio.h>
-#include <stdlib.h>
-
 #include "cmockery.h"
+
+#include "postgres.h"
 
 #include "../guc_gp.c"
 
-static bool check_result(const char *expected_result);
-static void setup_test(void);
-static void cleanup_test(void);
+void init(void );
 
-void
-test__set_gp_replication_config_synchronous_standby_names_to_empty(void **state)
+void init()
 {
-	setup_test();
+	sync_guc_num = sizeof(sync_guc_names_array)/ sizeof(char *);
+	unsync_guc_num = sizeof(unsync_guc_names_array)/ sizeof(char *);
+	qsort((void *) sync_guc_names_array, sync_guc_num,
+			sizeof(char *), guc_array_compare);
 
-	set_gp_replication_config("synchronous_standby_names", "");
-
-	assert_true(check_result("synchronous_standby_names = ''"));
-
-	cleanup_test();
+	qsort((void *) unsync_guc_names_array, unsync_guc_num,
+			sizeof(char *), guc_array_compare);
 }
 
-void
-test__set_gp_replication_config_synchronous_standby_names_to_star(void **state)
+static void assert_guc(struct config_generic *conf)
 {
-	setup_test();
-
-	set_gp_replication_config("synchronous_standby_names", "*");
-
-	assert_true(check_result("synchronous_standby_names = '*'"));
-
-	cleanup_test();
-}
-
-void
-test__set_gp_replication_config_synchronous_standby_names_to_null(void **state)
-{
-	/*
-	 * initialize the guc to '*'
-	 */
-	setup_test();
-	set_gp_replication_config("synchronous_standby_names", "*");
-	assert_true(check_result("synchronous_standby_names = '*'"));
-
-	setup_test();
-	set_gp_replication_config("synchronous_standby_names", NULL);
-
-	/*
-	 * it should be removed
-	 */
-	assert_false(check_result("synchronous_standby_names = '*'"));
-
-	cleanup_test();
-}
-
-void
-test__set_gp_replication_config_new_guc_to_null(void **state)
-{
-	/*
-	 * initialize the guc to '*'
-	 */
-	setup_test();
-	set_gp_replication_config("synchronous_standby_names", "*");
-	assert_true(check_result("synchronous_standby_names = '*'"));
-
-	/*
-	 * this is a NO-OP, since NULL valued GUC will be removed.
-	 */
-	setup_test();
-	set_gp_replication_config("gp_select_invisible", NULL);
-
-	/*
-	 * it should be removed
-	 */
-	assert_true(check_result("synchronous_standby_names = '*'"));
-	assert_false(check_result("gp_select_invisible = false"));
-
-	cleanup_test();
-}
-
-void
-test__validate_gp_replication_conf_option(void **state)
-{
-	struct config_generic *record;
-	build_guc_variables();
-
-	/*
-	 * PGC_BOOL
-	 */
-	record = find_option("optimizer", false, LOG);
-
-	PG_TRY();
+	char *res = (char *) bsearch((void *) &conf->name,
+			(void *) sync_guc_names_array,
+			sync_guc_num,
+			sizeof(char *),
+			guc_array_compare);
+	if (!res)
 	{
-		validate_gp_replication_conf_option(record, "should output fatal", ERROR);
-		fail();
+		char *res = (char *) bsearch((void *) &conf->name,
+				(void *) unsync_guc_names_array,
+				unsync_guc_num,
+				sizeof(char *),
+				guc_array_compare);
+
+		if ( res == NULL)
+			printf("GUC: '%s' does not exist in both list.\n", conf->name);
+
+		assert_true(res);
 	}
-	PG_CATCH();
-	{
-	}
-	PG_END_TRY();
-
-	assert_true(validate_gp_replication_conf_option(record, "true", NOTICE));
-	assert_false(validate_gp_replication_conf_option(record, "should output fatal", NOTICE));
-
-	/*
-	 * PGC_INT
-	 */
-	record = find_option("max_connections", false, LOG);
-	assert_true(validate_gp_replication_conf_option(record, "10", NOTICE));
-	assert_false(validate_gp_replication_conf_option(record, "-10", NOTICE));
-
-	/*
-	 * PGC_REAL
-	 */
-	record = find_option("cursor_tuple_fraction", false, LOG);
-	assert_true(validate_gp_replication_conf_option(record, "0.0", NOTICE));
-	assert_false(validate_gp_replication_conf_option(record, "2.0", NOTICE));
-
-	/*
-	 * PGC_STRING
-	 */
-	char valid_name[NAMEDATALEN];
-	char invalid_name[NAMEDATALEN + 10];
-	sprintf(valid_name, "%0*d", sizeof(valid_name)-1, 0);
-	sprintf(invalid_name, "%0*d", sizeof(invalid_name)-1, 0);
-
-	record = find_option("client_encoding", false, LOG);
-	assert_true(validate_gp_replication_conf_option(record, valid_name, NOTICE));
-	assert_false(validate_gp_replication_conf_option(record, invalid_name, NOTICE));
 }
 
 static void
-setup_test(void)
+test_bool_guc_gp_coverage(void **state)
 {
-	will_return(superuser, true);
+	for (int i = 0; ConfigureNamesBool_gp[i].gen.name; i++)
+	{
+		struct config_generic *conf = (struct config_generic *)&ConfigureNamesBool_gp[i];
+		assert_guc(conf);
+	}
 
-	expect_any(LWLockAcquire, lockid);
-	expect_any(LWLockAcquire, mode);
-	will_be_called(LWLockAcquire);
-
-	expect_any(LWLockRelease, lockid);
-	will_be_called(LWLockRelease);
-
-	gp_replication_config_filename = "/tmp/test_gp_replication.conf";
-	build_guc_variables();
 }
 
 static void
-cleanup_test(void)
+test_int_guc_gp_coverage(void **state)
 {
-	unlink(gp_replication_config_filename);
-}
-
-static bool
-check_result(const char *expected_result)
-{
-	FILE *fp;
-	char *line = NULL;
-	size_t len = 0;
-	ssize_t read;
-	bool found = false;
-
-	fp = fopen(gp_replication_config_filename, "r");
-	assert_true(fp);
-
-	while ((read = getline(&line, &len, fp)) != -1)
+	for (int i = 0; ConfigureNamesInt_gp[i].gen.name; i++)
 	{
-		if (strncmp(line, expected_result, strlen(expected_result)) == 0)
-		{
-			found = true;
-			break;
-		}
+		struct config_generic *conf = (struct config_generic *)&ConfigureNamesInt_gp[i];
+		assert_guc(conf);
 	}
 
-	fclose(fp);
-	if (line)
-		free(line);
+}
 
-	return found;
+static void
+test_string_guc_gp_coverage(void **state)
+{
+	for (int i = 0; ConfigureNamesString_gp[i].gen.name; i++)
+	{
+		struct config_generic *conf = (struct config_generic *)&ConfigureNamesString_gp[i];
+		assert_guc(conf);
+	}
+
+}
+
+static void
+test_real_guc_gp_coverage(void **state)
+{
+	for (int i = 0; ConfigureNamesReal_gp[i].gen.name; i++)
+	{
+		struct config_generic *conf = (struct config_generic *)&ConfigureNamesReal_gp[i];
+		assert_guc(conf);
+	}
+
+}
+
+static void
+test_enum_guc_gp_coverage(void **state)
+{
+	for (int i = 0; ConfigureNamesEnum_gp[i].gen.name; i++)
+	{
+		struct config_generic *conf = (struct config_generic *)&ConfigureNamesEnum_gp[i];
+		assert_guc(conf);
+	}
+
 }
 
 int
 main(int argc, char* argv[])
 {
 	cmockery_parse_arguments(argc, argv);
+	init();
 
 	const UnitTest tests[] = {
-		unit_test(test__set_gp_replication_config_synchronous_standby_names_to_empty),
-		unit_test(test__set_gp_replication_config_synchronous_standby_names_to_star),
-		unit_test(test__set_gp_replication_config_synchronous_standby_names_to_null),
-		unit_test(test__set_gp_replication_config_new_guc_to_null),
-		unit_test(test__validate_gp_replication_conf_option)
+		unit_test(test_bool_guc_gp_coverage),
+		unit_test(test_int_guc_gp_coverage),
+		unit_test(test_real_guc_gp_coverage),
+		unit_test(test_string_guc_gp_coverage),
+		unit_test(test_enum_guc_gp_coverage)
 	};
+
 	return run_tests(tests);
 }

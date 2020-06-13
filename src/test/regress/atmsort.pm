@@ -35,10 +35,7 @@ my $bpref = '';
 my $cpref = '';
 my $dpref = '';
 
-my $glob_compare_equiv;
-my $glob_make_equiv_expected;
 my $glob_ignore_plans;
-my $glob_ignore_whitespace;
 my @glob_init;
 
 my $glob_orderwarn;
@@ -47,17 +44,12 @@ my $glob_fqo;
 
 my $atmsort_outfh;
 
-# array of "expected" rows from first query of equiv region
-my $equiv_expected_rows;
-
 sub atmsort_init
 {
     my %args = (
         # defaults
-        IGNORE_HEADERS  => 0,
         IGNORE_PLANS    => 0,
         INIT_FILES      => [],
-        DO_EQUIV        => 'ignore',    # can be 'ignore', 'compare', or 'make'
         ORDER_WARN      => 0,
         VERBOSE         => 0,
 
@@ -65,49 +57,19 @@ sub atmsort_init
         @_
     );
 
-    $glob_compare_equiv       = 0;
-    $glob_make_equiv_expected = 0;
     $glob_ignore_plans        = 0;
-    $glob_ignore_whitespace   = 0;
     @glob_init                = ();
 
     $glob_orderwarn           = 0;
     $glob_verbose             = 0;
     $glob_fqo                 = {count => 0};
 
-    my $compare_equiv = 0;
-    my $make_equiv_expected = 0;
-    my $do_equiv;
-    my $ignore_headers;
     my $ignore_plans;
     my @init_file;
     my $verbose;
     my $orderwarn;
 
-    if ($args{DO_EQUIV} =~ m/^ignore/i)
-    {
-        # ignore all - default
-    }
-    elsif ($args{DO_EQUIV} =~ m/^compare/i)
-    {
-        # compare equiv region
-        $compare_equiv = 1;
-    }
-    elsif ($args{DO_EQUIV} =~ m/^make/i)
-    {
-        # make equiv expected output
-        $make_equiv_expected = 1;
-    }
-    else
-    {
-        die "unknown do_equiv option: $do_equiv\nvalid options are:\n\tdo_equiv=compare\n\tdo_equiv=make";
-    }
-    $glob_compare_equiv       = $compare_equiv;
-    $glob_make_equiv_expected = $make_equiv_expected;
-
     $glob_ignore_plans        = $args{IGNORE_PLANS};
-
-    $glob_ignore_whitespace   = $ignore_headers; # XXX XXX: for now
 
     @glob_init = @{$args{INIT_FILES}};
 
@@ -266,10 +228,6 @@ sub init_match_subs
 m/\s+\(seg.*pid.*\)/
 s/\s+\(seg.*pid.*\)//
 
-# distributed transactions
-m/^(?:ERROR|WARNING|CONTEXT|NOTICE):.*gid\s+=\s+(?:\d+)/
-s/gid.*/gid DUMMY/
-
 m/^(?:ERROR|WARNING|CONTEXT|NOTICE):.*connection.*failed.*(?:http|gpfdist)/
 s/connection.*failed.*(http|gpfdist).*/connection failed dummy_protocol\:\/\/DUMMY_LOCATION/
 
@@ -385,11 +343,11 @@ sub init_matchignores
 
     $here_matchignores = << 'EOF_matchignores';
 
-m/^NOTICE:  Dropping a column that is part of the distribution policy/
+m/^NOTICE:  dropping a column that is part of the distribution policy/
 
-m/^NOTICE:  Table has parent\, setting distribution columns to match parent table/
+m/^NOTICE:  table has parent\, setting distribution columns to match parent table/
 
-m/^WARNING:  Referential integrity \(.*\) constraints are not supported in Greenplum Database/
+m/^WARNING:  referential integrity \(.*\) constraints are not supported in Greenplum Database/
 
         # ignore notices for DROP sqlobject IF EXISTS "objectname"
         # eg NOTICE:  table "foo" does not exist, skipping
@@ -580,46 +538,19 @@ sub format_query_output
         print $atmsort_outfh "GP_IGNORE: start fqo $fqostate->{count}\n";
     }
 
-    if (exists($directive->{make_equiv_expected}))
-    {
-        # special case for EXPLAIN PLAN as first "query"
-        if (exists($directive->{explain}))
-        {
-            my $stat = format_explain($outarr, $directive);
-
-            # save the first query output from equiv as "expected rows"
-
-            if ($stat)
-            {
-                push @{$equiv_expected_rows}, @{$stat};
-            }
-            else
-            {
-                push @{$equiv_expected_rows}, @{$outarr};
-            }
-
-            if ($glob_verbose)
-            {
-                print $atmsort_outfh "GP_IGNORE: end fqo $fqostate->{count}\n";
-            }
-
-            return ;
-
-        }
-
-        # save the first query output from equiv as "expected rows"
-        push @{$equiv_expected_rows}, @{$outarr};
-    }
-    elsif (defined($equiv_expected_rows)
-           && scalar(@{$equiv_expected_rows}))
-    {
-        # reuse equiv expected rows if you have them
-        $outarr = [];
-        push @{$outarr}, @{$equiv_expected_rows};
-    }
-
-    # explain (if not in an equivalence region)
-    if (exists($directive->{explain}))
+    # EXPLAIN
+    #
+    # EXPLAIN (COSTS OFF) output is *not* processed. The output with COSTS OFF
+    # shouldn't contain anything that varies across runs, and shouldn't need
+    # sanitizing.
+	#
+	# However when -ignore_plans is specified we also need to process
+	# EXPLAIN (COSTS OFF) to ignore the segments information.
+    if (exists($directive->{explain})
+		&& ($glob_ignore_plans
+			|| $directive->{explain} ne 'costs_off')
+        && (!exists($directive->{explain_processing})
+            || ($directive->{explain_processing} =~ m/on/)))
     {
        format_explain($outarr, $directive);
        if ($glob_verbose)
@@ -989,31 +920,11 @@ sub format_query_output
     {
         my @ggg= @{$outarr};
 
-        if ($glob_ignore_whitespace)
-        {
-           my @ggg2;
-
-           for my $line (@ggg)
-           {
-              # remove all leading, trailing whitespace (changes sorting)
-              # and whitespace around column separators
-              $line =~ s/^(\s+|\s+$)//;
-              $line =~ s/\|\s+/\|/gm;
-              $line =~ s/\s+\|/\|/gm;
-
-              $line .= "\n" # replace linefeed if necessary
-                unless ($line =~ m/\n$/);
-
-              push @ggg2, $line;
-           }
-           @ggg= @ggg2;
-        }
-
         if ($glob_orderwarn)
         {
             # If no ordering cols specified (no directive), and SELECT has
             # ORDER BY, see if number of order by cols matches all cols in
-            # selected lists. Treat the order by cols as a column separated
+            # selected lists. Treat the order by cols as a comma separated
             # list and count them. Works ok for simple ORDER BY clauses
             if (defined($directive->{sql_statement}))
             {
@@ -1057,25 +968,6 @@ sub format_query_output
     {
         my @ggg= sort @{$outarr};
 
-        if ($glob_ignore_whitespace)
-        {
-           my @ggg2;
-
-           for my $line (@ggg)
-           {
-              # remove all leading, trailing whitespace (changes sorting)
-              # and whitespace around column separators
-              $line =~ s/^(\s+|\s+$)//;
-              $line =~ s/\|\s+/\|/gm;
-              $line =~ s/\s+\|/\|/gm;
-
-              $line .= "\n" # replace linefeed if necessary
-                unless ($line =~ m/\n$/);
-
-              push @ggg2, $line;
-           }
-           @ggg= sort @ggg2;
-        }
         for my $line (@ggg)
         {
             print $atmsort_outfh $bpref, $prefix, $line;
@@ -1098,17 +990,17 @@ sub atmsort_bigloop
     my $sql_statement = "";
     my @outarr;
 
+    my $lastmsg = -1;
     my $getrows = 0;
     my $getstatement = 0;
     my $has_order = 0;
     my $copy_to_stdout_result = 0;
+    my $describe_mode = 0;
     my $directive = {};
     my $big_ignore = 0;
     my %define_match_expression;
 
     print $atmsort_outfh "GP_IGNORE: formatted by atmsort.pm\n";
-
-    my $do_equiv = $glob_compare_equiv || $glob_make_equiv_expected;
 
   L_bigwhile:
     while (<$infh>) # big while
@@ -1177,10 +1069,6 @@ sub atmsort_bigloop
 
         if ($big_ignore > 0)
         {
-            if (!$do_equiv && $ini =~ m/\-\-\s*end\_equiv\s*$/)
-            {
-                $big_ignore--;
-            }
             if ($ini =~ m/\-\-\s*end\_ignore\s*$/)
             {
                 $big_ignore--;
@@ -1188,9 +1076,16 @@ sub atmsort_bigloop
             print $atmsort_outfh "GP_IGNORE:", $ini;
             next;
         }
-        elsif ($do_equiv && $ini =~ m/\-\-\s*end\_equiv\s*$/)
+
+        # if MATCH then SUBSTITUTE
+        # see HERE document for definitions
+        $ini = match_then_subs($ini);
+
+        # if MATCH then IGNORE
+        # see HERE document for definitions
+        if ( match_then_ignore($ini))
         {
-            $equiv_expected_rows = undef;
+            next; # ignore matching lines
         }
 
         if ($getrows) # getting rows from SELECT output
@@ -1218,12 +1113,41 @@ sub atmsort_bigloop
                 goto reprocess_row;
             }
 
+            my $end_of_table = 0;
+
+            if ($describe_mode)
+            {
+                # \d tables don't always end with a row count, and there may be
+                # more than one of them per command. So we allow any of the
+                # following to end the table:
+                # - a blank line
+                # - a row that doesn't have the same number of column separators
+                #   as the header line
+                # - a row count (checked below)
+                if ($ini =~ m/^$/)
+                {
+                    $end_of_table = 1;
+                }
+                elsif (exists($directive->{firstline}))
+                {
+                    # Count the number of column separators in the table header
+                    # and our current line.
+                    my $headerSeparators = ($directive->{firstline} =~ tr/\|//);
+                    my $lineSeparators = ($ini =~ tr/\|//);
+
+                    if ($headerSeparators != $lineSeparators)
+                    {
+                        $end_of_table = 1;
+                    }
+                }
+
+                # Don't reset describe_mode at the end of the table; there may
+                # be more tables still to go.
+            }
+
             # regex example: (5 rows)
             if ($ini =~ m/^\s*\(\d+\s+row(?:s)*\)\s*$/)
             {
-                format_query_output($glob_fqo,
-                                    $has_order, \@outarr, $directive);
-
                 # Always ignore the rowcount for explain plan out as the
                 # skeleton plans might be the same even if the row counts
                 # differ because of session level GUCs.
@@ -1231,6 +1155,14 @@ sub atmsort_bigloop
                 {
                     $ini = 'GP_IGNORE:' . $ini;
                 }
+
+                $end_of_table = 1;
+            }
+
+            if ($end_of_table)
+            {
+                format_query_output($glob_fqo,
+                                    $has_order, \@outarr, $directive);
 
                 $directive = {};
                 @outarr = ();
@@ -1251,8 +1183,7 @@ sub atmsort_bigloop
                 $define_match_expression{"expr"} = $ini;
                 goto L_push_outarr;
             }
-            if ($has_comment && (($ini =~ m/\-\-\s*start\_ignore\s*$/) ||
-                (!$do_equiv && ($ini =~ m/\-\-\s*start\_equiv\s*$/))))
+            if ($has_comment && ($ini =~ m/\-\-\s*start\_ignore\s*$/))
             {
                 $big_ignore += 1;
 
@@ -1265,23 +1196,27 @@ sub atmsort_bigloop
                 print $atmsort_outfh 'GP_IGNORE:', $ini;
                 next;
             }
-            elsif ($has_comment && ($glob_make_equiv_expected && $ini =~ m/\-\-\s*start\_equiv\s*$/))
-            {
-                $equiv_expected_rows = [];
-                $directive->{make_equiv_expected} = 1;
-            }
 
+            # EXPLAIN (COSTS OFF) ...
+            if ($ini =~ m/explain\s*\(.*costs\s+off.*\)/i)
+            {
+                $directive->{explain} = "costs_off";
+            }
             # Note: \d is for the psql "describe"
-            if ($ini =~ m/(?:insert|update|delete|select|\\d|copy)/i)
+            elsif ($ini =~ m/(?:insert|update|delete|select|^\s*\\d|copy|execute)/i)
             {
                 $copy_to_stdout_result = 0;
                 $has_order = 0;
                 $sql_statement = "";
 
-                if ($ini =~ m/explain.*(?:insert|update|delete|select)/i)
+                if ($ini =~ m/explain.*(?:insert|update|delete|select|execute)/i)
                 {
                     $directive->{explain} = 'normal';
                 }
+
+                # Should we apply more heuristics to try to find the end of \d
+                # output?
+                $describe_mode = ($ini =~ m/^\s*\\d/);
             }
 
 			# Catching multiple commands and capturing the parens matches
@@ -1289,9 +1224,10 @@ sub atmsort_bigloop
 			# each command has a unique first character. This allows us to
 			# use fewer regular expression matches in this hot section.
 			if ($has_comment &&
-				$ini =~ m/\-\-\s*((force_explain)\s*(operator)?\s*$|(ignore)\s*$|(order)\s+\d+.*$|(mvd)\s+\d+.*$)/)
+				$ini =~ m/\-\-\s*((force_explain)\s*(operator)?\s*$|(ignore)\s*$|(order)\s+(\d+|none).*$|(mvd)\s+\d+.*$|(explain_processing_(on|off))\s+.*$)/)
 			{
-				my $cmd = substr($1, 0, 1);
+				my $full_command = $1;
+				my $cmd = substr($full_command, 0, 1);
 				if ($cmd eq 'i')
 				{
 					$directive->{ignore} = 'ignore';
@@ -1300,7 +1236,14 @@ sub atmsort_bigloop
 				{
 					my $olist = $ini;
 					$olist =~ s/^.*\-\-\s*order//;
-					$directive->{order} = $olist;
+					if ($olist =~ /none/)
+					{
+						$directive->{order_none} = 1;
+					}
+					else
+					{
+						$directive->{order} = $olist;
+					}
 				}
 				elsif ($cmd eq 'f')
 				{
@@ -1312,6 +1255,11 @@ sub atmsort_bigloop
 					{
 						$directive->{explain} = 'normal';
 					}
+				}
+				elsif ($cmd eq 'e')
+				{
+					$full_command =~ m/(on|off)$/;
+					$directive->{explain_processing} = $1;
 				}
 				else
 				{
@@ -1332,18 +1280,18 @@ sub atmsort_bigloop
             }
 
             # prune notices with segment info if they are duplicates
-            if ($ini =~ m/^\s*(?:NOTICE|ERROR|HINT|DETAIL|WARNING)\:.*\(seg.*pid.*\)/)
+            if ($ini =~ m/^\s*(?:NOTICE|ERROR|HINT|DETAIL|WARNING)\:.*/)
             {
                 $ini =~ s/\s+(?:\W)?(?:\W)?\(seg.*pid.*\)//;
 
                 my $outsize = scalar(@outarr);
 
-                my $lastguy = -1;
+                $lastmsg = -1;
 
               L_checkfor:
                 for my $jj (1..$outsize)
                 {
-                    my $checkstr = $outarr[$lastguy];
+                    my $checkstr = $outarr[$lastmsg];
 
                     #remove trailing spaces for comparison
                     $checkstr =~ s/\s+$//;
@@ -1363,9 +1311,10 @@ sub atmsort_bigloop
                             $ini = "DUP: " . $ini;
                             last L_checkfor;
                         }
+                        $lastmsg = -1;
                         next L_bigwhile;
                     }
-                    $lastguy--;
+                    $lastmsg--;
                 } # end for
 
             } # end if pruning notices
@@ -1377,14 +1326,28 @@ sub atmsort_bigloop
             #  copy test1 to stdout
             #  \copy test1 to stdout
             my $matches_copy_to_stdout = 0;
-            if ($ini =~ m/^(?:\\)?copy\s+(?:(?:\(select.*\))|\w+)\s+to stdout.*$/i)
+            if ($ini =~ m/^(?:\\)?copy\s+(?:(?:\(select.*\))|\S+)\s+to stdout.*$/i)
             {
                 $matches_copy_to_stdout = 1;
             }
-            # regex example: ---- or ---+---
-            # need at least 3 dashes to avoid confusion with "--" comments
+
+            # Try to detect the beginning of result set, as printed by psql
+            #
+            # Examples:
+            #
+            #    hdr    
+            # ----------
+            #
+            #  a | b 
+            # ---+---
+            #
+            # The previous line should be the header. It should have a space at the
+            # beginning and end. This line should consist of dashes and plus signs,
+            # with at least three dashes for each column.
+            #
             if (($matches_copy_to_stdout && $ini !~ m/order by/i) ||
-					$ini =~ m/^\s*(?:(?:\-\-)(?:\-)+(?:\+(?:\-)+)*)+\s*$/)
+                (scalar(@outarr) > 1 && $outarr[-1] =~ m/^\s+.*\s$/ &&
+                 $ini =~ m/^(?:(?:\-\-)(?:\-)+(?:\+(?:\-)+)*)$/))
                 # special case for copy select
             { # sort this region
 
@@ -1422,19 +1385,48 @@ sub atmsort_bigloop
 
                 print $atmsort_outfh $apref, $ini;
 
-                if (defined($sql_statement)
+                # If there is an ORDER BY in the query, then the results must
+                # be in the order that we have memorized in the expected
+                # output. Otherwise, the order of the rows is not
+                # well-defined, so we sort them before comparing, to mask out
+                # any differences in the order.
+                #
+                # This isn't foolproof, and will get fooled by ORDER BYs in
+                # subqueries, for example. But it catches the commmon cases.
+                if (defined($directive->{explain}))
+                {
+                    $has_order = 1; # Do not reorder EXPLAIN output
+                }
+                elsif (defined($sql_statement)
                     && length($sql_statement)
+                    && !defined($directive->{order_none})
                     # multiline match
                     && ($sql_statement =~ m/select.*order.*by/is))
                 {
-                    $has_order = 1; # so do *not* sort output
-                    $directive->{sql_statement} = $sql_statement;
+                    # There was an ORDER BY. But if it was part of an
+                    # "agg() OVER (ORDER BY ...)" or "WITHIN GROUP (ORDER BY
+                    # ...)" construct, ignore it, because those constructs
+                    # don't mean that the final result has to be in order.
+                    my $t = $sql_statement;
+                    $t =~ s/over\s*\(order\s+by.*\)/xx/isg;
+                    $t =~ s/over\s*\((partition\s+by.*)?order\s+by.*\)/xx/isg;
+                    $t =~ s/window\s+\w+\s+as\s+\((partition\s+by.*)?order\s+by.*\)/xx/isg;
+                    $t =~ s/within\s+group\s*\((order\s+by.*)\)/xx/isg;
+
+                    if ($t =~ m/order\s+by/is)
+                    {
+                        $has_order = 1; # so do *not* sort output
+                    }
+                    else
+                    {
+                        $has_order = 0; # need to sort query output
+                    }
                 }
                 else
                 {
                     $has_order = 0; # need to sort query output
-                    $directive->{sql_statement} = $sql_statement;
                 }
+                $directive->{sql_statement} = $sql_statement;
                 $sql_statement = '';
 
                 $getrows = 1;
@@ -1442,20 +1434,22 @@ sub atmsort_bigloop
             } # end sort this region
         } # end finding SQL
 
-        # if MATCH then SUBSTITUTE
-        # see HERE document for definitions
-        $ini = match_then_subs($ini);
-
-        # if MATCH then IGNORE
-        # see HERE document for definitions
-        if ( match_then_ignore($ini))
-        {
-            next; # ignore matching lines
-        }
 
 L_push_outarr:
 
         push @outarr, $ini;
+
+        # lastmsg < -1 means we found sequential block of messages like
+        # "NOTICE|ERROR|HINT|DETAIL|WARNING", they might come from different
+        # QEs, the order of output in QD is uncertain, so let's sort them to
+        # aid diff comparison
+        if ($lastmsg < -1)
+        {
+            my @msgblock = @outarr[$lastmsg..-1];
+            @msgblock = sort @msgblock;
+            splice @outarr, $lastmsg, abs $lastmsg, @msgblock;
+            $lastmsg = -1;
+        }
 
     } # end big while
 

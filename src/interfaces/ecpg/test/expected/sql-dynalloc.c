@@ -52,7 +52,7 @@ struct sqlca_t
 	/* Element 0: set to 'W' if at least one other is 'W'	*/
 	/* 1: if 'W' at least one character string		*/
 	/* value was truncated when it was			*/
-	/* stored into a host variable.				*/
+	/* stored into a host variable.             */
 
 	/*
 	 * 2: if 'W' a (hopefully) non-fatal notice occurred
@@ -170,7 +170,7 @@ int main(void)
    /* exec sql whenever sqlerror  do sqlprint ( ) ; */
 #line 32 "dynalloc.pgc"
 
-   { ECPGconnect(__LINE__, 0, "regress1" , NULL, NULL , NULL, 0); 
+   { ECPGconnect(__LINE__, 0, "ecpg1_regression" , NULL, NULL , NULL, 0); 
 #line 33 "dynalloc.pgc"
 
 if (sqlca.sqlcode < 0) sqlprint ( );}
@@ -210,7 +210,7 @@ if (sqlca.sqlcode < 0) sqlprint ( );
 #line 41 "dynalloc.pgc"
 
    { ECPGdo(__LINE__, 0, 1, NULL, 0, ECPGst_normal, "select a , b , c , d , e , f , g , h , i from test order by a", ECPGt_EOIT, 
-	ECPGt_descriptor, "mydesc", 0L, 0L, 0L, 
+	ECPGt_descriptor, "mydesc", 1L, 1L, 1L, 
 	ECPGt_NO_INDICATOR, NULL , 0L, 0L, 0L, ECPGt_EORT);
 #line 42 "dynalloc.pgc"
 
@@ -296,28 +296,28 @@ if (sqlca.sqlcode < 0) sqlprint ( );}
    for (i=0;i<sqlca.sqlerrd[2];++i)
    {
       if (i1[i]) printf("NULL, ");
-      else printf("%d, ",d1[i]); 
+      else printf("%d, ",d1[i]);
 
       if (i2[i]) printf("NULL, ");
-      else printf("%f, ",d2[i]); 
+      else printf("%f, ",d2[i]);
 
       if (i3[i]) printf("NULL, ");
-      else printf("'%s', ",d3[i]); 
+      else printf("'%s', ",d3[i]);
 
       if (i4[i]) printf("NULL, ");
-      else printf("'%s', ",d4[i]); 
+      else printf("'%s', ",d4[i]);
 
       if (i5[i]) printf("NULL, ");
-      else printf("'%s', ",d5[i]); 
+      else printf("'%s', ",d5[i]);
 
       if (i6[i]) printf("NULL, ");
-      else printf("'%s', ",d6[i]); 
+      else printf("'%s', ",d6[i]);
 
       if (i7[i]) printf("NULL, ");
-      else printf("'%s', ",d7[i]); 
+      else printf("'%s', ",d7[i]);
 
       if (i9[i]) printf("NULL, ");
-      else printf("'%s', ",d9[i]); 
+      else printf("'%s', ",d9[i]);
 
       printf("\n");
    }

@@ -5,11 +5,11 @@
 #
 # By default, this builds against an existing PostgreSQL installation
 # (the one identified by whichever pg_config is first in your path).
-# Within a configured source tree, you can say "gmake NO_PGXS=1 all"
+# Within a configured source tree, you can say "make NO_PGXS=1 all"
 # to build using the surrounding source tree.
 #
 # IDENTIFICATION
-#    $PostgreSQL: pgsql/src/tutorial/Makefile,v 1.21 2008/04/07 14:15:58 petere Exp $
+#    src/tutorial/Makefile
 #
 #-------------------------------------------------------------------------
 

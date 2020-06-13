@@ -6,14 +6,26 @@ create table bm_test (i int, t text);
 insert into bm_test select i % 10, (i % 10)::text  from generate_series(1, 100) i;
 create index bm_test_idx on bm_test using bitmap (i);
 select count(*) from bm_test where i=1;
-select count(*) from bm_test where i in(1, 2);
+select count(*) from bm_test where i in(1, 3);
+
+ -- this sql should confirm that the tuple with i=1
+ -- and the tuple with i=5 are on different segments
+select count(distinct gp_segment_id) from bm_test where i in (1, 5);
+select count(*) from bm_test where i in(1, 5);
+
 select * from bm_test where i > 10;
 reindex index bm_test_idx;
-select count(*) from bm_test where i in(1, 2);
+select count(*) from bm_test where i in(1, 3);
 drop index bm_test_idx;
 create index bm_test_multi_idx on bm_test using bitmap(i, t);
 select * from bm_test where i=5 and t='5';
 select * from bm_test where i=5 or t='6';
+
+ -- this sql should confirm that the tuple with i=5
+ -- and the tuple with t='1' are on different segments
+ select count(distinct gp_segment_id) from bm_test where i=5 or t='1';
+select * from bm_test where i=5 or t='1';
+
 select * from bm_test where i between 1 and 10 and i::text = t;
 drop table bm_test;
 
@@ -81,10 +93,6 @@ select a.t from bm_test a where d in(select d from bm_test b where a.g=b.g);
 -- functional and predicate indexes
 select t from bm_test where upper(t3) = 'FOO';
 select t from bm_test where n ISNULL;
--- bitmap index builds do not support concurrent building (even with
--- gp_create_index_concurrently=on), test for this
-set gp_create_index_concurrently=true;
-create index concurrently should_not_work on bm_test using bitmap(a);
 -- test updates
 update bm_test set i4 = 3;
 -- should return nothing
@@ -202,7 +210,7 @@ create unique index ijk_ijk on ijk(i,j,k);
 set gp_enable_mk_sort=off;
 drop table ijk;
 
----------
+--
 -- test bitmaps with NULL and non-NULL values (MPP-8461)
 --
 create table bmap_test (x int, y int, z int);
@@ -221,3 +229,96 @@ analyze bmap_test;
 select * from bmap_test where x = 1 order by x,y,z;
 
 drop table bmap_test;
+
+--
+-- Test over-sized values
+--
+create table oversize_test (c1 text);
+CREATE INDEX oversize_test_idx ON oversize_test USING BITMAP (c1);
+insert into oversize_test values ('a');
+select * from oversize_test;
+-- this fails, because the value is too large
+insert into oversize_test values (array_to_string(array(select generate_series(1, 10000)), '123456789'));
+set enable_seqscan=off;
+select * from oversize_test where c1 < 'z';
+
+-- Drop the index, insert the row, and then try creating the index again. This is essentially
+-- the same test, but now the failure happens during CREATE INDEX rather than INSERT.
+drop index oversize_test_idx;
+insert into oversize_test values (array_to_string(array(select generate_series(1, 10000)), '123456789'));
+CREATE INDEX oversize_test_idx ON oversize_test USING BITMAP (c1);
+
+
+--
+-- Test unlogged table
+--
+set enable_seqscan=off;
+set enable_indexscan=on;
+set optimizer_enable_bitmapscan=on;
+create unlogged table unlogged_test(c1 int); 
+insert into unlogged_test select * from generate_series(1,1000);
+CREATE INDEX unlogged_test_idx ON unlogged_test USING BITMAP (c1);
+analyze unlogged_test;
+explain select * from unlogged_test where c1 = 100;
+select * from unlogged_test where c1 = 100;
+drop table unlogged_test;
+
+--
+-- Test crash recovery
+--
+
+--
+-- disable fault-tolerance service (FTS) probing to ensure
+-- the mirror does not accidentally get promoted
+--
+SELECT gp_inject_fault_infinite('fts_probe', 'skip', dbid) FROM gp_segment_configuration WHERE role = 'p' and content = -1;
+CREATE TABLE bm_test_insert(a int) DISTRIBUTED BY (a);
+CREATE INDEX bm_a_idx ON bm_test_insert USING bitmap(a);
+CREATE TABLE bm_test_update(a int, b int) DISTRIBUTED BY (a);
+CREATE INDEX bm_b_idx ON bm_test_update USING bitmap(b);
+INSERT INTO bm_test_update SELECT i,i FROM generate_series (1, 10000) i;
+-- flush the data to disk
+CHECKPOINT;
+-- skip all further checkpoint
+SELECT gp_inject_fault_infinite('checkpoint', 'skip', dbid) FROM gp_segment_configuration WHERE role = 'p' AND content > -1;
+INSERT INTO bm_test_insert SELECT generate_series (1, 10000);
+UPDATE bm_test_update SET b=b+1;
+-- trigger recovery on primaries 
+SELECT gp_inject_fault_infinite('finish_prepared_after_record_commit_prepared', 'panic', dbid) FROM gp_segment_configuration WHERE role = 'p' AND content > -1;
+SET client_min_messages='ERROR';
+CREATE TABLE trigger_recovery_on_primaries(c int);
+RESET client_min_messages;
+-- reconnect to the database after restart
+\c
+SELECT gp_inject_fault('checkpoint', 'reset', dbid) FROM gp_segment_configuration WHERE role = 'p' AND content > -1;
+SELECT gp_inject_fault('finish_prepared_after_record_commit_prepared', 'reset', dbid) FROM gp_segment_configuration WHERE role = 'p' AND content > -1;
+SET enable_seqscan=off;
+SET enable_indexscan=off;
+SELECT * FROM bm_test_insert WHERE a=1;
+SELECT * FROM bm_test_update WHERE b=1;
+DROP TABLE trigger_recovery_on_primaries;
+DROP TABLE bm_test_insert;
+DROP TABLE bm_test_update;
+
+--
+-- re-enable fault-tolerance service (FTS) probing after recovery completed.
+--
+SELECT gp_inject_fault('fts_probe', 'reset', dbid) FROM gp_segment_configuration WHERE role = 'p' and content = -1;
+
+
+-- If the table is AO table, it need generate some fake tuple pointer,
+-- this pointer is a little different from the heap tables pointer,
+-- If the Offset in pointer is 0(If the row number is 32768, the Offset
+-- should be 0), we set the 16th bit of the Offsert to be 1, so we
+-- do not forget to remove the flag when we use it, otherwise we will
+-- get an wrong value.
+CREATE TABLE bm_test_reindex(c1 int, c2 int) WITH (appendonly=true);
+CREATE INDEX bm_test_reindex_idx ON bm_test_reindex USING bitmap(c2);
+INSERT INTO bm_test_reindex SELECT 1,i FROM generate_series(1, 65537)i;
+REINDEX INDEX bm_test_reindex_idx;
+SET enable_bitmapscan to on;
+SET enable_seqscan to off;
+SELECT * from bm_test_reindex where c2 = 32767;
+SELECT * from bm_test_reindex where c2 = 32768;
+SELECT * from bm_test_reindex where c2 = 32769;
+SELECT * from bm_test_reindex where c2 = 65536;

@@ -279,6 +279,7 @@ typedef struct MKContext {
     int strxfrmConstantFactor;
 
     TupleDesc tupdesc;
+    Relation heapRel;
     Relation indexRel;
     MemTupleBinding *mt_bind;
 
@@ -321,7 +322,7 @@ extern int tupsort_compare_datum(MKEntry *v1, MKEntry *v2, MKLvContext *ctxt, MK
 extern void create_mksort_context(
         MKContext *mkctxt,
         int nkeys, AttrNumber *attNums,
-        Oid *sortOperators, bool *nullsFirstFlags,
+        Oid *sortOperators, Oid *sortCollations, bool *nullsFirstFlags,
 		ScanKey sk,
         MKFetchDatumForPrepare fetchForPrep, MKFreeTuple freeTup, TupleDesc tupdesc, bool tbyv, int tlen);
 

@@ -4,12 +4,12 @@
  *	   This file contains index tuple accessor and mutator routines,
  *	   as well as various tuple utilities.
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/access/common/indextuple.c,v 1.89 2009/08/01 19:59:41 tgl Exp $
+ *	  src/backend/access/common/indextuple.c
  *
  *-------------------------------------------------------------------------
  */
@@ -28,6 +28,9 @@
 
 /* ----------------
  *		index_form_tuple
+ *
+ *		This shouldn't leak any memory; otherwise, callers such as
+ *		tuplesort_putindextuplevalues() will be very unhappy.
  * ----------------
  */
 IndexTuple
@@ -71,7 +74,7 @@ index_form_tuple(TupleDesc tupleDescriptor,
 
 		/*
 		 * If value is stored EXTERNAL, must fetch it so we are not depending
-		 * on outside storage.	This should be improved someday.
+		 * on outside storage.  This should be improved someday.
 		 */
 		if (VARATT_IS_EXTERNAL(DatumGetPointer(values[i])))
 		{
@@ -85,8 +88,8 @@ index_form_tuple(TupleDesc tupleDescriptor,
 		 * If value is above size target, and is of a compressible datatype,
 		 * try to compress it in-line.
 		 */
-		if (!VARATT_IS_EXTENDED(untoasted_values[i]) &&
-			VARSIZE(untoasted_values[i]) > TOAST_INDEX_TARGET &&
+		if (!VARATT_IS_EXTENDED(DatumGetPointer(untoasted_values[i])) &&
+		VARSIZE(DatumGetPointer(untoasted_values[i])) > TOAST_INDEX_TARGET &&
 			(att->attstorage == 'x' || att->attstorage == 'm'))
 		{
 			Datum		cvalue = toast_compress_datum(untoasted_values[i]);
@@ -158,6 +161,11 @@ index_form_tuple(TupleDesc tupleDescriptor,
 	if (tupmask & HEAP_HASVARWIDTH)
 		infomask |= INDEX_VAR_MASK;
 
+	/* Also assert we got rid of external attributes */
+#ifdef TOAST_INDEX_HACK
+	Assert((tupmask & HEAP_HASEXTERNAL) == 0);
+#endif
+
 	/*
 	 * Here we make sure that the size will fit in the field reserved for it
 	 * in t_info.
@@ -165,9 +173,8 @@ index_form_tuple(TupleDesc tupleDescriptor,
 	if ((size & INDEX_SIZE_MASK) != size)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("index row requires %lu bytes, maximum size is %lu",
-						(unsigned long) size,
-						(unsigned long) INDEX_SIZE_MASK)));
+				 errmsg("index row requires %zu bytes, maximum size is %zu",
+						size, (Size) INDEX_SIZE_MASK)));
 
 	infomask |= size;
 
@@ -200,8 +207,7 @@ index_form_tuple(TupleDesc tupleDescriptor,
 Datum
 nocache_index_getattr(IndexTuple tup,
 					  int attnum,
-					  TupleDesc tupleDesc,
-					  bool *isnull)
+					  TupleDesc tupleDesc)
 {
 	Form_pg_attribute *att = tupleDesc->attrs;
 	char	   *tp;				/* ptr to data part of tuple */
@@ -209,8 +215,6 @@ nocache_index_getattr(IndexTuple tup,
 	bool		slow = false;	/* do we have to walk attrs? */
 	int			data_off;		/* tuple data offset */
 	int			off;			/* current offset within data */
-
-	(void) isnull;				/* not used */
 
 	/* ----------------
 	 *	 Three cases:
@@ -221,31 +225,11 @@ nocache_index_getattr(IndexTuple tup,
 	 * ----------------
 	 */
 
-#ifdef IN_MACRO
-/* This is handled in the macro */
-	Assert(PointerIsValid(isnull));
-	Assert(attnum > 0);
-
-	*isnull = false;
-#endif
-
 	data_off = IndexInfoFindDataOffset(tup->t_info);
 
 	attnum--;
 
-	if (!IndexTupleHasNulls(tup))
-	{
-#ifdef IN_MACRO
-/* This is handled in the macro */
-		if (att[attnum]->attcacheoff >= 0)
-		{
-			return fetchatt(att[attnum],
-							(char *) tup + data_off +
-							att[attnum]->attcacheoff);
-		}
-#endif
-	}
-	else
+	if (IndexTupleHasNulls(tup))
 	{
 		/*
 		 * there's a null somewhere in the tuple
@@ -255,16 +239,6 @@ nocache_index_getattr(IndexTuple tup,
 
 		/* XXX "knows" t_bits are just after fixed tuple header! */
 		bp = (bits8 *) ((char *) tup + sizeof(IndexTupleData));
-
-#ifdef IN_MACRO
-/* This is handled in the macro */
-
-		if (att_isnull(attnum, bp))
-		{
-			*isnull = true;
-			return (Datum) NULL;
-		}
-#endif
 
 		/*
 		 * Now check to see if any preceding bits are null...
@@ -309,7 +283,7 @@ nocache_index_getattr(IndexTuple tup,
 
 		/*
 		 * Otherwise, check for non-fixed-length attrs up to and including
-		 * target.	If there aren't any, it's safe to cheaply initialize the
+		 * target.  If there aren't any, it's safe to cheaply initialize the
 		 * cached offsets for these attrs.
 		 */
 		if (IndexTupleHasVarwidths(tup))
@@ -376,7 +350,7 @@ nocache_index_getattr(IndexTuple tup,
 		 *
 		 * Note - This loop is a little tricky.  For each non-null attribute,
 		 * we have to first account for alignment padding before the attr,
-		 * then advance over the attr based on its length.	Nulls have no
+		 * then advance over the attr based on its length.  Nulls have no
 		 * storage and no alignment padding either.  We can use/set
 		 * attcacheoff until we reach either a null or a var-width attribute.
 		 */

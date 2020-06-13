@@ -17,41 +17,29 @@
 /* This is a shipped header, do not include other files under "cdb" */
 #include "c.h"     /* DistributedTransactionId */
 
-#define DistributedSnapshot_StaticInit {0,0,0,0,0,0}
+#define DistributedSnapshot_StaticInit {0,0,0,0,0,0,0}
 
 typedef struct DistributedSnapshot
 {
-	DistributedTransactionTimeStamp		distribTransactionTimeStamp;
-										/*
-										 * The unique timestamp for this
-										 * start of the DTM.  It applies to
-										 * all of the distributed transactions
-										 * in this snapshot.
-										 */
+	/*
+	 * The unique timestamp for this start of the DTM.  It applies to all of
+	 * the distributed transactions in this snapshot.
+	 */
+	DistributedTransactionTimeStamp	distribTransactionTimeStamp;
 
-	DistributedTransactionId		xminAllDistributedSnapshots;
-										/*
-										 * The lowest distributed transaction
-										 * being used for distributed snapshots.
-										 */
-	
-	DistributedSnapshotId			distribSnapshotId;
-										/* 
-										 * Unique number identifying this
-										 * particular distributed snapshot.
-										 */
-										   
-	DistributedTransactionId 	xmin;	/* XID < xmin are visible to me */
-	DistributedTransactionId 	xmax;	/* XID >= xmax are invisible to me */
-	int32						count;	/* 
-										 * Count of distributed transactions
-										 * in inProgress*Array. 
-										 */
-	int32						maxCount;
-										/*
-										 * Max entry count for 
-										 * inProgress*Array.
-										 */
+	/*
+	 * The lowest distributed transaction being used for distributed snapshots.
+	 */
+	DistributedTransactionId xminAllDistributedSnapshots;
+
+	/*
+	 * Unique number identifying this particular distributed snapshot.
+	 */
+	DistributedSnapshotId distribSnapshotId;
+
+	DistributedTransactionId xmin;	/* XID < xmin are visible to me */
+	DistributedTransactionId xmax;	/* XID >= xmax are invisible to me */
+	int32		count;		/*  # of distributed xids in inProgressXidArray */
 
 	/* Array of distributed transactions in progress. */
 	DistributedTransactionId        *inProgressXidArray;
@@ -72,7 +60,6 @@ typedef struct DistributedSnapshotWithLocalMapping
 	TransactionId minCachedLocalXid;
 	TransactionId maxCachedLocalXid;
 	int32 currentLocalXidsCount;
-	int32 maxLocalXidsCount;
 	TransactionId *inProgressMappedLocalXids;
 } DistributedSnapshotWithLocalMapping;
 
@@ -81,11 +68,9 @@ typedef enum
 	DISTRIBUTEDSNAPSHOT_COMMITTED_NONE = 0,		
 	DISTRIBUTEDSNAPSHOT_COMMITTED_INPROGRESS,
 	DISTRIBUTEDSNAPSHOT_COMMITTED_VISIBLE,
+	DISTRIBUTEDSNAPSHOT_COMMITTED_UNKNOWN,
 	DISTRIBUTEDSNAPSHOT_COMMITTED_IGNORE
 } DistributedSnapshotCommitted;
-
-extern bool
-localXidSatisfiesAnyDistributedSnapshot(TransactionId localXid);
 
 extern DistributedSnapshotCommitted DistributedSnapshotWithLocalMapping_CommittedTest(
 	DistributedSnapshotWithLocalMapping		*dslm,

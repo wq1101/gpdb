@@ -9,6 +9,8 @@ TESTS = array array.c \
         copystdout copystdout.c \
 	define define.c \
         desc desc.c \
+        sqlda sqlda.c \
+        describe describe.c \
         dyntest dyntest.c \
         dynalloc dynalloc.c \
         dynalloc2 dynalloc2.c \
@@ -20,10 +22,9 @@ TESTS = array array.c \
         parser parser.c \
         quote quote.c \
         show show.c \
-        insupd insupd.c 
+        insupd insupd.c
 
 all: $(TESTS)
 
-oldexec.c:	oldexec.pgc ../regression.h
-	$(ECPG) -r questionmarks -o $@ -I$(srcdir) $<
-
+oldexec.c: oldexec.pgc $(ECPG_TEST_DEPENDENCIES)
+	$(ECPG) -r questionmarks -o $@ $<

@@ -9,6 +9,7 @@ import copy
 
 import dbconn
 from  gppylib import gplog
+from  pygresql import pg
 
 logger=gplog.get_default_logger()
 
@@ -36,20 +37,11 @@ def getDatabaseList(conn):
     sql = "SELECT datname FROM pg_catalog.pg_database"
     return basicSQLExec(conn,sql)
 
-def getUserPIDs(conn):
+def getUserConnectionInfo(conn):
     """dont count ourselves"""
-    sql = """SELECT procpid FROM pg_stat_activity WHERE procpid != pg_backend_pid()"""
-    return basicSQLExec(conn,sql)
-
-def getCollationSettings(conn):
-    sql = """ 
-    SELECT current_setting('lc_collate') as lc_collate,
-           current_setting('lc_monetary') as lc_monetary,
-           current_setting('lc_numeric') as lc_numeric;
-    """
-    rows = basicSQLExec(conn,sql)
-    
-    return (rows[0][0],rows[0][1],rows[0][2])
+    header = ["pid", "usename", "application_name", "client_addr", "client_hostname", "client_port", "backend_start", "query"]
+    sql = """SELECT pid, usename, application_name, client_addr, client_hostname, client_port, backend_start, query FROM pg_stat_activity WHERE pid != pg_backend_pid() ORDER BY usename"""
+    return header, basicSQLExec(conn,sql)
 
 def doesSchemaExist(conn,schemaname):
     sql = "SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname = '%s'" % schemaname
@@ -84,81 +76,3 @@ def dropSchemaIfExist(conn,schemaname):
         if cursor:
             cursor.close()
         conn.commit()
-
-def get_master_filespace_map(conn):
-    """Returns an array of [fsname, fspath] arrays that represents
-    all the filespaces on the master."""
-    sql = """SELECT fsname, fselocation 
-    FROM pg_filespace, pg_filespace_entry 
-WHERE pg_filespace.oid = pg_filespace_entry.fsefsoid 
-    AND fsedbid = (SELECT dbid FROM gp_segment_configuration
-                    WHERE role = 'p' AND content = -1)"""
-    cursor = None
-    try:
-        cursor = dbconn.execSQL(conn, sql)
-        return cursor.fetchall()
-    finally:
-        if cursor:
-            cursor.close()
-
-
-def get_catalogtable_list(conn):
-    sql = """SELECT schemaname || '.' ||  tablename 
-             FROM pg_tables 
-             WHERE schemaname = 'pg_catalog'
-          """
-    cursor=None
-    try:
-        cursor=dbconn.execSQL(conn,sql)
-        
-        return cursor.fetchall()
-    finally:
-        if cursor:
-            cursor.close()
-
-
-def vacuum_catalog(dburl,conn,full=False,utility=False):
-    """ Will use the provided connection to enumerate the list of databases
-        and then connect to each one in turn and vacuum full all of the 
-        catalog files
-        
-        TODO:  There are a few tables that are cluster-wide that strictly speaking
-               don't need to be vacuumed for each database.  These are most likely
-               small and so perhaps isn't worth the added complexity to optimize them.
-    
-        WARNING:  doing a vacuum full on the catalog requires that 
-        there aren't any users idle in a transaction as they typically
-        hold catalog share locks.  The result is this vacuum will wait forever on
-        getting the lock.  This method is best called when no one else
-        is connected to the system.  Our own connections are typically idle
-        in transactions and so are especially bad.
-    """
-    dblist = getDatabaseList(conn)
-    catlist = get_catalogtable_list(conn)
-    conn.commit()
-    
-    for db in dblist:
-        test_url = copy.deepcopy(dburl)
-        test_url.pgdb = db[0]
-        
-        if db[0] == 'template0' or db[0] == 'postgres':
-            continue
-        
-        vac_conn = dbconn.connect(test_url,utility)
-        vac_curs = vac_conn.cursor()
-        vac_curs.execute("COMMIT")
-        vac_curs.execute("SET CLIENT_MIN_MESSAGES='ERROR'")
-        for table in catlist:
-            logger.debug('Vacuuming %s %s' % (db[0],table[0]) )
-            
-            if full:
-                sql = "VACUUM FULL %s" % table[0]
-            else:
-                sql = "VACUUM %s" % table[0]
-            
-            vac_curs.execute(sql)
-            
-        
-        vac_curs.execute(sql)
-        vac_conn.commit()
-        vac_conn.close()

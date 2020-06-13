@@ -4,10 +4,10 @@
  *	  header file for postgres hash access method implementation
  *
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/access/hash.h,v 1.84 2008/01/01 19:45:56 momjian Exp $
+ * src/include/access/hash.h
  *
  * NOTES
  *		modeled after Margo Seltzer's hash implementation for unix.
@@ -17,12 +17,15 @@
 #ifndef HASH_H
 #define HASH_H
 
+#include "access/amapi.h"
 #include "access/itup.h"
-#include "access/relscan.h"
 #include "access/sdir.h"
-#include "access/xlog.h"
+#include "access/xlogreader.h"
 #include "fmgr.h"
-#include "storage/lock.h"
+#include "lib/stringinfo.h"
+#include "storage/bufmgr.h"
+#include "storage/lockdefs.h"
+#include "utils/relcache.h"
 
 /*
  * Mapping from hash bucket number to physical block number of bucket's
@@ -74,6 +77,9 @@ typedef HashPageOpaqueData *HashPageOpaque;
  */
 typedef struct HashScanOpaqueData
 {
+	/* Hash value of the scan key, ie, the hash key we seek */
+	uint32		hashso_sk_hash;
+
 	/*
 	 * By definition, a hash scan should be examining only one bucket. We
 	 * record the bucket number here as soon as it is known.
@@ -88,17 +94,18 @@ typedef struct HashScanOpaqueData
 	BlockNumber hashso_bucket_blkno;
 
 	/*
-	 * We also want to remember which buffers we're currently examining in the
-	 * scan. We keep these buffers pinned (but not locked) across hashgettuple
+	 * We also want to remember which buffer we're currently examining in the
+	 * scan. We keep the buffer pinned (but not locked) across hashgettuple
 	 * calls, in order to avoid doing a ReadBuffer() for every tuple in the
 	 * index.
 	 */
 	Buffer		hashso_curbuf;
-	Buffer		hashso_mrkbuf;
 
-	/* Current and marked position of the scan */
+	/* Current position of the scan, as an index TID */
 	ItemPointerData hashso_curpos;
-	ItemPointerData hashso_mrkpos;
+
+	/* Current position of the scan, as a heap TID */
+	ItemPointerData hashso_heappos;
 } HashScanOpaqueData;
 
 typedef HashScanOpaqueData *HashScanOpaque;
@@ -110,7 +117,7 @@ typedef HashScanOpaqueData *HashScanOpaque;
 #define HASH_METAPAGE	0		/* metapage is always block 0 */
 
 #define HASH_MAGIC		0x6440640
-#define HASH_VERSION	1		/* new for Pg 7.4 */
+#define HASH_VERSION	2		/* 2 signifies only hash key value is stored */
 
 /*
  * Spares[] holds the number of overflow pages currently allocated at or
@@ -137,7 +144,6 @@ typedef HashScanOpaqueData *HashScanOpaque;
 
 typedef struct HashMetaPageData
 {
-	PageHeaderData hashm_phdr;	/* pad for page header (do not use) */
 	uint32		hashm_magic;	/* magic no. for hash tables */
 	uint32		hashm_version;	/* version ID */
 	double		hashm_ntuples;	/* number of tuples stored in the table */
@@ -165,10 +171,10 @@ typedef HashMetaPageData *HashMetaPage;
  * Maximum size of a hash index item (it's okay to have only one per page)
  */
 #define HashMaxItemSize(page) \
-	(PageGetPageSize(page) - \
-	 sizeof(PageHeaderData) - \
-	 MAXALIGN(sizeof(HashPageOpaqueData)) - \
-	 sizeof(ItemIdData))
+	MAXALIGN_DOWN(PageGetPageSize(page) - \
+				  SizeOfPageHeaderData - \
+				  sizeof(ItemIdData) - \
+				  MAXALIGN(sizeof(HashPageOpaqueData)))
 
 #define HASH_MIN_FILLFACTOR			10
 #define HASH_DEFAULT_FILLFACTOR		75
@@ -180,7 +186,7 @@ typedef HashMetaPageData *HashMetaPage;
 #define ALL_SET					((uint32) ~0)
 
 /*
- * Bitmap pages do not contain tuples.	They do contain the standard
+ * Bitmap pages do not contain tuples.  They do contain the standard
  * page headers and trailers; however, everything in between is a
  * giant bit array.  The number of bits that fit on a page obviously
  * depends on the page size and the header/trailer overhead.  We require
@@ -190,8 +196,16 @@ typedef HashMetaPageData *HashMetaPage;
 #define BMPGSZ_BIT(metap)		((metap)->hashm_bmsize << BYTE_TO_BIT)
 #define BMPG_SHIFT(metap)		((metap)->hashm_bmshift)
 #define BMPG_MASK(metap)		(BMPGSZ_BIT(metap) - 1)
-#define HashPageGetBitmap(pg) \
-	((uint32 *) (((char *) (pg)) + MAXALIGN(sizeof(PageHeaderData))))
+
+#define HashPageGetBitmap(page) \
+	((uint32 *) PageGetContents(page))
+
+#define HashGetMaxBitmapSize(page) \
+	(PageGetPageSize((Page) page) - \
+	 (MAXALIGN(SizeOfPageHeaderData) + MAXALIGN(sizeof(HashPageOpaqueData))))
+
+#define HashPageGetMeta(page) \
+	((HashMetaPage) PageGetContents(page))
 
 /*
  * The number of bits in an ovflpage bitmap word.
@@ -225,22 +239,32 @@ typedef HashMetaPageData *HashMetaPage;
  *	Since we only have one such proc in amproc, it's number 1.
  */
 #define HASHPROC		1
+#define HASHNProcs		1
 
 
 /* public routines */
 
-extern Datum hashbuild(PG_FUNCTION_ARGS);
-extern Datum hashinsert(PG_FUNCTION_ARGS);
-extern Datum hashbeginscan(PG_FUNCTION_ARGS);
-extern Datum hashgettuple(PG_FUNCTION_ARGS);
-extern Datum hashgetmulti(PG_FUNCTION_ARGS);
-extern Datum hashrescan(PG_FUNCTION_ARGS);
-extern Datum hashendscan(PG_FUNCTION_ARGS);
-extern Datum hashmarkpos(PG_FUNCTION_ARGS);
-extern Datum hashrestrpos(PG_FUNCTION_ARGS);
-extern Datum hashbulkdelete(PG_FUNCTION_ARGS);
-extern Datum hashvacuumcleanup(PG_FUNCTION_ARGS);
-extern Datum hashoptions(PG_FUNCTION_ARGS);
+extern Datum hashhandler(PG_FUNCTION_ARGS);
+extern IndexBuildResult *hashbuild(Relation heap, Relation index,
+		  struct IndexInfo *indexInfo);
+extern void hashbuildempty(Relation index);
+extern bool hashinsert(Relation rel, Datum *values, bool *isnull,
+		   ItemPointer ht_ctid, Relation heapRel,
+		   IndexUniqueCheck checkUnique);
+extern bool hashgettuple(IndexScanDesc scan, ScanDirection dir);
+extern Node *hashgetbitmap(IndexScanDesc scan, Node *tbm);
+extern IndexScanDesc hashbeginscan(Relation rel, int nkeys, int norderbys);
+extern void hashrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
+		   ScanKey orderbys, int norderbys);
+extern void hashendscan(IndexScanDesc scan);
+extern IndexBulkDeleteResult *hashbulkdelete(IndexVacuumInfo *info,
+			   IndexBulkDeleteResult *stats,
+			   IndexBulkDeleteCallback callback,
+			   void *callback_state);
+extern IndexBulkDeleteResult *hashvacuumcleanup(IndexVacuumInfo *info,
+				  IndexBulkDeleteResult *stats);
+extern bytea *hashoptions(Datum reloptions, bool validate);
+extern bool hashvalidate(Oid opclassoid);
 
 /*
  * Datatype-specific hash functions in hashfunc.c.
@@ -271,13 +295,15 @@ extern Datum hash_uint32(uint32 k);
 
 /* hashinsert.c */
 extern void _hash_doinsert(Relation rel, IndexTuple itup);
+extern OffsetNumber _hash_pgaddtup(Relation rel, Buffer buf,
+			   Size itemsize, IndexTuple itup);
 
 /* hashovfl.c */
 extern Buffer _hash_addovflpage(Relation rel, Buffer metabuf, Buffer buf);
 extern BlockNumber _hash_freeovflpage(Relation rel, Buffer ovflbuf,
 				   BufferAccessStrategy bstrategy);
 extern void _hash_initbitmap(Relation rel, HashMetaPage metap,
-				 BlockNumber blkno);
+				 BlockNumber blkno, ForkNumber forkNum);
 extern void _hash_squeezebucket(Relation rel,
 					Bucket bucket, BlockNumber bucket_blkno,
 					BufferAccessStrategy bstrategy);
@@ -289,7 +315,8 @@ extern void _hash_droplock(Relation rel, BlockNumber whichlock, int access);
 extern Buffer _hash_getbuf(Relation rel, BlockNumber blkno,
 			 int access, int flags);
 extern Buffer _hash_getinitbuf(Relation rel, BlockNumber blkno);
-extern Buffer _hash_getnewbuf(Relation rel, BlockNumber blkno);
+extern Buffer _hash_getnewbuf(Relation rel, BlockNumber blkno,
+				ForkNumber forkNum);
 extern Buffer _hash_getbuf_with_strategy(Relation rel, BlockNumber blkno,
 						   int access, int flags,
 						   BufferAccessStrategy bstrategy);
@@ -298,7 +325,8 @@ extern void _hash_dropbuf(Relation rel, Buffer buf);
 extern void _hash_wrtbuf(Relation rel, Buffer buf);
 extern void _hash_chgbufaccess(Relation rel, Buffer buf, int from_access,
 				   int to_access);
-extern void _hash_metapinit(Relation rel);
+extern uint32 _hash_metapinit(Relation rel, double num_tuples,
+				ForkNumber forkNum);
 extern void _hash_pageinit(Page page, Size size);
 extern void _hash_expandtable(Relation rel, Buffer metabuf);
 
@@ -313,6 +341,15 @@ extern bool _hash_next(IndexScanDesc scan, ScanDirection dir);
 extern bool _hash_first(IndexScanDesc scan, ScanDirection dir);
 extern bool _hash_step(IndexScanDesc scan, Buffer *bufP, ScanDirection dir);
 
+/* hashsort.c */
+typedef struct HSpool HSpool;	/* opaque struct in hashsort.c */
+
+extern HSpool *_h_spoolinit(Relation heap, Relation index, uint32 num_buckets);
+extern void _h_spooldestroy(HSpool *hspool);
+extern void _h_spool(HSpool *hspool, ItemPointer self,
+		 Datum *values, bool *isnull);
+extern void _h_indexbuild(HSpool *hspool);
+
 /* hashutil.c */
 extern bool _hash_checkqual(IndexScanDesc scan, IndexTuple itup);
 extern uint32 _hash_datum2hashkey(Relation rel, Datum key);
@@ -321,9 +358,16 @@ extern Bucket _hash_hashkey2bucket(uint32 hashkey, uint32 maxbucket,
 					 uint32 highmask, uint32 lowmask);
 extern uint32 _hash_log2(uint32 num);
 extern void _hash_checkpage(Relation rel, Buffer buf, int flags);
+extern uint32 _hash_get_indextuple_hashkey(IndexTuple itup);
+extern bool _hash_convert_tuple(Relation index,
+					Datum *user_values, bool *user_isnull,
+					Datum *index_values, bool *index_isnull);
+extern OffsetNumber _hash_binsearch(Page page, uint32 hash_value);
+extern OffsetNumber _hash_binsearch_last(Page page, uint32 hash_value);
 
 /* hash.c */
-extern void hash_redo(XLogRecPtr beginLoc, XLogRecPtr lsn, XLogRecord *record);
-extern void hash_desc(StringInfo buf, XLogRecPtr beginLoc, XLogRecord *record);
+extern void hash_redo(XLogReaderState *record);
+extern void hash_desc(StringInfo buf, XLogReaderState *record);
+extern const char *hash_identify(uint8 info);
 
 #endif   /* HASH_H */

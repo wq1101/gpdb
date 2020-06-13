@@ -41,7 +41,6 @@ on the standard options.  The following options are specific to gpdiff:
     -man                  full documentation
     -version              print gpdiff version and underlying diff version
     -verbose              print verbose info
-    -gpd_ignore_headers   ignore header lines in query output
     -gpd_ignore_plans     ignore explain plan content in input files
     -gpd_init <file>      load initialization file
 
@@ -64,16 +63,6 @@ on the standard options.  The following options are specific to gpdiff:
 =item B<-verbose>
 
     Prints verbose information.
-
-=item B<-gpd_ignore_headers>
-
-gpdiff/atmsort expect PostgreSQL "psql-style" output for SELECT
-statements, with a two line header composed of the column names,
-separated by vertical bars (|), and a "separator" line of dashes and
-pluses beneath, followed by the row output.  The psql utility performs
-some formatting to adjust the column widths to match the size of the
-row output.  Setting this parameter causes gpdiff to ignore any
-differences in the column naming and format widths globally.
 
 =item B<-gpd_ignore_plans>
 
@@ -98,7 +87,7 @@ This comparison is designed to ignore certain Greenplum-specific
 informational messages, as well as handle the cases where query output
 order may differ for a multi-segment Greenplum database versus a
 single PostgreSQL instance.  Type "atmsort.pl --man" for more details.
-gpdiff is invoked by pg_regress as part of "make install-check".
+gpdiff is invoked by pg_regress as part of "make installcheck-world".
 In this case the diff options are something like:
 
  "-w -I NOTICE: -I HINT: -I CONTEXT: -I GP_IGNORE:".
@@ -147,26 +136,13 @@ my $glob_init_file = [];
 sub gpdiff_files
 {
     my ($f1, $f2, $d2d) = @_;
-    my $need_equiv = 0;
     my @tmpfils;
     my $newf1;
     my $newf2;
 
-    if (defined($d2d) && exists($d2d->{equiv}))
-    {
-        # assume f1 and f2 are the same...
-        atmsort::atmsort_init(%glob_atmsort_args, DO_EQUIV => 'compare');
-        $newf1 = atmsort::run($f1);
-
-        atmsort::atmsort_init(%glob_atmsort_args, DO_EQUIV => 'make');
-        $newf2 = atmsort::run($f2);
-    }
-    else
-    {
-        atmsort::atmsort_init(%glob_atmsort_args);
-        $newf1 = atmsort::run($f1);
-        $newf2 = atmsort::run($f2);
-    }
+    atmsort::atmsort_init(%glob_atmsort_args);
+    $newf1 = atmsort::run($f1);
+    $newf2 = atmsort::run($f2);
 
     my $args = join(' ', @ARGV, $newf1, $newf2);
 
@@ -176,38 +152,16 @@ sub gpdiff_files
 
     my $stat = $? >> 8; # diff status
 
-    unless (defined($d2d) && exists($d2d->{equiv}))
-    {
-        # check if the file contains any "start_equiv" directives, unless
-        # already doing equiv check
-        open(FILE, $f1);
-        $need_equiv = (grep{/start_equiv/} <FILE>);
-        close FILE;
-
-        if ($need_equiv)
-        {
-            $d2d = {} unless (defined($d2d));
-            $d2d->{dir} = 1;
-        }
-    }
-
     # prefix the diff output with the files names for a "directory to
     # directory" diff
     if (defined($d2d) && length($outi))
     {
-        if (exists($d2d->{equiv}))
-        {
-            $outi = "diff $f1 $f2" . ".equiv\n" . $outi;
-        }
-        else
-        {
-            $outi = "diff $f1 $f2\n" . $outi;
-        }
+	$outi = "diff $f1 $f2\n" . $outi;
     }
 
     # replace temp file name references with actual file names
-    $outi =~ s/$newf1/$f1/gm;
-    $outi =~ s/$newf2/$f2/gm;
+    $outi =~ s/\Q$newf1\E/$f1/gm;
+    $outi =~ s/\Q$newf2\E/$f2/gm;
 
     print $outi;
 
@@ -215,20 +169,6 @@ sub gpdiff_files
 
     unlink $newf1;
     unlink $newf2;
-
-    if ($need_equiv)
-    {
-        my $new_d2d = {};
-        $new_d2d->{equiv} = 1;
-
-        # call recursively if need to perform equiv comparison.
-
-        my $stat1 = gpdiff_files($f1, $f1, $new_d2d);
-        my $stat2 = gpdiff_files($f2, $f2, $new_d2d);
-
-        $stat = $stat1 if ($stat1);
-        $stat = $stat2 if ($stat2);
-    }
 
     return ($stat);
 }
@@ -313,7 +253,6 @@ if (1)
         "help" => sub { lazy_pod2usage(-msg => $pmsg, -exitstatus => 1) },
         "version|v" => \&print_version ,
         "verbose|Verbose" => \$glob_atmsort_args{VERBOSE},
-        "gpd_ignore_headers|gp_ignore_headers" => \$glob_atmsort_args{IGNORE_HEADERS},
         "gpd_ignore_plans|gp_ignore_plans" => \$glob_atmsort_args{IGNORE_PLANS},
         "gpd_init|gp_init_file=s" => \@{$glob_atmsort_args{INIT_FILES}}
     );

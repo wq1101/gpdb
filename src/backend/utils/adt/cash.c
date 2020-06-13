@@ -13,7 +13,7 @@
  * this version handles 64 bit numbers and so can hold values up to
  * $92,233,720,368,547,758.07.
  *
- * $PostgreSQL: pgsql/src/backend/utils/adt/cash.c,v 1.77.2.2 2009/06/10 16:31:38 tgl Exp $
+ * src/backend/utils/adt/cash.c
  */
 
 #include "postgres.h"
@@ -24,16 +24,11 @@
 #include <locale.h>
 
 #include "libpq/pqformat.h"
+#include "utils/builtins.h"
 #include "utils/cash.h"
+#include "utils/int8.h"
+#include "utils/numeric.h"
 #include "utils/pg_locale.h"
-
-/*
- * Cash is a pass-by-ref SQL type, so we must pass and return pointers.
- * These macros and support routine hide the pass-by-refness.
- */
-#define PG_GETARG_CASH(n)  (* ((Cash *) PG_GETARG_POINTER(n)))
-#define PG_RETURN_CASH(x)  return CashGetDatum(x)
-
 
 
 /*************************************************************************
@@ -92,16 +87,6 @@ num_word(Cash value)
 	return buf;
 }	/* num_word() */
 
-static Datum
-CashGetDatum(Cash value)
-{
-	Cash	   *result = (Cash *) palloc(sizeof(Cash));
-
-	*result = value;
-	return PointerGetDatum(result);
-}
-
-
 /* cash_in()
  * Convert a string to a cash data type.
  * Format is [$]###[,]###[.##]
@@ -124,7 +109,6 @@ cash_in(PG_FUNCTION_ARGS)
 			   *psymbol,
 			   *nsymbol,
 			   *csymbol;
-
 	struct lconv *lconvert = PGLC_localeconv();
 
 	/*
@@ -149,7 +133,7 @@ cash_in(PG_FUNCTION_ARGS)
 		dsymbol = '.';
 	if (*lconvert->mon_thousands_sep != '\0')
 		ssymbol = lconvert->mon_thousands_sep;
-	else						/* ssymbol should not equal dsymbol */
+	else	/* ssymbol should not equal dsymbol */
 		ssymbol = (dsymbol != ',') ? "," : ".";
 	csymbol = (*lconvert->currency_symbol != '\0') ? lconvert->currency_symbol : "$";
 	psymbol = (*lconvert->positive_sign != '\0') ? lconvert->positive_sign : "+";
@@ -166,6 +150,8 @@ cash_in(PG_FUNCTION_ARGS)
 		s++;
 	if (strncmp(s, csymbol, strlen(csymbol)) == 0)
 		s += strlen(csymbol);
+	while (isspace((unsigned char) *s))
+		s++;
 
 #ifdef CASHDEBUG
 	printf("cashin- string is '%s'\n", s);
@@ -196,6 +182,8 @@ cash_in(PG_FUNCTION_ARGS)
 		s++;
 	if (strncmp(s, csymbol, strlen(csymbol)) == 0)
 		s += strlen(csymbol);
+	while (isspace((unsigned char) *s))
+		s++;
 
 #ifdef CASHDEBUG
 	printf("cashin- string is '%s'\n", s);
@@ -234,10 +222,11 @@ cash_in(PG_FUNCTION_ARGS)
 
 	/*
 	 * should only be trailing digits followed by whitespace, right paren,
-	 * or possibly a trailing minus sign
+	 * trailing sign, and/or trailing currency symbol
 	 */
 	while (isdigit((unsigned char) *s))
 		s++;
+
 	while (*s)
 	{
 		if (isspace((unsigned char) *s) || *s == ')')
@@ -247,6 +236,10 @@ cash_in(PG_FUNCTION_ARGS)
 			sgn = -1;
 			s += strlen(nsymbol);
 		}
+		else if (strncmp(s, psymbol, strlen(psymbol)) == 0)
+			s += strlen(psymbol);
+		else if (strncmp(s, csymbol, strlen(csymbol)) == 0)
+			s += strlen(csymbol);
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
@@ -275,16 +268,16 @@ cash_out(PG_FUNCTION_ARGS)
 	char	   *result;
 	char		buf[128];
 	char	   *bufptr;
-	bool		minus = false;
 	int			digit_pos;
 	int			points,
 				mon_group;
 	char		dsymbol;
 	const char *ssymbol,
 			   *csymbol,
-			   *nsymbol;
-	char		convention;
-
+			   *signsymbol;
+	char		sign_posn,
+				cs_precedes,
+				sep_by_space;
 	struct lconv *lconvert = PGLC_localeconv();
 
 	/* see comments about frac_digits in cash_in() */
@@ -300,8 +293,6 @@ cash_out(PG_FUNCTION_ARGS)
 	if (mon_group <= 0 || mon_group > 6)
 		mon_group = 3;
 
-	convention = lconvert->n_sign_posn;
-
 	/* we restrict dsymbol to be a single byte, but not the other symbols */
 	if (*lconvert->mon_decimal_point != '\0' &&
 		lconvert->mon_decimal_point[1] == '\0')
@@ -310,19 +301,29 @@ cash_out(PG_FUNCTION_ARGS)
 		dsymbol = '.';
 	if (*lconvert->mon_thousands_sep != '\0')
 		ssymbol = lconvert->mon_thousands_sep;
-	else						/* ssymbol should not equal dsymbol */
+	else	/* ssymbol should not equal dsymbol */
 		ssymbol = (dsymbol != ',') ? "," : ".";
 	csymbol = (*lconvert->currency_symbol != '\0') ? lconvert->currency_symbol : "$";
-	nsymbol = (*lconvert->negative_sign != '\0') ? lconvert->negative_sign : "-";
 
-	/* we work with positive amounts and add the minus sign at the end */
 	if (value < 0)
 	{
-		minus = true;
+		/* make the amount positive for digit-reconstruction loop */
 		value = -value;
+		/* set up formatting data */
+		signsymbol = (*lconvert->negative_sign != '\0') ? lconvert->negative_sign : "-";
+		sign_posn = lconvert->n_sign_posn;
+		cs_precedes = lconvert->n_cs_precedes;
+		sep_by_space = lconvert->n_sep_by_space;
+	}
+	else
+	{
+		signsymbol = lconvert->positive_sign;
+		sign_posn = lconvert->p_sign_posn;
+		cs_precedes = lconvert->p_cs_precedes;
+		sep_by_space = lconvert->p_sep_by_space;
 	}
 
-	/* we build the result string right-to-left in buf[] */
+	/* we build the digits+decimal-point+sep string right-to-left in buf[] */
 	bufptr = buf + sizeof(buf) - 1;
 	*bufptr = '\0';
 
@@ -337,12 +338,12 @@ cash_out(PG_FUNCTION_ARGS)
 	{
 		if (points && digit_pos == 0)
 		{
-			/* insert decimal point */
+			/* insert decimal point, but not if value cannot be fractional */
 			*(--bufptr) = dsymbol;
 		}
-		else if (digit_pos < points && (digit_pos % mon_group) == 0)
+		else if (digit_pos < 0 && (digit_pos % mon_group) == 0)
 		{
-			/* insert thousands sep */
+			/* insert thousands sep, but only to left of radix point */
 			bufptr -= strlen(ssymbol);
 			memcpy(bufptr, ssymbol, strlen(ssymbol));
 		}
@@ -352,27 +353,109 @@ cash_out(PG_FUNCTION_ARGS)
 		digit_pos--;
 	} while (value || digit_pos >= 0);
 
-	/* prepend csymbol */
-	bufptr -= strlen(csymbol);
-	memcpy(bufptr, csymbol, strlen(csymbol));
-
-	/* see if we need to signify negative amount */
-	if (minus)
+	/*----------
+	 * Now, attach currency symbol and sign symbol in the correct order.
+	 *
+	 * The POSIX spec defines these values controlling this code:
+	 *
+	 * p/n_sign_posn:
+	 *	0	Parentheses enclose the quantity and the currency_symbol.
+	 *	1	The sign string precedes the quantity and the currency_symbol.
+	 *	2	The sign string succeeds the quantity and the currency_symbol.
+	 *	3	The sign string precedes the currency_symbol.
+	 *	4	The sign string succeeds the currency_symbol.
+	 *
+	 * p/n_cs_precedes: 0 means currency symbol after value, else before it.
+	 *
+	 * p/n_sep_by_space:
+	 *	0	No <space> separates the currency symbol and value.
+	 *	1	If the currency symbol and sign string are adjacent, a <space>
+	 *		separates them from the value; otherwise, a <space> separates
+	 *		the currency symbol from the value.
+	 *	2	If the currency symbol and sign string are adjacent, a <space>
+	 *		separates them; otherwise, a <space> separates the sign string
+	 *		from the value.
+	 *----------
+	 */
+	switch (sign_posn)
 	{
-		result = palloc(strlen(bufptr) + strlen(nsymbol) + 3);
-
-		/* Position code of 0 means use parens */
-		if (convention == 0)
-			sprintf(result, "(%s)", bufptr);
-		else if (convention == 2)
-			sprintf(result, "%s%s", bufptr, nsymbol);
-		else
-			sprintf(result, "%s%s", nsymbol, bufptr);
-	}
-	else
-	{
-		/* just emit what we have */
-		result = pstrdup(bufptr);
+		case 0:
+			if (cs_precedes)
+				result = psprintf("(%s%s%s)",
+								  csymbol,
+								  (sep_by_space == 1) ? " " : "",
+								  bufptr);
+			else
+				result = psprintf("(%s%s%s)",
+								  bufptr,
+								  (sep_by_space == 1) ? " " : "",
+								  csymbol);
+			break;
+		case 1:
+		default:
+			if (cs_precedes)
+				result = psprintf("%s%s%s%s%s",
+								  signsymbol,
+								  (sep_by_space == 2) ? " " : "",
+								  csymbol,
+								  (sep_by_space == 1) ? " " : "",
+								  bufptr);
+			else
+				result = psprintf("%s%s%s%s%s",
+								  signsymbol,
+								  (sep_by_space == 2) ? " " : "",
+								  bufptr,
+								  (sep_by_space == 1) ? " " : "",
+								  csymbol);
+			break;
+		case 2:
+			if (cs_precedes)
+				result = psprintf("%s%s%s%s%s",
+								  csymbol,
+								  (sep_by_space == 1) ? " " : "",
+								  bufptr,
+								  (sep_by_space == 2) ? " " : "",
+								  signsymbol);
+			else
+				result = psprintf("%s%s%s%s%s",
+								  bufptr,
+								  (sep_by_space == 1) ? " " : "",
+								  csymbol,
+								  (sep_by_space == 2) ? " " : "",
+								  signsymbol);
+			break;
+		case 3:
+			if (cs_precedes)
+				result = psprintf("%s%s%s%s%s",
+								  signsymbol,
+								  (sep_by_space == 2) ? " " : "",
+								  csymbol,
+								  (sep_by_space == 1) ? " " : "",
+								  bufptr);
+			else
+				result = psprintf("%s%s%s%s%s",
+								  bufptr,
+								  (sep_by_space == 1) ? " " : "",
+								  signsymbol,
+								  (sep_by_space == 2) ? " " : "",
+								  csymbol);
+			break;
+		case 4:
+			if (cs_precedes)
+				result = psprintf("%s%s%s%s%s",
+								  csymbol,
+								  (sep_by_space == 2) ? " " : "",
+								  signsymbol,
+								  (sep_by_space == 1) ? " " : "",
+								  bufptr);
+			else
+				result = psprintf("%s%s%s%s%s",
+								  bufptr,
+								  (sep_by_space == 1) ? " " : "",
+								  csymbol,
+								  (sep_by_space == 2) ? " " : "",
+								  signsymbol);
+			break;
 	}
 
 	PG_RETURN_CSTRING(result);
@@ -508,6 +591,26 @@ cash_mi(PG_FUNCTION_ARGS)
 }
 
 
+/* cash_div_cash()
+ * Divide cash by cash, returning float8.
+ */
+Datum
+cash_div_cash(PG_FUNCTION_ARGS)
+{
+	Cash		dividend = PG_GETARG_CASH(0);
+	Cash		divisor = PG_GETARG_CASH(1);
+	float8		quotient;
+
+	if (divisor == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_DIVISION_BY_ZERO),
+				 errmsg("division by zero")));
+
+	quotient = (float8) dividend / (float8) divisor;
+	PG_RETURN_FLOAT8(quotient);
+}
+
+
 /* cash_mul_flt8()
  * Multiply cash by float8.
  */
@@ -518,7 +621,7 @@ cash_mul_flt8(PG_FUNCTION_ARGS)
 	float8		f = PG_GETARG_FLOAT8(1);
 	Cash		result;
 
-	result = c * f;
+	result = rint(c * f);
 	PG_RETURN_CASH(result);
 }
 
@@ -533,7 +636,7 @@ flt8_mul_cash(PG_FUNCTION_ARGS)
 	Cash		c = PG_GETARG_CASH(1);
 	Cash		result;
 
-	result = f * c;
+	result = rint(f * c);
 	PG_RETURN_CASH(result);
 }
 
@@ -568,7 +671,7 @@ cash_mul_flt4(PG_FUNCTION_ARGS)
 	float4		f = PG_GETARG_FLOAT4(1);
 	Cash		result;
 
-	result = c * f;
+	result = rint(c * (float8) f);
 	PG_RETURN_CASH(result);
 }
 
@@ -583,7 +686,7 @@ flt4_mul_cash(PG_FUNCTION_ARGS)
 	Cash		c = PG_GETARG_CASH(1);
 	Cash		result;
 
-	result = f * c;
+	result = rint((float8) f * c);
 	PG_RETURN_CASH(result);
 }
 
@@ -604,7 +707,7 @@ cash_div_flt4(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_DIVISION_BY_ZERO),
 				 errmsg("division by zero")));
 
-	result = rint(c / f);
+	result = rint(c / (float8) f);
 	PG_RETURN_CASH(result);
 }
 
@@ -653,7 +756,7 @@ cash_div_int8(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_DIVISION_BY_ZERO),
 				 errmsg("division by zero")));
 
-	result = rint(c / i);
+	result = c / i;
 
 	PG_RETURN_CASH(result);
 }
@@ -705,7 +808,7 @@ cash_div_int4(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_DIVISION_BY_ZERO),
 				 errmsg("division by zero")));
 
-	result = rint(c / i);
+	result = c / i;
 
 	PG_RETURN_CASH(result);
 }
@@ -755,7 +858,7 @@ cash_div_int2(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_DIVISION_BY_ZERO),
 				 errmsg("division by zero")));
 
-	result = rint(c / s);
+	result = c / s;
 	PG_RETURN_CASH(result);
 }
 
@@ -790,7 +893,7 @@ cashsmaller(PG_FUNCTION_ARGS)
 }
 
 /* cash_words()
- * This converts a int4 as well but to a representation using words
+ * This converts an int4 as well but to a representation using words
  * Obviously way North American centric - sorry
  */
 Datum
@@ -807,7 +910,6 @@ cash_words(PG_FUNCTION_ARGS)
 	Cash		m4;
 	Cash		m5;
 	Cash		m6;
-	text	   *result;
 
 	/* work with positive numbers */
 	if (value < 0)
@@ -822,13 +924,13 @@ cash_words(PG_FUNCTION_ARGS)
 	/* Now treat as unsigned, to avoid trouble at INT_MIN */
 	val = (uint64) value;
 
-	m0 = val % INT64CONST(100);							/* cents */
-	m1 = (val / INT64CONST(100)) % 1000;				/* hundreds */
-	m2 = (val / INT64CONST(100000)) % 1000;				/* thousands */
-	m3 = (val / INT64CONST(100000000)) % 1000;			/* millions */
+	m0 = val % INT64CONST(100); /* cents */
+	m1 = (val / INT64CONST(100)) % 1000;		/* hundreds */
+	m2 = (val / INT64CONST(100000)) % 1000;		/* thousands */
+	m3 = (val / INT64CONST(100000000)) % 1000;	/* millions */
 	m4 = (val / INT64CONST(100000000000)) % 1000;		/* billions */
 	m5 = (val / INT64CONST(100000000000000)) % 1000;	/* trillions */
-	m6 = (val / INT64CONST(100000000000000000)) % 1000;	/* quadrillions */
+	m6 = (val / INT64CONST(100000000000000000)) % 1000; /* quadrillions */
 
 	if (m6)
 	{
@@ -873,10 +975,140 @@ cash_words(PG_FUNCTION_ARGS)
 	/* capitalize output */
 	buf[0] = pg_toupper((unsigned char) buf[0]);
 
-	/* make a text type for output */
-	result = (text *) palloc(strlen(buf) + VARHDRSZ);
-	SET_VARSIZE(result, strlen(buf) + VARHDRSZ);
-	memcpy(VARDATA(result), buf, strlen(buf));
+	/* return as text datum */
+	PG_RETURN_TEXT_P(cstring_to_text(buf));
+}
 
-	PG_RETURN_TEXT_P(result);
+
+/* cash_numeric()
+ * Convert cash to numeric.
+ */
+Datum
+cash_numeric(PG_FUNCTION_ARGS)
+{
+	Cash		money = PG_GETARG_CASH(0);
+	Numeric		result;
+	int			fpoint;
+	int64		scale;
+	int			i;
+	Datum		amount;
+	Datum		numeric_scale;
+	Datum		quotient;
+	struct lconv *lconvert = PGLC_localeconv();
+
+	/* see comments about frac_digits in cash_in() */
+	fpoint = lconvert->frac_digits;
+	if (fpoint < 0 || fpoint > 10)
+		fpoint = 2;
+
+	/* compute required scale factor */
+	scale = 1;
+	for (i = 0; i < fpoint; i++)
+		scale *= 10;
+
+	/* form the result as money / scale */
+	amount = DirectFunctionCall1(int8_numeric, Int64GetDatum(money));
+	numeric_scale = DirectFunctionCall1(int8_numeric, Int64GetDatum(scale));
+	quotient = DirectFunctionCall2(numeric_div, amount, numeric_scale);
+
+	/* forcibly round to exactly the intended number of digits */
+	result = DatumGetNumeric(DirectFunctionCall2(numeric_round,
+												 quotient,
+												 Int32GetDatum(fpoint)));
+
+	PG_RETURN_NUMERIC(result);
+}
+
+/* numeric_cash()
+ * Convert numeric to cash.
+ */
+Datum
+numeric_cash(PG_FUNCTION_ARGS)
+{
+	Datum		amount = PG_GETARG_DATUM(0);
+	Cash		result;
+	int			fpoint;
+	int64		scale;
+	int			i;
+	Datum		numeric_scale;
+	struct lconv *lconvert = PGLC_localeconv();
+
+	/* see comments about frac_digits in cash_in() */
+	fpoint = lconvert->frac_digits;
+	if (fpoint < 0 || fpoint > 10)
+		fpoint = 2;
+
+	/* compute required scale factor */
+	scale = 1;
+	for (i = 0; i < fpoint; i++)
+		scale *= 10;
+
+	/* multiply the input amount by scale factor */
+	numeric_scale = DirectFunctionCall1(int8_numeric, Int64GetDatum(scale));
+	amount = DirectFunctionCall2(numeric_mul, amount, numeric_scale);
+
+	/* note that numeric_int8 will round to nearest integer for us */
+	result = DatumGetInt64(DirectFunctionCall1(numeric_int8, amount));
+
+	PG_RETURN_CASH(result);
+}
+
+/* int4_cash()
+ * Convert int4 (int) to cash
+ */
+Datum
+int4_cash(PG_FUNCTION_ARGS)
+{
+	int32		amount = PG_GETARG_INT32(0);
+	Cash		result;
+	int			fpoint;
+	int64		scale;
+	int			i;
+	struct lconv *lconvert = PGLC_localeconv();
+
+	/* see comments about frac_digits in cash_in() */
+	fpoint = lconvert->frac_digits;
+	if (fpoint < 0 || fpoint > 10)
+		fpoint = 2;
+
+	/* compute required scale factor */
+	scale = 1;
+	for (i = 0; i < fpoint; i++)
+		scale *= 10;
+
+	/* compute amount * scale, checking for overflow */
+	result = DatumGetInt64(DirectFunctionCall2(int8mul, Int64GetDatum(amount),
+											   Int64GetDatum(scale)));
+
+	PG_RETURN_CASH(result);
+}
+
+/* int8_cash()
+ * Convert int8 (bigint) to cash
+ */
+Datum
+int8_cash(PG_FUNCTION_ARGS)
+{
+	int64		amount = PG_GETARG_INT64(0);
+	Cash		result;
+	int			fpoint;
+	int64		scale;
+	int			i;
+	struct lconv *lconvert = PGLC_localeconv();
+
+	/* see comments about frac_digits in cash_in() */
+	fpoint = lconvert->frac_digits;
+	if (fpoint < 0 || fpoint > 10)
+		fpoint = 2;
+
+	/* compute required scale factor */
+	scale = 1;
+	for (i = 0; i < fpoint; i++)
+		scale *= 10;
+
+	/* compute amount * scale, checking for overflow */
+	result = DatumGetInt64(DirectFunctionCall2(int8mul, Int64GetDatum(amount),
+											   Int64GetDatum(scale)));
+
+	PG_RETURN_CASH(result);
 }

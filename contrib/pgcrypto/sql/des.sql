@@ -1,6 +1,8 @@
 --
 -- DES cipher
 --
+-- ensure consistent test output regardless of the default bytea format
+SET bytea_output TO escape;
 
 -- no official test vectors atm
 
@@ -25,4 +27,3 @@ select decrypt_iv(decode('50735067b073bb93', 'hex'), '0123456', 'abcd', 'des');
 -- long message
 select encode(encrypt('Lets try a longer message.', '01234567', 'des'), 'hex');
 select decrypt(encrypt('Lets try a longer message.', '01234567', 'des'), '01234567', 'des');
-

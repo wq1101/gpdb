@@ -23,13 +23,13 @@
 #define CDBTARGETEDDISPATCH_H
 
 #include "nodes/plannodes.h"
-#include "nodes/parsenodes.h"
 #include "nodes/relation.h"
 
-/**
- * @param query the query that produced the given plan
- * @param plan the plan to augment with directDispatch info (in its directDispatch field)
- */
-extern void AssignContentIdsToPlanData(Query *query, Plan *plan, PlannerInfo *root);
+extern void FinalizeDirectDispatchDataForSlice(PlanSlice *slice);
+extern void DirectDispatchUpdateContentIdsFromPlan(PlannerInfo *root, Plan *plan);
+extern void DirectDispatchUpdateContentIdsForInsert(PlannerInfo *root, Plan *plan,
+													GpPolicy *targetPolicy, Oid *hashfuncs);
+
+extern void MergeDirectDispatchCalculationInfo(DirectDispatchInfo *to, DirectDispatchInfo *from);
 
 #endif   /* CDBTARGETEDDISPATCH_H */

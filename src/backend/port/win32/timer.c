@@ -8,17 +8,15 @@
  *	  - Does not support interval timer (value->it_interval)
  *	  - Only supports ITIMER_REAL
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/port/win32/timer.c,v 1.17 2009/06/11 14:49:00 momjian Exp $
+ *	  src/backend/port/win32/timer.c
  *
  *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
-
-#include "libpq/pqsignal.h"
 
 
 /* Communication area for inter-thread communication */
@@ -27,7 +25,7 @@ typedef struct timerCA
 	struct itimerval value;
 	HANDLE		event;
 	CRITICAL_SECTION crit_sec;
-}	timerCA;
+} timerCA;
 
 static timerCA timerCommArea;
 static HANDLE timerThreadHandle = INVALID_HANDLE_VALUE;
@@ -97,8 +95,8 @@ setitimer(int which, const struct itimerval * value, struct itimerval * ovalue)
 		timerCommArea.event = CreateEvent(NULL, TRUE, FALSE, NULL);
 		if (timerCommArea.event == NULL)
 			ereport(FATAL,
-					(errmsg_internal("failed to create timer event: %d",
-									 (int) GetLastError())));
+			 (errmsg_internal("could not create timer event: error code %lu",
+							  GetLastError())));
 
 		MemSet(&timerCommArea.value, 0, sizeof(struct itimerval));
 
@@ -107,8 +105,8 @@ setitimer(int which, const struct itimerval * value, struct itimerval * ovalue)
 		timerThreadHandle = CreateThread(NULL, 0, pg_timer_thread, NULL, 0, NULL);
 		if (timerThreadHandle == INVALID_HANDLE_VALUE)
 			ereport(FATAL,
-					(errmsg_internal("failed to create timer thread: %d",
-									 (int) GetLastError())));
+			(errmsg_internal("could not create timer thread: error code %lu",
+							 GetLastError())));
 	}
 
 	/* Request the timer thread to change settings */

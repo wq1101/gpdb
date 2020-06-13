@@ -7,701 +7,11 @@
 
 #include "postgres.h"
 
+#include "catalog/pg_collation.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/walkers.h"
 #include "optimizer/var.h"
-
-/*
- * Standard expression-tree walking support
- *
- * We used to have near-duplicate code in many different routines that
- * understood how to recurse through an expression node tree.  That was
- * a pain to maintain, and we frequently had bugs due to some particular
- * routine neglecting to support a particular node type.  In most cases,
- * these routines only actually care about certain node types, and don't
- * care about other types except insofar as they have to recurse through
- * non-primitive node types.  Therefore, we now provide generic tree-walking
- * logic to consolidate the redundant "boilerplate" code.  There are
- * two versions: expression_tree_walker() and expression_tree_mutator().
- */
-
-/*--------------------
- * expression_tree_walker() is designed to support routines that traverse
- * a tree in a read-only fashion (although it will also work for routines
- * that modify nodes in-place but never add/delete/replace nodes).
- * A walker routine should look like this:
- *
- * bool my_walker (Node *node, my_struct *context)
- * {
- *		if (node == NULL)
- *			return false;
- *		// check for nodes that special work is required for, eg:
- *		if (IsA(node, Var))
- *		{
- *			... do special actions for Var nodes
- *		}
- *		else if (IsA(node, ...))
- *		{
- *			... do special actions for other node types
- *		}
- *		// for any node type not specially processed, do:
- *		return expression_tree_walker(node, my_walker, (void *) context);
- * }
- *
- * The "context" argument points to a struct that holds whatever context
- * information the walker routine needs --- it can be used to return data
- * gathered by the walker, too.  This argument is not touched by
- * expression_tree_walker, but it is passed down to recursive sub-invocations
- * of my_walker.  The tree walk is started from a setup routine that
- * fills in the appropriate context struct, calls my_walker with the top-level
- * node of the tree, and then examines the results.
- *
- * The walker routine should return "false" to continue the tree walk, or
- * "true" to abort the walk and immediately return "true" to the top-level
- * caller.	This can be used to short-circuit the traversal if the walker
- * has found what it came for.	"false" is returned to the top-level caller
- * iff no invocation of the walker returned "true".
- *
- * The node types handled by expression_tree_walker include all those
- * normally found in target lists and qualifier clauses during the planning
- * stage.  In particular, it handles List nodes since a cnf-ified qual clause
- * will have List structure at the top level, and it handles TargetEntry nodes
- * so that a scan of a target list can be handled without additional code.
- * Also, RangeTblRef, FromExpr, JoinExpr, and SetOperationStmt nodes are
- * handled, so that query jointrees and setOperation trees can be processed
- * without additional code.
- *
- * expression_tree_walker will handle SubLink nodes by recursing normally
- * into the "testexpr" subtree (which is an expression belonging to the outer
- * plan).  It will also call the walker on the sub-Query node; however, when
- * expression_tree_walker itself is called on a Query node, it does nothing
- * and returns "false".  The net effect is that unless the walker does
- * something special at a Query node, sub-selects will not be visited during
- * an expression tree walk. This is exactly the behavior wanted in many cases
- * --- and for those walkers that do want to recurse into sub-selects, special
- * behavior is typically needed anyway at the entry to a sub-select (such as
- * incrementing a depth counter). A walker that wants to examine sub-selects
- * should include code along the lines of:
- *
- *		if (IsA(node, Query))
- *		{
- *			adjust context for subquery;
- *			result = query_tree_walker((Query *) node, my_walker, context,
- *									   0); // adjust flags as needed
- *			restore context if needed;
- *			return result;
- *		}
- *
- * query_tree_walker is a convenience routine (see below) that calls the
- * walker on all the expression subtrees of the given Query node.
- *
- * expression_tree_walker will handle SubPlan nodes by recursing normally
- * into the "testexpr" and the "args" list (which are expressions belonging to
- * the outer plan).  It will not touch the completed subplan, however.	Since
- * there is no link to the original Query, it is not possible to recurse into
- * subselects of an already-planned expression tree.  This is OK for current
- * uses, but may need to be revisited in future.
- *--------------------
- */
-
-bool
-expression_tree_walker(Node *node,
-					   bool (*walker) (),
-					   void *context)
-{
-	ListCell   *temp = NULL;
-
-	/*
-	 * The walker has already visited the current node, and so we need only
-	 * recurse into any sub-nodes it has.
-	 *
-	 * We assume that the walker is not interested in List nodes per se, so
-	 * when we expect a List we just recurse directly to self without
-	 * bothering to call the walker.
-	 */
-	if (node == NULL)
-		return false;
-
-	/* Guard against stack overflow due to overly complex expressions */
-	check_stack_depth();
-
-	switch (nodeTag(node))
-	{
-		case T_Var:
-		case T_A_Const:
-		case T_Const:
-		case T_Param:
-		case T_CoerceToDomainValue:
-		case T_CaseTestExpr:
-		case T_CurrentOfExpr:
-		case T_SetToDefault:
-		case T_RangeTblRef:
-		case T_OuterJoinInfo:
-		case T_DMLActionExpr:
-		case T_PartSelectedExpr:
-		case T_PartDefaultExpr:
-		case T_PartBoundExpr:
-		case T_PartBoundInclusionExpr:
-		case T_PartBoundOpenExpr:
-		case T_PartListRuleExpr:
-		case T_PartListNullTestExpr:
-			/* primitive node types with no expression subnodes */
-			break;
-		case T_Aggref:
-			{
-				Aggref	   *expr = (Aggref *) node;
-
-				/* recurse directly on List */
-				if (expression_tree_walker((Node *) expr->args,
-										   walker, context))
-					return true;
-				if (expression_tree_walker((Node *) expr->aggorder,
-										   walker, context))
-					return true;
-			}
-			break;
-		case T_AggOrder:
-			{
-				AggOrder	   *expr = (AggOrder *) node;
-
-				/* recurse directly on List */
-				if (expression_tree_walker((Node *) expr->sortTargets,
-										   walker, context))
-					return true;
-				if (expression_tree_walker((Node *) expr->sortClause,
-										   walker, context))
-					return true;
-			}
-			break;
-		case T_WindowRef:
-			{
-				WindowRef	   *expr = (WindowRef *) node;
-
-				/* recurse directly on explicit arg List */
-				if (expression_tree_walker((Node *) expr->args,
-										   walker, context))
-					return true;
-				/* don't recurse on implicit args under winspec */
-			}
-			break;
-		case T_ArrayRef:
-			{
-				ArrayRef   *aref = (ArrayRef *) node;
-
-				/* recurse directly for upper/lower array index lists */
-				if (expression_tree_walker((Node *) aref->refupperindexpr,
-										   walker, context))
-					return true;
-				if (expression_tree_walker((Node *) aref->reflowerindexpr,
-										   walker, context))
-					return true;
-				/* walker must see the refexpr and refassgnexpr, however */
-				if (walker(aref->refexpr, context))
-					return true;
-				if (walker(aref->refassgnexpr, context))
-					return true;
-			}
-			break;
-		case T_FuncExpr:
-			{
-				FuncExpr   *expr = (FuncExpr *) node;
-
-				if (expression_tree_walker((Node *) expr->args,
-										   walker, context))
-					return true;
-			}
-			break;
-		case T_OpExpr:
-			{
-				OpExpr	   *expr = (OpExpr *) node;
-
-				if (expression_tree_walker((Node *) expr->args,
-										   walker, context))
-					return true;
-			}
-			break;
-		case T_DistinctExpr:
-			{
-				DistinctExpr *expr = (DistinctExpr *) node;
-
-				if (expression_tree_walker((Node *) expr->args,
-										   walker, context))
-					return true;
-			}
-			break;
-		case T_ScalarArrayOpExpr:
-			{
-				ScalarArrayOpExpr *expr = (ScalarArrayOpExpr *) node;
-
-				if (expression_tree_walker((Node *) expr->args,
-										   walker, context))
-					return true;
-			}
-			break;
-		case T_BoolExpr:
-			{
-				BoolExpr   *expr = (BoolExpr *) node;
-
-				if (expression_tree_walker((Node *) expr->args,
-										   walker, context))
-					return true;
-			}
-			break;
-		case T_SubLink:
-			{
-				SubLink    *sublink = (SubLink *) node;
-
-				if (walker(sublink->testexpr, context))
-					return true;
-
-				/*
-				 * Also invoke the walker on the sublink's Query node, so it
-				 * can recurse into the sub-query if it wants to.
-				 */
-				return walker(sublink->subselect, context);
-			}
-			break;
-		case T_SubPlan:
-			{
-				SubPlan    *subplan = (SubPlan *) node;
-
-				/* recurse into the testexpr, but not into the Plan */
-				if (walker(subplan->testexpr, context))
-					return true;
-				/* also examine args list */
-				if (expression_tree_walker((Node *) subplan->args,
-										   walker, context))
-					return true;
-			}
-			break;
-		case T_FieldSelect:
-			return walker(((FieldSelect *) node)->arg, context);
-		case T_FieldStore:
-			{
-				FieldStore *fstore = (FieldStore *) node;
-
-				if (walker(fstore->arg, context))
-					return true;
-				if (walker(fstore->newvals, context))
-					return true;
-			}
-			break;
-		case T_RelabelType:
-			return walker(((RelabelType *) node)->arg, context);
-		case T_CoerceViaIO:
-			return walker(((CoerceViaIO *) node)->arg, context);
-		case T_ArrayCoerceExpr:
-			return walker(((ArrayCoerceExpr *) node)->arg, context);
-		case T_ConvertRowtypeExpr:
-			return walker(((ConvertRowtypeExpr *) node)->arg, context);
-		case T_CaseExpr:
-			{
-				CaseExpr   *caseexpr = (CaseExpr *) node;
-
-				if (walker(caseexpr->arg, context))
-					return true;
-				/* we assume walker doesn't care about CaseWhens, either */
-				foreach(temp, caseexpr->args)
-				{
-					CaseWhen   *when = (CaseWhen *) lfirst(temp);
-
-					Assert(IsA(when, CaseWhen));
-					if (walker(when->expr, context))
-						return true;
-					if (walker(when->result, context))
-						return true;
-				}
-				if (walker(caseexpr->defresult, context))
-					return true;
-			}
-			break;
-		case T_ArrayExpr:
-			return walker(((ArrayExpr *) node)->elements, context);
-		case T_RowExpr:
-			return walker(((RowExpr *) node)->args, context);
-		case T_RowCompareExpr:
-			{
-				RowCompareExpr *rcexpr = (RowCompareExpr *) node;
-
-				if (walker(rcexpr->largs, context))
-					return true;
-				if (walker(rcexpr->rargs, context))
-					return true;
-			}
-			break;
-		case T_CoalesceExpr:
-			return walker(((CoalesceExpr *) node)->args, context);
-		case T_MinMaxExpr:
-			return walker(((MinMaxExpr *) node)->args, context);
-		case T_XmlExpr:
-			{
-				XmlExpr    *xexpr = (XmlExpr *) node;
-
-				if (walker(xexpr->named_args, context))
-					return true;
-				/* we assume walker doesn't care about arg_names */
-				if (walker(xexpr->args, context))
-					return true;
-			}
-			break;
-		case T_NullIfExpr:
-			return walker(((NullIfExpr *) node)->args, context);
-		case T_NullTest:
-			return walker(((NullTest *) node)->arg, context);
-		case T_BooleanTest:
-			return walker(((BooleanTest *) node)->arg, context);
-		case T_CoerceToDomain:
-			return walker(((CoerceToDomain *) node)->arg, context);
-		case T_TargetEntry:
-			return walker(((TargetEntry *) node)->expr, context);
-		case T_Query:
-			/* Do nothing with a sub-Query, per discussion above */
-			break;
-		case T_CommonTableExpr:
-			{
-				CommonTableExpr *cte = (CommonTableExpr *) node;
-
-				/*
-				 * Invoke the walker on the CTE's Query node, so it can
-				 * recurse into the sub-query if it wants to.
-				 */
-				return walker(cte->ctequery, context);
-			}
-			break;
-		case T_List:
-			foreach(temp, (List *) node)
-			{
-				if (walker((Node *) lfirst(temp), context))
-					return true;
-			}
-			break;
-		case T_IntList:
-			/* do nothing */
-			break;
-		case T_FromExpr:
-			{
-				FromExpr   *from = (FromExpr *) node;
-
-				if (walker(from->fromlist, context))
-					return true;
-				if (walker(from->quals, context))
-					return true;
-			}
-			break;
-		case T_JoinExpr:
-			{
-				JoinExpr   *join = (JoinExpr *) node;
-
-				if (walker(join->larg, context))
-					return true;
-				if (walker(join->rarg, context))
-					return true;
-				if (walker(join->subqfromlist, context))    /*CDB*/
-					return true;                            /*CDB*/
-				if (walker(join->quals, context))
-					return true;
-
-				/*
-				 * alias clause, using list are deemed uninteresting.
-				 */
-			}
-			break;
-		case T_SetOperationStmt:
-			{
-				SetOperationStmt *setop = (SetOperationStmt *) node;
-
-				if (walker(setop->larg, context))
-					return true;
-				if (walker(setop->rarg, context))
-					return true;
-			}
-			break;
-		case T_InClauseInfo:
-			{
-				InClauseInfo *ininfo = (InClauseInfo *) node;
-
-				if (expression_tree_walker((Node *) ininfo->sub_targetlist,
-										   walker, context))
-					return true;
-			}
-			break;
-		case T_AppendRelInfo:
-			{
-				AppendRelInfo *appinfo = (AppendRelInfo *) node;
-
-				if (expression_tree_walker((Node *) appinfo->translated_vars,
-										   walker, context))
-					return true;
-			}
-			break;
-		case T_GroupingClause:
-			{
-				GroupingClause *g = (GroupingClause *) node;
-				if (expression_tree_walker((Node *)g->groupsets, walker,
-					context))
-					return true;
-			}
-			break;
-		case T_GroupingFunc:
-			break;
-		case T_Grouping:
-		case T_GroupId:
-		case T_GroupClause:
-		case T_SortClause: /* occurs in WindowClause lists */
-			{
-				/* do nothing */
-			}
-			break;
-		case T_WindowDef:
-			{
-				WindowDef  *wd = (WindowDef *) node;
-
-				if (expression_tree_walker((Node *) wd->partitionClause, walker,
-										   context))
-					return true;
-				if (expression_tree_walker((Node *) wd->orderClause, walker,
-										   context))
-					return true;
-				if (walker((Node *) wd->startOffset, context))
-					return true;
-				if (walker((Node *) wd->endOffset, context))
-					return true;
-			}
-			break;
-		case T_TypeCast:
-			{
-				TypeCast *tc = (TypeCast *)node;
-
-				if (expression_tree_walker((Node*) tc->arg, walker, context))
-					return true;
-			}
-			break;
-		case T_TableValueExpr:
-			{
-				TableValueExpr *expr = (TableValueExpr *) node;
-
-				return walker(expr->subquery, context);
-			}
-			break;
-		case T_WindowClause:
-			{
-				WindowClause *wc = (WindowClause *) node;
-
-				if (expression_tree_walker((Node *) wc->partitionClause, walker,
-										   context))
-					return true;
-				if (expression_tree_walker((Node *) wc->orderClause, walker,
-										   context))
-					return true;
-				if (walker((Node *) wc->startOffset, context))
-					return true;
-				if (walker((Node *) wc->endOffset, context))
-					return true;
-				return false;
-			}
-			break;
-		case T_WindowKey:
-			{
-				WindowKey *wk = (WindowKey *) node;
-
-				if (walker((Node *) wk->startOffset, context))
-					return true;
-				if (walker((Node *) wk->endOffset, context))
-					return true;
-			}
-			break;
-		case T_PercentileExpr:
-			{
-				PercentileExpr *perc = (PercentileExpr *) node;
-
-				if (walker((Node *) perc->args, context))
-					return true;
-				if (walker((Node *) perc->sortClause, context))
-					return true;
-				if (walker((Node *) perc->sortTargets, context))
-					return true;
-				if (walker((Node *) perc->pcExpr, context))
-					return true;
-				if (walker((Node *) perc->tcExpr, context))
-					return true;
-			}
-			break;
-
-		default:
-            ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
-                            errmsg_internal("unrecognized node type: %d",
-				                            nodeTag(node)) ));
-			break;
-	}
-	return false;
-} /* end expression_tree_walker */
-
-/*
- * query_tree_walker --- initiate a walk of a Query's expressions
- *
- * This routine exists just to reduce the number of places that need to know
- * where all the expression subtrees of a Query are.  Note it can be used
- * for starting a walk at top level of a Query regardless of whether the
- * walker intends to descend into subqueries.  It is also useful for
- * descending into subqueries within a walker.
- *
- * Some callers want to suppress visitation of certain items in the sub-Query,
- * typically because they need to process them specially, or don't actually
- * want to recurse into subqueries.  This is supported by the flags argument,
- * which is the bitwise OR of flag values to suppress visitation of
- * indicated items.  (More flag bits may be added as needed.)
- */
-bool
-query_tree_walker(Query *query,
-				  bool (*walker) (),
-				  void *context,
-				  int flags)
-{
-	Assert(query != NULL && IsA(query, Query));
-
-	if (walker((Node *) query->targetList, context))
-		return true;
-	if (walker((Node *) query->returningList, context))
-		return true;
-	if (walker((Node *) query->jointree, context))
-		return true;
-	if (walker(query->setOperations, context))
-		return true;
-	if (walker(query->havingQual, context))
-		return true;
-	if (walker(query->groupClause, context))
-		return true;
-	if (walker(query->windowClause, context))
-		return true;
-	if (walker(query->limitOffset, context))
-		return true;
-	if (walker(query->limitCount, context))
-		return true;
-	if (!(flags & QTW_IGNORE_CTE_SUBQUERIES))
-	{
-		if (walker((Node *) query->cteList, context))
-			return true;
-	}
-	if (range_table_walker(query->rtable, walker, context, flags))
-		return true;
-	if (query->utilityStmt)
-	{
-		/*
-		 * Certain utility commands contain general-purpose Querys embedded in
-		 * them --- if this is one, invoke the walker on the sub-Query.
-		 */
-		if (IsA(query->utilityStmt, CopyStmt))
-		{
-			if (walker(((CopyStmt *) query->utilityStmt)->query, context))
-				return true;
-		}
-		if (IsA(query->utilityStmt, DeclareCursorStmt))
-		{
-			if (walker(((DeclareCursorStmt *) query->utilityStmt)->query, context))
-				return true;
-		}
-		if (IsA(query->utilityStmt, ExplainStmt))
-		{
-			if (walker(((ExplainStmt *) query->utilityStmt)->query, context))
-				return true;
-		}
-		if (IsA(query->utilityStmt, PrepareStmt))
-		{
-			if (walker(((PrepareStmt *) query->utilityStmt)->query, context))
-				return true;
-		}
-		if (IsA(query->utilityStmt, ViewStmt))
-		{
-			if (walker(((ViewStmt *) query->utilityStmt)->query, context))
-				return true;
-		}
-	}
-	return false;
-}
-
-/*
- * range_table_walker is just the part of query_tree_walker that scans
- * a query's rangetable.  This is split out since it can be useful on
- * its own.
- */
-bool
-range_table_walker(List *rtable,
-				   bool (*walker) (),
-				   void *context,
-				   int flags)
-{
-	ListCell   *rt;
-
-	foreach(rt, rtable)
-	{
-		RangeTblEntry *rte = (RangeTblEntry *) lfirst(rt);
-
-		/* For historical reasons, visiting RTEs is not the default */
-		if (flags & QTW_EXAMINE_RTES)
-			if (walker(rte, context))
-				return true;
-
-		switch (rte->rtekind)
-		{
-			case RTE_RELATION:
-			case RTE_SPECIAL:
-            case RTE_VOID:
-			case RTE_CTE:
-				/* nothing to do */
-				break;
-			case RTE_SUBQUERY:
-				if (!(flags & QTW_IGNORE_RT_SUBQUERIES))
-					if (walker(rte->subquery, context))
-						return true;
-				break;
-			case RTE_JOIN:
-				if (!(flags & QTW_IGNORE_JOINALIASES))
-					if (walker(rte->joinaliasvars, context))
-						return true;
-				break;
-			case RTE_FUNCTION:
-				if (walker(rte->funcexpr, context))
-					return true;
-				break;
-			case RTE_TABLEFUNCTION:
-				if (walker(rte->subquery, context))
-					return true;
-				if (walker(rte->funcexpr, context))
-					return true;
-				break;
-			case RTE_VALUES:
-				if (walker(rte->values_lists, context))
-					return true;
-				break;
-		}
-	}
-	return false;
-}
-
-/*
- * query_or_expression_tree_walker --- hybrid form
- *
- * This routine will invoke query_tree_walker if called on a Query node,
- * else will invoke the walker directly.  This is a useful way of starting
- * the recursion when the walker's normal change of state is not appropriate
- * for the outermost Query node.
- */
-bool
-query_or_expression_tree_walker(Node *node,
-								bool (*walker) (),
-								void *context,
-								int flags)
-{
-	if (node && IsA(node, Query))
-		return query_tree_walker((Query *) node,
-								 walker,
-								 context,
-								 flags);
-	else
-		return walker(node, context);
-}
-
 
 /**
  * Plan node walker related methods.
@@ -833,7 +143,8 @@ walk_join_node_fields(Join *join,
 bool
 plan_tree_walker(Node *node,
 				 bool (*walker) (),
-				 void *context)
+				 void *context,
+				 bool recurse_into_subplans)
 {
 	/*
 	 * The walker has already visited the current node, and so we need
@@ -877,10 +188,7 @@ plan_tree_walker(Node *node,
 				return true;
 			if (walker(((PartitionSelector *) node)->propagationExpression, context))
 				return true;
-			break;
-
-		case T_Repeat:
-			if (walk_plan_node_fields((Plan *) node, walker, context))
+			if (walker(((PartitionSelector *) node)->partTabTargetlist, context))
 				return true;
 			break;
 
@@ -888,6 +196,13 @@ plan_tree_walker(Node *node,
 			if (walk_plan_node_fields((Plan *) node, walker, context))
 				return true;
 			if (walker((Node *) ((Append *) node)->appendplans, context))
+				return true;
+			break;
+
+		case T_MergeAppend:
+			if (walk_plan_node_fields((Plan *) node, walker, context))
+				return true;
+			if (walker((Node *) ((MergeAppend *) node)->mergeplans, context))
 				return true;
 			break;
 
@@ -921,23 +236,53 @@ plan_tree_walker(Node *node,
 			return walk_scan_node_fields((Scan *) node, walker, context);
 
 		case T_SeqScan:
-		case T_ExternalScan:
-		case T_AppendOnlyScan:
-		case T_AOCSScan:
-		case T_TableScan:
-		case T_DynamicTableScan:
+		case T_SampleScan:
+		case T_DynamicSeqScan:
 		case T_BitmapHeapScan:
-		case T_BitmapAppendOnlyScan:
-		case T_BitmapTableScan:
-		case T_TableFunctionScan:
-		case T_ValuesScan:
+		case T_DynamicBitmapHeapScan:
 		case T_WorkTableScan:
 			if (walk_scan_node_fields((Scan *) node, walker, context))
 				return true;
 			break;
 
+		case T_ForeignScan:
+			if (walk_scan_node_fields((Scan *) node, walker, context))
+				return true;
+			if (walker(((ForeignScan *) node)->fdw_exprs, context))
+				return true;
+			break;
+
+		case T_CustomScan:
+			if (walk_scan_node_fields((Scan *) node, walker, context))
+				return true;
+			if (walker(((CustomScan *) node)->custom_plans, context))
+				return true;
+			if (walker(((CustomScan *) node)->custom_exprs, context))
+				return true;
+			if (walker(((CustomScan *) node)->custom_private, context))
+				return true;
+			if (walker(((CustomScan *) node)->custom_scan_tlist, context))
+				return true;
+			break;
+
+		case T_ValuesScan:
+			if (walker((Node *) ((ValuesScan *) node)->values_lists, context))
+				return true;
+			if (walk_scan_node_fields((Scan *) node, walker, context))
+				return true;
+			break;
+
+		case T_TableFunctionScan:
+			if (walker((Node *) ((TableFunctionScan *) node)->function, context))
+				return true;
+			if (walk_scan_node_fields((Scan *) node, walker, context))
+				return true;
+			break;
+
 		case T_FunctionScan:
-			if (walker((Node *) ((FunctionScan *) node)->funcexpr, context))
+			if (walker((Node *) ((FunctionScan *) node)->functions, context))
+				return true;
+			if (walker((Node *) ((FunctionScan *) node)->param, context))
 				return true;
 			if (walk_scan_node_fields((Scan *) node, walker, context))
 				return true;
@@ -952,7 +297,15 @@ plan_tree_walker(Node *node,
 			/* Other fields are lists of basic items, nothing to walk. */
 			break;
 
+		case T_IndexOnlyScan:
+			if (walk_scan_node_fields((Scan *) node, walker, context))
+				return true;
+			if (walker((Node *) ((IndexOnlyScan *) node)->indexqual, context))
+				return true;
+			break;
+
 		case T_BitmapIndexScan:
+		case T_DynamicBitmapIndexScan:
 			if (walk_scan_node_fields((Scan *) node, walker, context))
 				return true;
 			if (walker((Node *) ((BitmapIndexScan *) node)->indexqual, context))
@@ -1016,10 +369,18 @@ plan_tree_walker(Node *node,
 			/* Other fields are simple items and lists of simple items. */
 			break;
 
-		case T_Window:
+		case T_TupleSplit:
 			if (walk_plan_node_fields((Plan *) node, walker, context))
 				return true;
-			if (walker(((Window *) node)->windowKeys, context))
+			/* Other fields are simple items and lists of simple items. */
+			break;
+
+		case T_WindowAgg:
+			if (walk_plan_node_fields((Plan *) node, walker, context))
+				return true;
+			if (walker(((WindowAgg *) node)->startOffset, context))
+				return true;
+			if (walker(((WindowAgg *) node)->endOffset, context))
 				return true;
 			break;
 
@@ -1027,6 +388,12 @@ plan_tree_walker(Node *node,
 			if (walk_plan_node_fields((Plan *) node, walker, context))
 				return true;
 			/* Other fields are simple items and lists of simple items. */
+			break;
+
+		case T_Gather:
+			if (walk_plan_node_fields((Plan *) node, walker, context))
+				return true;
+			/* Other fields are simple items. */
 			break;
 
 		case T_Hash:
@@ -1061,10 +428,7 @@ plan_tree_walker(Node *node,
 			if (walk_plan_node_fields((Plan *) node, walker, context))
 				return true;
 
-			if (walker((Node *) ((Motion *)node)->hashExpr, context))
-				return true;
-
-			if (walker((Node *) ((Motion *)node)->hashDataTypes, context))
+			if (walker((Node *) ((Motion *)node)->hashExprs, context))
 				return true;
 
 			break;
@@ -1104,8 +468,8 @@ plan_tree_walker(Node *node,
 										   walker, context))
 					return true;
 
-				/* recur into the subplan's plan, a kind of Plan node */
-				if (walker((Node *) subplan_plan, context))
+				/* recurse into the subplan's plan, a kind of Plan node */
+				if (recurse_into_subplans && walker((Node *) subplan_plan, context))
 					return true;
 
 				/* also examine args list */
@@ -1124,18 +488,33 @@ plan_tree_walker(Node *node,
 			 */
 			break;
 
-		case T_DML:
-		case T_SplitUpdate:
-		case T_RowTrigger:
-		case T_AssertOp:
-
+		case T_ModifyTable:
 			if (walk_plan_node_fields((Plan *) node, walker, context))
-			{
 				return true;
-			}
-			
+			if (walker((Node *) ((ModifyTable *) node)->plans, context))
+				return true;
+			if (walker((Node *) ((ModifyTable *) node)->withCheckOptionLists, context))
+				return true;
+			if (walker((Node *) ((ModifyTable *) node)->onConflictSet, context))
+				return true;
+			if (walker((Node *) ((ModifyTable *) node)->onConflictWhere, context))
+				return true;
+			if (walker((Node *) ((ModifyTable *) node)->returningLists, context))
+				return true;
+
 			break;
-			
+
+		case T_LockRows:
+			if (walk_plan_node_fields((Plan *) node, walker, context))
+				return true;
+			break;
+
+		case T_SplitUpdate:
+		case T_AssertOp:
+			if (walk_plan_node_fields((Plan *) node, walker, context))
+				return true;
+			break;
+
 			/*
 			 * Query nodes are handled by the Postgres query_tree_walker. We
 			 * just use it without setting any ignore flags.  The caller must
@@ -1162,7 +541,6 @@ plan_tree_walker(Node *node,
 		case T_CurrentOfExpr:
 		case T_RangeTblRef:
 		case T_Aggref:
-		case T_AggOrder:
 		case T_ArrayRef:
 		case T_FuncExpr:
 		case T_OpExpr:
@@ -1186,7 +564,7 @@ plan_tree_walker(Node *node,
 		case T_FromExpr:
 		case T_JoinExpr:
 		case T_SetOperationStmt:
-		case T_InClauseInfo:
+		case T_SpecialJoinInfo:
 		case T_TableValueExpr:
 		case T_PartSelectedExpr:
 		case T_PartDefaultExpr:
@@ -1195,7 +573,6 @@ plan_tree_walker(Node *node,
 		case T_PartBoundOpenExpr:
 		case T_PartListRuleExpr:
 		case T_PartListNullTestExpr:
-		case T_WindowKey:
 
 		default:
 			return expression_tree_walker(node, walker, context);
@@ -1302,27 +679,24 @@ extract_nodes_walker(Node *node, extract_context *context)
 		SubPlan	   *subplan = (SubPlan *) node;
 
 		/*
-		 * SubPlan has both of expressions and subquery.
-		 * In case the caller wants non-subquery version,
-		 * still we need to walk through its expressions.
+		 * SubPlan has both of expressions and subquery.  In case the caller wants
+		 * non-subquery version, still we need to walk through its expressions.
+		 * NB: Since we're not going to descend into SUBPLANs anyway (see below),
+		 * look at the SUBPLAN node here, even if descendIntoSubqueries is false
+		 * lest we miss some nodes there.
 		 */
-		if (!context->descendIntoSubqueries)
-		{
-			if (extract_nodes_walker((Node *) subplan->testexpr,
-									 context))
-				return true;
-			if (expression_tree_walker((Node *) subplan->args,
-									   extract_nodes_walker, context))
-				return true;
+		if (extract_nodes_walker((Node *) subplan->testexpr,
+								 context))
+			return true;
+		if (expression_tree_walker((Node *) subplan->args,
+								   extract_nodes_walker, context))
+			return true;
 
-			/* Do not descend into subplans */
-			return false;
-		}
 		/*
-		 * Although the flag indicates the caller wants to
-		 * descend into subqueries, SubPlan seems special;
-		 * Some partitioning code assumes this should return
-		 * immediately without descending.  See MPP-17168.
+		 * Do not descend into subplans.
+		 * Even if descendIntoSubqueries indicates the caller wants to descend into
+		 * subqueries, SubPlan seems special; Some partitioning code assumes this
+		 * should return immediately without descending.  See MPP-17168.
 		 */
 		return false;
 	}
@@ -1340,7 +714,8 @@ extract_nodes_walker(Node *node, extract_context *context)
 	}
 
 	return plan_tree_walker(node, extract_nodes_walker,
-								  (void *) context);
+							(void *) context,
+							true);
 }
 
 /**
@@ -1451,317 +826,155 @@ find_nodes_walker(Node *node, find_nodes_context *context)
 	return expression_tree_walker(node, find_nodes_walker, (void *) context);
 }
 
-/*
- * raw_expression_tree_walker --- walk raw parse trees
- *
- * This has exactly the same API as expression_tree_walker, but instead of
- * walking post-analysis parse trees, it knows how to walk the node types
- * found in raw grammar output.  (There is not currently any need for a
- * combined walker, so we keep them separate in the name of efficiency.)
- * Unlike expression_tree_walker, there is no special rule about query
- * boundaries: we descend to everything that's possibly interesting.
- *
- * Currently, the node type coverage extends to SelectStmt and everything
- * that could appear under it, but not other statement types.
+/**
+ * GPDB_91_MERGE_FIXME: collation
+ * Look for nodes with non-default collation; return 1 if any exist, -1
+ * otherwise.
  */
-bool
-raw_expression_tree_walker(Node *node, bool (*walker) (), void *context)
+typedef struct check_collation_context
 {
-	ListCell   *temp;
+	int foundNonDefaultCollation;
+} check_collation_context;
 
-	/*
-	 * The walker has already visited the current node, and so we need only
-	 * recurse into any sub-nodes it has.
-	 */
-	if (node == NULL)
+static bool check_collation_walker(Node *node, check_collation_context *context);
+
+int check_collation(Node *node)
+{
+	check_collation_context context;
+	Assert(NULL != node);
+	context.foundNonDefaultCollation = -1;
+	check_collation_walker(node, &context);
+
+	return context.foundNonDefaultCollation;
+}
+
+
+static void
+check_collation_in_list(List *colllist, check_collation_context *context)
+{
+	ListCell *lc;
+	foreach (lc, colllist)
+	{
+		Oid coll = lfirst_oid(lc);
+		if (InvalidOid != coll && DEFAULT_COLLATION_OID != coll)
+		{
+			context->foundNonDefaultCollation = 1;
+			break;
+		}
+	}
+}
+
+static bool
+check_collation_walker(Node *node, check_collation_context *context)
+{
+	Oid collation, inputCollation;
+
+	if (NULL == node)
+	{
 		return false;
+	}
 
-	/* Guard against stack overflow due to overly complex expressions */
-	check_stack_depth();
+	if (IsA(node, Query))
+	{
+		/* Recurse into subselects */
+		return query_tree_walker((Query *) node, check_collation_walker, (void *) context, 0 /* flags */);
+	}
 
 	switch (nodeTag(node))
 	{
-		case T_SetToDefault:
-		case T_CurrentOfExpr:
-		case T_Integer:
-		case T_Float:
-		case T_String:
-		case T_BitString:
-		case T_Null:
-		case T_ParamRef:
-		case T_A_Const:
-		case T_A_Star:
-			/* primitive node types with no subnodes */
-			break;
-		case T_Alias:
-			/* we assume the colnames list isn't interesting */
-			break;
-		case T_RangeVar:
-			return walker(((RangeVar *) node)->alias, context);
-		case T_SubLink:
-			{
-				SubLink    *sublink = (SubLink *) node;
-
-				if (walker(sublink->testexpr, context))
-					return true;
-				/* we assume the operName is not interesting */
-				if (walker(sublink->subselect, context))
-					return true;
-			}
-			break;
-		case T_CaseExpr:
-			{
-				CaseExpr   *caseexpr = (CaseExpr *) node;
-
-				if (walker(caseexpr->arg, context))
-					return true;
-				/* we assume walker doesn't care about CaseWhens, either */
-				foreach(temp, caseexpr->args)
-				{
-					CaseWhen   *when = (CaseWhen *) lfirst(temp);
-
-					Assert(IsA(when, CaseWhen));
-					if (walker(when->expr, context))
-						return true;
-					if (walker(when->result, context))
-						return true;
-				}
-				if (walker(caseexpr->defresult, context))
-					return true;
-			}
-			break;
-		case T_RowExpr:
-			return walker(((RowExpr *) node)->args, context);
-		case T_CoalesceExpr:
-			return walker(((CoalesceExpr *) node)->args, context);
-		case T_MinMaxExpr:
-			return walker(((MinMaxExpr *) node)->args, context);
-		case T_XmlExpr:
-			{
-				XmlExpr    *xexpr = (XmlExpr *) node;
-
-				if (walker(xexpr->named_args, context))
-					return true;
-				/* we assume walker doesn't care about arg_names */
-				if (walker(xexpr->args, context))
-					return true;
-			}
-			break;
-		case T_NullTest:
-			return walker(((NullTest *) node)->arg, context);
+		case T_Var:
+		case T_Const:
+		case T_OpExpr:
+		case T_ScalarArrayOpExpr:
+		case T_DistinctExpr:
+		case T_BoolExpr:
 		case T_BooleanTest:
-			return walker(((BooleanTest *) node)->arg, context);
-		case T_JoinExpr:
+		case T_CaseExpr:
+		case T_CaseTestExpr:
+		case T_CoalesceExpr:
+		case T_MinMaxExpr:
+		case T_FuncExpr:
+		case T_Aggref:
+		case T_WindowFunc:
+		case T_NullTest:
+		case T_NullIfExpr:
+		case T_RelabelType:
+		case T_CoerceToDomain:
+		case T_CoerceViaIO:
+		case T_ArrayCoerceExpr:
+		case T_SubLink:
+		case T_ArrayExpr:
+		case T_ArrayRef:
+		case T_RowExpr:
+		case T_RowCompareExpr:
+		case T_FieldSelect:
+		case T_FieldStore:
+		case T_CoerceToDomainValue:
+		case T_CurrentOfExpr:
+		case T_NamedArgExpr:
+		case T_ConvertRowtypeExpr:
+		case T_CollateExpr:
+		case T_TableValueExpr:
+		case T_XmlExpr:
+		case T_SetToDefault:
+		case T_PlaceHolderVar:
+		case T_Param:
+		case T_SubPlan:
+		case T_AlternativeSubPlan:
+		case T_GroupingFunc:
+		case T_DMLActionExpr:
+		case T_PartBoundExpr:
+			collation = exprCollation(node);
+			inputCollation = exprInputCollation(node);
+			if ((InvalidOid != collation && DEFAULT_COLLATION_OID != collation) ||
+				(InvalidOid != inputCollation && DEFAULT_COLLATION_OID != inputCollation))
 			{
-				JoinExpr   *join = (JoinExpr *) node;
-
-				if (walker(join->larg, context))
-					return true;
-				if (walker(join->rarg, context))
-					return true;
-				if (walker(join->quals, context))
-					return true;
-				if (walker(join->alias, context))
-					return true;
-				/* using list is deemed uninteresting */
+				context->foundNonDefaultCollation = 1;
 			}
 			break;
-		case T_IntoClause:
-			{
-				IntoClause *into = (IntoClause *) node;
-
-				if (walker(into->rel, context))
-					return true;
-				/* colNames, options are deemed uninteresting */
-			}
-			break;
-		case T_List:
-			foreach(temp, (List *) node)
-			{
-				if (walker((Node *) lfirst(temp), context))
-					return true;
-			}
-			break;
-		case T_SelectStmt:
-			{
-				SelectStmt *stmt = (SelectStmt *) node;
-
-				if (walker(stmt->distinctClause, context))
-					return true;
-				if (walker(stmt->intoClause, context))
-					return true;
-				if (walker(stmt->targetList, context))
-					return true;
-				if (walker(stmt->fromClause, context))
-					return true;
-				if (walker(stmt->whereClause, context))
-					return true;
-				if (walker(stmt->groupClause, context))
-					return true;
-				if (walker(stmt->havingClause, context))
-					return true;
-				if (walker(stmt->withClause, context))
-					return true;
-				if (walker(stmt->valuesLists, context))
-					return true;
-				if (walker(stmt->sortClause, context))
-					return true;
-				if (walker(stmt->limitOffset, context))
-					return true;
-				if (walker(stmt->limitCount, context))
-					return true;
-				if (walker(stmt->lockingClause, context))
-					return true;
-				if (walker(stmt->larg, context))
-					return true;
-				if (walker(stmt->rarg, context))
-					return true;
-			}
-			break;
-		case T_A_Expr:
-			{
-				A_Expr *expr = (A_Expr *) node;
-
-				if (walker(expr->lexpr, context))
-					return true;
-				if (walker(expr->rexpr, context))
-					return true;
-				/* operator name is deemed uninteresting */
-			}
-			break;
-		case T_ColumnRef:
-			/* we assume the fields contain nothing interesting */
-			break;
-		case T_FuncCall:
-			{
-				FuncCall *fcall = (FuncCall *) node;
-
-				if (walker(fcall->args, context))
-					return true;
-				/* function name is deemed uninteresting */
-			}
-			break;
-		case T_A_Indices:
-			{
-				A_Indices *indices = (A_Indices *) node;
-
-				if (walker(indices->lidx, context))
-					return true;
-				if (walker(indices->uidx, context))
-					return true;
-			}
-			break;
-		case T_A_Indirection:
-			{
-				A_Indirection *indir = (A_Indirection *) node;
-
-				if (walker(indir->arg, context))
-					return true;
-				if (walker(indir->indirection, context))
-					return true;
-			}
-			break;
-		case T_A_ArrayExpr:
-			return walker(((A_ArrayExpr *) node)->elements, context);
-		case T_ResTarget:
-			{
-				ResTarget *rt = (ResTarget *) node;
-
-				if (walker(rt->indirection, context))
-					return true;
-				if (walker(rt->val, context))
-					return true;
-			}
-			break;
-		case T_TypeCast:
-			{
-				TypeCast *tc = (TypeCast *) node;
-
-				if (walker(tc->arg, context))
-					return true;
-				if (walker(tc->typeName, context))
-					return true;
-			}
-			break;
-		case T_SortBy:
-			return walker(((SortBy *) node)->node, context);
-		case T_WindowDef:
-			{
-				WindowDef  *wd = (WindowDef *) node;
-
-				if (walker(wd->partitionClause, context))
-					return true;
-				if (walker(wd->orderClause, context))
-					return true;
-				if (walker((Node *) wd->startOffset, context))
-					return true;
-				if (walker((Node *) wd->endOffset, context))
-					return true;
-			}
-			break;
-		case T_RangeSubselect:
-			{
-				RangeSubselect *rs = (RangeSubselect *) node;
-
-				if (walker(rs->subquery, context))
-					return true;
-				if (walker(rs->alias, context))
-					return true;
-			}
-			break;
-		case T_RangeFunction:
-			{
-				RangeFunction *rf = (RangeFunction *) node;
-
-				if (walker(rf->funccallnode, context))
-					return true;
-				if (walker(rf->alias, context))
-					return true;
-			}
-			break;
-		case T_TypeName:
-			{
-				TypeName *tn = (TypeName *) node;
-
-				if (walker(tn->typmods, context))
-					return true;
-				if (walker(tn->arrayBounds, context))
-					return true;
-				/* type name itself is deemed uninteresting */
-			}
+		case T_CollateClause:
+			/* unsupported */
+			context->foundNonDefaultCollation = 1;
 			break;
 		case T_ColumnDef:
+			collation = ((ColumnDef *) node)->collOid;
+			if (InvalidOid != collation && DEFAULT_COLLATION_OID != collation)
 			{
-				ColumnDef *coldef = (ColumnDef *) node;
-
-				if (walker(coldef->typeName, context))
-					return true;
-				if (walker(coldef->raw_default, context))
-					return true;
-				/* for now, constraints are ignored */
+				context->foundNonDefaultCollation = 1;
 			}
 			break;
-		case T_LockingClause:
-			return walker(((LockingClause *) node)->lockedRels, context);
-		case T_XmlSerialize:
+		case T_IndexElem:
+			if (NIL != ((IndexElem *) node)->collation)
 			{
-				XmlSerialize *xs = (XmlSerialize *) node;
-
-				if (walker(xs->expr, context))
-					return true;
-				if (walker(xs->typeName, context))
-					return true;
+				context->foundNonDefaultCollation = 1;
 			}
 			break;
-		case T_WithClause:
-			return walker(((WithClause *) node)->ctes, context);
+		case T_RangeTblEntry:
+			check_collation_in_list(((RangeTblEntry *) node)->values_collations, context);
+			check_collation_in_list(((RangeTblEntry *) node)->ctecolcollations, context);
+			break;
+		case T_RangeTblFunction:
+			check_collation_in_list(((RangeTblFunction *) node)->funccolcollations, context);
+			break;
 		case T_CommonTableExpr:
-			return walker(((CommonTableExpr *) node)->ctequery, context);
+			check_collation_in_list(((CommonTableExpr *) node)->ctecolcollations, context);
+			break;
+		case T_SetOperationStmt:
+			check_collation_in_list(((SetOperationStmt *) node)->colCollations, context);
+			break;
 		default:
-			elog(ERROR, "unrecognized node type: %d",
-				 (int) nodeTag(node));
+			/* make compiler happy */
 			break;
 	}
-	return false;
+
+	if (context->foundNonDefaultCollation == 1)
+	{
+		/* end recursion */
+		return true;
+	}
+	else
+	{
+		return expression_tree_walker(node, check_collation_walker, (void *) context);
+	}
 }
 

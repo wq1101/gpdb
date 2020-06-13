@@ -3,20 +3,19 @@
  * tsquery_gist.c
  *	  GiST index support for tsquery
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/adt/tsquery_gist.c,v 1.4.2.1 2008/04/20 09:29:48 teodor Exp $
+ *	  src/backend/utils/adt/tsquery_gist.c
  *
  *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
 
-#include "access/skey.h"
+#include "access/stratnum.h"
 #include "access/gist.h"
-#include "tsearch/ts_type.h"
 #include "tsearch/ts_utils.h"
 
 #define GETENTRY(vec,pos) DatumGetTSQuerySign((vec)->vector[pos].key)
@@ -53,11 +52,17 @@ Datum
 gtsquery_consistent(PG_FUNCTION_ARGS)
 {
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
-	TSQuerySign	key = DatumGetTSQuerySign(entry->key);
 	TSQuery		query = PG_GETARG_TSQUERY(1);
 	StrategyNumber strategy = (StrategyNumber) PG_GETARG_UINT16(2);
+
+	/* Oid		subtype = PG_GETARG_OID(3); */
+	bool	   *recheck = (bool *) PG_GETARG_POINTER(4);
+	TSQuerySign key = DatumGetTSQuerySign(entry->key);
 	TSQuerySign sq = makeTSQuerySign(query);
 	bool		retval;
+
+	/* All cases served by this function are inexact */
+	*recheck = true;
 
 	switch (strategy)
 	{
@@ -145,16 +150,16 @@ gtsquery_penalty(PG_FUNCTION_ARGS)
 typedef struct
 {
 	OffsetNumber pos;
-	int4		cost;
+	int32		cost;
 } SPLITCOST;
 
 static int
 comparecost(const void *a, const void *b)
 {
-	if (((SPLITCOST *) a)->cost == ((SPLITCOST *) b)->cost)
+	if (((const SPLITCOST *) a)->cost == ((const SPLITCOST *) b)->cost)
 		return 0;
 	else
-		return (((SPLITCOST *) a)->cost > ((SPLITCOST *) b)->cost) ? 1 : -1;
+		return (((const SPLITCOST *) a)->cost > ((const SPLITCOST *) b)->cost) ? 1 : -1;
 }
 
 #define WISH_F(a,b,c) (double)( -(double)(((a)-(b))*((a)-(b))*((a)-(b)))*(c) )
@@ -169,11 +174,11 @@ gtsquery_picksplit(PG_FUNCTION_ARGS)
 				j;
 	TSQuerySign datum_l,
 				datum_r;
-	int4		size_alpha,
+	int32		size_alpha,
 				size_beta;
-	int4		size_waste,
+	int32		size_waste,
 				waste = -1;
-	int4		nbytes;
+	int32		nbytes;
 	OffsetNumber seed_1 = 0,
 				seed_2 = 0;
 	OffsetNumber *left,
@@ -256,4 +261,17 @@ gtsquery_picksplit(PG_FUNCTION_ARGS)
 	v->spl_rdatum = TSQuerySignGetDatum(datum_r);
 
 	PG_RETURN_POINTER(v);
+}
+
+/*
+ * Formerly, gtsquery_consistent was declared in pg_proc.h with arguments
+ * that did not match the documented conventions for GiST support functions.
+ * We fixed that, but we still need a pg_proc entry with the old signature
+ * to support reloading pre-9.6 contrib/tsearch2 opclass declarations.
+ * This compatibility function should go away eventually.
+ */
+Datum
+gtsquery_consistent_oldsig(PG_FUNCTION_ARGS)
+{
+	return gtsquery_consistent(fcinfo);
 }

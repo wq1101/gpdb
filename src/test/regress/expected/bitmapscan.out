@@ -845,7 +845,7 @@ SELECT COUNT(DISTINCT lowCardinalityHighDomain) FROM card_heap_table_w_bitmap;
 SELECT COUNT(*) FROM card_heap_table_w_bitmap WHERE lowCardinalityHighDomain = 5;
  count 
 -------
-   99
+    99
 (1 row)
 
 -- Each of these tests a "single-sided range".
@@ -880,7 +880,7 @@ SELECT COUNT(DISTINCT lowCardinalityHighDomain) FROM card_heap_table_w_bitmap;
 SELECT COUNT(*) FROM card_heap_table_w_bitmap WHERE lowCardinalityHighDomain IS NULL;
  count 
 -------
-  115
+   115
 (1 row)
 
 -- There should no longer be any rows with value 4.
@@ -892,7 +892,7 @@ SELECT COUNT(*) FROM card_heap_table_w_bitmap WHERE lowCardinalityHighDomain = 4
 
 -- We should have 10,000 rows now.
 SELECT COUNT(*) FROM card_heap_table_w_bitmap;
- count  
+ count 
 -------
  10000
 (1 row)
@@ -903,7 +903,7 @@ DELETE FROM card_heap_table_w_bitmap WHERE lowCardinalityHighDomain = 3;
 SELECT COUNT(*) FROM card_heap_table_w_bitmap WHERE lowCardinalityHighDomain = 22;
  count 
 -------
-   99
+    99
 (1 row)
 
 -- Now reduce the cardinality
@@ -936,7 +936,7 @@ SELECT COUNT(*) FROM card_heap_table_w_bitmap WHERE lowCardinalityHighDomain IS 
 -- The number of rows updated here should be equal to the total number of rows 
 -- minus the number that have lowCardinalityHighDomain less than 10 
 -- minus the number that have lowCardinalityHighDomain greater than 100
--- minus the number that are NULL (if any).   
+-- minus the number that are NULL (if any).
 UPDATE card_heap_table_w_bitmap SET lowCardinalityHighDomain = 200 WHERE lowCardinalityHighDomain >= 10 and lowCardinalityHighDomain <= 100;
 -- Should be around 14 rows.
 SELECT DISTINCT lowCardinalityHighDomain FROM card_heap_table_w_bitmap;
@@ -1010,38 +1010,38 @@ NOTICE:  table "bm_test" does not exist, skipping
 create table bm_table_foo (c int, d int) distributed by (c);
 create index ie_bm_table_foo on bm_table_foo using bitmap(d);
 insert into bm_table_foo values (1, 1);
-insert into bm_table_foo values (2, 2);
+insert into bm_table_foo values (3, 3);
 -- Next queries will create additional StreamNodes. In particular,
 -- d in (1, 2) will be transformed into an OR with two BMS_INDEX input streams.
-select * from bm_table_foo where d in (1, 2) and (d = 1 or d = 2);
+select * from bm_table_foo where d in (1, 3) and (d = 1 or d = 3);
  c | d 
 ---+---
  1 | 1
- 2 | 2
+ 3 | 3
 (2 rows)
 
-select * from bm_table_foo where (d = 1 or d = 2) and d in (1, 2);
+select * from bm_table_foo where (d = 1 or d = 3) and d in (1, 3);
  c | d 
 ---+---
  1 | 1
- 2 | 2
+ 3 | 3
 (2 rows)
 
--- This query will eliminate StreamNodes since there is no tuple where d =3.
-select * from bm_table_foo where d = 3 and (d = 1 or d = 2);
+-- This query will eliminate StreamNodes since there is no tuple where d =2.
+select * from bm_table_foo where d = 2 and (d = 1 or d = 3);
  c | d 
 ---+---
 (0 rows)
 
--- If a segment contains tuples with d in (1, 2), then it will create the whole StreamNode tree, 
+-- If a segment contains tuples with d in (1, 3), then it will create the whole StreamNode tree,
 -- otherwise segments will eliminate nodes.
-select * from bm_table_foo where d = 2 and (d = 1 or d = 2);
+select * from bm_table_foo where d = 3 and (d = 1 or d = 3);
  c | d 
 ---+---
- 2 | 2
+ 3 | 3
 (1 row)
 
--- double free mixed bitmap indexes (StreamBitmap with HashBitmap)
+-- double free mixed bitmap indexes (StreamBitmap with TIDBitmap)
 CREATE TABLE bmheapcrash (
     btree_col2 date DEFAULT now(),
     bitmap_col text NOT NULL,
@@ -1049,7 +1049,6 @@ CREATE TABLE bmheapcrash (
     dist_col serial
 )
 DISTRIBUTED BY (dist_col);
-NOTICE:  CREATE TABLE will create implicit sequence "bmheapcrash_dist_col_seq" for serial column "bmheapcrash.dist_col"
 CREATE INDEX bm_heap_idx ON bmheapcrash USING bitmap (bitmap_col);
 CREATE INDEX bt_heap_idx ON bmheapcrash USING btree (btree_col1);
 CREATE INDEX bt_heap_idx_2 ON bmheapcrash USING btree (btree_col2);

@@ -4,7 +4,7 @@
  *		Replacement header file for Snowball stemmer modules
  *
  * The Snowball stemmer modules do #include "header.h", and think they
- * are including snowball/libstemmer/header.h.	We adjust the CPPFLAGS
+ * are including snowball/libstemmer/header.h.  We adjust the CPPFLAGS
  * so that this file is found instead, and thereby we can modify the
  * headers they see.  The main point here is to ensure that pg_config.h
  * is included before any system headers such as <stdio.h>; without that,
@@ -13,9 +13,9 @@
  *
  * NOTE: this file should not be included into any non-snowball sources!
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  *
- * $PostgreSQL: pgsql/src/include/snowball/header.h,v 1.3 2008/01/01 19:45:58 momjian Exp $
+ * src/include/snowball/header.h
  *
  *-------------------------------------------------------------------------
  */
@@ -33,7 +33,7 @@
 #endif
 
 /* Now we can include the original Snowball header.h */
-#include "snowball/libstemmer/header.h"
+#include "snowball/libstemmer/header.h" /* pgrminclude ignore */
 
 /*
  * Redefine standard memory allocation interface to pgsql's one.

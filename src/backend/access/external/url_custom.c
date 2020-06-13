@@ -15,7 +15,7 @@
 #include "postgres.h"
 
 #include "access/extprotocol.h"
-#include "access/fileam.h"
+#include "access/url.h"
 #include "catalog/pg_extprotocol.h"
 #include "commands/copy.h"
 #include "utils/memutils.h"
@@ -34,11 +34,19 @@ typedef struct URL_CUSTOM_FILE
 
 } URL_CUSTOM_FILE;
 
-static int32 InvokeExtProtocol(void *ptr, size_t nbytes, URL_CUSTOM_FILE *file, CopyState pstate,
-								bool last_call);
+static int32
+InvokeExtProtocol(void *ptr,
+                  size_t nbytes,
+                  URL_CUSTOM_FILE *file,
+                  CopyState pstate,
+                  bool last_call);
 
 URL_FILE *
-url_custom_fopen(char *url, bool forwrite, extvar_t *ev, CopyState pstate)
+url_custom_fopen(char *url,
+                 bool forwrite,
+                 extvar_t *ev,
+                 CopyState pstate,
+                 ExternalSelectDesc desc)
 {
 	/* we're using a custom protocol */
 	URL_CUSTOM_FILE   *file;
@@ -79,7 +87,7 @@ url_custom_fopen(char *url, bool forwrite, extvar_t *ev, CopyState pstate)
 										  ALLOCSET_DEFAULT_MAXSIZE);
 
 	oldcontext = MemoryContextSwitchTo(file->protcxt);
-		
+
 	file->protocol_udf = palloc(sizeof(FmgrInfo));
 	file->extprotocol = (ExtProtocolData *) palloc (sizeof(ExtProtocolData));
 
@@ -92,6 +100,7 @@ url_custom_fopen(char *url, bool forwrite, extvar_t *ev, CopyState pstate)
 	file->extprotocol->prot_last_call = false;
 	file->extprotocol->prot_url = NULL;
 	file->extprotocol->prot_databuf = NULL;
+	file->extprotocol->desc = desc;
 
 	pfree(prot_name);
 
@@ -141,33 +150,36 @@ url_custom_fwrite(void *ptr, size_t size, URL_FILE *file, CopyState pstate)
 	return (size_t) InvokeExtProtocol(ptr, size, cfile, pstate, false);
 }
 
-
 static int32
-InvokeExtProtocol(void *ptr, size_t nbytes, URL_CUSTOM_FILE *file, CopyState pstate,
-				  bool last_call)
+InvokeExtProtocol(void *ptr,
+                  size_t nbytes,
+                  URL_CUSTOM_FILE *file,
+                  CopyState pstate,
+                  bool last_call)
 {
-	FunctionCallInfoData	fcinfo;
-	ExtProtocolData *extprotocol = file->extprotocol;
-	FmgrInfo	   *extprotocol_udf = file->protocol_udf;
-	Datum					d;
-	MemoryContext			oldcontext;
+	FunctionCallInfoData fcinfo;
+	ExtProtocolData      *extprotocol     = file->extprotocol;
+	FmgrInfo             *extprotocol_udf = file->protocol_udf;
+	Datum                d;
+	MemoryContext        oldcontext;
 
 	/* must have been created during url_fopen() */
 	Assert(extprotocol);
-	
-	extprotocol->type = T_ExtProtocolData;
-	extprotocol->prot_url = file->common.url;
-	extprotocol->prot_relation = (last_call ? NULL : pstate->rel);
-	extprotocol->prot_databuf  = (last_call ? NULL : (char *)ptr);
-	extprotocol->prot_maxbytes = nbytes;
+
+	extprotocol->type           = T_ExtProtocolData;
+	extprotocol->prot_url       = file->common.url;
+	extprotocol->prot_relation  = (last_call ? NULL : pstate->rel);
+	extprotocol->prot_databuf   = (last_call ? NULL : (char *) ptr);
+	extprotocol->prot_maxbytes  = nbytes;
 	extprotocol->prot_last_call = last_call;
-	
+
 	InitFunctionCallInfoData(/* FunctionCallInfoData */ fcinfo,
 							 /* FmgrInfo */ extprotocol_udf,
 							 /* nArgs */ 0,
+							 /* collation */ InvalidOid,
 							 /* Call Context */ (Node *) extprotocol,
 							 /* ResultSetInfo */ NULL);
-	
+
 	/* invoke the protocol within a designated memory context */
 	oldcontext = MemoryContextSwitchTo(file->protcxt);
 	d = FunctionCallInvoke(&fcinfo);

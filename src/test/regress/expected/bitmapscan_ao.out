@@ -21,7 +21,7 @@ CREATE TABLE outer_table (
     purgedate date ENCODING (compresstype=None,compresslevel=1,blocksize=32768)
 )
 WITH (appendonly=true, orientation=column, compresstype=None) DISTRIBUTED BY (flex_value_id);
-set allow_system_table_mods="DML";
+set allow_system_table_mods=true;
 UPDATE pg_class
 SET
 	relpages = 1::int,
@@ -149,7 +149,7 @@ WHERE foo.fid = bar.flex_value_set_id;
  54321
 (2 rows)
 
--- double free mixed bitmap indexes (StreamBitmap with HashBitmap)
+-- double free mixed bitmap indexes (StreamBitmap with TIDBitmap)
 CREATE TABLE bmcrash (
     btree_col2 date DEFAULT now(),
     bitmap_col text NOT NULL,
@@ -157,7 +157,6 @@ CREATE TABLE bmcrash (
     dist_col serial
 )
 WITH (appendonly=true, compresslevel=5, compresstype=zlib) DISTRIBUTED BY (dist_col);
-NOTICE:  CREATE TABLE will create implicit sequence "bmcrash_dist_col_seq" for serial column "bmcrash.dist_col"
 CREATE INDEX bm_idx ON bmcrash USING bitmap (bitmap_col);
 CREATE INDEX bt_idx ON bmcrash USING btree (btree_col1);
 CREATE INDEX bt_idx_2 ON bmcrash USING btree (btree_col2);

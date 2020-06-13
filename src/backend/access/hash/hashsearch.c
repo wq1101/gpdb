@@ -3,19 +3,22 @@
  * hashsearch.c
  *	  search code for postgres hash tables
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/access/hash/hashsearch.c,v 1.51 2008/01/01 19:45:46 momjian Exp $
+ *	  src/backend/access/hash/hashsearch.c
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
 #include "access/hash.h"
+#include "access/relscan.h"
+#include "miscadmin.h"
 #include "pgstat.h"
+#include "utils/rel.h"
 
 
 /*
@@ -54,7 +57,7 @@ _hash_next(IndexScanDesc scan, ScanDirection dir)
 	_hash_checkpage(rel, buf, LH_BUCKET_PAGE | LH_OVERFLOW_PAGE);
 	page = BufferGetPage(buf);
 	itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, offnum));
-	scan->xs_ctup.t_self = itup->t_tid;
+	so->hashso_heappos = itup->t_tid;
 
 	return true;
 }
@@ -67,8 +70,6 @@ _hash_readnext(Relation rel,
 			   Buffer *bufp, Page *pagep, HashPageOpaque *opaquep)
 {
 	BlockNumber blkno;
-
-	MIRROREDLOCK_BUFMGR_MUST_ALREADY_BE_HELD;
 
 	blkno = (*opaquep)->hasho_nextblkno;
 	_hash_relbuf(rel, *bufp);
@@ -91,8 +92,6 @@ _hash_readprev(Relation rel,
 			   Buffer *bufp, Page *pagep, HashPageOpaque *opaquep)
 {
 	BlockNumber blkno;
-
-	MIRROREDLOCK_BUFMGR_MUST_ALREADY_BE_HELD;
 
 	blkno = (*opaquep)->hasho_prevblkno;
 	_hash_relbuf(rel, *bufp);
@@ -126,6 +125,8 @@ _hash_first(IndexScanDesc scan, ScanDirection dir)
 	uint32		hashkey;
 	Bucket		bucket;
 	BlockNumber blkno;
+	BlockNumber oldblkno = InvalidBuffer;
+	bool		retry = false;
 	Buffer		buf;
 	Buffer		metabuf;
 	Page		page;
@@ -134,8 +135,6 @@ _hash_first(IndexScanDesc scan, ScanDirection dir)
 	IndexTuple	itup;
 	ItemPointer current;
 	OffsetNumber offnum;
-
-	MIRROREDLOCK_BUFMGR_MUST_ALREADY_BE_HELD;
 
 	pgstat_count_index_scan(rel);
 
@@ -185,35 +184,55 @@ _hash_first(IndexScanDesc scan, ScanDirection dir)
 		hashkey = _hash_datum2hashkey_type(rel, cur->sk_argument,
 										   cur->sk_subtype);
 
-	/*
-	 * Acquire shared split lock so we can compute the target bucket safely
-	 * (see README).
-	 */
-	_hash_getlock(rel, 0, HASH_SHARE);
+	so->hashso_sk_hash = hashkey;
 
 	/* Read the metapage */
 	metabuf = _hash_getbuf(rel, HASH_METAPAGE, HASH_READ, LH_META_PAGE);
-	metap = (HashMetaPage) BufferGetPage(metabuf);
+	page = BufferGetPage(metabuf);
+	metap = HashPageGetMeta(page);
 
 	/*
-	 * Compute the target bucket number, and convert to block number.
+	 * Loop until we get a lock on the correct target bucket.
 	 */
-	bucket = _hash_hashkey2bucket(hashkey,
-								  metap->hashm_maxbucket,
-								  metap->hashm_highmask,
-								  metap->hashm_lowmask);
+	for (;;)
+	{
+		/*
+		 * Compute the target bucket number, and convert to block number.
+		 */
+		bucket = _hash_hashkey2bucket(hashkey,
+									  metap->hashm_maxbucket,
+									  metap->hashm_highmask,
+									  metap->hashm_lowmask);
 
-	blkno = BUCKET_TO_BLKNO(metap, bucket);
+		blkno = BUCKET_TO_BLKNO(metap, bucket);
+
+		/* Release metapage lock, but keep pin. */
+		_hash_chgbufaccess(rel, metabuf, HASH_READ, HASH_NOLOCK);
+
+		/*
+		 * If the previous iteration of this loop locked what is still the
+		 * correct target bucket, we are done.  Otherwise, drop any old lock
+		 * and lock what now appears to be the correct bucket.
+		 */
+		if (retry)
+		{
+			if (oldblkno == blkno)
+				break;
+			_hash_droplock(rel, oldblkno, HASH_SHARE);
+		}
+		_hash_getlock(rel, blkno, HASH_SHARE);
+
+		/*
+		 * Reacquire metapage lock and check that no bucket split has taken
+		 * place while we were awaiting the bucket lock.
+		 */
+		_hash_chgbufaccess(rel, metabuf, HASH_NOLOCK, HASH_READ);
+		oldblkno = blkno;
+		retry = true;
+	}
 
 	/* done with the metapage */
-	_hash_relbuf(rel, metabuf);
-
-	/*
-	 * Acquire share lock on target bucket; then we can release split lock.
-	 */
-	_hash_getlock(rel, blkno, HASH_SHARE);
-
-	_hash_droplock(rel, 0, HASH_SHARE);
+	_hash_dropbuf(rel, metabuf);
 
 	/* Update scan opaque state to show we have lock on the bucket */
 	so->hashso_bucket = bucket;
@@ -242,7 +261,7 @@ _hash_first(IndexScanDesc scan, ScanDirection dir)
 	_hash_checkpage(rel, buf, LH_BUCKET_PAGE | LH_OVERFLOW_PAGE);
 	page = BufferGetPage(buf);
 	itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, offnum));
-	scan->xs_ctup.t_self = itup->t_tid;
+	so->hashso_heappos = itup->t_tid;
 
 	return true;
 }
@@ -251,7 +270,7 @@ _hash_first(IndexScanDesc scan, ScanDirection dir)
  *	_hash_step() -- step to the next valid item in a scan in the bucket.
  *
  *		If no valid record exists in the requested direction, return
- *		false.	Else, return true and set the hashso_curpos for the
+ *		false.  Else, return true and set the hashso_curpos for the
  *		scan to the right thing.
  *
  *		'bufP' points to the current buffer, which is pinned and read-locked.
@@ -304,25 +323,39 @@ _hash_step(IndexScanDesc scan, Buffer *bufP, ScanDirection dir)
 				if (offnum != InvalidOffsetNumber)
 					offnum = OffsetNumberNext(offnum);	/* move forward */
 				else
-					offnum = FirstOffsetNumber; /* new page */
+				{
+					/* new page, locate starting position by binary search */
+					offnum = _hash_binsearch(page, so->hashso_sk_hash);
+				}
 
-				while (offnum > maxoff)
+				for (;;)
 				{
 					/*
-					 * either this page is empty (maxoff ==
-					 * InvalidOffsetNumber) or we ran off the end.
+					 * check if we're still in the range of items with the
+					 * target hash key
+					 */
+					if (offnum <= maxoff)
+					{
+						Assert(offnum >= FirstOffsetNumber);
+						itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, offnum));
+						if (so->hashso_sk_hash == _hash_get_indextuple_hashkey(itup))
+							break;		/* yes, so exit for-loop */
+					}
+
+					/*
+					 * ran off the end of this page, try the next
 					 */
 					_hash_readnext(rel, &buf, &page, &opaque);
 					if (BufferIsValid(buf))
 					{
 						maxoff = PageGetMaxOffsetNumber(page);
-						offnum = FirstOffsetNumber;
+						offnum = _hash_binsearch(page, so->hashso_sk_hash);
 					}
 					else
 					{
 						/* end of bucket */
-						maxoff = offnum = InvalidOffsetNumber;
-						break;	/* exit while */
+						itup = NULL;
+						break;	/* exit for-loop */
 					}
 				}
 				break;
@@ -331,22 +364,39 @@ _hash_step(IndexScanDesc scan, Buffer *bufP, ScanDirection dir)
 				if (offnum != InvalidOffsetNumber)
 					offnum = OffsetNumberPrev(offnum);	/* move back */
 				else
-					offnum = maxoff;	/* new page */
+				{
+					/* new page, locate starting position by binary search */
+					offnum = _hash_binsearch_last(page, so->hashso_sk_hash);
+				}
 
-				while (offnum < FirstOffsetNumber)
+				for (;;)
 				{
 					/*
-					 * either this page is empty (offnum ==
-					 * InvalidOffsetNumber) or we ran off the end.
+					 * check if we're still in the range of items with the
+					 * target hash key
+					 */
+					if (offnum >= FirstOffsetNumber)
+					{
+						Assert(offnum <= maxoff);
+						itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, offnum));
+						if (so->hashso_sk_hash == _hash_get_indextuple_hashkey(itup))
+							break;		/* yes, so exit for-loop */
+					}
+
+					/*
+					 * ran off the end of this page, try the next
 					 */
 					_hash_readprev(rel, &buf, &page, &opaque);
 					if (BufferIsValid(buf))
-						maxoff = offnum = PageGetMaxOffsetNumber(page);
+					{
+						maxoff = PageGetMaxOffsetNumber(page);
+						offnum = _hash_binsearch_last(page, so->hashso_sk_hash);
+					}
 					else
 					{
 						/* end of bucket */
-						maxoff = offnum = InvalidOffsetNumber;
-						break;	/* exit while */
+						itup = NULL;
+						break;	/* exit for-loop */
 					}
 				}
 				break;
@@ -354,11 +404,11 @@ _hash_step(IndexScanDesc scan, Buffer *bufP, ScanDirection dir)
 			default:
 				/* NoMovementScanDirection */
 				/* this should not be reached */
+				itup = NULL;
 				break;
 		}
 
-		/* we ran off the end of the world without finding a match */
-		if (offnum == InvalidOffsetNumber)
+		if (itup == NULL)
 		{
 			/* we ran off the end of the bucket without finding a match */
 			*bufP = so->hashso_curbuf = InvalidBuffer;
@@ -366,8 +416,7 @@ _hash_step(IndexScanDesc scan, Buffer *bufP, ScanDirection dir)
 			return false;
 		}
 
-		/* get ready to check this tuple */
-		itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, offnum));
+		/* check the tuple quals, loop around if not met */
 	} while (!_hash_checkqual(scan, itup));
 
 	/* if we made it to here, we've found a valid tuple */

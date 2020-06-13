@@ -3,9 +3,9 @@
  * syslogger.h
  *	  Exports from postmaster/syslogger.c.
  *
- * Copyright (c) 2004-2009, PostgreSQL Global Development Group
+ * Copyright (c) 2004-2016, PostgreSQL Global Development Group
  *
- * $PostgreSQL: pgsql/src/include/postmaster/syslogger.h,v 1.14 2008/01/01 19:45:58 momjian Exp $
+ * src/include/postmaster/syslogger.h
  *
  *-------------------------------------------------------------------------
  */
@@ -99,7 +99,6 @@ extern void syslogger_log_chunk_list(PipeProtoChunk *chunk);
 typedef struct
 {
 	pg_time_t session_start_time;
-	char send_alert;
 	char omit_location;
 	char gp_is_primary;
 	int32 gp_session_id;
@@ -171,6 +170,7 @@ extern int	Log_RotationSize;
 extern PGDLLIMPORT char *Log_directory;
 extern PGDLLIMPORT char *Log_filename;
 extern bool Log_truncate_on_rotation;
+extern int	Log_file_mode;
 extern int gp_log_format;
 
 extern bool am_syslogger;
@@ -193,7 +193,7 @@ extern void syslogger_write_int32(bool test0, const char *prefix, int32 i,
 extern int syslogger_write_str(const char *data, int len, bool amsyslogger, bool csv);
 
 #ifdef EXEC_BACKEND
-extern void SysLoggerMain(int argc, char *argv[]);
+extern void SysLoggerMain(int argc, char *argv[]) pg_attribute_noreturn();
 #endif
 
 #endif   /* _SYSLOGGER_H */

@@ -29,6 +29,8 @@ B125	Routine language MUMPS			NO
 B126	Routine language Pascal			NO	
 B127	Routine language PL/I			NO	
 B128	Routine language SQL			NO	
+B211	Module language Ada: VARCHAR and NUMERIC support			NO	
+B221	Routine language Ada: VARCHAR and NUMERIC support			NO	
 E011	Numeric data types			YES	
 E011	Numeric data types	01	INTEGER and SMALLINT data types	YES	
 E011	Numeric data types	02	REAL, DOUBLE PRECISION, and FLOAT data types	YES	
@@ -82,16 +84,16 @@ E071	Basic query expressions	02	UNION ALL table operator	YES
 E071	Basic query expressions	03	EXCEPT DISTINCT table operator	YES	
 E071	Basic query expressions	05	Columns combined via table operators need not have exactly the same data type	YES	
 E071	Basic query expressions	06	Table operators in subqueries	YES	
-E081	Basic Privileges			NO	
+E081	Basic Privileges			YES	
 E081	Basic Privileges	01	SELECT privilege	YES	
 E081	Basic Privileges	02	DELETE privilege	YES	
 E081	Basic Privileges	03	INSERT privilege at the table level	YES	
 E081	Basic Privileges	04	UPDATE privilege at the table level	YES	
-E081	Basic Privileges	05	UPDATE privilege at the column level	NO	
+E081	Basic Privileges	05	UPDATE privilege at the column level	YES	
 E081	Basic Privileges	06	REFERENCES privilege at the table level	YES	
-E081	Basic Privileges	07	REFERENCES privilege at the column level	NO	
+E081	Basic Privileges	07	REFERENCES privilege at the column level	YES	
 E081	Basic Privileges	08	WITH GRANT OPTION	YES	
-E081	Basic Privileges	09	USAGE privilege	NO	
+E081	Basic Privileges	09	USAGE privilege	YES	
 E081	Basic Privileges	10	EXECUTE privilege	YES	
 E091	Set functions			YES	
 E091	Set functions	01	AVG	YES	
@@ -111,8 +113,8 @@ E121	Basic cursor support	01	DECLARE CURSOR	YES
 E121	Basic cursor support	02	ORDER BY columns need not be in select list	YES	
 E121	Basic cursor support	03	Value expressions in ORDER BY clause	YES	
 E121	Basic cursor support	04	OPEN statement	YES	
-E121	Basic cursor support	06	Positioned UPDATE statement	NO	
-E121	Basic cursor support	07	Positioned DELETE statement	NO	
+E121	Basic cursor support	06	Positioned UPDATE statement	YES	
+E121	Basic cursor support	07	Positioned DELETE statement	YES	
 E121	Basic cursor support	08	CLOSE statement	YES	
 E121	Basic cursor support	10	FETCH statement implicit NEXT	YES	
 E121	Basic cursor support	17	WITH HOLD cursors	YES	
@@ -132,7 +134,7 @@ E151	Transaction support	02	ROLLBACK statement	YES
 E152	Basic SET TRANSACTION statement			YES	
 E152	Basic SET TRANSACTION statement	01	SET TRANSACTION statement: ISOLATION LEVEL SERIALIZABLE clause	YES	
 E152	Basic SET TRANSACTION statement	02	SET TRANSACTION statement: READ ONLY and READ WRITE clauses	YES	
-E153	Updatable queries with subqueries			NO	
+E153	Updatable queries with subqueries			YES	
 E161	SQL comments using leading double minus			YES	
 E171	SQLSTATE support			YES	
 E182	Module language			NO	
@@ -176,6 +178,7 @@ F051	Basic date and time	07	LOCALTIME	YES
 F051	Basic date and time	08	LOCALTIMESTAMP	YES	
 F052	Intervals and datetime arithmetic			YES	
 F053	OVERLAPS predicate			YES	
+F054	TIMESTAMP in DATE type precedence list			NO	
 F081	UNION and EXCEPT in views			YES	
 F111	Isolation levels other than SERIALIZABLE			YES	
 F111	Isolation levels other than SERIALIZABLE	01	READ UNCOMMITTED isolation level	NO	
@@ -210,7 +213,7 @@ F261	CASE expression	01	Simple CASE	YES
 F261	CASE expression	02	Searched CASE	YES	
 F261	CASE expression	03	NULLIF	YES	
 F261	CASE expression	04	COALESCE	YES	
-F262	Extended CASE expression			NO	
+F262	Extended CASE expression			YES	
 F263	Comma-separated predicates in simple CASE expression			NO	
 F271	Compound character literals			YES	
 F281	LIKE enhancements			YES	
@@ -224,27 +227,32 @@ F311	Schema definition statement			NO
 F311	Schema definition statement	01	CREATE SCHEMA	YES	
 F311	Schema definition statement	02	CREATE TABLE for persistent base tables	YES	
 F311	Schema definition statement	03	CREATE VIEW	YES	
-F311	Schema definition statement	04	CREATE VIEW: WITH CHECK OPTION	NO	
+F311	Schema definition statement	04	CREATE VIEW: WITH CHECK OPTION	YES	
 F311	Schema definition statement	05	GRANT statement	YES	
-F312	MERGE statement			NO	
+F312	MERGE statement			NO	consider INSERT ... ON CONFLICT DO UPDATE
 F313	Enhanced MERGE statement			NO	
+F314	MERGE statement with DELETE branch			NO	
 F321	User authorization			YES	
-F341	Usage tables			NO	
+F341	Usage tables			NO	no ROUTINE_*_USAGE tables
 F361	Subprogram support			YES	
 F381	Extended schema manipulation			YES	
 F381	Extended schema manipulation	01	ALTER TABLE statement: ALTER COLUMN clause	YES	
 F381	Extended schema manipulation	02	ALTER TABLE statement: ADD CONSTRAINT clause	YES	
 F381	Extended schema manipulation	03	ALTER TABLE statement: DROP CONSTRAINT clause	YES	
 F382	Alter column data type			YES	
+F383	Set column not null clause			YES	
+F384	Drop identity property clause			NO	
+F385	Drop column generation expression clause			NO	
+F386	Set identity column generation clause			NO	
 F391	Long identifiers			YES	
-F392	Unicode escapes in identifiers			NO	
-F393	Unicode escapes in literals			NO	
+F392	Unicode escapes in identifiers			YES	
+F393	Unicode escapes in literals			YES	
 F394	Optional normal form specification			NO	
 F401	Extended joined table			YES	
 F401	Extended joined table	01	NATURAL JOIN	YES	
 F401	Extended joined table	02	FULL OUTER JOIN	YES	
 F401	Extended joined table	04	CROSS JOIN	YES	
-F402	Named column joins for LOBs, arrays, and multisets			NO	
+F402	Named column joins for LOBs, arrays, and multisets			YES	
 F403	Partitioned joined tables			NO	
 F411	Time zone specification			YES	differences regarding literal interpretation
 F421	National character			YES	
@@ -262,6 +270,7 @@ F461	Named character sets			NO
 F471	Scalar subquery values			YES	
 F481	Expanded NULL predicate			YES	
 F491	Constraint management			YES	
+F492	Optional table constraint enforcement			NO	
 F501	Features and conformance views			YES	
 F501	Features and conformance views	01	SQL_FEATURES view	YES	
 F501	Features and conformance views	02	SQL_SIZING view	YES	
@@ -277,25 +286,25 @@ F561	Full value expressions			YES
 F571	Truth value tests			YES	
 F591	Derived tables			YES	
 F611	Indicator data types			YES	
-F641	Row and table constructors			NO	
+F641	Row and table constructors			YES	
 F651	Catalog name qualifiers			YES	
-F661	Simple tables			NO	
+F661	Simple tables			YES	
 F671	Subqueries in CHECK			NO	intentionally omitted
 F672	Retrospective check constraints			YES	
-F690	Collation support			NO	
-F692	Enhanced collation support			NO	
+F690	Collation support			YES	but no character set support
+F692	Extended collation support			YES	
 F693	SQL-session and client module collations			NO	
 F695	Translation support			NO	
 F696	Additional translation documentation			NO	
 F701	Referential update actions			NO	
 F711	ALTER domain			YES	
 F721	Deferrable constraints			NO	
-F731	INSERT column privileges			NO	
+F731	INSERT column privileges			YES	
 F741	Referential MATCH types			NO	no partial match yet
-F751	View CHECK enhancements			NO	
+F751	View CHECK enhancements			YES	
 F761	Session management			YES	
-F762	CURRENT_CATALOG			NO	
-F763	CURRENT_SCHEMA			NO	
+F762	CURRENT_CATALOG			YES	
+F763	CURRENT_SCHEMA			YES	
 F771	Connection management			YES	
 F781	Self-referencing operations			YES	
 F791	Insensitive cursors			YES	
@@ -307,26 +316,28 @@ F831	Full cursor update			NO
 F831	Full cursor update	01	Updatable scrollable cursors	NO	
 F831	Full cursor update	02	Updatable ordered cursors	NO	
 F841	LIKE_REGEX predicate			NO	
-F842	OCCURENCES_REGEX function			NO	
+F842	OCCURRENCES_REGEX function			NO	
 F843	POSITION_REGEX function			NO	
 F844	SUBSTRING_REGEX function			NO	
 F845	TRANSLATE_REGEX function			NO	
 F846	Octet support in regular expression operators			NO	
 F847	Nonconstant regular expressions			NO	
 F850	Top-level <order by clause> in <query expression>			YES	
-F851	<order by clause> in subqueries			NO	
-F852	Top-level <order by clause> in views			NO	
-F855	Nested <order by clause> in <query expression>			NO	
-F856	Nested <fetch first clause> in <query expression>			NO	
-F857	Top-level <fetch first clause> in <query expression>			NO	
-F858	<fetch first clause> in subqueries			NO	
-F859	Top-level <fetch first clause> in views			NO	
-F860	<fetch first row count> in <fetch first clause>			NO	
-F861	Top-level <result offset clause> in <query expression>			NO	
-F862	<result offset clause> in subqueries			NO	
-F863	Nested <result offset clause> in <query expression>			NO	
-F864	Top-level <result offset clause> in views			NO	
-F865	<offset row count> in <result offset clause>			NO	
+F851	<order by clause> in subqueries			YES	
+F852	Top-level <order by clause> in views			YES	
+F855	Nested <order by clause> in <query expression>			YES	
+F856	Nested <fetch first clause> in <query expression>			YES	
+F857	Top-level <fetch first clause> in <query expression>			YES	
+F858	<fetch first clause> in subqueries			YES	
+F859	Top-level <fetch first clause> in views			YES	
+F860	<fetch first row count> in <fetch first clause>			YES	
+F861	Top-level <result offset clause> in <query expression>			YES	
+F862	<result offset clause> in subqueries			YES	
+F863	Nested <result offset clause> in <query expression>			YES	
+F864	Top-level <result offset clause> in views			YES	
+F865	<offset row count> in <result offset clause>			YES	
+F866	FETCH FIRST clause: PERCENT option			NO	
+F867	FETCH FIRST clause: WITH TIES option			NO	
 S011	Distinct data types			NO	
 S011	Distinct data types	01	USER_DEFINED_TYPES view	NO	
 S023	Basic structured types			NO	
@@ -337,26 +348,26 @@ S027	Create method by specific method name			NO
 S028	Permutable UDT options list			NO	
 S041	Basic reference types			NO	
 S043	Enhanced reference types			NO	
-S051	Create table of type			NO	
+S051	Create table of type			NO	partially supported
 S071	SQL paths in function and type name resolution			YES	
 S081	Subtables			NO	
-S091	Basic array support			NO	
+S091	Basic array support			NO	partially supported
 S091	Basic array support	01	Arrays of built-in data types	NO	
 S091	Basic array support	02	Arrays of distinct types	NO	
 S091	Basic array support	03	Array expressions	NO	
-S092	Arrays of user-defined types			NO	
+S092	Arrays of user-defined types			YES	
 S094	Arrays of reference types			NO	
-S095	Array constructors by query			NO	
-S096	Optional array bounds			NO	
+S095	Array constructors by query			YES	
+S096	Optional array bounds			YES	
 S097	Array element assignment			NO	
-S098	ARRAY_AGG			NO	ORDER BY clause not supported
+S098	ARRAY_AGG			YES	
 S111	ONLY in query expressions			YES	
 S151	Type predicate			NO	
 S161	Subtype treatment			NO	
 S162	Subtype treatment for references			NO	
-S201	SQL-invoked routines on arrays			NO	
-S201	SQL-invoked routines on arrays	01	Array parameters	NO	
-S201	SQL-invoked routines on arrays	02	Array as result type of functions	NO	
+S201	SQL-invoked routines on arrays			YES	
+S201	SQL-invoked routines on arrays	01	Array parameters	YES	
+S201	SQL-invoked routines on arrays	02	Array as result type of functions	YES	
 S202	SQL-invoked routines on multisets			NO	
 S211	User-defined cast functions			YES	
 S231	Structured type locators			NO	
@@ -372,10 +383,10 @@ S274	Multisets of reference types			NO
 S275	Advanced multiset support			NO	
 S281	Nested collection types			NO	
 S291	Unique constraint on entire row			NO	
-S301	Enhanced UNNEST			NO	
+S301	Enhanced UNNEST			YES	
 S401	Distinct types based on array types			NO	
 S402	Distinct types based on distinct types			NO	
-S403	MAX_CARDINALITY			NO	
+S403	ARRAY_MAX_CARDINALITY			NO	
 S404	TRIM_ARRAY			NO	
 T011	Timestamp in Information Schema			NO	
 T021	BINARY and VARBINARY data types			NO	
@@ -397,15 +408,15 @@ T052	MAX and MIN for row types			NO
 T053	Explicit aliases for all-fields reference			NO	
 T061	UCS support			NO	
 T071	BIGINT data type			YES	
-T101	Enhanced nullability determiniation			NO	
+T101	Enhanced nullability determination			NO	
 T111	Updatable joins, unions, and columns			NO	
-T121	WITH (excluding RECURSIVE) in query expression			NO	
-T122	WITH (excluding RECURSIVE) in subquery			NO	
-T131	Recursive query			NO	
-T132	Recursive query in subquery			NO	
+T121	WITH (excluding RECURSIVE) in query expression			YES	
+T122	WITH (excluding RECURSIVE) in subquery			YES	
+T131	Recursive query			YES	
+T132	Recursive query in subquery			YES	
 T141	SIMILAR predicate			YES	
 T151	DISTINCT predicate			YES	
-T152	DISTINCT predicate with negation			NO	
+T152	DISTINCT predicate with negation			YES	
 T171	LIKE clause in table definition			YES	
 T172	AS subquery clause in table definition			YES	
 T173	Extended LIKE clause in table definition			YES	
@@ -414,6 +425,8 @@ T175	Generated columns			NO
 T176	Sequence generator support			NO	
 T177	Sequence generator support: simple restart option			NO	
 T178	Identity columns:  simple restart option			NO	
+T180	System-versioned tables			NO	
+T181	Application-time period tables			NO	
 T191	Referential action RESTRICT			NO	
 T201	Comparable data types for referential constraints			NO	
 T211	Basic trigger capability			NO	
@@ -433,9 +446,9 @@ T251	SET TRANSACTION statement: LOCAL option			NO
 T261	Chained transactions			NO	
 T271	Savepoints			YES	
 T272	Enhanced savepoint management			NO	
-T281	SELECT privilege with column granularity			NO	
+T281	SELECT privilege with column granularity			YES	
 T285	Enhanced derived column names			NO	
-T301	Functional dependencies			NO	
+T301	Functional dependencies			NO	partially supported
 T312	OVERLAY function			YES	
 T321	Basic SQL-invoked routines			NO	
 T321	Basic SQL-invoked routines	01	User-defined functions with no overloading	YES	
@@ -445,25 +458,30 @@ T321	Basic SQL-invoked routines	04	CALL statement	NO
 T321	Basic SQL-invoked routines	05	RETURN statement	NO	
 T321	Basic SQL-invoked routines	06	ROUTINES view	YES	
 T321	Basic SQL-invoked routines	07	PARAMETERS view	YES	
-T322	Overloading of SQL-invoked functions and procedures			YES	
+T322	Declared data type attributes			NO	
 T323	Explicit security for external routines			YES	
 T324	Explicit security for SQL routines			NO	
-T325	Qualified SQL parameter references			NO	
+T325	Qualified SQL parameter references			YES	
 T326	Table functions			NO	
-T331	Basic roles			NO	
-T332	Extended roles			NO	
+T331	Basic roles			YES	
+T332	Extended roles			NO	mostly supported
+T341	Overloading of SQL-invoked functions and procedures			YES	
 T351	Bracketed SQL comments (/*...*/ comments)			YES	
-T431	Extended grouping capabilities			NO	
-T432	Nested and concatenated GROUPING SETS			NO	
-T433	Multiargument GROUPING function			NO	
+T431	Extended grouping capabilities			YES	
+T432	Nested and concatenated GROUPING SETS			YES	
+T433	Multiargument GROUPING function			YES	
 T434	GROUP BY DISTINCT			NO	
 T441	ABS and MOD functions			YES	
 T461	Symmetric BETWEEN predicate			YES	
 T471	Result sets return value			NO	
-T491	LATERAL derived table			NO	
+T472	DESCRIBE CURSOR			NO	
+T491	LATERAL derived table			YES	
+T495	Combined data change and retrieval			NO	different syntax
 T501	Enhanced EXISTS predicate			NO	
+T502	Period predicates			NO	
 T511	Transaction counts			NO	
-T541	Updatable table references			NO	
+T521	Named arguments in CALL statement			NO	
+T522	Default values for IN parameters of SQL-invoked procedures			NO	supported except DEFAULT key word in invocation
 T551	Optional key words for default syntax			YES	
 T561	Holdable locators			NO	
 T571	Array-returning external SQL-invoked functions			NO	
@@ -473,29 +491,31 @@ T591	UNIQUE constraints of possibly null columns			YES
 T601	Local cursor references			NO	
 T611	Elementary OLAP operations			YES	
 T612	Advanced OLAP operations			NO	some forms supported
-T613	Sampling			NO	
+T613	Sampling			YES	
 T614	NTILE function			YES	
 T615	LEAD and LAG functions			YES	
 T616	Null treatment option for LEAD and LAG functions			NO	
 T617	FIRST_VALUE and LAST_VALUE function			YES	
 T618	NTH_VALUE function			NO	function exists, but some options missing
+T619	Nested window functions			NO	
+T620	WINDOW clause: GROUPS option			NO	
 T621	Enhanced numeric functions			YES	
-T631	IN predicate with one list element			NO	
+T631	IN predicate with one list element			YES	
 T641	Multiple column assignment			NO	only some syntax variants supported
-T651	SQL-schema statements in SQL routines			NO	
+T651	SQL-schema statements in SQL routines			YES	
 T652	SQL-dynamic statements in SQL routines			NO	
 T653	SQL-schema statements in external routines			NO	
 T654	SQL-dynamic statements in external routines			NO	
-T655	Cyclically dependent routines			NO	
+T655	Cyclically dependent routines			YES	
 M001	Datalinks			NO	
 M002	Datalinks via SQL/CLI			NO	
 M003	Datalinks via Embedded SQL			NO	
-M004	Foreign data support			NO	
+M004	Foreign data support			NO	partially supported
 M005	Foreign schema support			NO	
 M006	GetSQLString routine			NO	
 M007	TransmitRequest			NO	
 M009	GetOpts and GetStatistics routines			NO	
-M010	Foreign data wrapper support			NO	
+M010	Foreign data wrapper support			NO	different API
 M011	Datalinks via Ada			NO	
 M012	Datalinks via C			NO	
 M013	Datalinks via COBOL			NO	
@@ -504,7 +524,7 @@ M015	Datalinks via M			NO
 M016	Datalinks via Pascal			NO	
 M017	Datalinks via PL/I			NO	
 M018	Foreign data wrapper interface routines in Ada			NO	
-M019	Foreign data wrapper interface routines in C			NO	
+M019	Foreign data wrapper interface routines in C			NO	different API
 M020	Foreign data wrapper interface routines in COBOL			NO	
 M021	Foreign data wrapper interface routines in Fortran			NO	
 M022	Foreign data wrapper interface routines in MUMPS			NO	
@@ -519,15 +539,17 @@ X013	Distinct types of XML type			NO
 X014	Attributes of XML type			NO	
 X015	Fields of XML type			NO	
 X016	Persistent XML values			YES	
-X020	XML concatenation			YES	
+X020	XMLConcat			YES	
+X025	XMLCast			NO	
+X030	XMLDocument			NO	
 X031	XMLElement			YES	
 X032	XMLForest			YES	
-X033	XMLRoot			YES	
 X034	XMLAgg			YES	
-X035	XMLAgg: ORDER BY option			NO	
+X035	XMLAgg: ORDER BY option			YES	
 X036	XMLComment			YES	
 X037	XMLPI			YES	
 X038	XMLText			NO	
+X040	Basic table mapping			YES	
 X041	Basic table mapping: nulls absent			YES	
 X042	Basic table mapping: null as nil			YES	
 X043	Basic table mapping: table as forest			YES	
@@ -537,25 +559,25 @@ X046	Basic table mapping: data mapping			YES
 X047	Basic table mapping: metadata mapping			YES	
 X048	Basic table mapping: base64 encoding of binary strings			YES	
 X049	Basic table mapping: hex encoding of binary strings			YES	
+X050	Advanced table mapping			YES	
 X051	Advanced table mapping: nulls absent			YES	
 X052	Advanced table mapping: null as nil			YES	
 X053	Advanced table mapping: table as forest			YES	
 X054	Advanced table mapping: table as element			YES	
-X055	Advanced table mapping: target namespace			YES	
+X055	Advanced table mapping: with target namespace			YES	
 X056	Advanced table mapping: data mapping			YES	
 X057	Advanced table mapping: metadata mapping			YES	
 X058	Advanced table mapping: base64 encoding of binary strings			YES	
 X059	Advanced table mapping: hex encoding of binary strings			YES	
-X060	XMLParse: Character string input and CONTENT option			YES	
-X061	XMLParse: Character string input and DOCUMENT option			YES	
-X062	XMLParse: explicit WHITESPACE option			YES	
+X060	XMLParse: character string input and CONTENT option			YES	
+X061	XMLParse: character string input and DOCUMENT option			YES	
 X065	XMLParse: BLOB input and CONTENT option			NO	
 X066	XMLParse: BLOB input and DOCUMENT option			NO	
 X068	XMLSerialize: BOM			NO	
 X069	XMLSerialize: INDENT			NO	
-X070	XMLSerialize: Character string serialization and CONTENT option			YES	
-X071	XMLSerialize: Character string serialization and DOCUMENT option			YES	
-X072	XMLSerialize: Character string serialization			NO	
+X070	XMLSerialize: character string serialization and CONTENT option			YES	
+X071	XMLSerialize: character string serialization and DOCUMENT option			YES	
+X072	XMLSerialize: character string serialization			YES	
 X073	XMLSerialize: BLOB serialization and CONTENT option			NO	
 X074	XMLSerialize: BLOB serialization and DOCUMENT option			NO	
 X075	XMLSerialize: BLOB serialization			NO	
@@ -634,10 +656,10 @@ X271	XMLValidate: data-driven case			NO
 X272	XMLValidate: ACCORDING TO clause			NO	
 X273	XMLValidate: ELEMENT clause			NO	
 X274	XMLValidate: schema location			NO	
-X281	XMLValidate: with DOCUMENT option			NO	
+X281	XMLValidate with DOCUMENT option			NO	
 X282	XMLValidate with CONTENT option			NO	
 X283	XMLValidate with SEQUENCE option			NO	
-X284	XMLValidate NAMESPACE without ELEMENT clause			NO	
+X284	XMLValidate: NAMESPACE without ELEMENT clause			NO	
 X286	XMLValidate: NO NAMESPACE with ELEMENT clause			NO	
 X300	XMLTable			NO	
 X301	XMLTable: derived column list option			NO	
@@ -645,4 +667,5 @@ X302	XMLTable: ordinality column option			NO
 X303	XMLTable: column default option			NO	
 X304	XMLTable: passing a context item			NO	
 X305	XMLTable: initializing an XQuery variable			NO	
-X400	Name and identifier mapping			NO	
+X400	Name and identifier mapping			YES	
+X410	Alter column data type: XML type			YES	

@@ -36,20 +36,20 @@
  * to look like NO SCROLL cursors.
  *
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/utils/portal.h,v 1.78.2.1 2010/07/05 09:27:31 heikki Exp $
+ * src/include/utils/portal.h
  *
  *-------------------------------------------------------------------------
  */
 #ifndef PORTAL_H
 #define PORTAL_H
 
+#include "datatype/timestamp.h"
 #include "executor/execdesc.h"
+#include "utils/plancache.h"
 #include "utils/resowner.h"
-#include "utils/timestamp.h"
-#include "utils/tuplestore.h"
 
 /*
  * We have several execution strategies for Portals, depending on what
@@ -58,8 +58,8 @@
  * single result from the user's viewpoint.  However, the rule rewriter
  * may expand the single source query to zero or many actual queries.)
  *
- * PORTAL_ONE_SELECT: the portal contains one single SELECT query.	We run
- * the Executor incrementally as results are demanded.	This strategy also
+ * PORTAL_ONE_SELECT: the portal contains one single SELECT query.  We run
+ * the Executor incrementally as results are demanded.  This strategy also
  * supports holdable cursors (the Executor results can be dumped into a
  * tuplestore for access after transaction completion).
  *
@@ -71,6 +71,11 @@
  * suspension of the query partway through, because the AFTER TRIGGER code
  * can't cope, and also because we don't want to risk failing to execute
  * all the auxiliary queries.)
+ *
+ * PORTAL_ONE_MOD_WITH: the portal contains one single SELECT query, but
+ * it has data-modifying CTEs.  This is currently treated the same as the
+ * PORTAL_ONE_RETURNING case because of the possibility of needing to fire
+ * triggers.  It may act more like PORTAL_ONE_SELECT in future.
  *
  * PORTAL_UTIL_SELECT: the portal contains a utility statement that returns
  * a SELECT-like result (for example, EXPLAIN or SHOW).  On first execution,
@@ -84,6 +89,7 @@ typedef enum PortalStrategy
 {
 	PORTAL_ONE_SELECT,
 	PORTAL_ONE_RETURNING,
+	PORTAL_ONE_MOD_WITH,
 	PORTAL_UTIL_SELECT,
 	PORTAL_MULTI_QUERY
 } PortalStrategy;
@@ -104,10 +110,7 @@ typedef enum PortalStatus
 	PORTAL_FAILED				/* portal got error (can't re-run it) */
 } PortalStatus;
 
-/*
- * Note: typedef Portal is declared in tcop/dest.h as
- *		typedef struct PortalData *Portal;
- */
+typedef struct PortalData *Portal;
 
 typedef struct PortalData
 {
@@ -117,12 +120,16 @@ typedef struct PortalData
 	MemoryContext heap;			/* subsidiary memory for portal */
 	ResourceOwner resowner;		/* resources owned by portal */
 	void		(*cleanup) (Portal portal);		/* cleanup hook */
-	SubTransactionId createSubid;		/* the ID of the creating subxact */
 
 	/*
-	 * if createSubid is InvalidSubTransactionId, the portal is held over from
-	 * a previous transaction
+	 * State data for remembering which subtransaction(s) the portal was
+	 * created or used in.  If the portal is held over from a previous
+	 * transaction, both subxids are InvalidSubTransactionId.  Otherwise,
+	 * createSubid is the creating subxact and activeSubid is the last subxact
+	 * in which we ran the portal.
 	 */
+	SubTransactionId createSubid;		/* the creating subxact */
+	SubTransactionId activeSubid;		/* the last subxact with activity */
 
 	/*
 	 * if Resource Scheduling is enabled, we need to save the original
@@ -134,7 +141,7 @@ typedef struct PortalData
 	Oid			queueId;		/* Oid of queue locking this portal */
 
 	/* The query or queries the portal will execute */
-	const char *sourceText;		/* text of query (as of PlannedStmt, never NULL) */
+	const char *sourceText;		/* text of query (as of 8.4, never NULL) */
 	const char *commandTag;		/* command tag for original query */
 	List	   *stmts;			/* PlannedStmts and/or utility statements */
 	CachedPlan *cplan;			/* CachedPlan, if stmts are from one */
@@ -147,8 +154,8 @@ typedef struct PortalData
 
 	/* Status data */
 	PortalStatus status;		/* see above */
-	bool		releaseResLock;	/* true => resscheduler lock must be released */
 	bool		portalPinned;	/* a pinned portal can't be dropped */
+	bool		hasResQueueLock;	/* true => resscheduler lock must be released */
 
 	/* If not NULL, Executor is active; call ExecutorEnd eventually: */
 	QueryDesc  *queryDesc;		/* info needed for executor invocation */
@@ -169,18 +176,27 @@ typedef struct PortalData
 	MemoryContext holdContext;	/* memory containing holdStore */
 
 	/*
+	 * Snapshot under which tuples in the holdStore were read.  We must keep a
+	 * reference to this snapshot if there is any possibility that the tuples
+	 * contain TOAST references, because releasing the snapshot could allow
+	 * recently-dead rows to be vacuumed away, along with any toast data
+	 * belonging to them.  In the case of a held cursor, we avoid needing to
+	 * keep such a snapshot by forcibly detoasting the data.
+	 */
+	Snapshot	holdSnapshot;	/* registered snapshot, or NULL if none */
+
+	/*
 	 * atStart, atEnd and portalPos indicate the current cursor position.
 	 * portalPos is zero before the first row, N after fetching N'th row of
 	 * query.  After we run off the end, portalPos = # of rows in query, and
-	 * atEnd is true.  If portalPos overflows, set posOverflow (this causes us
-	 * to stop relying on its value for navigation).  Note that atStart
-	 * implies portalPos == 0, but not the reverse (portalPos could have
-	 * overflowed).
+	 * atEnd is true.  Note that atStart implies portalPos == 0, but not the
+	 * reverse: we might have backed up only as far as the first row, not to
+	 * the start.  Also note that various code inspects atStart and atEnd, but
+	 * only the portal movement routines should touch portalPos.
 	 */
 	bool		atStart;
 	bool		atEnd;
-	bool		posOverflow;
-	int64		portalPos;
+	uint64		portalPos;
 
 	/* Presentation data, primarily used by the pg_cursors system view */
 	TimestampTz creation_time;	/* time at which this portal was defined */
@@ -188,8 +204,7 @@ typedef struct PortalData
 
 	/* MPP: is this portal a CURSOR, or protocol level portal? */
 	bool		is_extended_query; /* simple or extended query protocol? */
-	bool		is_simply_updatable;
-} PortalData;
+}	PortalData;
 
 /*
  * PortalIsValid
@@ -207,9 +222,7 @@ typedef struct PortalData
 
 /* Prototypes for functions in utils/mmgr/portalmem.c */
 extern void EnablePortalManager(void);
-extern bool CommitHoldablePortals(void);
-extern bool PrepareHoldablePortals(void);
-extern void AtCommit_Portals(void);
+extern bool PreCommit_Portals(bool isPrepare);
 extern void AtAbort_Portals(void);
 extern void AtCleanup_Portals(void);
 extern void AtSubCommit_Portals(SubTransactionId mySubid,
@@ -217,12 +230,16 @@ extern void AtSubCommit_Portals(SubTransactionId mySubid,
 					ResourceOwner parentXactOwner);
 extern void AtSubAbort_Portals(SubTransactionId mySubid,
 				   SubTransactionId parentSubid,
+				   ResourceOwner myXactOwner,
 				   ResourceOwner parentXactOwner);
 extern void AtSubCleanup_Portals(SubTransactionId mySubid);
 extern Portal CreatePortal(const char *name, bool allowDup, bool dupSilent);
 extern Portal CreateNewPortal(void);
 extern void PinPortal(Portal portal);
 extern void UnpinPortal(Portal portal);
+extern void MarkPortalActive(Portal portal);
+extern void MarkPortalDone(Portal portal);
+extern void MarkPortalFailed(Portal portal);
 extern void PortalDrop(Portal portal, bool isTopCommit);
 extern Portal GetPortalByName(const char *name);
 extern void PortalDefineQuery(Portal portal,
@@ -235,6 +252,8 @@ extern void PortalDefineQuery(Portal portal,
 extern Node *PortalListGetPrimaryStmt(List *stmts);
 extern void PortalCreateHoldStore(Portal portal);
 extern void PortalHashTableDeleteAll(void);
+extern bool ThereAreNoReadyPortals(void);
+
 extern void AtExitCleanup_ResPortals(void);
 extern void TotalResPortalIncrements(int pid, Oid queueid,
 									 Cost *totalIncrements, int *num);

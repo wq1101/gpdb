@@ -26,7 +26,7 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $PostgreSQL: pgsql/contrib/pgcrypto/mbuf.c,v 1.5 2009/06/11 14:48:52 momjian Exp $
+ * contrib/pgcrypto/mbuf.c
  */
 
 #include "postgres.h"
@@ -136,7 +136,7 @@ mbuf_create(int len)
 }
 
 MBuf *
-mbuf_create_from_data(const uint8 *data, int len)
+mbuf_create_from_data(uint8 *data, int len)
 {
 	MBuf	   *mbuf;
 
@@ -311,7 +311,7 @@ pullf_read_max(PullFilter *pf, int len, uint8 **data_p, uint8 *tmpbuf)
 }
 
 /*
- * caller wants exatly len bytes and dont bother with references
+ * caller wants exactly len bytes and don't bother with references
  */
 int
 pullf_read_fixed(PullFilter *src, int len, uint8 *dst)

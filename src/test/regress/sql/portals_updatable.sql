@@ -37,6 +37,7 @@ SELECT * FROM uctest ORDER BY 1, 2, 3;
 COMMIT;
 SELECT * FROM uctest ORDER BY 1, 2, 3;
 
+
 -- 
 -- UPDATE ... WHERE CURRENT against SELECT ... FOR SHARE
 --
@@ -170,9 +171,6 @@ DECLARE c CURSOR FOR SELECT * FROM portals_updatable_rank_1_prt_extra WHERE rank
 DELETE FROM portals_updatable_rank WHERE CURRENT OF c;	-- error out on wrong table
 ROLLBACK;
 
--- Partitioning, negative, cursor-agnostic: cannot update distribution key
-UPDATE portals_updatable_rank SET id = id + 1 WHERE CURRENT OF c;
-
 -- Partitioning, negative, cursor-agnostic: cannot move tuple across partitions
 BEGIN;
 DECLARE c CURSOR FOR SELECT * FROM portals_updatable_rank WHERE rank = 1;
@@ -245,6 +243,7 @@ DROP TABLE aopart;
 CREATE TABLE aopart (LIKE portals_updatable_rank) WITH (appendonly=true) DISTRIBUTED BY (id);
 INSERT INTO aopart SELECT * FROM portals_updatable_rank_1_prt_11;
 ALTER TABLE portals_updatable_rank EXCHANGE PARTITION FOR (9) WITH TABLE aopart;
+ANALYZE portals_updatable_rank;
 BEGIN;
 DECLARE c CURSOR FOR SELECT * FROM portals_updatable_rank WHERE rank = 10;    -- isolate the remaining heap part
 FETCH 1 FROM c;
@@ -270,6 +269,14 @@ FETCH 1 FROM a;
 UPDATE bar SET d = -1000 WHERE CURRENT OF a;
 COMMIT;
 SELECT * FROM bar ORDER BY 1, 2, 3, 4;
+
+-- Partitioning, update distribution key
+BEGIN;
+DECLARE c CURSOR FOR SELECT * FROM portals_updatable_rank  WHERE rank = 10;
+FETCH 1 FROM c;
+UPDATE portals_updatable_rank SET id = id + 1 WHERE CURRENT OF c;
+COMMIT;
+SELECT * FROM portals_updatable_rank  ORDER BY 1, 2, 3;
 
 -- 
 -- Expected Failure
@@ -414,18 +421,15 @@ FETCH 1 FROM c1;
 DELETE FROM ucview WHERE CURRENT OF c1;
 ROLLBACK;
 
--- Negative, cursor-agnostic: cannot update distribution key
-UPDATE uctest SET f1 = f1 + 10 WHERE CURRENT OF a;
-
 -- Negative, cursor-agnostic: cannot update external tables
-CREATE EXTERNAL WEB TABLE foo (x text) EXECUTE 'echo "foo";' FORMAT 'TEXT';
+CREATE EXTERNAL WEB TABLE ucexttest (x text) EXECUTE 'echo "foo";' FORMAT 'TEXT';
 BEGIN;
-DECLARE c CURSOR FOR SELECT * FROM foo;
+DECLARE c CURSOR FOR SELECT * FROM ucexttest;
 FETCH 1 from c;
-UPDATE foo SET x = 'bar' WHERE CURRENT OF c;
+UPDATE ucexttest SET x = 'bar' WHERE CURRENT OF c;
 ROLLBACK;
 
-DROP EXTERNAL TABLE foo;
+DROP EXTERNAL TABLE ucexttest;
 
 -- Negative, cursor-agnostic: cannot update AO
 CREATE TEMP TABLE aotest (a int, b text)
@@ -442,3 +446,28 @@ BEGIN;
 DECLARE c CURSOR FOR SELECT * FROM aocotest;
 DELETE FROM aocotest WHERE CURRENT OF c;
 ROLLBACK;
+
+
+--
+-- PL/pgSQL cursors
+--
+
+-- Test that cursors opened in PL/pgSQL can also be updated.
+-- (Not supported by ORCA, as of this writing.)
+create temp table uctest3 as
+  select n as i, n as j from generate_series(1, 5) n distributed randomly;
+
+create or replace function plpgsql_uc_test() returns void as $$
+declare
+  c cursor for select * from uctest3 where i = 3;
+  r record;
+begin
+  open c;
+  fetch c into r;
+  raise notice '%, %', r.i, r.j;
+  update uctest3 set i = i * 100, j = r.j * 2 where current of c;
+end;
+$$ language plpgsql;
+
+select plpgsql_uc_test();
+select * from uctest3;

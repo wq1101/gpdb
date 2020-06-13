@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2010, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2016, PostgreSQL Global Development Group
  *
  * src/bin/psql/stringutils.c
  */
@@ -74,7 +74,7 @@ strtokx(const char *s,
 
 		/*
 		 * We may need extra space to insert delimiter nulls for adjacent
-		 * tokens.	2X the space is a gross overestimate, but it's unlikely
+		 * tokens.  2X the space is a gross overestimate, but it's unlikely
 		 * that this code will be used on huge strings anyway.
 		 */
 		storage = pg_malloc(2 * strlen(s) + 1);
@@ -104,7 +104,7 @@ strtokx(const char *s,
 	{
 		/*
 		 * If not at end of string, we need to insert a null to terminate the
-		 * returned token.	We can just overwrite the next character if it
+		 * returned token.  We can just overwrite the next character if it
 		 * happens to be in the whitespace set ... otherwise move over the
 		 * rest of the string to make room.  (This is why we allocated extra
 		 * space above).
@@ -158,7 +158,7 @@ strtokx(const char *s,
 
 		/*
 		 * If not at end of string, we need to insert a null to terminate the
-		 * returned token.	See notes above.
+		 * returned token.  See notes above.
 		 */
 		if (*p != '\0')
 		{
@@ -181,7 +181,7 @@ strtokx(const char *s,
 	}
 
 	/*
-	 * Otherwise no quoting character.	Scan till next whitespace, delimiter
+	 * Otherwise no quoting character.  Scan till next whitespace, delimiter
 	 * or quote.  NB: at this point, *start is known not to be '\0',
 	 * whitespace, delim, or quote, so we will consume at least one character.
 	 */
@@ -207,7 +207,7 @@ strtokx(const char *s,
 
 	/*
 	 * If not at end of string, we need to insert a null to terminate the
-	 * returned token.	See notes above.
+	 * returned token.  See notes above.
 	 */
 	if (*p != '\0')
 	{
@@ -242,8 +242,8 @@ strip_quotes(char *source, char quote, char escape, int encoding)
 	char	   *src;
 	char	   *dst;
 
-	psql_assert(source);
-	psql_assert(quote);
+	Assert(source != NULL);
+	Assert(quote != '\0');
 
 	src = dst = source;
 
@@ -268,4 +268,73 @@ strip_quotes(char *source, char quote, char escape, int encoding)
 	}
 
 	*dst = '\0';
+}
+
+
+/*
+ * quote_if_needed
+ *
+ * Opposite of strip_quotes().  If "source" denotes itself literally without
+ * quoting or escaping, returns NULL.  Otherwise, returns a malloc'd copy with
+ * quoting and escaping applied:
+ *
+ * source -			string to parse
+ * entails_quote -	any of these present?  need outer quotes
+ * quote -			doubled within string, affixed to both ends
+ * escape -			doubled within string
+ * encoding -		the active character-set encoding
+ *
+ * Do not use this as a substitute for PQescapeStringConn().  Use it for
+ * strings to be parsed by strtokx() or psql_scan_slash_option().
+ */
+char *
+quote_if_needed(const char *source, const char *entails_quote,
+				char quote, char escape, int encoding)
+{
+	const char *src;
+	char	   *ret;
+	char	   *dst;
+	bool		need_quotes = false;
+
+	Assert(source != NULL);
+	Assert(quote != '\0');
+
+	src = source;
+	dst = ret = pg_malloc(2 * strlen(src) + 3); /* excess */
+
+	*dst++ = quote;
+
+	while (*src)
+	{
+		char		c = *src;
+		int			i;
+
+		if (c == quote)
+		{
+			need_quotes = true;
+			*dst++ = quote;
+		}
+		else if (c == escape)
+		{
+			need_quotes = true;
+			*dst++ = escape;
+		}
+		else if (strchr(entails_quote, c))
+			need_quotes = true;
+
+		i = PQmblen(src, encoding);
+		while (i--)
+			*dst++ = *src++;
+	}
+
+	*dst++ = quote;
+	*dst = '\0';
+
+	if (!need_quotes)
+	{
+		free(ret);
+		ret = NULL;
+	}
+
+	return ret;
 }

@@ -16,18 +16,24 @@ top_builddir = ../..
 export enable_gpfdist
 export with_openssl
 
-MASTER_PORT ?= 15432
-PORT_BASE ?= 25432
+PORT_BASE ?= 7000
 NUM_PRIMARY_MIRROR_PAIRS ?= 3
+BLDWRAP_POSTGRES_CONF_ADDONS := fsync=off $(BLDWRAP_POSTGRES_CONF_ADDONS)
 
 ifeq ($(WITH_MIRRORS), )
 WITH_MIRRORS = true
 endif
 
-export MASTER_DEMO_PORT=$(MASTER_PORT)
+ifeq ($(WITH_MIRRORS), true)
+WITH_STANDBY = true
+endif
+
 export DEMO_PORT_BASE=$(PORT_BASE)
 export NUM_PRIMARY_MIRROR_PAIRS
 export WITH_MIRRORS
+export WITH_STANDBY
+export BLDWRAP_POSTGRES_CONF_ADDONS
+export DEFAULT_QD_MAX_CONNECT=150
 
 all:
 	$(MAKE) clean
@@ -36,18 +42,8 @@ all:
 	$(MAKE) probe
 
 cluster create-demo-cluster:
-ifeq ($(enable_segwalrep), yes)
-	@WITH_MIRRORS=false ./demo_cluster.sh # will generate gpdemo-env.sh
-	@if [[ $(WITH_MIRRORS) == true ]]; then \
-	 	. ./gpdemo-env.sh; \
-	 	./gpsegwalrep.py init --host `hostname`; \
-	 	./gpsegwalrep.py start; \
-	 fi
-	@echo ""
-else
 	@./demo_cluster.sh
 	@echo ""
-endif
 
 probe:
 	@./probe_config.sh

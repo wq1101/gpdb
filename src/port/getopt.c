@@ -1,4 +1,4 @@
-/* $PostgreSQL: pgsql/src/port/getopt.c,v 1.14 2009/06/11 14:49:15 momjian Exp $ */
+/* src/port/getopt.c */
 
 /* This is used by psql under Win32 */
 
@@ -21,7 +21,7 @@
  * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
  * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED.	IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
  * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
  * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
  * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
@@ -32,6 +32,8 @@
 
 #include "c.h"
 
+#include "pg_getopt.h"
+
 #if defined(LIBC_SCCS) && !defined(lint)
 static char sccsid[] = "@(#)getopt.c	8.3 (Berkeley) 4/27/95";
 #endif   /* LIBC_SCCS and not lint */
@@ -41,7 +43,7 @@ static char sccsid[] = "@(#)getopt.c	8.3 (Berkeley) 4/27/95";
  * On some versions of Solaris, opterr and friends are defined in core libc
  * rather than in a separate getopt module.  Define these variables only
  * if configure found they aren't there by default.  (We assume that testing
- * opterr is sufficient for all of these except optreset.)
+ * opterr is sufficient for all of these.)
  */
 #ifndef HAVE_INT_OPTERR
 
@@ -49,18 +51,7 @@ int			opterr = 1,			/* if error message should be printed */
 			optind = 1,			/* index into parent argv vector */
 			optopt;				/* character checked for validity */
 char	   *optarg;				/* argument associated with option */
-#else
 
-extern int	opterr;
-extern int	optind;
-extern int	optopt;
-extern char *optarg;
-#endif
-
-#ifndef HAVE_INT_OPTRESET
-int			optreset;			/* reset getopt */
-#else
-extern int	optreset;
 #endif
 
 #define BADCH	(int)'?'
@@ -70,19 +61,21 @@ extern int	optreset;
 /*
  * getopt
  *	Parse argc/argv argument vector.
+ *
+ * This implementation does not use optreset.  Instead, we guarantee that
+ * it can be restarted on a new argv array after a previous call returned -1,
+ * if the caller resets optind to 1 before the first call of the new series.
+ * (Internally, this means we must be sure to reset "place" to EMSG before
+ * returning -1.)
  */
 int
-getopt(nargc, nargv, ostr)
-int			nargc;
-char	   *const * nargv;
-const char *ostr;
+getopt(int nargc, char *const * nargv, const char *ostr)
 {
 	static char *place = EMSG;	/* option letter processing */
 	char	   *oli;			/* option letter list index */
 
-	if (optreset || !*place)
+	if (!*place)
 	{							/* update scanning pointer */
-		optreset = 0;
 		if (optind >= nargc || *(place = nargv[optind]) != '-')
 		{
 			place = EMSG;
@@ -102,7 +95,10 @@ const char *ostr;
 		 * if the user didn't specify '-' as an option, assume it means -1.
 		 */
 		if (optopt == (int) '-')
+		{
+			place = EMSG;
 			return -1;
+		}
 		if (!*place)
 			++optind;
 		if (opterr && *ostr != ':')

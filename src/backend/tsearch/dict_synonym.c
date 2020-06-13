@@ -3,11 +3,11 @@
  * dict_synonym.c
  *		Synonym dictionary: replace word by its synonym
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/tsearch/dict_synonym.c,v 1.7.2.1 2008/06/18 20:55:49 tgl Exp $
+ *	  src/backend/tsearch/dict_synonym.c
  *
  *-------------------------------------------------------------------------
  */
@@ -15,31 +15,35 @@
 
 #include "commands/defrem.h"
 #include "tsearch/ts_locale.h"
-#include "tsearch/ts_public.h"
 #include "tsearch/ts_utils.h"
-#include "utils/builtins.h"
 
 typedef struct
 {
 	char	   *in;
 	char	   *out;
+	int			outlen;
+	uint16		flags;
 } Syn;
 
 typedef struct
 {
 	int			len;			/* length of syn array */
 	Syn		   *syn;
+	bool		case_sensitive;
 } DictSyn;
 
 /*
  * Finds the next whitespace-delimited word within the 'in' string.
  * Returns a pointer to the first character of the word, and a pointer
  * to the next byte after the last character in the word (in *end).
+ * Character '*' at the end of word will not be threated as word
+ * character if flags is not null.
  */
 static char *
-findwrd(char *in, char **end)
+findwrd(char *in, char **end, uint16 *flags)
 {
 	char	   *start;
+	char	   *lastchar;
 
 	/* Skip leading spaces */
 	while (*in && t_isspace(in))
@@ -52,20 +56,34 @@ findwrd(char *in, char **end)
 		return NULL;
 	}
 
-	start = in;
+	lastchar = start = in;
 
 	/* Find end of word */
 	while (*in && !t_isspace(in))
+	{
+		lastchar = in;
 		in += pg_mblen(in);
+	}
 
-	*end = in;
+	if (in - lastchar == 1 && t_iseq(lastchar, '*') && flags)
+	{
+		*flags = TSL_PREFIX;
+		*end = lastchar;
+	}
+	else
+	{
+		if (flags)
+			*flags = 0;
+		*end = in;
+	}
+
 	return start;
 }
 
 static int
 compareSyn(const void *a, const void *b)
 {
-	return strcmp(((Syn *) a)->in, ((Syn *) b)->in);
+	return strcmp(((const Syn *) a)->in, ((const Syn *) b)->in);
 }
 
 
@@ -76,12 +94,14 @@ dsynonym_init(PG_FUNCTION_ARGS)
 	DictSyn    *d;
 	ListCell   *l;
 	char	   *filename = NULL;
+	bool		case_sensitive = false;
 	tsearch_readline_state trst;
 	char	   *starti,
 			   *starto,
 			   *end = NULL;
 	int			cur = 0;
 	char	   *line = NULL;
+	uint16		flags = 0;
 
 	foreach(l, dictoptions)
 	{
@@ -89,6 +109,8 @@ dsynonym_init(PG_FUNCTION_ARGS)
 
 		if (pg_strcasecmp("Synonyms", defel->defname) == 0)
 			filename = defGetString(defel);
+		else if (pg_strcasecmp("CaseSensitive", defel->defname) == 0)
+			case_sensitive = defGetBoolean(defel);
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -113,7 +135,7 @@ dsynonym_init(PG_FUNCTION_ARGS)
 
 	while ((line = tsearch_readline(&trst)) != NULL)
 	{
-		starti = findwrd(line, &end);
+		starti = findwrd(line, &end, NULL);
 		if (!starti)
 		{
 			/* Empty line */
@@ -126,7 +148,7 @@ dsynonym_init(PG_FUNCTION_ARGS)
 		}
 		*end = '\0';
 
-		starto = findwrd(end + 1, &end);
+		starto = findwrd(end + 1, &end, &flags);
 		if (!starto)
 		{
 			/* A line with only one word (+whitespace). Ignore silently. */
@@ -153,8 +175,19 @@ dsynonym_init(PG_FUNCTION_ARGS)
 			}
 		}
 
-		d->syn[cur].in = lowerstr(starti);
-		d->syn[cur].out = lowerstr(starto);
+		if (case_sensitive)
+		{
+			d->syn[cur].in = pstrdup(starti);
+			d->syn[cur].out = pstrdup(starto);
+		}
+		else
+		{
+			d->syn[cur].in = lowerstr(starti);
+			d->syn[cur].out = lowerstr(starto);
+		}
+
+		d->syn[cur].outlen = strlen(starto);
+		d->syn[cur].flags = flags;
 
 		cur++;
 
@@ -166,6 +199,8 @@ skipline:
 
 	d->len = cur;
 	qsort(d->syn, d->len, sizeof(Syn), compareSyn);
+
+	d->case_sensitive = case_sensitive;
 
 	PG_RETURN_POINTER(d);
 }
@@ -184,7 +219,11 @@ dsynonym_lexize(PG_FUNCTION_ARGS)
 	if (len <= 0 || d->len <= 0)
 		PG_RETURN_POINTER(NULL);
 
-	key.in = lowerstr_with_len(in, len);
+	if (d->case_sensitive)
+		key.in = pnstrdup(in, len);
+	else
+		key.in = lowerstr_with_len(in, len);
+
 	key.out = NULL;
 
 	found = (Syn *) bsearch(&key, d->syn, d->len, sizeof(Syn), compareSyn);
@@ -194,7 +233,8 @@ dsynonym_lexize(PG_FUNCTION_ARGS)
 		PG_RETURN_POINTER(NULL);
 
 	res = palloc0(sizeof(TSLexeme) * 2);
-	res[0].lexeme = pstrdup(found->out);
+	res[0].lexeme = pnstrdup(found->out, found->outlen);
+	res[0].flags = found->flags;
 
 	PG_RETURN_POINTER(res);
 }

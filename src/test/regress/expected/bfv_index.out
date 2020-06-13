@@ -30,7 +30,7 @@ explain select * from bfv_tab1, (values(147, 'RFAAAA'), (931, 'VJAAAA')) as v (i
          ->  Seq Scan on bfv_tab1  (cost=0.00..219.00 rows=3967 width=244)
          ->  Hash  (cost=0.03..0.03 rows=1 width=36)
                ->  Values Scan on "*VALUES*"  (cost=0.00..0.03 rows=1 width=36)
- Optimizer status: legacy query optimizer
+ Optimizer status: Postgres query optimizer
 (7 rows)
 
 set gp_enable_relsize_collection=on;
@@ -45,7 +45,7 @@ explain select * from bfv_tab1, (values(147, 'RFAAAA'), (931, 'VJAAAA')) as v (i
          ->  Hash  (cost=0.00..0.00 rows=1 width=244)
                ->  Seq Scan on bfv_tab1  (cost=0.00..0.00 rows=1 width=244)
  Settings:  gp_enable_relsize_collection=on
- Optimizer status: legacy query optimizer
+ Optimizer status: Postgres query optimizer
 (8 rows)
 
 reset gp_enable_relsize_collection;
@@ -57,6 +57,7 @@ NOTICE:  table "bfv_tab2_dimdate" does not exist, skipping
 DROP TABLE IF EXISTS bfv_tab2_dimtabl1;
 NOTICE:  table "bfv_tab2_dimtabl1" does not exist, skipping
 --end_ignore
+-- Bug-fix verification for MPP-25537: PANIC when bitmap index used in ORCA select
 CREATE TABLE bfv_tab2_facttable1 (
 col1 integer,
 wk_id smallint,
@@ -147,46 +148,93 @@ explain SELECT count(*)
 FROM bfv_tab2_facttable1 ft, bfv_tab2_dimdate dt, bfv_tab2_dimtabl1 dt1
 WHERE ft.wk_id = dt.wk_id
 AND ft.id = dt1.id;
-                                                                 QUERY PLAN                                                                 
---------------------------------------------------------------------------------------------------------------------------------------------
- Aggregate  (cost=27.51..27.52 rows=1 width=8)
-   ->  Gather Motion 3:1  (slice3; segments: 3)  (cost=27.44..27.49 rows=1 width=8)
-         ->  Aggregate  (cost=27.44..27.45 rows=1 width=8)
-               ->  Hash Join  (cost=6.84..27.43 rows=2 width=0)
-                     Hash Cond: ft.wk_id = dt.wk_id
-                     ->  Redistribute Motion 3:3  (slice2; segments: 3)  (cost=3.61..24.14 rows=3 width=2)
+                                                         QUERY PLAN                                                         
+----------------------------------------------------------------------------------------------------------------------------
+ Finalize Aggregate  (cost=27.43..27.44 rows=1 width=8)
+   ->  Gather Motion 3:1  (slice3; segments: 3)  (cost=27.39..27.42 rows=1 width=8)
+         ->  Partial Aggregate  (cost=27.39..27.40 rows=1 width=8)
+               ->  Hash Join  (cost=6.84..27.39 rows=2 width=0)
+                     Hash Cond: (ft.wk_id = dt.wk_id)
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)  (cost=3.61..24.10 rows=3 width=2)
                            Hash Key: ft.wk_id
-                           ->  Hash Join  (cost=3.61..23.99 rows=3 width=2)
-                                 Hash Cond: ft.id = dt1.id
+                           ->  Hash Join  (cost=3.61..23.96 rows=3 width=2)
+                                 Hash Cond: (ft.id = dt1.id)
                                  ->  Append  (cost=0.00..20.20 rows=7 width=6)
-                                       ->  Append-only Columnar Scan on bfv_tab2_facttable1_1_prt_dflt ft  (cost=0.00..1.00 rows=1 width=6)
-                                       ->  Append-only Columnar Scan on bfv_tab2_facttable1_1_prt_2 ft  (cost=0.00..1.01 rows=1 width=6)
-                                       ->  Append-only Columnar Scan on bfv_tab2_facttable1_1_prt_3 ft  (cost=0.00..1.01 rows=1 width=6)
-                                       ->  Append-only Columnar Scan on bfv_tab2_facttable1_1_prt_4 ft  (cost=0.00..1.01 rows=1 width=6)
-                                       ->  Append-only Columnar Scan on bfv_tab2_facttable1_1_prt_5 ft  (cost=0.00..1.01 rows=1 width=6)
-                                       ->  Append-only Columnar Scan on bfv_tab2_facttable1_1_prt_6 ft  (cost=0.00..1.01 rows=1 width=6)
-                                       ->  Append-only Columnar Scan on bfv_tab2_facttable1_1_prt_7 ft  (cost=0.00..1.01 rows=1 width=6)
-                                       ->  Append-only Columnar Scan on bfv_tab2_facttable1_1_prt_8 ft  (cost=0.00..1.01 rows=1 width=6)
-                                       ->  Append-only Columnar Scan on bfv_tab2_facttable1_1_prt_9 ft  (cost=0.00..1.01 rows=1 width=6)
-                                       ->  Append-only Columnar Scan on bfv_tab2_facttable1_1_prt_10 ft  (cost=0.00..1.01 rows=1 width=6)
-                                       ->  Append-only Columnar Scan on bfv_tab2_facttable1_1_prt_11 ft  (cost=0.00..1.01 rows=1 width=6)
-                                       ->  Append-only Columnar Scan on bfv_tab2_facttable1_1_prt_12 ft  (cost=0.00..1.01 rows=1 width=6)
-                                       ->  Append-only Columnar Scan on bfv_tab2_facttable1_1_prt_13 ft  (cost=0.00..1.01 rows=1 width=6)
-                                       ->  Append-only Columnar Scan on bfv_tab2_facttable1_1_prt_14 ft  (cost=0.00..1.01 rows=1 width=6)
-                                       ->  Append-only Columnar Scan on bfv_tab2_facttable1_1_prt_15 ft  (cost=0.00..1.01 rows=1 width=6)
-                                       ->  Append-only Columnar Scan on bfv_tab2_facttable1_1_prt_16 ft  (cost=0.00..1.01 rows=1 width=6)
-                                       ->  Append-only Columnar Scan on bfv_tab2_facttable1_1_prt_17 ft  (cost=0.00..1.01 rows=1 width=6)
-                                       ->  Append-only Columnar Scan on bfv_tab2_facttable1_1_prt_18 ft  (cost=0.00..1.01 rows=1 width=6)
-                                       ->  Append-only Columnar Scan on bfv_tab2_facttable1_1_prt_19 ft  (cost=0.00..1.01 rows=1 width=6)
-                                       ->  Append-only Columnar Scan on bfv_tab2_facttable1_1_prt_20 ft  (cost=0.00..1.02 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_dflt ft  (cost=0.00..1.00 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_2 ft_1  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_3 ft_2  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_4 ft_3  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_5 ft_4  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_6 ft_5  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_7 ft_6  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_8 ft_7  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_9 ft_8  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_10 ft_9  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_11 ft_10  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_12 ft_11  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_13 ft_12  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_14 ft_13  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_15 ft_14  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_16 ft_15  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_17 ft_16  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_18 ft_17  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_19 ft_18  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_20 ft_19  (cost=0.00..1.02 rows=1 width=6)
                                  ->  Hash  (cost=3.35..3.35 rows=7 width=4)
                                        ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..3.35 rows=7 width=4)
                                              ->  Seq Scan on bfv_tab2_dimtabl1 dt1  (cost=0.00..3.07 rows=3 width=4)
                      ->  Hash  (cost=3.10..3.10 rows=4 width=2)
                            ->  Seq Scan on bfv_tab2_dimdate dt  (cost=0.00..3.10 rows=4 width=2)
- Optimizer status: legacy query optimizer
+ Optimizer: Postgres query optimizer
 (36 rows)
 
+-- experimental cost model guc generates bitmap scan
+set optimizer_cost_model=experimental;
+explain SELECT count(*)
+FROM bfv_tab2_facttable1 ft, bfv_tab2_dimdate dt, bfv_tab2_dimtabl1 dt1
+WHERE ft.wk_id = dt.wk_id
+AND ft.id = dt1.id;
+                                                         QUERY PLAN                                                         
+----------------------------------------------------------------------------------------------------------------------------
+ Finalize Aggregate  (cost=27.40..27.41 rows=1 width=8)
+   ->  Gather Motion 3:1  (slice1; segments: 3)  (cost=27.37..27.40 rows=1 width=8)
+         ->  Partial Aggregate  (cost=27.37..27.38 rows=1 width=8)
+               ->  Hash Join  (cost=6.84..27.36 rows=2 width=0)
+                     Hash Cond: (ft.wk_id = dt.wk_id)
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)  (cost=3.61..24.08 rows=3 width=2)
+                           Hash Key: ft.wk_id
+                           ->  Hash Join  (cost=3.61..23.94 rows=3 width=2)
+                                 Hash Cond: (ft.id = dt1.id)
+                                 ->  Append  (cost=0.00..20.20 rows=7 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_dflt ft  (cost=0.00..1.00 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_2 ft_1  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_3 ft_2  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_4 ft_3  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_5 ft_4  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_6 ft_5  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_7 ft_6  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_8 ft_7  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_9 ft_8  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_10 ft_9  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_11 ft_10  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_12 ft_11  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_13 ft_12  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_14 ft_13  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_15 ft_14  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_16 ft_15  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_17 ft_16  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_18 ft_17  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_19 ft_18  (cost=0.00..1.01 rows=1 width=6)
+                                       ->  Seq Scan on bfv_tab2_facttable1_1_prt_20 ft_19  (cost=0.00..1.02 rows=1 width=6)
+                                 ->  Hash  (cost=3.35..3.35 rows=7 width=4)
+                                       ->  Broadcast Motion 3:3  (slice3; segments: 3)  (cost=0.00..3.35 rows=7 width=4)
+                                             ->  Seq Scan on bfv_tab2_dimtabl1 dt1  (cost=0.00..3.07 rows=3 width=4)
+                     ->  Hash  (cost=3.10..3.10 rows=4 width=2)
+                           ->  Seq Scan on bfv_tab2_dimdate dt  (cost=0.00..3.10 rows=4 width=2)
+ Optimizer: Postgres query optimizer
+(36 rows)
+
+reset optimizer_cost_model;
 -- start_ignore
 create language plpythonu;
 ERROR:  language "plpythonu" already exists
@@ -437,7 +485,7 @@ select * from Tbl23383_partitioned where c='1';
 drop table Tbl23383_partitioned;
 -- end_ignore
 reset enable_seqscan;
--- when optimizer is on PG exception raised during DXL->PlStmt translation for IndexScan query
+-- negative test: due to non compatible cast and CXformGet2TableScan disabled no index plan possible, fallback to planner
 -- start_ignore
 drop table if exists tbl_ab;
 NOTICE:  table "tbl_ab" does not exist, skipping
@@ -460,8 +508,220 @@ explain select * from tbl_ab where b::oid=1;
  Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..1176.25 rows=87 width=8)
    ->  Seq Scan on tbl_ab  (cost=0.00..1176.25 rows=29 width=8)
          Filter: b::oid = 1::oid
- Optimizer status: legacy query optimizer
+ Optimizer status: Postgres query optimizer
 (4 rows)
 
 drop table tbl_ab;
 drop function count_index_scans(text);
+-- start_ignore
+select enable_xform('CXformGet2TableScan');
+          enable_xform          
+--------------------------------
+ CXformGet2TableScan is enabled
+(1 row)
+
+-- end_ignore
+--
+-- Check that ORCA can use an index for joins on quals like:
+--
+-- indexkey CMP expr
+-- expr CMP indexkey
+--
+-- where expr is a scalar expression free of index keys and may have outer
+-- references.
+--
+create table nestloop_x (i int, j int) distributed by (i);
+create table nestloop_y (i int, j int) distributed by (i);
+insert into nestloop_x select g, g from generate_series(1, 20) g;
+insert into nestloop_y select g, g from generate_series(1, 7) g;
+create index nestloop_y_idx on nestloop_y (j);
+-- Coerce the Postgres planner to produce a similar plan. Nested loop joins
+-- are not enabled by default. And to dissuade it from choosing a sequential
+-- scan, bump up the cost. enable_seqscan=off  won't help, because there is
+-- no other way to scan table 'x', and once the planner chooses a seqscan for
+-- one table, it will happily use a seqscan for other tables as well, despite
+-- enable_seqscan=off. (On PostgreSQL, enable_seqscan works differently, and
+-- just bumps up the cost of a seqscan, so it would work there.)
+set seq_page_cost=10000000;
+set enable_indexscan=on;
+set enable_nestloop=on;
+explain select * from nestloop_x as x, nestloop_y as y where x.i + x.j < y.j;
+                                            QUERY PLAN                                             
+---------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice2; segments: 3)  (cost=0.00..30030626.55 rows=47 width=16)
+   ->  Nested Loop  (cost=0.00..30030626.55 rows=16 width=16)
+         ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..30000001.00 rows=20 width=8)
+               ->  Seq Scan on nestloop_x x  (cost=0.00..30000000.20 rows=7 width=8)
+         ->  Index Scan using nestloop_y_idx on nestloop_y y  (cost=0.00..510.39 rows=1 width=8)
+               Index Cond: (x.i + x.j) < y.j
+ Settings:  enable_indexscan=on; enable_nestloop=on; optimizer=off; seq_page_cost=1e+07
+ Optimizer status: Postgres query optimizer
+(8 rows)
+
+select * from nestloop_x as x, nestloop_y as y where x.i + x.j < y.j;
+ i | j | i | j 
+---+---+---+---
+ 1 | 1 | 3 | 3
+ 1 | 1 | 4 | 4
+ 1 | 1 | 5 | 5
+ 1 | 1 | 6 | 6
+ 1 | 1 | 7 | 7
+ 2 | 2 | 5 | 5
+ 2 | 2 | 6 | 6
+ 2 | 2 | 7 | 7
+ 3 | 3 | 7 | 7
+(9 rows)
+
+explain select * from nestloop_x as x, nestloop_y as y where y.j > x.i + x.j + 2;
+                                            QUERY PLAN                                             
+---------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice2; segments: 3)  (cost=0.00..30030627.05 rows=47 width=16)
+   ->  Nested Loop  (cost=0.00..30030627.05 rows=16 width=16)
+         ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..30000001.00 rows=20 width=8)
+               ->  Seq Scan on nestloop_x x  (cost=0.00..30000000.20 rows=7 width=8)
+         ->  Index Scan using nestloop_y_idx on nestloop_y y  (cost=0.00..510.39 rows=1 width=8)
+               Index Cond: y.j > (x.i + x.j + 2)
+ Settings:  enable_indexscan=on; enable_nestloop=on; optimizer=off; seq_page_cost=1e+07
+ Optimizer status: Postgres query optimizer
+(8 rows)
+
+select * from nestloop_x as x, nestloop_y as y where y.j > x.i + x.j + 2;
+ i | j | i | j 
+---+---+---+---
+ 1 | 1 | 5 | 5
+ 1 | 1 | 6 | 6
+ 1 | 1 | 7 | 7
+ 2 | 2 | 7 | 7
+(4 rows)
+
+drop table nestloop_x, nestloop_y;
+SET enable_seqscan = OFF;
+SET enable_indexscan = ON;
+DROP TABLE IF EXISTS bpchar_ops;
+CREATE TABLE bpchar_ops(id INT8, v char(10)) DISTRIBUTED BY(id);
+CREATE INDEX bpchar_ops_btree_idx ON bpchar_ops USING btree(v bpchar_pattern_ops);
+INSERT INTO bpchar_ops VALUES (0, 'row');
+SELECT * FROM bpchar_ops WHERE v = 'row '::char(20);
+ id |     v      
+----+------------
+  0 | row       
+(1 row)
+
+DROP TABLE bpchar_ops;
+--
+-- Test index rechecks with AO and AOCS tables (and heaps as well, for good measure)
+--
+create table shape_heap (c circle) with (appendonly=false);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, and no column type is suitable for a distribution key. Creating a NULL policy entry.
+create table shape_ao (c circle) with (appendonly=true, orientation=row);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, and no column type is suitable for a distribution key. Creating a NULL policy entry.
+create table shape_aocs (c circle) with (appendonly=true, orientation=column);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, and no column type is suitable for a distribution key. Creating a NULL policy entry.
+insert into shape_heap values ('<(0,0), 5>');
+insert into shape_ao   values ('<(0,0), 5>');
+insert into shape_aocs values ('<(0,0), 5>');
+create index shape_heap_bb_idx on shape_heap using gist(c);
+create index shape_ao_bb_idx   on shape_ao   using gist(c);
+create index shape_aocs_bb_idx on shape_aocs using gist(c);
+select c && '<(5,5), 1>'::circle,
+       c && '<(5,5), 2>'::circle,
+       c && '<(5,5), 3>'::circle
+from shape_heap;
+ ?column? | ?column? | ?column? 
+----------+----------+----------
+ f        | f        | t
+(1 row)
+
+-- Test the same values with (bitmap) index scans
+--
+-- The first two values don't overlap with the value in the tables, <(0,0), 5>,
+-- but their bounding boxes do. In a GiST index scan that uses the bounding
+-- boxes, these will fetch the row from the index, but filtered out by the
+-- recheck using the actual overlap operator. The third entry is sanity check
+-- that the index returns any rows.
+set enable_seqscan=off;
+set enable_indexscan=off;
+set enable_bitmapscan=on;
+-- Use EXPLAIN to verify that these use a bitmap index scan
+explain select * from shape_heap where c && '<(5,5), 1>'::circle;
+                                       QUERY PLAN                                       
+----------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=101.26..201.27 rows=1 width=24)
+   ->  Bitmap Heap Scan on shape_heap  (cost=101.26..201.27 rows=1 width=24)
+         Recheck Cond: c && '<(5,5),1>'::circle
+         ->  Bitmap Index Scan on shape_heap_bb_idx  (cost=0.00..101.26 rows=1 width=0)
+               Index Cond: c && '<(5,5),1>'::circle
+ Optimizer: Postgres query optimizer
+(6 rows)
+
+explain select * from shape_ao   where c && '<(5,5), 1>'::circle;
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=101.26..201.27 rows=1 width=24)
+   ->  Bitmap Heap Scan on shape_ao  (cost=101.26..201.27 rows=1 width=24)
+         Recheck Cond: c && '<(5,5),1>'::circle
+         ->  Bitmap Index Scan on shape_ao_bb_idx  (cost=0.00..101.26 rows=1 width=0)
+               Index Cond: c && '<(5,5),1>'::circle
+ Optimizer: Postgres query optimizer
+(6 rows)
+
+explain select * from shape_aocs where c && '<(5,5), 1>'::circle;
+                                       QUERY PLAN                                       
+----------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=101.26..201.27 rows=1 width=24)
+   ->  Bitmap Heap Scan on shape_aocs  (cost=101.26..201.27 rows=1 width=24)
+         Recheck Cond: c && '<(5,5),1>'::circle
+         ->  Bitmap Index Scan on shape_aocs_bb_idx  (cost=0.00..101.26 rows=1 width=0)
+               Index Cond: c && '<(5,5),1>'::circle
+ Optimizer: Postgres query optimizer
+(6 rows)
+
+-- Test that they return correct results.
+select * from shape_heap where c && '<(5,5), 1>'::circle;
+ c 
+---
+(0 rows)
+
+select * from shape_ao   where c && '<(5,5), 1>'::circle;
+ c 
+---
+(0 rows)
+
+select * from shape_aocs where c && '<(5,5), 1>'::circle;
+ c 
+---
+(0 rows)
+
+select * from shape_heap where c && '<(5,5), 2>'::circle;
+ c 
+---
+(0 rows)
+
+select * from shape_ao   where c && '<(5,5), 2>'::circle;
+ c 
+---
+(0 rows)
+
+select * from shape_aocs where c && '<(5,5), 2>'::circle;
+ c 
+---
+(0 rows)
+
+select * from shape_heap where c && '<(5,5), 3>'::circle;
+     c     
+-----------
+ <(0,0),5>
+(1 row)
+
+select * from shape_ao   where c && '<(5,5), 3>'::circle;
+     c     
+-----------
+ <(0,0),5>
+(1 row)
+
+select * from shape_aocs where c && '<(5,5), 3>'::circle;
+     c     
+-----------
+ <(0,0),5>
+(1 row)
+

@@ -4,10 +4,10 @@
  *	  prototypes for utility.c.
  *
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/tcop/utility.h,v 1.34 2008/01/01 19:45:59 momjian Exp $
+ * src/include/tcop/utility.h
  *
  *-------------------------------------------------------------------------
  */
@@ -16,22 +16,37 @@
 
 #include "tcop/tcopprot.h"
 
+typedef enum
+{
+	PROCESS_UTILITY_TOPLEVEL,	/* toplevel interactive command */
+	PROCESS_UTILITY_QUERY,		/* a complete query, but not toplevel */
+	PROCESS_UTILITY_SUBCOMMAND	/* a portion of a query */
+} ProcessUtilityContext;
+
+/* Hook for plugins to get control in ProcessUtility() */
+typedef void (*ProcessUtility_hook_type) (Node *parsetree,
+					  const char *queryString, ProcessUtilityContext context,
+													  ParamListInfo params,
+									DestReceiver *dest, char *completionTag);
+extern PGDLLIMPORT ProcessUtility_hook_type ProcessUtility_hook;
 
 extern void ProcessUtility(Node *parsetree, const char *queryString,
-			   ParamListInfo params, bool isTopLevel,
+			   ProcessUtilityContext context, ParamListInfo params,
 			   DestReceiver *dest, char *completionTag);
+extern void standard_ProcessUtility(Node *parsetree, const char *queryString,
+						ProcessUtilityContext context, ParamListInfo params,
+						DestReceiver *dest, char *completionTag);
 
 extern bool UtilityReturnsTuples(Node *parsetree);
 
 extern TupleDesc UtilityTupleDescriptor(Node *parsetree);
+
+extern Query *UtilityContainsQuery(Node *parsetree);
 
 extern const char *CreateCommandTag(Node *parsetree);
 
 extern LogStmtLevel GetCommandLogLevel(Node *parsetree);
 
 extern bool CommandIsReadOnly(Node *parsetree);
-
-extern void CheckRelationOwnership(RangeVar *rel, bool noCatalogs);
-extern void DropErrorMsgNonExistent(const RangeVar *rel, char rightkind, bool missing_ok);
 
 #endif   /* UTILITY_H */

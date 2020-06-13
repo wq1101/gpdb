@@ -17,12 +17,16 @@
 #include "postgres.h"
 
 #include "access/clog.h"
+#include "access/htup_details.h"
 #include "access/distributedlog.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "cdb/cdbtm.h"
+#include "cdb/cdbvars.h"
 #include "lib/stringinfo.h"
 #include "utils/builtins.h"
 #include "utils/tqual.h"
+#include "utils/visibility_summary.h"
 
 static char *
 TupleTransactionStatus_Name(TupleTransactionStatus status)
@@ -126,7 +130,7 @@ GetTupleVisibilitySummary(HeapTuple tuple,
 		tupleVisibilitySummary->xminStatus =
 			GetTupleVisibilityCLogStatus(tupleVisibilitySummary->xmin);
 	}
-	tupleVisibilitySummary->xmax = HeapTupleHeaderGetXmax(tuple->t_data);
+	tupleVisibilitySummary->xmax = HeapTupleHeaderGetRawXmax(tuple->t_data);
 	if (!TransactionIdIsNormal(tupleVisibilitySummary->xmax))
 	{
 		if (tupleVisibilitySummary->xmax == FrozenTransactionId)
@@ -235,15 +239,15 @@ GetTupleVisibilityDistribId(TransactionId xid,
 
 		case TupleTransactionStatus_HintCommitted:
 		case TupleTransactionStatus_CLogCommitted:
-			if (DistributedLog_CommittedCheck(xid,
+			if ((!IS_QUERY_DISPATCHER()) &&
+				DistributedLog_CommittedCheck(xid,
 											  &distribTimeStamp,
 											  &distribXid))
 			{
 				char	   *distribId;
 
 				distribId = palloc(TMGIDSIZE);
-				sprintf(distribId, "%u-%.10u",
-						distribTimeStamp, distribXid);
+				dtxFormGID(distribId, distribTimeStamp, distribXid);
 				return distribId;
 			}
 			else
@@ -287,7 +291,7 @@ GetTupleVisibilityInfoMaskSet(int16 infomask, int16 infomask2)
 
 	TupleVisibilityAddFlagName(&buf, infomask & HEAP_COMBOCID, "HEAP_COMBOCID", &atLeastOne);
 	TupleVisibilityAddFlagName(&buf, infomask & HEAP_XMAX_EXCL_LOCK, "HEAP_XMAX_EXCL_LOCK", &atLeastOne);
-	TupleVisibilityAddFlagName(&buf, infomask & HEAP_XMAX_SHARED_LOCK, "HEAP_XMAX_SHARED_LOCK", &atLeastOne);
+	TupleVisibilityAddFlagName(&buf, infomask & HEAP_XMAX_LOCK_ONLY, "HEAP_XMAX_LOCK_ONLY", &atLeastOne);
 	TupleVisibilityAddFlagName(&buf, infomask & HEAP_XMIN_COMMITTED, "HEAP_XMIN_COMMITTED", &atLeastOne);
 	TupleVisibilityAddFlagName(&buf, infomask & HEAP_XMIN_INVALID, "HEAP_XMIN_INVALID", &atLeastOne);
 	TupleVisibilityAddFlagName(&buf, infomask & HEAP_XMAX_COMMITTED, "HEAP_XMAX_COMMITTED", &atLeastOne);

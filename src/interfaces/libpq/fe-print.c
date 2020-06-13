@@ -3,7 +3,7 @@
  * fe-print.c
  *	  functions for pretty-printing query results
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * These functions were formerly part of fe-exec.c, but they
@@ -35,7 +35,6 @@
 
 #include "libpq-fe.h"
 #include "libpq-int.h"
-#include "pqsignal.h"
 
 
 static void do_field(const PQprintOpt *po, const PGresult *res,
@@ -167,8 +166,9 @@ PQprint(FILE *fout, const PGresult *res, const PQprintOpt *po)
 			screen_size.ws_col = 80;
 #endif
 			pagerenv = getenv("PAGER");
+			/* if PAGER is unset, empty or all-white-space, don't use pager */
 			if (pagerenv != NULL &&
-				pagerenv[0] != '\0' &&
+				strspn(pagerenv, " \t\r\n") != strlen(pagerenv) &&
 				!po->html3 &&
 				((po->expanded &&
 				  nTups * (nFields + 1) >= screen_size.ws_row) ||
@@ -330,7 +330,6 @@ do_field(const PQprintOpt *po, const PGresult *res,
 		 unsigned char *fieldNotNum, int *fieldMax,
 		 const int fieldMaxLen, FILE *fout)
 {
-
 	const char *pval,
 			   *p;
 	int			plen;
@@ -442,7 +441,6 @@ do_header(FILE *fout, const PQprintOpt *po, const int nFields, int *fieldMax,
 		  const char **fieldNames, unsigned char *fieldNotNum,
 		  const int fs_len, const PGresult *res)
 {
-
 	int			j;				/* for loop index */
 	char	   *border = NULL;
 
@@ -529,7 +527,6 @@ output_row(FILE *fout, const PQprintOpt *po, const int nFields, char **fields,
 		   unsigned char *fieldNotNum, int *fieldMax, char *border,
 		   const int row_index)
 {
-
 	int			field_index;	/* for loop index */
 
 	if (po->html3)

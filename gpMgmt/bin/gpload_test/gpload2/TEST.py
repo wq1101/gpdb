@@ -9,7 +9,10 @@ import socket
 import fileinput
 import platform
 import re
-import subprocess
+try:
+    import subprocess32 as subprocess
+except:
+    import subprocess
 from pygresql import pg
 
 def get_port_from_conf():
@@ -64,7 +67,7 @@ def getPortMasterOnly(host = 'localhost',master_value = None,
         if re.search(master_pattern, line):
             master_value = int(line.split()[3].strip())
 
-    if master_value == None:
+    if master_value is None:
         error_msg = "".join(out)
         raise Exception(error_msg)
 
@@ -95,7 +98,7 @@ d = mkpath('config')
 if not os.path.exists(d):
     os.mkdir(d)
 
-def write_config_file(mode='insert', reuse_flag='',columns_flag='0',mapping='0',portNum='8081',database='reuse_gptest',host='localhost',formatOpts='text',file='data/external_file_01.txt',table='texttable',format='text',delimiter="'|'",escape='',quote='',truncate='False'):
+def write_config_file(mode='insert', reuse_flag='',columns_flag='0',mapping='0',portNum='8081',database='reuse_gptest',host='localhost',formatOpts='text',file='data/external_file_01.txt',table='texttable',format='text',delimiter="'|'",escape='',quote='',truncate='False',log_errors=None, error_limit='0',error_table=None,externalSchema=None,staging_table=None,fast_match='false', encoding=None, preload=True, fill=False):
 
     f = open(mkpath('config/config_file'),'w')
     f.write("VERSION: 1.0.0.1")
@@ -130,12 +133,22 @@ def write_config_file(mode='insert', reuse_flag='',columns_flag='0',mapping='0',
         f.write("\n           - s_n9: text")
     if format:
         f.write("\n    - FORMAT: "+format)
+    if log_errors:
+        f.write("\n    - LOG_ERRORS: true")
+        f.write("\n    - ERROR_LIMIT: " + error_limit)
+    if error_table:
+        f.write("\n    - ERROR_TABLE: " + error_table)
+        f.write("\n    - ERROR_LIMIT: " + error_limit)
     if delimiter:
         f.write("\n    - DELIMITER: "+delimiter)
+    if encoding:
+        f.write("\n    - ENCODING: "+encoding)
     if escape:
         f.write("\n    - ESCAPE: "+escape)
     if quote:
         f.write("\n    - QUOTE: "+quote)
+    if fill:
+        f.write("\n    - FILL_MISSING_FIELDS: true")
     f.write("\n   OUTPUT:")
     f.write("\n    - TABLE: "+table)
     if mode:
@@ -166,8 +179,15 @@ def write_config_file(mode='insert', reuse_flag='',columns_flag='0',mapping='0',
         f.write("\n           n7: s_n7")
         f.write("\n           n8: s_n8")
         f.write("\n           n9: s_n9")
-    f.write("\n   PRELOAD:")
-    f.write("\n    - REUSE_TABLES: "+reuse_flag)
+    if externalSchema:
+        f.write("\n   EXTERNAL:")
+        f.write("\n    - SCHEMA: "+externalSchema)
+    if preload:
+        f.write("\n   PRELOAD:")
+        f.write("\n    - REUSE_TABLES: "+reuse_flag)
+        f.write("\n    - FAST_MATCH: "+fast_match)
+        if staging_table:
+            f.write("\n    - STAGING_TABLE: "+staging_table)
     f.write("\n")
     f.close()
 
@@ -202,13 +222,13 @@ def psql_run(ifile = None, ofile = None, cmd = None,
     @param port    : port where gpdb is running
     @param PGOPTIONS: connects to postgres via utility mode
     '''
-    if dbname == None:
+    if dbname is None:
         dbname = DBNAME
 
-    if username == None:
+    if username is None:
         username = PGUSER  # Use the default login user
 
-    if PGOPTIONS == None:
+    if PGOPTIONS is None:
         PGOPTIONS = ""
     else:
         PGOPTIONS = "PGOPTIONS='%s'" % PGOPTIONS
@@ -292,17 +312,17 @@ def isFileEqual( f1, f2, optionalFlags = "", outputPath = "", myinitfile = ""):
     # Gets the suitePath name to add init_file
     suitePath = f1[0:f1.rindex( "/" )]
     if os.path.exists(suitePath + "/init_file"):
-        (ok, out) = run('gpdiff.pl -w ' + optionalFlags + \
+        (ok, out) = run('../gpdiff.pl -w ' + optionalFlags + \
                               ' -I NOTICE: -I HINT: -I CONTEXT: -I GP_IGNORE: --gp_init_file=%s/global_init_file --gp_init_file=%s/init_file '
                               '%s %s > %s 2>&1' % (LMYD, suitePath, f1, f2, dfile))
 
     else:
         if os.path.exists(myinitfile):
-            (ok, out) = run('gpdiff.pl -w ' + optionalFlags + \
+            (ok, out) = run('../gpdiff.pl -w ' + optionalFlags + \
                                   ' -I NOTICE: -I HINT: -I CONTEXT: -I GP_IGNORE: --gp_init_file=%s/global_init_file --gp_init_file=%s '
                                   '%s %s > %s 2>&1' % (LMYD, myinitfile, f1, f2, dfile))
         else:
-            (ok, out) = run( 'gpdiff.pl -w ' + optionalFlags + \
+            (ok, out) = run( '../gpdiff.pl -w ' + optionalFlags + \
                               ' -I NOTICE: -I HINT: -I CONTEXT: -I GP_IGNORE: --gp_init_file=%s/global_init_file '
                               '%s %s > %s 2>&1' % ( LMYD, f1, f2, dfile ) )
 
@@ -310,6 +330,15 @@ def isFileEqual( f1, f2, optionalFlags = "", outputPath = "", myinitfile = ""):
     if ok:
         os.unlink( dfile )
     return ok
+
+def read_diff(ifile, outputPath):
+    """
+    Opens the diff file that is assocated with the given input file and returns
+    its contents as a string.
+    """
+    dfile = diffFile(ifile, outputPath)
+    with open(dfile, 'r') as diff:
+        return diff.read()
 
 def modify_sql_file(num):
     file = mkpath('query%d.sql' % num)
@@ -338,11 +367,11 @@ def get_table_name():
     except Exception,e:
         errorMessage = str(e)
         print 'could not connect to database: ' + errorMessage
-    queryString = """SELECT tablename
-                     from pg_tables
-                     WHERE tablename
+    queryString = """SELECT relname
+                     from pg_class
+                     WHERE relname
                      like 'ext_gpload_reusable%'
-                     OR tablename
+                     OR relname
                      like 'staging_gpload_reusable%';"""
     resultList = db.query(queryString.encode('utf-8')).getresult()
     return resultList
@@ -382,7 +411,7 @@ class PSQLError(Exception):
 
 class GPLoad_FormatOpts_TestCase(unittest.TestCase):
 
-    def check_result(self,ifile, optionalFlags = "", outputPath = ""):
+    def check_result(self,ifile, optionalFlags = "-U3", outputPath = ""):
         """
         PURPOSE: compare the actual and expected output files and report an
             error if they don't match.
@@ -393,13 +422,15 @@ class GPLoad_FormatOpts_TestCase(unittest.TestCase):
                 figure out the proper names of the .out and .ans files.
             optionalFlags: command-line options (if any) for diff.
                 For example, pass " -B " (with the blank spaces) to ignore
-                blank lines.
+                blank lines. By default, diffs are unified with 3 lines of
+                context (i.e. optionalFlags is "-U3").
         """
-        f1 = outFile(ifile, outputPath=outputPath)
-        f2 = gpdbAnsFile(ifile)
+        f1 = gpdbAnsFile(ifile)
+        f2 = outFile(ifile, outputPath=outputPath)
 
         result = isFileEqual(f1, f2, optionalFlags, outputPath=outputPath)
-        self.failUnless(result)
+        diff = None if result else read_diff(ifile, outputPath)
+        self.assertTrue(result, "query resulted in diff:\n{}".format(diff))
 
         return True
 
@@ -414,7 +445,7 @@ class GPLoad_FormatOpts_TestCase(unittest.TestCase):
 
     def test_00_gpload_formatOpts_setup(self):
         "0  gpload setup"
-        for num in range(1,22):
+        for num in range(1,40):
            f = open(mkpath('query%d.sql' % num),'w')
            f.write("\! gpload -f "+mkpath('config/config_file')+ " -d reuse_gptest\n"+"\! gpload -f "+mkpath('config/config_file')+ " -d reuse_gptest\n")
            f.close()
@@ -559,6 +590,178 @@ class GPLoad_FormatOpts_TestCase(unittest.TestCase):
         copy_data('external_file_01.txt','data_file.txt')
         write_config_file(reuse_flag='true',formatOpts='text',file='data_file.txt',table='texttable',escape="E'\\\\'")
         self.doTest(21)
+    # case 22 is flaky on concourse. It may report: Fatal Python error: GC object already tracked during testing.
+    # This is seldom issue. we can't reproduce it locally, so we disable it, in order to not blocking others
+    #def test_22_gpload_error_count(self):
+    #    "22  gpload error count"
+    #    f = open(mkpath('query22.sql'),'a')
+    #    f.write("\! psql -d reuse_gptest -c 'select count(*) from csvtable;'")
+    #    f.close()
+    #    f = open(mkpath('data/large_file.csv'),'w')
+    #    for i in range(0, 10000):
+    #        if i % 2 == 0:
+    #            f.write('1997,Ford,E350,"ac, abs, moon",3000.00,a\n')
+    #        else:
+    #            f.write('1997,Ford,E350,"ac, abs, moon",3000.00\n')
+    #    f.close()
+    #    copy_data('large_file.csv','data_file.csv')
+    #    write_config_file(reuse_flag='true',formatOpts='csv',file='data_file.csv',table='csvtable',format='csv',delimiter="','",log_errors=True,error_limit='90000000')
+    #   self.doTest(22)
+    def test_23_gpload_error_count(self):
+        "23  gpload error_table"
+        file = mkpath('setup.sql')
+        runfile(file)
+        f = open(mkpath('query23.sql'),'a')
+        f.write("\! psql -d reuse_gptest -c 'select count(*) from csvtable;'")
+        f.close()
+        f = open(mkpath('data/large_file.csv'),'w')
+        for i in range(0, 10000):
+            if i % 2 == 0:
+                f.write('1997,Ford,E350,"ac, abs, moon",3000.00,a\n')
+            else:
+                f.write('1997,Ford,E350,"ac, abs, moon",3000.00\n')
+        f.close()
+        copy_data('large_file.csv','data_file.csv')
+        write_config_file(reuse_flag='true',formatOpts='csv',file='data_file.csv',table='csvtable',format='csv',delimiter="','",error_table="err_table",error_limit='90000000')
+        self.doTest(23)
+    def test_24_gpload_error_count(self):
+        "24  gpload error count with ext schema"
+        file = mkpath('setup.sql')
+        runfile(file)
+        f = open(mkpath('query24.sql'),'a')
+        f.write("\! psql -d reuse_gptest -c 'select count(*) from csvtable;'")
+        f.close()
+        f = open(mkpath('data/large_file.csv'),'w')
+        for i in range(0, 10000):
+            if i % 2 == 0:
+                f.write('1997,Ford,E350,"ac, abs, moon",3000.00,a\n')
+            else:
+                f.write('1997,Ford,E350,"ac, abs, moon",3000.00\n')
+        f.close()
+        copy_data('large_file.csv','data_file.csv')
+        write_config_file(reuse_flag='true',formatOpts='csv',file='data_file.csv',table='csvtable',format='csv',delimiter="','",log_errors=True,error_limit='90000000',externalSchema='test')
+        self.doTest(24)
+    def test_25_gpload_ext_staging_table(self):
+        "25  gpload reuse ext_staging_table if it is configured"
+        file = mkpath('setup.sql')
+        runfile(file)
+        f = open(mkpath('query25.sql'),'a')
+        f.write("\! psql -d reuse_gptest -c 'select count(*) from csvtable;'")
+        f.close()
+        copy_data('external_file_13.csv','data_file.csv')
+        write_config_file(reuse_flag='true',formatOpts='csv',file='data_file.csv',table='csvtable',format='csv',delimiter="','",log_errors=True,error_limit='10',staging_table='staging_table')
+        self.doTest(25)
+    def test_26_gpload_ext_staging_table_with_externalschema(self):
+        "26  gpload reuse ext_staging_table if it is configured with externalschema"
+        file = mkpath('setup.sql')
+        runfile(file)
+        f = open(mkpath('query26.sql'),'a')
+        f.write("\! psql -d reuse_gptest -c 'select count(*) from csvtable;'")
+        f.close()
+        copy_data('external_file_13.csv','data_file.csv')
+        write_config_file(reuse_flag='true',formatOpts='csv',file='data_file.csv',table='csvtable',format='csv',delimiter="','",log_errors=True,error_limit='10',staging_table='staging_table',externalSchema='test')
+        self.doTest(26)
+    def test_27_gpload_ext_staging_table_with_externalschema(self):
+        "27  gpload reuse ext_staging_table if it is configured with externalschema"
+        file = mkpath('setup.sql')
+        runfile(file)
+        f = open(mkpath('query27.sql'),'a')
+        f.write("\! psql -d reuse_gptest -c 'select count(*) from test.csvtable;'")
+        f.close()
+        copy_data('external_file_13.csv','data_file.csv')
+        write_config_file(reuse_flag='true',formatOpts='csv',file='data_file.csv',table='test.csvtable',format='csv',delimiter="','",log_errors=True,error_limit='10',staging_table='staging_table',externalSchema="'%'")
+        self.doTest(27)
+    def test_28_gpload_ext_staging_table_with_dot(self):
+        "28  gpload reuse ext_staging_table if it is configured with dot"
+        file = mkpath('setup.sql')
+        runfile(file)
+        f = open(mkpath('query28.sql'),'a')
+        f.write("\! psql -d reuse_gptest -c 'select count(*) from test.csvtable;'")
+        f.close()
+        copy_data('external_file_13.csv','data_file.csv')
+        write_config_file(reuse_flag='true',formatOpts='csv',file='data_file.csv',table='test.csvtable',format='csv',delimiter="','",log_errors=True,error_limit='10',staging_table='t.staging_table')
+        self.doTest(28)
+    def test_29_gpload_reuse_table_insert_mode_with_reuse_and_null(self):
+        "29  gpload insert mode with reuse and null"
+        runfile(mkpath('setup.sql'))
+        f = open(mkpath('query29.sql'),'a')
+        f.write("\! psql -d reuse_gptest -c 'select count(*) from texttable where n2 is null;'")
+        f.close()
+        copy_data('external_file_14.txt','data_file.txt')
+        write_config_file(mode='insert',reuse_flag='true',file='data_file.txt',log_errors=True, error_limit='100')
+        self.doTest(29)
+
+    def test_30_gpload_reuse_table_update_mode_with_fast_match(self):
+        "30  gpload update mode with fast match"
+        drop_tables()
+        copy_data('external_file_04.txt','data_file.txt')
+        write_config_file(mode='update',reuse_flag='true',fast_match='true',file='data_file.txt')
+        self.doTest(30)
+
+    def test_31_gpload_reuse_table_update_mode_with_fast_match_and_different_columns_number(self):
+        "31 gpload update mode with fast match and differenct columns number) "
+        psql_run(cmd="ALTER TABLE texttable ADD column n8 text",dbname='reuse_gptest')
+        copy_data('external_file_08.txt','data_file.txt')
+        write_config_file(mode='update',reuse_flag='true',fast_match='true',file='data_file.txt')
+        self.doTest(31)
+
+    def test_32_gpload_update_mode_without_reuse_table_with_fast_match(self):
+        "32  gpload update mode when reuse table is false and fast match is true"
+        drop_tables()
+        copy_data('external_file_08.txt','data_file.txt')
+        write_config_file(mode='update',reuse_flag='false',fast_match='true',file='data_file.txt')
+        self.doTest(32)
+    def test_33_gpload_reuse_table_merge_mode_with_fast_match_and_external_schema(self):
+        "33  gpload update mode with fast match and external schema"
+        file = mkpath('setup.sql')
+        runfile(file)
+        copy_data('external_file_04.txt','data_file.txt')
+        write_config_file(mode='merge',reuse_flag='true',fast_match='true',file='data_file.txt',externalSchema='test')
+        self.doTest(33)
+    def test_34_gpload_reuse_table_merge_mode_with_fast_match_and_encoding(self):
+        "34  gpload merge mode with fast match and encoding GBK"
+        file = mkpath('setup.sql')
+        runfile(file)
+        copy_data('external_file_04.txt','data_file.txt')
+        write_config_file(mode='merge',reuse_flag='true',fast_match='true',file='data_file.txt',encoding='GBK')
+        self.doTest(34)
+
+    def test_35_gpload_reuse_table_merge_mode_with_fast_match_default_encoding(self):
+        "35  gpload does not reuse table when encoding is setted from GBK to empty"
+        write_config_file(mode='merge',reuse_flag='true',fast_match='true',file='data_file.txt')
+        self.doTest(35)
+
+    def test_36_gpload_reuse_table_merge_mode_default_encoding(self):
+        "36  gpload merge mode with encoding GBK"
+        file = mkpath('setup.sql')
+        runfile(file)
+        copy_data('external_file_04.txt','data_file.txt')
+        write_config_file(mode='merge',reuse_flag='true',fast_match='false',file='data_file.txt',encoding='GBK')
+        self.doTest(36)
+
+    def test_37_gpload_reuse_table_merge_mode_invalid_encoding(self):
+        "37  gpload merge mode with invalid encoding"
+        file = mkpath('setup.sql')
+        runfile(file)
+        copy_data('external_file_04.txt','data_file.txt')
+        write_config_file(mode='merge',reuse_flag='true',fast_match='false',file='data_file.txt',encoding='xxxx')
+        self.doTest(37)
+
+    def test_38_gpload_without_preload(self):
+        "38  gpload insert mode without preload"
+        file = mkpath('setup.sql')
+        runfile(file)
+        copy_data('external_file_04.txt','data_file.txt')
+        write_config_file(mode='insert',reuse_flag='true',fast_match='false',file='data_file.txt',error_table="err_table",error_limit='1000',preload=False)
+        self.doTest(38)
+
+    def test_39_gpload_fill_missing_fields(self):
+        "39  gpload fill missing fields"
+        file = mkpath('setup.sql')
+        runfile(file)
+        copy_data('external_file_04.txt','data_file.txt')
+        write_config_file(mode='insert',reuse_flag='false',fast_match='false',file='data_file.txt',table='texttable1', error_limit='1000', fill=True)
+        self.doTest(39)
 
 if __name__ == '__main__':
     suite = unittest.TestLoader().loadTestsFromTestCase(GPLoad_FormatOpts_TestCase)

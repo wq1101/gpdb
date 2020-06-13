@@ -1,10 +1,36 @@
-/*
- * This file contains public functions for conversion between
- * client encoding and server (database) encoding.
+/*-------------------------------------------------------------------------
  *
- * Tatsuo Ishii
+ * mbutils.c
+ *	  This file contains functions for encoding conversion.
  *
- * $PostgreSQL: pgsql/src/backend/utils/mb/mbutils.c,v 1.69.2.1 2008/05/27 12:24:46 mha Exp $
+ * The string-conversion functions in this file share some API quirks.
+ * Note the following:
+ *
+ * The functions return a palloc'd, null-terminated string if conversion
+ * is required.  However, if no conversion is performed, the given source
+ * string pointer is returned as-is.
+ *
+ * Although the presence of a length argument means that callers can pass
+ * non-null-terminated strings, care is required because the same string
+ * will be passed back if no conversion occurs.  Such callers *must* check
+ * whether result == src and handle that case differently.
+ *
+ * If the source and destination encodings are the same, the source string
+ * is returned without any verification; it's assumed to be valid data.
+ * If that might not be the case, the caller is responsible for validating
+ * the string using a separate call to pg_verify_mbstr().  Whenever the
+ * source and destination encodings are different, the functions ensure that
+ * the result is validly encoded according to the destination encoding.
+ *
+ *
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ *
+ * IDENTIFICATION
+ *	  src/backend/utils/mb/mbutils.c
+ *
+ *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
@@ -13,7 +39,6 @@
 #include "mb/pg_wchar.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
-#include "utils/pg_locale.h"
 #include "utils/syscache.h"
 
 /*
@@ -28,22 +53,37 @@
 #define MAX_CONVERSION_GROWTH  4
 
 /*
- * We handle for actual FE and BE encoding setting encoding-identificator
- * and encoding-name too. It prevent searching and conversion from encoding
- * to encoding name in getdatabaseencoding() and other routines.
+ * We maintain a simple linked list caching the fmgr lookup info for the
+ * currently selected conversion functions, as well as any that have been
+ * selected previously in the current session.  (We remember previous
+ * settings because we must be able to restore a previous setting during
+ * transaction rollback, without doing any fresh catalog accesses.)
+ *
+ * Since we'll never release this data, we just keep it in TopMemoryContext.
  */
-static pg_enc2name *ClientEncoding = &pg_enc2name_tbl[PG_SQL_ASCII];
-static pg_enc2name *DatabaseEncoding = &pg_enc2name_tbl[PG_SQL_ASCII];
+typedef struct ConvProcInfo
+{
+	int			s_encoding;		/* server and client encoding IDs */
+	int			c_encoding;
+	FmgrInfo	to_server_info; /* lookup info for conversion procs */
+	FmgrInfo	to_client_info;
+} ConvProcInfo;
+
+static List *ConvProcList = NIL;	/* List of ConvProcInfo */
 
 /*
- * Caches for conversion function info. These values are allocated in
- * MbProcContext. That context is a child of TopMemoryContext,
- * which allows these values to survive across transactions. See
- * SetClientEncoding() for more details.
+ * These variables point to the currently active conversion functions,
+ * or are NULL when no conversion is needed.
  */
-static MemoryContext MbProcContext = NULL;
 static FmgrInfo *ToServerConvProc = NULL;
 static FmgrInfo *ToClientConvProc = NULL;
+
+/*
+ * These variables track the currently-selected encodings.
+ */
+static const pg_enc2name *ClientEncoding = &pg_enc2name_tbl[PG_SQL_ASCII];
+static const pg_enc2name *DatabaseEncoding = &pg_enc2name_tbl[PG_SQL_ASCII];
+static const pg_enc2name *MessageEncoding = &pg_enc2name_tbl[PG_SQL_ASCII];
 
 /*
  * During backend startup we can't set client encoding because we (a)
@@ -57,26 +97,127 @@ static int	pending_client_encoding = PG_SQL_ASCII;
 
 /* Internal functions */
 static char *
-perform_default_encoding_conversion(const char *src, int len, bool is_client_to_server, 
+perform_default_encoding_conversion(const char *src, int len, bool is_client_to_server,
 									int custom_client_encoding, 
 									FmgrInfo *custom_encoding_proc);
 static int	cliplen(const char *str, int len, int limit);
 
 
 /*
- * Set the client encoding and save fmgrinfo for the conversion
- * function if necessary.  Returns 0 if okay, -1 if not (bad encoding
- * or can't support conversion)
+ * Prepare for a future call to SetClientEncoding.  Success should mean
+ * that SetClientEncoding is guaranteed to succeed for this encoding request.
+ *
+ * (But note that success before backend_startup_complete does not guarantee
+ * success after ...)
+ *
+ * Returns 0 if okay, -1 if not (bad encoding or can't support conversion)
  */
 int
-SetClientEncoding(int encoding, bool doit)
+PrepareClientEncoding(int encoding)
 {
 	int			current_server_encoding;
-	Oid			to_server_proc,
-				to_client_proc;
-	FmgrInfo   *to_server;
-	FmgrInfo   *to_client;
-	MemoryContext oldcontext;
+	ListCell   *lc;
+
+	if (!PG_VALID_FE_ENCODING(encoding))
+		return -1;
+
+	/* Can't do anything during startup, per notes above */
+	if (!backend_startup_complete)
+		return 0;
+
+	current_server_encoding = GetDatabaseEncoding();
+
+	/*
+	 * Check for cases that require no conversion function.
+	 */
+	if (current_server_encoding == encoding ||
+		current_server_encoding == PG_SQL_ASCII ||
+		encoding == PG_SQL_ASCII)
+		return 0;
+
+	if (IsTransactionState())
+	{
+		/*
+		 * If we're in a live transaction, it's safe to access the catalogs,
+		 * so look up the functions.  We repeat the lookup even if the info is
+		 * already cached, so that we can react to changes in the contents of
+		 * pg_conversion.
+		 */
+		Oid			to_server_proc,
+					to_client_proc;
+		ConvProcInfo *convinfo;
+		MemoryContext oldcontext;
+
+		to_server_proc = FindDefaultConversionProc(encoding,
+												   current_server_encoding);
+		if (!OidIsValid(to_server_proc))
+			return -1;
+		to_client_proc = FindDefaultConversionProc(current_server_encoding,
+												   encoding);
+		if (!OidIsValid(to_client_proc))
+			return -1;
+
+		/*
+		 * Load the fmgr info into TopMemoryContext (could still fail here)
+		 */
+		convinfo = (ConvProcInfo *) MemoryContextAlloc(TopMemoryContext,
+													   sizeof(ConvProcInfo));
+		convinfo->s_encoding = current_server_encoding;
+		convinfo->c_encoding = encoding;
+		fmgr_info_cxt(to_server_proc, &convinfo->to_server_info,
+					  TopMemoryContext);
+		fmgr_info_cxt(to_client_proc, &convinfo->to_client_info,
+					  TopMemoryContext);
+
+		/* Attach new info to head of list */
+		oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+		ConvProcList = lcons(convinfo, ConvProcList);
+		MemoryContextSwitchTo(oldcontext);
+
+		/*
+		 * We cannot yet remove any older entry for the same encoding pair,
+		 * since it could still be in use.  SetClientEncoding will clean up.
+		 */
+
+		return 0;				/* success */
+	}
+	else
+	{
+		/*
+		 * If we're not in a live transaction, the only thing we can do is
+		 * restore a previous setting using the cache.  This covers all
+		 * transaction-rollback cases.  The only case it might not work for is
+		 * trying to change client_encoding on the fly by editing
+		 * postgresql.conf and SIGHUP'ing.  Which would probably be a stupid
+		 * thing to do anyway.
+		 */
+		foreach(lc, ConvProcList)
+		{
+			ConvProcInfo *oldinfo = (ConvProcInfo *) lfirst(lc);
+
+			if (oldinfo->s_encoding == current_server_encoding &&
+				oldinfo->c_encoding == encoding)
+				return 0;
+		}
+
+		return -1;				/* it's not cached, so fail */
+	}
+}
+
+/*
+ * Set the active client encoding and set up the conversion-function pointers.
+ * PrepareClientEncoding should have been called previously for this encoding.
+ *
+ * Returns 0 if okay, -1 if not (bad encoding or can't support conversion)
+ */
+int
+SetClientEncoding(int encoding)
+{
+	int			current_server_encoding;
+	bool		found;
+	ListCell   *lc;
+	ListCell   *prev;
+	ListCell   *next;
 
 	if (!PG_VALID_FE_ENCODING(encoding))
 		return -1;
@@ -84,8 +225,7 @@ SetClientEncoding(int encoding, bool doit)
 	/* Can't do anything during startup, per notes above */
 	if (!backend_startup_complete)
 	{
-		if (doit)
-			pending_client_encoding = encoding;
+		pending_client_encoding = encoding;
 		return 0;
 	}
 
@@ -98,84 +238,58 @@ SetClientEncoding(int encoding, bool doit)
 		current_server_encoding == PG_SQL_ASCII ||
 		encoding == PG_SQL_ASCII)
 	{
-		if (doit)
+		ClientEncoding = &pg_enc2name_tbl[encoding];
+		ToServerConvProc = NULL;
+		ToClientConvProc = NULL;
+		return 0;
+	}
+
+	/*
+	 * Search the cache for the entry previously prepared by
+	 * PrepareClientEncoding; if there isn't one, we lose.  While at it,
+	 * release any duplicate entries so that repeated Prepare/Set cycles don't
+	 * leak memory.
+	 */
+	found = false;
+	prev = NULL;
+	for (lc = list_head(ConvProcList); lc; lc = next)
+	{
+		ConvProcInfo *convinfo = (ConvProcInfo *) lfirst(lc);
+
+		next = lnext(lc);
+
+		if (convinfo->s_encoding == current_server_encoding &&
+			convinfo->c_encoding == encoding)
 		{
-			ClientEncoding = &pg_enc2name_tbl[encoding];
-			ToServerConvProc = NULL;
-			ToClientConvProc = NULL;
-			if (MbProcContext)
-				MemoryContextReset(MbProcContext);
+			if (!found)
+			{
+				/* Found newest entry, so set up */
+				ClientEncoding = &pg_enc2name_tbl[encoding];
+				ToServerConvProc = &convinfo->to_server_info;
+				ToClientConvProc = &convinfo->to_client_info;
+				found = true;
+			}
+			else
+			{
+				/* Duplicate entry, release it */
+				ConvProcList = list_delete_cell(ConvProcList, lc, prev);
+				pfree(convinfo);
+				continue;		/* prev mustn't advance */
+			}
 		}
-		return 0;
+
+		prev = lc;
 	}
 
-	/*
-	 * If we're not inside a transaction then we can't do catalog lookups, so
-	 * fail.  After backend startup, this could only happen if we are
-	 * re-reading postgresql.conf due to SIGHUP --- so basically this just
-	 * constrains the ability to change client_encoding on the fly from
-	 * postgresql.conf.  Which would probably be a stupid thing to do anyway.
-	 */
-	if (!IsTransactionState())
-		return -1;
-
-	/*
-	 * Look up the conversion functions.
-	 */
-	to_server_proc = FindDefaultConversionProc(encoding,
-											   current_server_encoding);
-	if (!OidIsValid(to_server_proc))
-		return -1;
-	to_client_proc = FindDefaultConversionProc(current_server_encoding,
-											   encoding);
-	if (!OidIsValid(to_client_proc))
-		return -1;
-
-	/*
-	 * Done if not wanting to actually apply setting.
-	 */
-	if (!doit)
-		return 0;
-
-	/* Before loading the new fmgr info, remove the old info, if any */
-	ToServerConvProc = NULL;
-	ToClientConvProc = NULL;
-	if (MbProcContext != NULL)
-	{
-		MemoryContextReset(MbProcContext);
-	}
+	if (found)
+		return 0;				/* success */
 	else
-	{
-		/*
-		 * This is the first time through, so create the context. Make it a
-		 * child of TopMemoryContext so that these values survive across
-		 * transactions.
-		 */
-		MbProcContext = AllocSetContextCreate(TopMemoryContext,
-											  "MbProcContext",
-											  ALLOCSET_SMALL_MINSIZE,
-											  ALLOCSET_SMALL_INITSIZE,
-											  ALLOCSET_SMALL_MAXSIZE);
-	}
-
-	/* Load the fmgr info into MbProcContext */
-	oldcontext = MemoryContextSwitchTo(MbProcContext);
-	to_server = palloc(sizeof(FmgrInfo));
-	to_client = palloc(sizeof(FmgrInfo));
-	fmgr_info(to_server_proc, to_server);
-	fmgr_info(to_client_proc, to_client);
-	MemoryContextSwitchTo(oldcontext);
-
-	ClientEncoding = &pg_enc2name_tbl[encoding];
-	ToServerConvProc = to_server;
-	ToClientConvProc = to_client;
-
-	return 0;
+		return -1;				/* it's not cached, so fail */
 }
 
 /*
- * Initialize client encoding if necessary.
- *		called from InitPostgres() once during backend startup.
+ * Initialize client encoding conversions.
+ *		Called from InitPostgres() once during backend startup.
  */
 void
 InitializeClientEncoding(void)
@@ -183,7 +297,8 @@ InitializeClientEncoding(void)
 	Assert(!backend_startup_complete);
 	backend_startup_complete = true;
 
-	if (SetClientEncoding(pending_client_encoding, true) < 0)
+	if (PrepareClientEncoding(pending_client_encoding) < 0 ||
+		SetClientEncoding(pending_client_encoding) < 0)
 	{
 		/*
 		 * Oops, the requested conversion is not available. We couldn't fail
@@ -203,7 +318,6 @@ InitializeClientEncoding(void)
 int
 pg_get_client_encoding(void)
 {
-	Assert(ClientEncoding);
 	return ClientEncoding->encoding;
 }
 
@@ -213,29 +327,13 @@ pg_get_client_encoding(void)
 const char *
 pg_get_client_encoding_name(void)
 {
-	Assert(ClientEncoding);
 	return ClientEncoding->name;
 }
 
 /*
- * Apply encoding conversion on src and return it. The encoding
- * conversion function is chosen from the pg_conversion system catalog
- * marked as "default". If it is not found in the schema search path,
- * it's taken from pg_catalog schema. If it even is not in the schema,
- * warn and return src.
+ * Convert src string to another encoding (general case).
  *
- * If conversion occurs, a palloc'd null-terminated string is returned.
- * In the case of no conversion, src is returned.
- *
- * CAUTION: although the presence of a length argument means that callers
- * can pass non-null-terminated strings, care is required because the same
- * string will be passed back if no conversion occurs.	Such callers *must*
- * check whether result == src and handle that case differently.
- *
- * Note: we try to avoid raising error, since that could get us into
- * infinite recursion when this function is invoked during error message
- * sending.  It should be OK to raise error for overlength strings though,
- * since the recursion will come with a shorter message.
+ * See the notes about string conversion functions at the top of this file.
  */
 unsigned char *
 pg_do_encoding_conversion(unsigned char *src, int len,
@@ -244,41 +342,32 @@ pg_do_encoding_conversion(unsigned char *src, int len,
 	unsigned char *result;
 	Oid			proc;
 
-	if (!IsTransactionState())
-		return src;
+	if (len <= 0)
+		return src;				/* empty string is always valid */
 
 	if (src_encoding == dest_encoding)
-		return src;
+		return src;				/* no conversion required, assume valid */
 
-	if (src_encoding == PG_SQL_ASCII || dest_encoding == PG_SQL_ASCII)
-		return src;
+	if (dest_encoding == PG_SQL_ASCII)
+		return src;				/* any string is valid in SQL_ASCII */
 
-	if (len <= 0)
+	if (src_encoding == PG_SQL_ASCII)
+	{
+		/* No conversion is possible, but we must validate the result */
+		(void) pg_verify_mbstr(dest_encoding, (const char *) src, len, false);
 		return src;
+	}
+
+	if (!IsTransactionState())	/* shouldn't happen */
+		elog(ERROR, "cannot perform encoding conversion outside a transaction");
 
 	proc = FindDefaultConversionProc(src_encoding, dest_encoding);
 	if (!OidIsValid(proc))
-	{
-		ereport(LOG,
+		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_FUNCTION),
 				 errmsg("default conversion function for encoding \"%s\" to \"%s\" does not exist",
 						pg_encoding_to_char(src_encoding),
 						pg_encoding_to_char(dest_encoding))));
-		return src;
-	}
-
-	/*
-	 * XXX we should avoid throwing errors in OidFunctionCall. Otherwise we
-	 * are going into infinite loop!  So we have to make sure that the
-	 * function exists before calling OidFunctionCall.
-	 */
-	if (!SearchSysCacheExists(PROCOID,
-							  ObjectIdGetDatum(proc),
-							  0, 0, 0))
-	{
-		elog(LOG, "cache lookup failed for function %u", proc);
-		return src;
-	}
 
 	/*
 	 * Allocate space for conversion result, being wary of integer overflow
@@ -302,7 +391,7 @@ pg_do_encoding_conversion(unsigned char *src, int len,
 }
 
 /*
- * Convert string using encoding_name. The source
+ * Convert string to encoding encoding_name. The source
  * encoding is the DB encoding.
  *
  * BYTEA convert_to(TEXT string, NAME encoding_name) */
@@ -327,7 +416,7 @@ pg_convert_to(PG_FUNCTION_ARGS)
 }
 
 /*
- * Convert string using encoding_name. The destination
+ * Convert string from encoding encoding_name. The destination
  * encoding is the DB encoding.
  *
  * TEXT convert_from(BYTEA string, NAME encoding_name) */
@@ -354,21 +443,21 @@ pg_convert_from(PG_FUNCTION_ARGS)
 }
 
 /*
- * Convert string using encoding_names.
+ * Convert string between two arbitrary encodings.
  *
  * BYTEA convert(BYTEA string, NAME src_encoding_name, NAME dest_encoding_name)
  */
 Datum
 pg_convert(PG_FUNCTION_ARGS)
 {
-	bytea	   *string = PG_GETARG_BYTEA_P(0);
+	bytea	   *string = PG_GETARG_BYTEA_PP(0);
 	char	   *src_encoding_name = NameStr(*PG_GETARG_NAME(1));
 	int			src_encoding = pg_char_to_encoding(src_encoding_name);
 	char	   *dest_encoding_name = NameStr(*PG_GETARG_NAME(2));
 	int			dest_encoding = pg_char_to_encoding(dest_encoding_name);
-	unsigned char *result;
+	const char *src_str;
+	char	   *dest_str;
 	bytea	   *retval;
-	unsigned char *str;
 	int			len;
 
 	if (src_encoding < 0)
@@ -382,26 +471,30 @@ pg_convert(PG_FUNCTION_ARGS)
 				 errmsg("invalid destination encoding name \"%s\"",
 						dest_encoding_name)));
 
-	/* make sure that source string is valid and null terminated */
-	len = VARSIZE(string) - VARHDRSZ;
-	pg_verify_mbstr(src_encoding, VARDATA(string), len, false);
-	str = palloc(len + 1);
-	memcpy(str, VARDATA(string), len);
-	*(str + len) = '\0';
+	/* make sure that source string is valid */
+	len = VARSIZE_ANY_EXHDR(string);
+	src_str = VARDATA_ANY(string);
+	pg_verify_mbstr_len(src_encoding, src_str, len, false);
 
-	result = pg_do_encoding_conversion(str, len, src_encoding, dest_encoding);
+	/* perform conversion */
+	dest_str = (char *) pg_do_encoding_conversion((unsigned char *) src_str,
+												  len,
+												  src_encoding,
+												  dest_encoding);
+
+	/* update len if conversion actually happened */
+	if (dest_str != src_str)
+		len = strlen(dest_str);
 
 	/*
 	 * build bytea data type structure.
 	 */
-	len = strlen((char *) result) + VARHDRSZ;
-	retval = palloc(len);
-	SET_VARSIZE(retval, len);
-	memcpy(VARDATA(retval), result, len - VARHDRSZ);
+	retval = (bytea *) palloc(len + VARHDRSZ);
+	SET_VARSIZE(retval, len + VARHDRSZ);
+	memcpy(VARDATA(retval), dest_str, len);
 
-	if (result != str)
-		pfree(result);
-	pfree(str);
+	if (dest_str != src_str)
+		pfree(dest_str);
 
 	/* free memory if allocated by the toaster */
 	PG_FREE_IF_COPY(string, 0);
@@ -419,10 +512,11 @@ pg_convert(PG_FUNCTION_ARGS)
 Datum
 length_in_encoding(PG_FUNCTION_ARGS)
 {
-	bytea	   *string = PG_GETARG_BYTEA_P(0);
+	bytea	   *string = PG_GETARG_BYTEA_PP(0);
 	char	   *src_encoding_name = NameStr(*PG_GETARG_NAME(1));
 	int			src_encoding = pg_char_to_encoding(src_encoding_name);
-	int			len = VARSIZE(string) - VARHDRSZ;
+	const char *src_str;
+	int			len;
 	int			retval;
 
 	if (src_encoding < 0)
@@ -431,33 +525,56 @@ length_in_encoding(PG_FUNCTION_ARGS)
 				 errmsg("invalid encoding name \"%s\"",
 						src_encoding_name)));
 
-	retval = pg_verify_mbstr_len(src_encoding, VARDATA(string), len, false);
-	PG_RETURN_INT32(retval);
+	len = VARSIZE_ANY_EXHDR(string);
+	src_str = VARDATA_ANY(string);
 
+	retval = pg_verify_mbstr_len(src_encoding, src_str, len, false);
+
+	PG_RETURN_INT32(retval);
 }
 
 /*
- * convert client encoding to server encoding.
+ * Get maximum multibyte character length in the specified encoding.
+ *
+ * Note encoding is specified numerically, not by name as above.
+ */
+Datum
+pg_encoding_max_length_sql(PG_FUNCTION_ARGS)
+{
+	int			encoding = PG_GETARG_INT32(0);
+
+	if (PG_VALID_ENCODING(encoding))
+		PG_RETURN_INT32(pg_wchar_table[encoding].maxmblen);
+	else
+		PG_RETURN_NULL();
+}
+
+/*
+ * Convert client encoding to server encoding.
+ *
+ * See the notes about string conversion functions at the top of this file.
  */
 char *
 pg_client_to_server(const char *s, int len)
 {
-	Assert(ClientEncoding);
-
 	return pg_any_to_server(s, len, ClientEncoding->encoding);
 }
 
 /*
- * convert any encoding to server encoding.
+ * Convert any encoding to server encoding.
+ *
+ * See the notes about string conversion functions at the top of this file.
+ *
+ * Unlike the other string conversion functions, this will apply validation
+ * even if encoding == DatabaseEncoding->encoding.  This is because this is
+ * used to process data coming in from outside the database, and we never
+ * want to just assume validity.
  */
 char *
 pg_any_to_server(const char *s, int len, int encoding)
 {
-	Assert(DatabaseEncoding);
-	Assert(ClientEncoding);
-
 	if (len <= 0)
-		return (char *) s;
+		return (char *) s;		/* empty string is always valid */
 
 	if (encoding == DatabaseEncoding->encoding ||
 		encoding == PG_SQL_ASCII)
@@ -477,7 +594,7 @@ pg_any_to_server(const char *s, int len, int encoding)
 		 * the selected client_encoding.  If the client encoding is ASCII-safe
 		 * then we just do a straight validation under that encoding.  For an
 		 * ASCII-unsafe encoding we have a problem: we dare not pass such data
-		 * to the parser but we have no way to convert it.	We compromise by
+		 * to the parser but we have no way to convert it.  We compromise by
 		 * rejecting the data if it contains any non-ASCII characters.
 		 */
 		if (PG_VALID_BE_ENCODING(encoding))
@@ -499,42 +616,59 @@ pg_any_to_server(const char *s, int len, int encoding)
 		return (char *) s;
 	}
 
-	return perform_default_encoding_conversion(s, len, true, -1, NULL);
+	/* Fast path if we can use cached conversion function */
+	if (encoding == ClientEncoding->encoding)
+		return perform_default_encoding_conversion(s, len, true, -1, NULL);
+
+	/* General case ... will not work outside transactions */
+	return (char *) pg_do_encoding_conversion((unsigned char *) s,
+											  len,
+											  encoding,
+											  DatabaseEncoding->encoding);
 }
 
 /*
- * convert server encoding to client encoding.
+ * Convert server encoding to client encoding.
+ *
+ * See the notes about string conversion functions at the top of this file.
  */
 char *
 pg_server_to_client(const char *s, int len)
 {
-	Assert(ClientEncoding);
-
-	return pg_any_to_server(s, len, ClientEncoding->encoding);
+	return pg_server_to_any(s, len, ClientEncoding->encoding);
 }
 
 /*
- * convert server encoding to any encoding.
+ * Convert server encoding to any encoding.
+ *
+ * See the notes about string conversion functions at the top of this file.
  */
 char *
 pg_server_to_any(const char *s, int len, int encoding)
 {
-	Assert(DatabaseEncoding);
-	Assert(ClientEncoding);
-
 	if (len <= 0)
-		return (char *) s;
+		return (char *) s;		/* empty string is always valid */
 
 	if (encoding == DatabaseEncoding->encoding ||
-		encoding == PG_SQL_ASCII ||
-		DatabaseEncoding->encoding == PG_SQL_ASCII)
+		encoding == PG_SQL_ASCII)
 		return (char *) s;		/* assume data is valid */
 
-	if (ClientEncoding->encoding == encoding)
+	if (DatabaseEncoding->encoding == PG_SQL_ASCII)
+	{
+		/* No conversion is possible, but we must validate the result */
+		(void) pg_verify_mbstr(encoding, s, len, false);
+		return (char *) s;
+	}
+
+	/* Fast path if we can use cached conversion function */
+	if (encoding == ClientEncoding->encoding)
 		return perform_default_encoding_conversion(s, len, false, -1, NULL);
-	else
-		return (char *) pg_do_encoding_conversion(
-			(unsigned char *) s, len, DatabaseEncoding->encoding, encoding);
+
+	/* General case ... will not work outside transactions */
+	return (char *) pg_do_encoding_conversion((unsigned char *) s,
+											  len,
+											  DatabaseEncoding->encoding,
+											  encoding);
 }
 
 /*
@@ -550,7 +684,8 @@ pg_server_to_any(const char *s, int len, int encoding)
  *  See pg_custom_client_to_server for information.
  */
 static char *
-perform_default_encoding_conversion(const char *src, int len, bool is_client_to_server, 
+perform_default_encoding_conversion(const char *src, int len,
+									bool is_client_to_server,
 									int custom_client_encoding, 
 									FmgrInfo *custom_encoding_proc)
 {
@@ -615,130 +750,9 @@ perform_default_encoding_conversion(const char *src, int len, bool is_client_to_
 				  CStringGetDatum((char *) src),
 				  CStringGetDatum(result),
 				  Int32GetDatum(len));
-		
 	return result;
 }
 
-
-
-#ifdef USE_WIDE_UPPER_LOWER
-
-/*
- * wchar2char --- convert wide characters to multibyte format
- *
- * This has the same API as the standard wcstombs() function; in particular,
- * tolen is the maximum number of bytes to store at *to, and *from must be
- * zero-terminated.  The output will be zero-terminated iff there is room.
- */
-size_t
-wchar2char(char *to, const wchar_t *from, size_t tolen)
-{
-	size_t		result;
-
-	if (tolen == 0)
-		return 0;
-
-#ifdef WIN32
-
-	/*
-	 * On Windows, the "Unicode" locales assume UTF16 not UTF8 encoding, and
-	 * for some reason mbstowcs and wcstombs won't do this for us, so we use
-	 * MultiByteToWideChar().
-	 */
-	if (GetDatabaseEncoding() == PG_UTF8)
-	{
-		result = WideCharToMultiByte(CP_UTF8, 0, from, -1, to, tolen,
-									 NULL, NULL);
-		/* A zero return is failure */
-		if (result <= 0)
-			result = -1;
-		else
-		{
-			Assert(result <= tolen);
-			/* Microsoft counts the zero terminator in the result */
-			result--;
-		}
-	}
-	else
-#endif   /* WIN32 */
-	{
-		Assert(!lc_ctype_is_c());
-		result = wcstombs(to, from, tolen);
-	}
-	return result;
-}
-
-/*
- * char2wchar --- convert multibyte characters to wide characters
- *
- * This has almost the API of mbstowcs(), except that *from need not be
- * null-terminated; instead, the number of input bytes is specified as
- * fromlen.  Also, we ereport() rather than returning -1 for invalid
- * input encoding.	tolen is the maximum number of wchar_t's to store at *to.
- * The output will be zero-terminated iff there is room.
- */
-size_t
-char2wchar(wchar_t *to, size_t tolen, const char *from, size_t fromlen)
-{
-	size_t		result;
-
-	if (tolen == 0)
-		return 0;
-
-#ifdef WIN32
-	/* See WIN32 "Unicode" comment above */
-	if (GetDatabaseEncoding() == PG_UTF8)
-	{
-		/* Win32 API does not work for zero-length input */
-		if (fromlen == 0)
-			result = 0;
-		else
-		{
-			result = MultiByteToWideChar(CP_UTF8, 0, from, fromlen, to, tolen - 1);
-			/* A zero return is failure */
-			if (result == 0)
-				result = -1;
-		}
-
-		if (result != -1)
-		{
-			Assert(result < tolen);
-			/* Append trailing null wchar (MultiByteToWideChar() does not) */
-			to[result] = 0;
-		}
-	}
-	else
-#endif   /* WIN32 */
-	{
-		/* mbstowcs requires ending '\0' */
-		char	   *str = pnstrdup(from, fromlen);
-
-		Assert(!lc_ctype_is_c());
-		result = mbstowcs(to, str, tolen);
-		pfree(str);
-	}
-
-	if (result == -1)
-	{
-		/*
-		 * Invalid multibyte character encountered.  We try to give a useful
-		 * error message by letting pg_verifymbstr check the string.  But it's
-		 * possible that the string is OK to us, and not OK to mbstowcs ---
-		 * this suggests that the LC_CTYPE locale is different from the
-		 * database encoding.  Give a generic error message if verifymbstr
-		 * can't find anything wrong.
-		 */
-		pg_verifymbstr(from, fromlen, false);	/* might not return */
-		/* but if it does ... */
-		ereport(ERROR,
-				(errcode(ERRCODE_CHARACTER_NOT_IN_REPERTOIRE),
-				 errmsg("invalid multibyte character for locale"),
-				 errhint("The server's LC_CTYPE locale is probably incompatible with the database encoding.")));
-	}
-
-	return result;
-}
-#endif
 
 /*
  * pg_custom_client_to_server
@@ -863,14 +877,14 @@ pg_encoding_mb2wchar_with_len(int encoding,
 int
 pg_wchar2mb(const pg_wchar *from, char *to)
 {
-	return (*pg_wchar_table[DatabaseEncoding->encoding].wchar2mb_with_len) (from, (unsigned char *)to, pg_wchar_strlen(from));
+	return (*pg_wchar_table[DatabaseEncoding->encoding].wchar2mb_with_len) (from, (unsigned char *) to, pg_wchar_strlen(from));
 }
 
 /* convert a wchar string to a multibyte with a limited length */
 int
 pg_wchar2mb_with_len(const pg_wchar *from, char *to, int len)
 {
-	return (*pg_wchar_table[DatabaseEncoding->encoding].wchar2mb_with_len) (from, (unsigned char *)to, len);
+	return (*pg_wchar_table[DatabaseEncoding->encoding].wchar2mb_with_len) (from, (unsigned char *) to, len);
 }
 
 /* same, with any encoding */
@@ -878,10 +892,10 @@ int
 pg_encoding_wchar2mb_with_len(int encoding,
 							  const pg_wchar *from, char *to, int len)
 {
-	return (*pg_wchar_table[encoding].wchar2mb_with_len) (from, (unsigned char *)to, len);
+	return (*pg_wchar_table[encoding].wchar2mb_with_len) (from, (unsigned char *) to, len);
 }
 
-/* returns the byte length of a multibyte word */
+/* returns the byte length of a multibyte character */
 int
 pg_mblen(const char *mbstr)
 {
@@ -1020,46 +1034,6 @@ cliplen(const char *str, int len, int limit)
 	return l;
 }
 
-#if defined(ENABLE_NLS) && defined(WIN32)
-static const struct codeset_map {
-	int	encoding;
-	const char *codeset;
-} codeset_map_array[] = {
-	{PG_UTF8, "UTF-8"},
-	{PG_LATIN1, "LATIN1"},
-	{PG_LATIN2, "LATIN2"},
-	{PG_LATIN3, "LATIN3"},
-	{PG_LATIN4, "LATIN4"},
-	{PG_ISO_8859_5, "ISO-8859-5"},
-	{PG_ISO_8859_6, "ISO_8859-6"},
-	{PG_ISO_8859_7, "ISO-8859-7"},
-	{PG_ISO_8859_8, "ISO-8859-8"},
-	{PG_LATIN5, "LATIN5"},
-	{PG_LATIN6, "LATIN6"},
-	{PG_LATIN7, "LATIN7"},
-	{PG_LATIN8, "LATIN8"},
-	{PG_LATIN9, "LATIN-9"},
-	{PG_LATIN10, "LATIN10"},
-	{PG_KOI8R, "KOI8-R"},
-	{PG_WIN1250, "CP1250"},
-	{PG_WIN1251, "CP1251"},
-	{PG_WIN1252, "CP1252"},
-	{PG_WIN1253, "CP1253"},
-	{PG_WIN1254, "CP1254"},
-	{PG_WIN1255, "CP1255"},
-	{PG_WIN1256, "CP1256"},
-	{PG_WIN1257, "CP1257"},
-	{PG_WIN1258, "CP1258"},
-	{PG_WIN866, "CP866"},
-	{PG_WIN874, "CP874"},
-	{PG_EUC_CN, "EUC-CN"},
-	{PG_EUC_JP, "EUC-JP"},
-	{PG_EUC_KR, "EUC-KR"},
-	{PG_EUC_TW, "EUC-TW"},
-	{PG_EUC_JIS_2004, "EUC-JP"}
-};
-#endif /* WIN32 */
-
 void
 SetDatabaseEncoding(int encoding)
 {
@@ -1068,97 +1042,204 @@ SetDatabaseEncoding(int encoding)
 
 	DatabaseEncoding = &pg_enc2name_tbl[encoding];
 	Assert(DatabaseEncoding->encoding == encoding);
-
-	/*
-	 * On Windows, we allow UTF-8 database encoding to be used with any
-	 * locale setting, because UTF-8 requires special handling anyway.
-	 * But this means that gettext() might be misled about what output
-	 * encoding it should use, so we have to tell it explicitly.
-	 *
-	 * In future we might want to call bind_textdomain_codeset
-	 * unconditionally, but that requires knowing how to spell the codeset
-	 * name properly for all encodings on all platforms, which might be
-	 * problematic.
-	 *
-	 * This is presently unnecessary, but harmless, on non-Windows platforms.
-	 */
-#ifdef ENABLE_NLS
-	if (encoding == PG_UTF8)
-		if (bind_textdomain_codeset("postgres", "UTF-8") == NULL)
-			elog(LOG, "bind_textdomain_codeset failed");
-#endif
 }
 
-/*
- * Bind gettext to the codeset equivalent with the database encoding.
- */
 void
-pg_bind_textdomain_codeset(const char *domainname)
+SetMessageEncoding(int encoding)
 {
-#if defined(ENABLE_NLS)
-	int			encoding = GetDatabaseEncoding();
+	/* Some calls happen before we can elog()! */
+	Assert(PG_VALID_ENCODING(encoding));
+
+	MessageEncoding = &pg_enc2name_tbl[encoding];
+	Assert(MessageEncoding->encoding == encoding);
+}
+
+#ifdef ENABLE_NLS
+/*
+ * Make one bind_textdomain_codeset() call, translating a pg_enc to a gettext
+ * codeset.  Fails for MULE_INTERNAL, an encoding unknown to gettext; can also
+ * fail for gettext-internal causes like out-of-memory.
+ */
+static bool
+raw_pg_bind_textdomain_codeset(const char *domainname, int encoding)
+{
+	bool		elog_ok = (CurrentMemoryContext != NULL);
 	int			i;
-
-	/*
-	 * gettext() uses the codeset specified by LC_CTYPE by default, so if that
-	 * matches the database encoding we don't need to do anything. In CREATE
-	 * DATABASE, we enforce or trust that the locale's codeset matches
-	 * database encoding, except for the C locale. In C locale, we bind
-	 * gettext() explicitly to the right codeset.
-	 *
-	 * On Windows, though, gettext() tends to get confused so we always bind
-	 * it.
-	 */
-#ifndef WIN32
-	const char *ctype = setlocale(LC_CTYPE, NULL);
-
-	if (pg_strcasecmp(ctype, "C") != 0 && pg_strcasecmp(ctype, "POSIX") != 0)
-		return;
-#endif
 
 	for (i = 0; pg_enc2gettext_tbl[i].name != NULL; i++)
 	{
 		if (pg_enc2gettext_tbl[i].encoding == encoding)
 		{
 			if (bind_textdomain_codeset(domainname,
-										pg_enc2gettext_tbl[i].name) == NULL)
+										pg_enc2gettext_tbl[i].name) != NULL)
+				return true;
+
+			if (elog_ok)
 				elog(LOG, "bind_textdomain_codeset failed");
+			else
+				write_stderr("bind_textdomain_codeset failed");
+
 			break;
 		}
 	}
-#endif
+
+	return false;
 }
 
-void
-SetDefaultClientEncoding(void)
+/*
+ * Bind a gettext message domain to the codeset corresponding to the database
+ * encoding.  For SQL_ASCII, instead bind to the codeset implied by LC_CTYPE.
+ * Return the MessageEncoding implied by the new settings.
+ *
+ * On most platforms, gettext defaults to the codeset implied by LC_CTYPE.
+ * When that matches the database encoding, we don't need to do anything.  In
+ * CREATE DATABASE, we enforce or trust that the locale's codeset matches the
+ * database encoding, except for the C locale.  (On Windows, we also permit a
+ * discrepancy under the UTF8 encoding.)  For the C locale, explicitly bind
+ * gettext to the right codeset.
+ *
+ * On Windows, gettext defaults to the Windows ANSI code page.  This is a
+ * convenient departure for software that passes the strings to Windows ANSI
+ * APIs, but we don't do that.  Compel gettext to use database encoding or,
+ * failing that, the LC_CTYPE encoding as it would on other platforms.
+ *
+ * This function is called before elog() and palloc() are usable.
+ */
+int
+pg_bind_textdomain_codeset(const char *domainname)
 {
-	ClientEncoding = &pg_enc2name_tbl[GetDatabaseEncoding()];
-}
+	bool		elog_ok = (CurrentMemoryContext != NULL);
+	int			encoding = GetDatabaseEncoding();
+	int			new_msgenc;
 
+#ifndef WIN32
+	const char *ctype = setlocale(LC_CTYPE, NULL);
+
+	if (pg_strcasecmp(ctype, "C") == 0 || pg_strcasecmp(ctype, "POSIX") == 0)
+#endif
+		if (encoding != PG_SQL_ASCII &&
+			raw_pg_bind_textdomain_codeset(domainname, encoding))
+			return encoding;
+
+	new_msgenc = pg_get_encoding_from_locale(NULL, elog_ok);
+	if (new_msgenc < 0)
+		new_msgenc = PG_SQL_ASCII;
+
+#ifdef WIN32
+	if (!raw_pg_bind_textdomain_codeset(domainname, new_msgenc))
+		/* On failure, the old message encoding remains valid. */
+		return GetMessageEncoding();
+#endif
+
+	return new_msgenc;
+}
+#endif
+
+/*
+ * The database encoding, also called the server encoding, represents the
+ * encoding of data stored in text-like data types.  Affected types include
+ * cstring, text, varchar, name, xml, and json.
+ */
 int
 GetDatabaseEncoding(void)
 {
-	Assert(DatabaseEncoding);
 	return DatabaseEncoding->encoding;
 }
 
 const char *
 GetDatabaseEncodingName(void)
 {
-	Assert(DatabaseEncoding);
 	return DatabaseEncoding->name;
 }
 
 Datum
 getdatabaseencoding(PG_FUNCTION_ARGS)
 {
-	Assert(DatabaseEncoding);
 	return DirectFunctionCall1(namein, CStringGetDatum(DatabaseEncoding->name));
 }
 
 Datum
 pg_client_encoding(PG_FUNCTION_ARGS)
 {
-	Assert(ClientEncoding);
 	return DirectFunctionCall1(namein, CStringGetDatum(ClientEncoding->name));
 }
+
+/*
+ * gettext() returns messages in this encoding.  This often matches the
+ * database encoding, but it differs for SQL_ASCII databases, for processes
+ * not attached to a database, and under a database encoding lacking iconv
+ * support (MULE_INTERNAL).
+ */
+int
+GetMessageEncoding(void)
+{
+	return MessageEncoding->encoding;
+}
+
+#ifdef WIN32
+/*
+ * Convert from MessageEncoding to a palloc'ed, null-terminated utf16
+ * string. The character length is also passed to utf16len if not
+ * null. Returns NULL iff failed. Before MessageEncoding initialization, "str"
+ * should be ASCII-only; this will function as though MessageEncoding is UTF8.
+ */
+WCHAR *
+pgwin32_message_to_UTF16(const char *str, int len, int *utf16len)
+{
+	WCHAR	   *utf16;
+	int			dstlen;
+	UINT		codepage;
+
+	codepage = pg_enc2name_tbl[GetMessageEncoding()].codepage;
+
+	/*
+	 * Use MultiByteToWideChar directly if there is a corresponding codepage,
+	 * or double conversion through UTF8 if not.  Double conversion is needed,
+	 * for example, in an ENCODING=LATIN8, LC_CTYPE=C database.
+	 */
+	if (codepage != 0)
+	{
+		utf16 = (WCHAR *) palloc(sizeof(WCHAR) * (len + 1));
+		dstlen = MultiByteToWideChar(codepage, 0, str, len, utf16, len);
+		utf16[dstlen] = (WCHAR) 0;
+	}
+	else
+	{
+		char	   *utf8;
+
+		/*
+		 * XXX pg_do_encoding_conversion() requires a transaction.  In the
+		 * absence of one, hope for the input to be valid UTF8.
+		 */
+		if (IsTransactionState())
+		{
+			utf8 = (char *) pg_do_encoding_conversion((unsigned char *) str,
+													  len,
+													  GetMessageEncoding(),
+													  PG_UTF8);
+			if (utf8 != str)
+				len = strlen(utf8);
+		}
+		else
+			utf8 = (char *) str;
+
+		utf16 = (WCHAR *) palloc(sizeof(WCHAR) * (len + 1));
+		dstlen = MultiByteToWideChar(CP_UTF8, 0, utf8, len, utf16, len);
+		utf16[dstlen] = (WCHAR) 0;
+
+		if (utf8 != str)
+			pfree(utf8);
+	}
+
+	if (dstlen == 0 && len > 0)
+	{
+		pfree(utf16);
+		return NULL;			/* error */
+	}
+
+	if (utf16len)
+		*utf16len = dstlen;
+	return utf16;
+}
+
+#endif

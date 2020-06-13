@@ -1,11 +1,15 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/vacuum.sgml,v 1.51 2008/02/03 16:24:08 tgl Exp $
+doc/src/sgml/ref/vacuum.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-VACUUM">
+ <indexterm zone="sql-vacuum">
+  <primary>VACUUM</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="sql-vacuum-title">VACUUM</refentrytitle>
+  <refentrytitle>VACUUM</refentrytitle>
   <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
@@ -15,14 +19,11 @@ PostgreSQL documentation
   <refpurpose>garbage-collect and optionally analyze a database</refpurpose>
  </refnamediv>
 
- <indexterm zone="sql-vacuum">
-  <primary>VACUUM</primary>
- </indexterm>
-
  <refsynopsisdiv>
 <synopsis>
-VACUUM [ FULL ] [ FREEZE ] [ VERBOSE ] [ <replaceable class="PARAMETER">table</replaceable> ]
-VACUUM [ FULL ] [ FREEZE ] [ VERBOSE ] ANALYZE [ <replaceable class="PARAMETER">table</replaceable> [ (<replaceable class="PARAMETER">column</replaceable> [, ...] ) ] ]
+VACUUM [ ( { FULL | FREEZE | VERBOSE | ANALYZE | DISABLE_PAGE_SKIPPING } [, ...] ) ] [ <replaceable class="PARAMETER">table_name</replaceable> [ (<replaceable class="PARAMETER">column_name</replaceable> [, ...] ) ] ]
+VACUUM [ FULL ] [ FREEZE ] [ VERBOSE ] [ <replaceable class="PARAMETER">table_name</replaceable> ]
+VACUUM [ FULL ] [ FREEZE ] [ VERBOSE ] ANALYZE [ <replaceable class="PARAMETER">table_name</replaceable> [ (<replaceable class="PARAMETER">column_name</replaceable> [, ...] ) ] ]
 </synopsis>
  </refsynopsisdiv>
 
@@ -48,7 +49,7 @@ VACUUM [ FULL ] [ FREEZE ] [ VERBOSE ] ANALYZE [ <replaceable class="PARAMETER">
    <command>VACUUM ANALYZE</command> performs a <command>VACUUM</command>
    and then an <command>ANALYZE</command> for each selected table.  This
    is a handy combination form for routine maintenance scripts.  See
-   <xref linkend="sql-analyze" endterm="sql-analyze-title">
+   <xref linkend="sql-analyze">
    for more details about its processing.
   </para>
 
@@ -57,11 +58,21 @@ VACUUM [ FULL ] [ FREEZE ] [ VERBOSE ] ANALYZE [ <replaceable class="PARAMETER">
    space and makes it
    available for re-use.  This form of the command can operate in parallel
    with normal reading and writing of the table, as an exclusive lock
-   is not obtained. <command>VACUUM
-   FULL</command> does more extensive processing, including moving of tuples
-   across blocks to try to compact the table to the minimum number of disk
-   blocks.  This form is much slower and requires an exclusive lock on each
-   table while it is being processed.
+   is not obtained.  However, extra space is not returned to the operating
+   system (in most cases); it's just kept available for re-use within the
+   same table.  <command>VACUUM FULL</command> rewrites the entire contents
+   of the table into a new disk file with no extra space, allowing unused
+   space to be returned to the operating system.  This form is much slower and
+   requires an exclusive lock on each table while it is being processed.
+  </para>
+
+  <para>
+   When the option list is surrounded by parentheses, the options can be
+   written in any order.  Without parentheses, options must be specified
+   in exactly the order shown above.
+   The parenthesized syntax was added in
+   <productname>PostgreSQL</productname> 9.0;  the unparenthesized
+   syntax is deprecated.
   </para>
  </refsect1>
 
@@ -75,6 +86,10 @@ VACUUM [ FULL ] [ FREEZE ] [ VERBOSE ] ANALYZE [ <replaceable class="PARAMETER">
      <para>
       Selects <quote>full</quote> vacuum, which can reclaim more
       space, but takes much longer and exclusively locks the table.
+      This method also requires extra disk space, since it writes a
+      new copy of the table and doesn't release the old copy until
+      the operation is complete.  Usually this should only be used when a
+      significant amount of space needs to be reclaimed from within the table.
      </para>
     </listitem>
    </varlistentry>
@@ -86,9 +101,11 @@ VACUUM [ FULL ] [ FREEZE ] [ VERBOSE ] ANALYZE [ <replaceable class="PARAMETER">
       Selects aggressive <quote>freezing</quote> of tuples.
       Specifying <literal>FREEZE</literal> is equivalent to performing
       <command>VACUUM</command> with the
-      <xref linkend="guc-vacuum-freeze-min-age"> parameter
-      set to zero.  The <literal>FREEZE</literal> option is deprecated and
-      will be removed in a future release; set the parameter instead.
+      <xref linkend="guc-vacuum-freeze-min-age"> and
+      <xref linkend="guc-vacuum-freeze-table-age"> parameters
+      set to zero.  Aggressive freezing is always performed when the
+      table is rewritten, so this option is redundant when <literal>FULL</>
+      is specified.
      </para>
     </listitem>
    </varlistentry>
@@ -97,11 +114,7 @@ VACUUM [ FULL ] [ FREEZE ] [ VERBOSE ] ANALYZE [ <replaceable class="PARAMETER">
     <term><literal>VERBOSE</literal></term>
     <listitem>
      <para>
-      Prints a detailed vacuum activity report for each table. Can be used
-      to help determine appropriate settings for
-      <xref linkend="guc-max-fsm-pages">,
-      <xref linkend="guc-max-fsm-relations">, and
-      <xref linkend="guc-default-statistics-target">.
+      Prints a detailed vacuum activity report for each table.
      </para>
     </listitem>
    </varlistentry>
@@ -117,7 +130,26 @@ VACUUM [ FULL ] [ FREEZE ] [ VERBOSE ] ANALYZE [ <replaceable class="PARAMETER">
    </varlistentry>
 
    <varlistentry>
-    <term><replaceable class="PARAMETER">table</replaceable></term>
+    <term><literal>DISABLE_PAGE_SKIPPING</literal></term>
+    <listitem>
+     <para>
+      Normally, <command>VACUUM</> will skip pages based on the <link
+      linkend="vacuum-for-visibility-map">visibility map</>.  Pages where
+      all tuples are known to be frozen can always be skipped, and those
+      where all tuples are known to be visible to all transactions may be
+      skipped except when performing an aggressive vacuum.  Furthermore,
+      except when performing an aggressive vacuum, some pages may be skipped
+      in order to avoid waiting for other sessions to finish using them.
+      This option disables all page-skipping behavior, and is intended to
+      be used only the contents of the visibility map are thought to
+      be suspect, which should happen only if there is a hardware or software
+      issue causing database corruption.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><replaceable class="PARAMETER">table_name</replaceable></term>
     <listitem>
      <para>
       The name (optionally schema-qualified) of a specific table to
@@ -127,10 +159,11 @@ VACUUM [ FULL ] [ FREEZE ] [ VERBOSE ] ANALYZE [ <replaceable class="PARAMETER">
    </varlistentry>
 
    <varlistentry>
-    <term><replaceable class="PARAMETER">column</replaceable></term>
+    <term><replaceable class="PARAMETER">column_name</replaceable></term>
     <listitem>
      <para>
       The name of a specific column to analyze. Defaults to all columns.
+      If a column list is specified, <literal>ANALYZE</> is implied.
      </para>
     </listitem>
    </varlistentry>
@@ -187,12 +220,9 @@ VACUUM [ FULL ] [ FREEZE ] [ VERBOSE ] ANALYZE [ <replaceable class="PARAMETER">
     The <option>FULL</option> option is not recommended for routine use,
     but might be useful in special cases.  An example is when you have deleted
     or updated most of the rows in a table and would like the table to
-	physically shrink to occupy less disk space and allow faster table scans.
-	<command>VACUUM FULL</command> will usually shrink the table more than a
-	plain <command>VACUUM</command> would.  The <option>FULL</option> option
-	does not shrink indexes; a periodic <command>REINDEX</> is still
-	recommended.  In fact, it is often faster to drop all indexes, <command>
-	VACUUM FULL</command>, and recreate the indexes.
+    physically shrink to occupy less disk space and allow faster table
+    scans. <command>VACUUM FULL</command> will usually shrink the table
+    more than a plain <command>VACUUM</command> would.
    </para>
 
    <para>
@@ -214,40 +244,12 @@ VACUUM [ FULL ] [ FREEZE ] [ VERBOSE ] ANALYZE [ <replaceable class="PARAMETER">
   <title>Examples</title>
 
   <para>
-   The following is an example from running <command>VACUUM</command> on a
-   table in the regression database:
+   To clean a single table <literal>onek</literal>, analyze it for
+   the optimizer and print a detailed vacuum activity report:
 
 <programlisting>
-regression=# VACUUM VERBOSE ANALYZE onek;
-INFO:  vacuuming "public.onek"
-INFO:  index "onek_unique1" now contains 1000 tuples in 14 pages
-DETAIL:  3000 index tuples were removed.
-0 index pages have been deleted, 0 are currently reusable.
-CPU 0.01s/0.08u sec elapsed 0.18 sec.
-INFO:  index "onek_unique2" now contains 1000 tuples in 16 pages
-DETAIL:  3000 index tuples were removed.
-0 index pages have been deleted, 0 are currently reusable.
-CPU 0.00s/0.07u sec elapsed 0.23 sec.
-INFO:  index "onek_hundred" now contains 1000 tuples in 13 pages
-DETAIL:  3000 index tuples were removed.
-0 index pages have been deleted, 0 are currently reusable.
-CPU 0.01s/0.08u sec elapsed 0.17 sec.
-INFO:  index "onek_stringu1" now contains 1000 tuples in 48 pages
-DETAIL:  3000 index tuples were removed.
-0 index pages have been deleted, 0 are currently reusable.
-CPU 0.01s/0.09u sec elapsed 0.59 sec.
-INFO:  "onek": removed 3000 tuples in 108 pages
-DETAIL:  CPU 0.01s/0.06u sec elapsed 0.07 sec.
-INFO:  "onek": found 3000 removable, 1000 nonremovable tuples in 143 pages
-DETAIL:  0 dead tuples cannot be removed yet.
-There were 0 unused item pointers.
-0 pages are entirely empty.
-CPU 0.07s/0.39u sec elapsed 1.56 sec.
-INFO:  analyzing "public.onek"
-INFO:  "onek": 36 pages, 1000 rows sampled, 1000 estimated total rows
-VACUUM
-</programlisting>
-  </para>
+VACUUM (VERBOSE, ANALYZE) onek;
+</programlisting></para>
  </refsect1>
 
  <refsect1>
@@ -262,9 +264,9 @@ VACUUM
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="app-vacuumdb" endterm="app-vacuumdb-title"></member>
-   <member><xref linkend="runtime-config-resource-vacuum-cost" endterm="runtime-config-resource-vacuum-cost-title"></member>
-   <member><xref linkend="autovacuum" endterm="autovacuum-title"></member>
+   <member><xref linkend="app-vacuumdb"></member>
+   <member><xref linkend="runtime-config-resource-vacuum-cost"></member>
+   <member><xref linkend="autovacuum"></member>
   </simplelist>
  </refsect1>
 </refentry>

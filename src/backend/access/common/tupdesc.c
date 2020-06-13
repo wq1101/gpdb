@@ -3,12 +3,12 @@
  * tupdesc.c
  *	  POSTGRES tuple descriptor support code
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/access/common/tupdesc.c,v 1.122 2008/01/01 19:45:46 momjian Exp $
+ *	  src/backend/access/common/tupdesc.c
  *
  * NOTES
  *	  some of the executor utility code such as "ExecTypeFromTL" should be
@@ -19,10 +19,13 @@
 
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "catalog/pg_type.h"
+#include "miscadmin.h"
 #include "parser/parse_type.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
-#include "utils/resowner.h"
+#include "utils/resowner_private.h"
 #include "utils/syscache.h"
 
 
@@ -200,6 +203,8 @@ CreateTupleDescCopyConstr(TupleDesc tupdesc)
 					cpy->check[i].ccname = pstrdup(constr->check[i].ccname);
 				if (constr->check[i].ccbin)
 					cpy->check[i].ccbin = pstrdup(constr->check[i].ccbin);
+				cpy->check[i].ccvalid = constr->check[i].ccvalid;
+				cpy->check[i].ccnoinherit = constr->check[i].ccnoinherit;
 			}
 		}
 
@@ -210,6 +215,47 @@ CreateTupleDescCopyConstr(TupleDesc tupdesc)
 	desc->tdtypmod = tupdesc->tdtypmod;
 
 	return desc;
+}
+
+/*
+ * TupleDescCopyEntry
+ *		This function copies a single attribute structure from one tuple
+ *		descriptor to another.
+ *
+ * !!! Constraints and defaults are not copied !!!
+ */
+void
+TupleDescCopyEntry(TupleDesc dst, AttrNumber dstAttno,
+				   TupleDesc src, AttrNumber srcAttno)
+{
+	/*
+	 * sanity checks
+	 */
+	AssertArg(PointerIsValid(src));
+	AssertArg(PointerIsValid(dst));
+	AssertArg(srcAttno >= 1);
+	AssertArg(srcAttno <= src->natts);
+	AssertArg(dstAttno >= 1);
+	AssertArg(dstAttno <= dst->natts);
+
+	memcpy(dst->attrs[dstAttno - 1], src->attrs[srcAttno - 1],
+		   ATTRIBUTE_FIXED_PART_SIZE);
+
+	/*
+	 * Aside from updating the attno, we'd better reset attcacheoff.
+	 *
+	 * XXX Actually, to be entirely safe we'd need to reset the attcacheoff of
+	 * all following columns in dst as well.  Current usage scenarios don't
+	 * require that though, because all following columns will get initialized
+	 * by other uses of this function or TupleDescInitEntry.  So we cheat a
+	 * bit to avoid a useless O(N^2) penalty.
+	 */
+	dst->attrs[dstAttno - 1]->attnum = dstAttno;
+	dst->attrs[dstAttno - 1]->attcacheoff = -1;
+
+	/* since we're not copying constraints or defaults, clear these */
+	dst->attrs[dstAttno - 1]->attnotnull = false;
+	dst->attrs[dstAttno - 1]->atthasdef = false;
 }
 
 /*
@@ -363,6 +409,9 @@ equalTupleDescs(TupleDesc tupdesc1, TupleDesc tupdesc2, bool strict)
 				return false;
 			if (attr1->attinhcount != attr2->attinhcount)
 				return false;
+			if (attr1->attcollation != attr2->attcollation)
+				return false;
+			/* attacl and attoptions are not even present... */
 		}
 	}
 
@@ -417,7 +466,9 @@ equalTupleDescs(TupleDesc tupdesc1, TupleDesc tupdesc2, bool strict)
 			for (j = 0; j < n; check2++, j++)
 			{
 				if (strcmp(check1->ccname, check2->ccname) == 0 &&
-					strcmp(check1->ccbin, check2->ccbin) == 0)
+					strcmp(check1->ccbin, check2->ccbin) == 0 &&
+					check1->ccvalid == check2->ccvalid &&
+					check1->ccnoinherit == check2->ccnoinherit)
 					break;
 			}
 			if (j >= n)
@@ -439,6 +490,10 @@ equalTupleDescs(TupleDesc tupdesc1, TupleDesc tupdesc2, bool strict)
  * Also, some callers use this function to change the datatype-related fields
  * in an existing tupdesc; they pass attributeName = NameStr(att->attname)
  * to indicate that the attname field shouldn't be modified.
+ *
+ * Note that attcollation is set to the default for the specified datatype.
+ * If a nondefault collation is needed, insert it afterwards using
+ * TupleDescInitEntryCollation.
  */
 void
 TupleDescInitEntry(TupleDesc desc,
@@ -488,10 +543,9 @@ TupleDescInitEntry(TupleDesc desc,
 	att->attisdropped = false;
 	att->attislocal = true;
 	att->attinhcount = 0;
+	/* attacl, attoptions and attfdwoptions are not present in tupledescs */
 
-	tuple = SearchSysCache(TYPEOID,
-						   ObjectIdGetDatum(oidtypeid),
-						   0, 0, 0);
+	tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(oidtypeid));
 	if (!HeapTupleIsValid(tuple))
 		elog(ERROR, "cache lookup failed for type %u", oidtypeid);
 	typeForm = (Form_pg_type) GETSTRUCT(tuple);
@@ -501,8 +555,30 @@ TupleDescInitEntry(TupleDesc desc,
 	att->attbyval = typeForm->typbyval;
 	att->attalign = typeForm->typalign;
 	att->attstorage = typeForm->typstorage;
+	att->attcollation = typeForm->typcollation;
 
 	ReleaseSysCache(tuple);
+}
+
+/*
+ * TupleDescInitEntryCollation
+ *
+ * Assign a nondefault collation to a previously initialized tuple descriptor
+ * entry.
+ */
+void
+TupleDescInitEntryCollation(TupleDesc desc,
+							AttrNumber attributeNumber,
+							Oid collationid)
+{
+	/*
+	 * sanity checks
+	 */
+	AssertArg(PointerIsValid(desc));
+	AssertArg(attributeNumber >= 1);
+	AssertArg(attributeNumber <= desc->natts);
+
+	desc->attrs[attributeNumber - 1]->attcollation = collationid;
 }
 
 
@@ -526,6 +602,7 @@ BuildDescForRelation(List *schema)
 	char	   *attname;
 	Oid			atttypid;
 	int32		atttypmod;
+	Oid			attcollation;
 	int			attdim;
 
 	/*
@@ -540,6 +617,7 @@ BuildDescForRelation(List *schema)
 	foreach(l, schema)
 	{
 		ColumnDef  *entry = lfirst(l);
+		AclResult	aclresult;
 
 		/*
 		 * for each entry in the list, get the name and type information from
@@ -549,7 +627,13 @@ BuildDescForRelation(List *schema)
 		attnum++;
 
 		attname = entry->colname;
-		atttypid = typenameTypeId(NULL, entry->typeName, &atttypmod);
+		typenameTypeIdAndMod(NULL, entry->typeName, &atttypid, &atttypmod);
+
+		aclresult = pg_type_aclcheck(atttypid, GetUserId(), ACL_USAGE);
+		if (aclresult != ACLCHECK_OK)
+			aclcheck_error_type(aclresult, atttypid);
+
+		attcollation = GetColumnDefCollation(NULL, entry, atttypid);
 		attdim = list_length(entry->typeName->arrayBounds);
 
 		if (entry->typeName->setof)
@@ -560,6 +644,11 @@ BuildDescForRelation(List *schema)
 
 		TupleDescInitEntry(desc, attnum, attname,
 						   atttypid, atttypmod, attdim);
+
+		/* Override TupleDescInitEntry's settings as requested */
+		TupleDescInitEntryCollation(desc, attnum, attcollation);
+		if (entry->storage)
+			desc->attrs[attnum - 1]->attstorage = entry->storage;
 
 		/* Fill in additional stuff not handled by TupleDescInitEntry */
 		desc->attrs[attnum - 1]->attnotnull = entry->is_not_null;
@@ -591,24 +680,28 @@ BuildDescForRelation(List *schema)
  * BuildDescFromLists
  *
  * Build a TupleDesc given lists of column names (as String nodes),
- * column type OIDs, and column typmods.  No constraints are generated.
+ * column type OIDs, typmods, and collation OIDs.
+ *
+ * No constraints are generated.
  *
  * This is essentially a cut-down version of BuildDescForRelation for use
  * with functions returning RECORD.
  */
 TupleDesc
-BuildDescFromLists(List *names, List *types, List *typmods)
+BuildDescFromLists(List *names, List *types, List *typmods, List *collations)
 {
 	int			natts;
 	AttrNumber	attnum;
 	ListCell   *l1;
 	ListCell   *l2;
 	ListCell   *l3;
+	ListCell   *l4;
 	TupleDesc	desc;
 
 	natts = list_length(names);
 	Assert(natts == list_length(types));
 	Assert(natts == list_length(typmods));
+	Assert(natts == list_length(collations));
 
 	/*
 	 * allocate a new tuple descriptor
@@ -619,20 +712,25 @@ BuildDescFromLists(List *names, List *types, List *typmods)
 
 	l2 = list_head(types);
 	l3 = list_head(typmods);
+	l4 = list_head(collations);
 	foreach(l1, names)
 	{
 		char	   *attname = strVal(lfirst(l1));
 		Oid			atttypid;
 		int32		atttypmod;
+		Oid			attcollation;
 
 		atttypid = lfirst_oid(l2);
 		l2 = lnext(l2);
 		atttypmod = lfirst_int(l3);
 		l3 = lnext(l3);
+		attcollation = lfirst_oid(l4);
+		l4 = lnext(l4);
 
 		attnum++;
 
 		TupleDescInitEntry(desc, attnum, attname, atttypid, atttypmod, 0);
+		TupleDescInitEntryCollation(desc, attnum, attcollation);
 	}
 
 	return desc;

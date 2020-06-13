@@ -26,7 +26,7 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $PostgreSQL: pgsql/contrib/pgcrypto/pgp-decrypt.c,v 1.8 2009/06/11 14:48:52 momjian Exp $
+ * contrib/pgcrypto/pgp-decrypt.c
  */
 
 #include "postgres.h"
@@ -643,6 +643,7 @@ parse_symenc_sesskey(PGP_Context *ctx, PullFilter *src)
 	if (res < 0)
 		return res;
 	ctx->s2k_mode = ctx->s2k.mode;
+	ctx->s2k_count = s2k_decode_count(ctx->s2k.iter);
 	ctx->s2k_digest_algo = ctx->s2k.digest_algo;
 
 	/*
@@ -1064,7 +1065,7 @@ pgp_skip_packet(PullFilter *pkt)
 
 	while (res > 0)
 		res = pullf_read(pkt, 32 * 1024, &tmp);
-	return res < 0 ? res : 0;
+	return res;
 }
 
 /*
@@ -1073,19 +1074,16 @@ pgp_skip_packet(PullFilter *pkt)
 int
 pgp_expect_packet_end(PullFilter *pkt)
 {
-	int			res = 1;
+	int			res;
 	uint8	   *tmp;
 
-	while (res > 0)
+	res = pullf_read(pkt, 32 * 1024, &tmp);
+	if (res > 0)
 	{
-		res = pullf_read(pkt, 32 * 1024, &tmp);
-		if (res > 0)
-		{
-			px_debug("pgp_expect_packet_end: got data");
-			return PXE_PGP_CORRUPT_DATA;
-		}
+		px_debug("pgp_expect_packet_end: got data");
+		return PXE_PGP_CORRUPT_DATA;
 	}
-	return res < 0 ? res : 0;
+	return res;
 }
 
 int

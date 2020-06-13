@@ -4,21 +4,18 @@
  *	  PREPARE, EXECUTE and DEALLOCATE commands, and prepared-stmt storage
  *
  *
- * Copyright (c) 2002-2008, PostgreSQL Global Development Group
+ * Copyright (c) 2002-2016, PostgreSQL Global Development Group
  *
- * $PostgreSQL: pgsql/src/include/commands/prepare.h,v 1.29 2008/01/01 19:45:57 momjian Exp $
+ * src/include/commands/prepare.h
  *
  *-------------------------------------------------------------------------
  */
 #ifndef PREPARE_H
 #define PREPARE_H
 
-#include "executor/execdesc.h"
-#include "executor/executor.h"
+#include "commands/explain.h"
+#include "datatype/timestamp.h"
 #include "utils/plancache.h"
-#include "utils/timestamp.h"
-
-struct TupOutputState;                  /* #include "executor/executor.h" */
 
 /*
  * The data structure representing a prepared statement.  This is now just
@@ -39,24 +36,17 @@ typedef struct
 
 /* Utility statements PREPARE, EXECUTE, DEALLOCATE, EXPLAIN EXECUTE */
 extern void PrepareQuery(PrepareStmt *stmt, const char *queryString);
-extern void ExecuteQuery(ExecuteStmt *stmt, const char *queryString,
-			 ParamListInfo params,
+extern void ExecuteQuery(ExecuteStmt *stmt, IntoClause *intoClause,
+			 const char *queryString, ParamListInfo params,
 			 DestReceiver *dest, char *completionTag);
 extern void DeallocateQuery(DeallocateStmt *stmt);
-extern void ExplainExecuteQuery(ExecuteStmt *execstmt, ExplainStmt *stmt,
-					const char *queryString,
-					ParamListInfo params, TupOutputState *tstate);
+extern void ExplainExecuteQuery(ExecuteStmt *execstmt, IntoClause *into,
+					ExplainState *es,
+					const char *queryString, ParamListInfo params);
 
 /* Low-level access to stored prepared statements */
 extern void StorePreparedStatement(const char *stmt_name,
-					   Node *raw_parse_tree,
-					   const char *query_string,
-					   NodeTag	   sourceTag, /* GPDB */
-					   const char *commandTag,
-					   Oid *param_types,
-					   int num_params,
-					   int cursor_options,
-					   List *stmt_list,
+					   CachedPlanSource *plansource,
 					   bool from_sql);
 extern PreparedStatement *FetchPreparedStatement(const char *stmt_name,
 					   bool throwError);
@@ -64,6 +54,6 @@ extern void DropPreparedStatement(const char *stmt_name, bool showError);
 extern TupleDesc FetchPreparedStatementResultDesc(PreparedStatement *stmt);
 extern List *FetchPreparedStatementTargetList(PreparedStatement *stmt);
 
-void		DropAllPreparedStatements(void);
+extern void DropAllPreparedStatements(void);
 
 #endif   /* PREPARE_H */

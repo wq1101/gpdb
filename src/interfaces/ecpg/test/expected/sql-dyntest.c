@@ -105,7 +105,7 @@ struct sqlca_t
 	/* Element 0: set to 'W' if at least one other is 'W'	*/
 	/* 1: if 'W' at least one character string		*/
 	/* value was truncated when it was			*/
-	/* stored into a host variable.				*/
+	/* stored into a host variable.             */
 
 	/*
 	 * 2: if 'W' a (hopefully) non-fatal notice occurred
@@ -218,7 +218,7 @@ if (sqlca.sqlcode < 0) error ( );
 #line 45 "dyntest.pgc"
 
 
-  { ECPGconnect(__LINE__, 0, "regress1" , NULL, NULL , NULL, 0); 
+  { ECPGconnect(__LINE__, 0, "ecpg1_regression" , NULL, NULL , NULL, 0); 
 #line 47 "dyntest.pgc"
 
 if (sqlca.sqlcode < 0) error ( );}
@@ -273,7 +273,7 @@ if (sqlca.sqlcode < 0) error ( );}
   while (1)
     {
       { ECPGdo(__LINE__, 0, 1, NULL, 0, ECPGst_normal, "fetch in MYCURS", ECPGt_EOIT, 
-	ECPGt_descriptor, "MYDESC", 0L, 0L, 0L, 
+	ECPGt_descriptor, "MYDESC", 1L, 1L, 1L, 
 	ECPGt_NO_INDICATOR, NULL , 0L, 0L, 0L, ECPGt_EORT);
 #line 64 "dyntest.pgc"
 
@@ -385,10 +385,7 @@ if (sqlca.sqlcode < 0) error ( );}
 		printf ("varchar()");
 	      break;
 	    default:
-	      if (TYPE < 0)
-		printf ("<OID %d>", -TYPE);
-	      else
-		printf ("<SQL3 %d>", TYPE);
+	      printf ("<SQL3 %d>", TYPE);
 	      break;
 	    }
 	  printf (")\n\toctet_length: %d returned_octet_length: %d)\n\t= ",
@@ -402,10 +399,10 @@ if (sqlca.sqlcode < 0) error ( );}
 	      { ECPGget_desc(__LINE__, "MYDESC", INDEX,ECPGd_data,
 	ECPGt_bool,&(BOOLVAR),(long)1,(long)1,sizeof(bool), ECPGd_EODT);
 
-#line 166 "dyntest.pgc"
+#line 163 "dyntest.pgc"
 
 if (sqlca.sqlcode < 0) error ( );}
-#line 166 "dyntest.pgc"
+#line 163 "dyntest.pgc"
 
 		printf ("%s\n", BOOLVAR ? "true" : "false");
 		break;
@@ -414,10 +411,10 @@ if (sqlca.sqlcode < 0) error ( );}
 	      { ECPGget_desc(__LINE__, "MYDESC", INDEX,ECPGd_data,
 	ECPGt_int,&(INTVAR),(long)1,(long)1,sizeof(int), ECPGd_EODT);
 
-#line 171 "dyntest.pgc"
+#line 168 "dyntest.pgc"
 
 if (sqlca.sqlcode < 0) error ( );}
-#line 171 "dyntest.pgc"
+#line 168 "dyntest.pgc"
 
 		printf ("%d\n", INTVAR);
 		break;
@@ -425,10 +422,10 @@ if (sqlca.sqlcode < 0) error ( );}
 	      { ECPGget_desc(__LINE__, "MYDESC", INDEX,ECPGd_data,
 	ECPGt_double,&(DOUBLEVAR),(long)1,(long)1,sizeof(double), ECPGd_EODT);
 
-#line 175 "dyntest.pgc"
+#line 172 "dyntest.pgc"
 
 if (sqlca.sqlcode < 0) error ( );}
-#line 175 "dyntest.pgc"
+#line 172 "dyntest.pgc"
 
 		printf ("%.*f\n", PRECISION, DOUBLEVAR);
 		break;
@@ -437,10 +434,10 @@ if (sqlca.sqlcode < 0) error ( );}
 	ECPGt_char,(STRINGVAR),(long)1024,(long)1,(1024)*sizeof(char), ECPGd_di_code,
 	ECPGt_int,&(DATETIME_INTERVAL_CODE),(long)1,(long)1,sizeof(int), ECPGd_EODT);
 
-#line 181 "dyntest.pgc"
+#line 178 "dyntest.pgc"
 
 if (sqlca.sqlcode < 0) error ( );}
-#line 181 "dyntest.pgc"
+#line 178 "dyntest.pgc"
 
 		printf ("%d \"%s\"\n", DATETIME_INTERVAL_CODE, STRINGVAR);
 		break;
@@ -449,10 +446,10 @@ if (sqlca.sqlcode < 0) error ( );}
 	      { ECPGget_desc(__LINE__, "MYDESC", INDEX,ECPGd_data,
 	ECPGt_char,(STRINGVAR),(long)1024,(long)1,(1024)*sizeof(char), ECPGd_EODT);
 
-#line 186 "dyntest.pgc"
+#line 183 "dyntest.pgc"
 
 if (sqlca.sqlcode < 0) error ( );}
-#line 186 "dyntest.pgc"
+#line 183 "dyntest.pgc"
 
 		printf ("\"%s\"\n", STRINGVAR);
 		break;
@@ -460,10 +457,10 @@ if (sqlca.sqlcode < 0) error ( );}
 	      { ECPGget_desc(__LINE__, "MYDESC", INDEX,ECPGd_data,
 	ECPGt_char,(STRINGVAR),(long)1024,(long)1,(1024)*sizeof(char), ECPGd_EODT);
 
-#line 190 "dyntest.pgc"
+#line 187 "dyntest.pgc"
 
 if (sqlca.sqlcode < 0) error ( );}
-#line 190 "dyntest.pgc"
+#line 187 "dyntest.pgc"
 
 		printf ("<\"%s\">\n", STRINGVAR);
 		break;
@@ -472,17 +469,17 @@ if (sqlca.sqlcode < 0) error ( );}
     }
 
   { ECPGdo(__LINE__, 0, 1, NULL, 0, ECPGst_normal, "close MYCURS", ECPGt_EOIT, ECPGt_EORT);
-#line 197 "dyntest.pgc"
+#line 194 "dyntest.pgc"
 
 if (sqlca.sqlcode < 0) error ( );}
-#line 197 "dyntest.pgc"
+#line 194 "dyntest.pgc"
 
 
   ECPGdeallocate_desc(__LINE__, "MYDESC");
-#line 199 "dyntest.pgc"
+#line 196 "dyntest.pgc"
 
 if (sqlca.sqlcode < 0) error ( );
-#line 199 "dyntest.pgc"
+#line 196 "dyntest.pgc"
 
 
   return 0;

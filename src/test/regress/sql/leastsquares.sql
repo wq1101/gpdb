@@ -47,8 +47,10 @@ COPY weibull (id, x1, x2, y) FROM stdin;
 17	77.8	32.9	349.0
 \.
 
+--
 -- Testing of basic single linear regression code
--- start_equiv
+--
+-- these queries should produce the same result.
 select 
     regr_count(y, x1)::real as count,
     regr_avgx(y, x1)::real as avgx,
@@ -73,30 +75,22 @@ select
     ((count(y) * sum(x1*y) - sum(x1)*sum(y))^2/
         ((count(y) * sum(x1*x1) - sum(x1)^2) * (count(y) * sum(y*y) - sum(y)^2)))::real as r2
 from weibull;
--- end_equiv
 
 -- Single linear and multivariate should match for a single independent variable
--- start_equiv
 select 
     array[regr_intercept(y, x1), regr_slope(y, x1)]::real[] as coef,
     regr_r2(y,x1)::real as r2
 from weibull;
--- end_equiv
 
--- start_equiv
 select 
     array[regr_intercept(y, x2), regr_slope(y, x2)]::real[] as coef,
     regr_r2(y,x2)::real as r2
 from weibull;
--- end_equiv
 
--- Accumulation/combination order shouldn't matter to the result.
--- start_equiv
+-- Accumulation/combination order shouldn't matter to the result. These should
+-- produce the same result.
 select float8_regr_accum(float8_regr_accum(array[0,0,0,0,0,0], 1, 2),  2, 1);
 select float8_regr_accum(float8_regr_accum(array[0,0,0,0,0,0], 2, 1),  1, 2);
-select float8_regr_amalg(float8_regr_accum(array[0,0,0,0,0,0], 1, 2),
-                         float8_regr_accum(array[0,0,0,0,0,0], 2, 1));
--- end_equiv
 
 -- Component testing of the individual aggregate callback functions
 --  * null handling
@@ -105,8 +99,6 @@ select float8_regr_amalg(float8_regr_accum(array[0,0,0,0,0,0], 1, 2),
 select float8_regr_accum(null, 1, 2);
 select float8_regr_accum(array[0,0,0,0,0,0], 1, null);
 select float8_regr_accum(array[0,0,0,0,0,0], null, 2);
-select float8_regr_amalg(array[0,0,0,0,0,0], null);
-select float8_regr_amalg(null, array[0,0,0,0,0,0]);
 select float8_regr_sxx(null);
 select float8_regr_sxx(array[0,0,0,0,0,0]);
 select float8_regr_sxx(float8_regr_accum(array[0,0,0,0,0,0], 1, 2));
@@ -133,9 +125,6 @@ select float8_regr_intercept(array[0,0,0,0,0,0]);
 select float8_regr_intercept(float8_regr_accum(array[0,0,0,0,0,0], 1, 2));
 
 select float8_regr_accum('{}'::float8[], 1, 2);
-select float8_regr_amalg('{}'::float8[], array[0,0,0,0,0,0]);
-select float8_regr_amalg(array[0,0,0,0,0,0], '{}'::float8[]);
-select float8_regr_amalg(array[null,0,0,0,0,0], '{}'::float8[]);
 select float8_regr_sxx('{}'::float8[]);
 select float8_regr_syy('{}'::float8[]);
 select float8_regr_sxy('{}'::float8[]);
@@ -151,10 +140,6 @@ DISTRIBUTED RANDOMLY;
 
 select float8_regr_accum(x, 0, 3), 
        float8_regr_accum(x, 0, 2), 
-       x 
-from regr_test;
-select float8_regr_amalg(x, array[1,3,9,0,0,0]), 
-       float8_regr_amalg(x, array[1,2,4,0,0,0]), 
        x 
 from regr_test;
 

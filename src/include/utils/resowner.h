@@ -9,22 +9,20 @@
  * See utils/resowner/README for more info.
  *
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/utils/resowner.h,v 1.15.2.1 2009/12/03 11:03:44 heikki Exp $
+ * src/include/utils/resowner.h
  *
  *-------------------------------------------------------------------------
  */
 #ifndef RESOWNER_H
 #define RESOWNER_H
 
-#include "storage/buf.h"
 #include "storage/fd.h"
-#include "storage/lock.h"
 #include "utils/catcache.h"
 #include "utils/plancache.h"
-
+#include "utils/snapshot.h"
 
 /*
  * ResourceOwner objects are an opaque data structure known only within
@@ -42,7 +40,7 @@ extern PGDLLIMPORT ResourceOwner TopTransactionResourceOwner;
 
 /*
  * Resource releasing is done in three phases: pre-locks, locks, and
- * post-locks.	The pre-lock phase must release any resources that are
+ * post-locks.  The pre-lock phase must release any resources that are
  * visible to other backends (such as pinned buffers); this ensures that
  * when we release a lock that another backend may be waiting on, it will
  * see us as being fully out of our transaction.  The post-lock phase
@@ -64,6 +62,7 @@ typedef void (*ResourceReleaseCallback) (ResourceReleasePhase phase,
 													 bool isTopLevel,
 													 void *arg);
 
+typedef void (*ResourceWalkerCallback) (const struct ResourceOwnerData * owner);
 
 /*
  * Functions in resowner.c
@@ -91,8 +90,9 @@ extern void ResourceOwnerRememberBuffer(ResourceOwner owner, Buffer buffer);
 extern void ResourceOwnerForgetBuffer(ResourceOwner owner, Buffer buffer);
 
 /* support for local lock management */
-extern void ResourceOwnerRememberLock(ResourceOwner owner, LOCALLOCK *locallock);
-extern void ResourceOwnerForgetLock(ResourceOwner owner, LOCALLOCK *locallock);
+struct LOCALLOCK;
+extern void ResourceOwnerRememberLock(ResourceOwner owner, struct LOCALLOCK *locallock);
+extern void ResourceOwnerForgetLock(ResourceOwner owner, struct LOCALLOCK *locallock);
 
 /* support for catcache refcount management */
 extern void ResourceOwnerEnlargeCatCacheRefs(ResourceOwner owner);
@@ -127,11 +127,21 @@ extern void ResourceOwnerRememberTupleDesc(ResourceOwner owner,
 extern void ResourceOwnerForgetTupleDesc(ResourceOwner owner,
 							 TupleDesc tupdesc);
 
+/* support for snapshot refcount management */
+extern void ResourceOwnerEnlargeSnapshots(ResourceOwner owner);
+extern void ResourceOwnerRememberSnapshot(ResourceOwner owner,
+							  Snapshot snapshot);
+extern void ResourceOwnerForgetSnapshot(ResourceOwner owner,
+							Snapshot snapshot);
+
 /* support for temporary file management */
 extern void ResourceOwnerEnlargeFiles(ResourceOwner owner);
 extern void ResourceOwnerRememberFile(ResourceOwner owner,
 						  File file);
 extern void ResourceOwnerForgetFile(ResourceOwner owner,
 						File file);
+
+extern void CdbResourceOwnerWalker(ResourceOwner owner,
+							ResourceWalkerCallback callback);
 
 #endif   /* RESOWNER_H */

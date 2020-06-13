@@ -1,19 +1,9 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/savepoint.sgml,v 1.5 2006/09/16 00:30:20 momjian Exp $
+doc/src/sgml/ref/savepoint.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-SAVEPOINT">
- <refmeta>
-  <refentrytitle id="SQL-SAVEPOINT-TITLE">SAVEPOINT</refentrytitle>
-  <refmiscinfo>SQL - Language Statements</refmiscinfo>
- </refmeta>
-
- <refnamediv>
-  <refname>SAVEPOINT</refname>
-  <refpurpose>define a new savepoint within the current transaction</refpurpose>
- </refnamediv>
-
  <indexterm zone="sql-savepoint">
   <primary>SAVEPOINT</primary>
  </indexterm>
@@ -23,12 +13,23 @@ PostgreSQL documentation
   <secondary>defining</secondary>
  </indexterm>
 
+ <refmeta>
+  <refentrytitle>SAVEPOINT</refentrytitle>
+  <manvolnum>7</manvolnum>
+  <refmiscinfo>SQL - Language Statements</refmiscinfo>
+ </refmeta>
+
+ <refnamediv>
+  <refname>SAVEPOINT</refname>
+  <refpurpose>define a new savepoint within the current transaction</refpurpose>
+ </refnamediv>
+
  <refsynopsisdiv>
 <synopsis>
 SAVEPOINT <replaceable>savepoint_name</replaceable>
 </synopsis>
  </refsynopsisdiv>
-  
+
  <refsect1>
   <title>Description</title>
 
@@ -43,7 +44,7 @@ SAVEPOINT <replaceable>savepoint_name</replaceable>
    the transaction state to what it was at the time of the savepoint.
   </para>
  </refsect1>
-  
+
  <refsect1>
   <title>Parameters</title>
 
@@ -63,9 +64,9 @@ SAVEPOINT <replaceable>savepoint_name</replaceable>
   <title>Notes</title>
 
   <para>
-   Use <xref linkend="SQL-ROLLBACK-TO" endterm="SQL-ROLLBACK-TO-TITLE"> to
-   rollback to a savepoint.  Use <xref linkend="SQL-RELEASE-SAVEPOINT"
-   endterm="SQL-RELEASE-SAVEPOINT-TITLE"> to destroy a savepoint, keeping
+   Use <xref linkend="SQL-ROLLBACK-TO"> to
+   rollback to a savepoint.  Use <xref linkend="SQL-RELEASE-SAVEPOINT">
+   to destroy a savepoint, keeping
    the effects of commands executed after it was established.
   </para>
 
@@ -109,15 +110,16 @@ COMMIT;
 
  <refsect1>
   <title>Compatibility</title>
-  
+
   <para>
    SQL requires a savepoint to be destroyed automatically when another
    savepoint with the same name is established.  In
    <productname>PostgreSQL</>, the old savepoint is kept, though only the more
    recent one will be used when rolling back or releasing.  (Releasing the
-   newer savepoint will cause the older one to again become accessible to
-   <command>ROLLBACK TO SAVEPOINT</> and <command>RELEASE SAVEPOINT</>.)
-   Otherwise, <command>SAVEPOINT</command> is fully SQL conforming.
+   newer savepoint with <command>RELEASE SAVEPOINT</> will cause the older one
+   to again become accessible to <command>ROLLBACK TO SAVEPOINT</> and
+   <command>RELEASE SAVEPOINT</>.) Otherwise, <command>SAVEPOINT</command> is
+   fully SQL conforming.
   </para>
  </refsect1>
 
@@ -125,11 +127,11 @@ COMMIT;
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-begin" endterm="sql-begin-title"></member>
-   <member><xref linkend="sql-commit" endterm="sql-commit-title"></member>
-   <member><xref linkend="sql-release-savepoint" endterm="sql-release-savepoint-title"></member>
-   <member><xref linkend="sql-rollback" endterm="sql-rollback-title"></member>
-   <member><xref linkend="sql-rollback-to" endterm="sql-rollback-to-title"></member>
+   <member><xref linkend="sql-begin"></member>
+   <member><xref linkend="sql-commit"></member>
+   <member><xref linkend="sql-release-savepoint"></member>
+   <member><xref linkend="sql-rollback"></member>
+   <member><xref linkend="sql-rollback-to"></member>
   </simplelist>
  </refsect1>
 </refentry>

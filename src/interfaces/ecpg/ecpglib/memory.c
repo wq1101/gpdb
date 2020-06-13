@@ -1,4 +1,4 @@
-/* $PostgreSQL: pgsql/src/interfaces/ecpg/ecpglib/memory.c,v 1.12 2007/11/15 21:14:45 momjian Exp $ */
+/* src/interfaces/ecpg/ecpglib/memory.c */
 
 #define POSTGRES_ECPG_INTERNAL
 #include "postgres_fe.h"
@@ -75,6 +75,7 @@ static pthread_once_t auto_mem_once = PTHREAD_ONCE_INIT;
 static void
 auto_mem_destructor(void *arg)
 {
+	(void) arg;					/* keep the compiler quiet */
 	ECPGfree_auto_mem();
 }
 
@@ -103,14 +104,34 @@ static struct auto_mem *auto_allocs = NULL;
 #define set_auto_allocs(am)		do { auto_allocs = (am); } while(0)
 #endif
 
-void
+char *
+ecpg_auto_alloc(long size, int lineno)
+{
+	void	   *ptr = (void *) ecpg_alloc(size, lineno);
+
+	if (!ptr)
+		return NULL;
+
+	if (!ecpg_add_mem(ptr, lineno))
+	{
+		ecpg_free(ptr);
+		return NULL;
+	}
+	return ptr;
+}
+
+bool
 ecpg_add_mem(void *ptr, int lineno)
 {
 	struct auto_mem *am = (struct auto_mem *) ecpg_alloc(sizeof(struct auto_mem), lineno);
 
+	if (!am)
+		return false;
+
 	am->pointer = ptr;
 	am->next = get_auto_allocs();
 	set_auto_allocs(am);
+	return true;
 }
 
 void

@@ -25,10 +25,9 @@
  *
  *-------------------------------------------------------------------------
  */
+#include "postgres.h"
 
 #include "postmaster/backoff.h"
-#include "postmaster/fork_process.h"
-#include "postmaster/postmaster.h"
 #ifndef HAVE_GETRUSAGE
 #include "rusagestub.h"
 #else
@@ -36,33 +35,24 @@
 #include <sys/resource.h>
 #endif
 #include "storage/ipc.h"
-#include "storage/smgr.h"
-#include "storage/shmem.h"
-#include "utils/resowner.h"
 #include "cdb/cdbvars.h"
-#include "storage/backendid.h"
-#include "pgstat.h"
-#include "miscadmin.h"
 #include "cdb/cdbdisp_query.h"
 #include "cdb/cdbdispatchresult.h"
-#include "gp-libpq-fe.h"
-#include <unistd.h>
+#include "libpq-fe.h"
 
 #include <signal.h>
 #include "libpq/pqsignal.h"
-#include "utils/ps_status.h"
 #include "tcop/tcopprot.h"
+#include "postmaster/bgworker.h"
 #include "storage/pmsignal.h"	/* PostmasterIsAlive */
-#include "catalog/pg_database.h"
-#include "catalog/pg_resqueue.h"
-#include "catalog/pg_tablespace.h"
-#include "catalog/catalog.h"
-#include "storage/sinval.h"
-#include "utils/syscache.h"
+#include "storage/proc.h"
+#include "catalog/pg_resourcetype.h"
+#include "utils/builtins.h"
+#include "utils/resource_manager.h"
 #include "funcapi.h"
-#include "catalog/pg_type.h"
-#include "access/tuptoaster.h"
+#include "access/xact.h"
 #include "port/atomics.h"
+#include "pg_trace.h"
 
 extern bool gp_debug_resqueue_priority;
 
@@ -104,8 +94,6 @@ typedef struct BackoffBackendLocalEntry
 								 * performed local backoff action */
 	double		lastSleepTime;	/* Last sleep time when local backing-off
 								 * action was performed */
-	int			counter;		/* Local counter is used as an approx measure
-								 * of time */
 	bool		inTick;			/* Is backend currently performing tick? - to
 								 * prevent nested calls */
 	bool		groupingTimeExpired;	/* Should backend try to find better
@@ -153,6 +141,8 @@ typedef struct BackoffBackendSharedEntry
  * Local entry for backoff.
  */
 static BackoffBackendLocalEntry myLocalEntry;
+
+int backoffTickCounter = 0;
 
 /**
  * This is the global state of the backoff mechanism. It is a singleton structure - one
@@ -203,9 +193,6 @@ static inline double numProcsPerSegment(void);
 /* Sweeper related routines */
 static void BackoffSweeper(void);
 static void BackoffSweeperLoop(void);
-NON_EXEC_STATIC void BackoffSweeperMain(int argc, char *argv[]);
-static void BackoffRequestShutdown(SIGNAL_ARGS);
-static volatile bool sweeperShutdownRequested = false;
 static volatile bool isSweeperProcess = false;
 
 /* Resource queue related routines */
@@ -213,17 +200,16 @@ static int	BackoffPriorityValueToInt(const char *priorityVal);
 static char *BackoffPriorityIntToValue(int weight);
 extern List *GetResqueueCapabilityEntry(Oid queueid);
 
+static int BackoffDefaultWeight(void);
+static int BackoffSuperuserStatementWeight(void);
+static int ResourceQueueGetPriorityWeight(Oid queueId);
+
 /*
  * Helper method that verifies setting of default priority guc.
  */
-const char *gpvars_assign_gp_resqueue_priority_default_value(const char *newval,
-												 bool doit,
-								   GucSource source __attribute__((unused)));
-
-
-/* Extern declarations */
-extern Datum textin(PG_FUNCTION_ARGS);
-extern Datum textout(PG_FUNCTION_ARGS);
+bool gpvars_check_gp_resqueue_priority_default_value(char **newval,
+													void **extra,
+													GucSource source);
 
 /**
  * Primitives on statement id.
@@ -310,6 +296,9 @@ SwitchGroupLeader(int newLeaderIndex)
 	BackoffBackendSharedEntry *oldLeaderEntry = NULL;
 	BackoffBackendSharedEntry *newLeaderEntry = NULL;
 
+	if (backoffSingleton->sweeperInProgress == true)
+		return;
+
 	Assert(newLeaderIndex < myEntry->groupLeaderIndex);
 	Assert(newLeaderIndex >= 0 && newLeaderIndex < backoffSingleton->numEntries);
 
@@ -365,6 +354,9 @@ findBetterGroupLeader()
 
 	Assert(myEntry);
 	leadersLeaderIndex = leaderEntry->groupLeaderIndex;
+
+	if (backoffSingleton->sweeperInProgress == true)
+		return;
 
 	/* If my leader has a different leader, then jump pointer */
 	if (myEntry->groupLeaderIndex != leadersLeaderIndex)
@@ -422,7 +414,7 @@ getBackoffEntryRW(int index)
  * is the first backend entry that has the same statement id with itself.
  */
 void
-BackoffBackendEntryInit(int sessionid, int commandcount, int weight)
+BackoffBackendEntryInit(int sessionid, int commandcount, Oid queueId)
 {
 	BackoffBackendSharedEntry *mySharedEntry = NULL;
 	BackoffBackendLocalEntry *myLocalEntry = NULL;
@@ -431,7 +423,6 @@ BackoffBackendEntryInit(int sessionid, int commandcount, int weight)
 	Assert(commandcount > -1);
 	Assert(Gp_role == GP_ROLE_DISPATCH || Gp_role == GP_ROLE_EXECUTE);
 	Assert(!isSweeperProcess);
-	Assert(weight > 0);
 
 	/* Shared information */
 	mySharedEntry = myBackoffSharedEntry();
@@ -448,7 +439,7 @@ BackoffBackendEntryInit(int sessionid, int commandcount, int weight)
 	}
 
 	mySharedEntry->groupLeaderIndex = MyBackendId;
-	mySharedEntry->weight = weight;
+	mySharedEntry->weight = ResourceQueueGetPriorityWeight(queueId);
 	mySharedEntry->groupSize = 0;
 	mySharedEntry->numFollowers = 1;
 
@@ -467,7 +458,6 @@ BackoffBackendEntryInit(int sessionid, int commandcount, int weight)
 		elog(ERROR, "Unable to execute getrusage(). Please disable query prioritization.");
 	}
 	memcpy(&myLocalEntry->startUsage, &myLocalEntry->lastUsage, sizeof(myLocalEntry->lastUsage));
-	myLocalEntry->counter = 1;
 	myLocalEntry->inTick = false;
 
 	/* Try to find a better leader for my group */
@@ -514,7 +504,7 @@ BackoffBackend()
 	Assert(se->weight > 0);
 
 	/* Provide tracing information */
-	PG_TRACE1(backoff__localcheck, MyBackendId);
+	TRACE_POSTGRESQL_BACKOFF_LOCALCHECK(MyBackendId);
 
 	if (gettimeofday(&currentTime, NULL) < 0)
 	{
@@ -609,22 +599,24 @@ BackoffBackend()
 	}
 }
 
-/**
- * The backend performs a 'tick' on its local counter as a record of the number of times
- * it called CHECK_FOR_INTERRUPTS, which we use as a loose measure of progress.
- * If the counter is sufficiently large, it performs a backoff action (see BackoffBackend()).
+/*
+ * CHECK_FOR_INTERRUPTS() increments a counter, 'backoffTickCounter', on
+ * every call, which we use as a loose measure of progress. Whenever the
+ * counter reaches 'gp_resqueue_priority_local_interval', CHECK_FOR_INTERRUPTS()
+ * calls this function, to perform a backoff action (see BackoffBackend()).
  */
 void
-BackoffBackendTick()
+BackoffBackendTickExpired(void)
 {
-	BackoffBackendLocalEntry *le = NULL;
-	BackoffBackendSharedEntry *se = NULL;
+	BackoffBackendLocalEntry *le;
+	BackoffBackendSharedEntry *se;
 	StatementId currentStatementId = {gp_session_id, gp_command_count};
 
-	Assert(gp_enable_resqueue_priority);
+	backoffTickCounter = 0;
 
-	if (!(Gp_role == GP_ROLE_DISPATCH
-		  || Gp_role == GP_ROLE_EXECUTE)
+	if (!(Gp_role == GP_ROLE_DISPATCH || Gp_role == GP_ROLE_EXECUTE)
+		|| !IsResQueueEnabled()
+		|| !gp_enable_resqueue_priority
 		|| !IsUnderPostmaster
 		|| (MyBackendId == InvalidBackendId)
 		|| proc_exit_inprogress
@@ -663,24 +655,13 @@ BackoffBackendTick()
 		return;
 	}
 
-	Assert(le->inTick == false);
-	Assert(le->counter < gp_resqueue_priority_local_interval);
-
 	le->inTick = true;
 
-	le->counter++;
-	if (le->counter == gp_resqueue_priority_local_interval)
-	{
-		le->counter = 0;
-		/* Enough time has passed. Perform backoff. */
-		BackoffBackend();
-		se->earlyBackoffExit = false;
-	}
+	/* Perform backoff. */
+	BackoffBackend();
+	se->earlyBackoffExit = false;
 
 	le->inTick = false;
-
-	Assert(le->counter < gp_resqueue_priority_local_interval);
-	Assert(le->inTick == false);
 }
 
 /**
@@ -740,7 +721,7 @@ BackoffSweeper()
 
 	backoffSingleton->sweeperInProgress = true;
 
-	PG_TRACE(backoff__globalcheck);
+	TRACE_POSTGRESQL_BACKOFF_GLOBALCHECK();
 
 	/* Reset status for all the backend entries */
 	for (i = 0; i < backoffSingleton->numEntries; i++)
@@ -860,12 +841,30 @@ BackoffSweeper()
 
 					Assert(gl->numFollowersActive > 0);
 
-					if (activeWeight <= 0.0) {
+					if (activeWeight <= 0.0)
+					{
 						/*
-						 * If activeWeight <= 0.0, it should be considered unexpected
-						 * behavior. Error out here instead of risking an underflow.
+						 * There is a race condition here:
+						 * Backend A,B,C are belong to same statement and have weight of
+						 * 100000.
+						 *
+						 * Timestamp1: backend A's leader is A, backend B's leader is B
+						 * backend C's leader is also B.
+						 *
+						 * Timestamp2: Sweeper calculates the activeWeight to 200000.
+						 *
+						 * Timestamp3: backend B changes it's leader to A.
+						 *
+						 * Timestamp4: Sweeper try to find the backends who deserve maxCPU,
+						 * if backend A, B, C all deserve maxCPU, then activeWeight = 
+						 * 200000 - 100000/1 - 100000/1 - 100000/2 which is less than zero.
+						 *
+						 * We can stop sweeping for such race condition because current
+						 * backoff mechanism dose not ask for accurate control.
 						 */
-						elog(ERROR, "activeWeight underflow!");
+						backoffSingleton->sweeperInProgress = false;
+						elog(LOG, "activeWeight underflow!");
+						return;
 					}
 
 					Assert(activeWeight > 0.0);
@@ -1017,15 +1016,10 @@ gp_adjust_priority_value(PG_FUNCTION_ARGS)
 	int32		session_id = PG_GETARG_INT32(0);
 	int32		command_count = PG_GETARG_INT32(1);
 	Datum		dVal = PG_GETARG_DATUM(2);
-	char	   *priorityVal = NULL;
-	int			wt = 0;
+	char	   *priorityVal;
+	int			wt;
 
-	priorityVal = DatumGetCString(DirectFunctionCall1(textout, dVal));
-
-	if (!priorityVal)
-	{
-		elog(ERROR, "Invalid priority value specified.");
-	}
+	priorityVal = TextDatumGetCString(dVal);
 
 	wt = BackoffPriorityValueToInt(priorityVal);
 
@@ -1062,7 +1056,7 @@ gp_adjust_priority_int(PG_FUNCTION_ARGS)
 	if (!superuser())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 (errmsg("Only superuser can re-prioritize a query after it has begun execution."))));
+				 (errmsg("only superuser can re-prioritize a query after it has begun execution"))));
 
 	if (Gp_role == GP_ROLE_UTILITY)
 		elog(ERROR, "Query prioritization does not work in utility mode.");
@@ -1167,125 +1161,26 @@ gp_adjust_priority_int(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32(numfound);
 }
 
-/*
- * Main entry point for backoff process. This forks off a sweeper process
- * and calls BackoffSweeperMain(), which does all the setup.
- *
- * This code is heavily based on pgarch.c, q.v.
- */
-int
-backoff_start(void)
+bool
+BackoffSweeperStartRule(Datum main_arg)
 {
-	pid_t		backoffId = -1;
+	if (IsResQueueEnabled())
+		return true;
 
-	switch ((backoffId = fork_process()))
-	{
-		case -1:
-			ereport(LOG,
-					(errmsg("could not fork sweeper process: %m")));
-			return 0;
-
-		case 0:
-			/* in postmaster child ... */
-			/* Close the postmaster's sockets */
-			ClosePostmasterPorts(false);
-
-			BackoffSweeperMain(0, NULL);
-			break;
-		default:
-			return (int) backoffId;
-	}
-
-	/* shouldn't get here */
-	Assert(false);
-	return 0;
+	return false;
 }
-
 
 /**
  * This method is called after fork of the sweeper process. It sets up signal
  * handlers and does initialization that is required by a postgres backend.
  */
-NON_EXEC_STATIC void
-BackoffSweeperMain(int argc, char *argv[])
+void
+BackoffSweeperMain(Datum main_arg)
 {
-	sigjmp_buf	local_sigjmp_buf;
-
-	IsUnderPostmaster = true;
 	isSweeperProcess = true;
 
-	/* Stay away from PMChildSlot */
-	MyPMChildSlot = -1;
-
-	/* reset MyProcPid */
-	MyProcPid = getpid();
-
-	/* Lose the postmaster's on-exit routines */
-	on_exit_reset();
-
-	/* Identify myself via ps */
-	init_ps_display("sweeper process", "", "", "");
-
-	SetProcessingMode(InitProcessing);
-
-	/*
-	 * Set up signal handlers.  We operate on databases much like a regular
-	 * backend, so we use the same signal handling.  See equivalent code in
-	 * tcop/postgres.c.
-	 */
-	pqsignal(SIGHUP, SIG_IGN);
-	pqsignal(SIGINT, SIG_IGN);
-	pqsignal(SIGALRM, SIG_IGN);
-	pqsignal(SIGPIPE, SIG_IGN);
-	pqsignal(SIGUSR1, SIG_IGN);
-
-	pqsignal(SIGTERM, die);
-	pqsignal(SIGQUIT, quickdie);
-	pqsignal(SIGUSR2, BackoffRequestShutdown);
-
-	pqsignal(SIGFPE, FloatExceptionHandler);
-	pqsignal(SIGCHLD, SIG_DFL);
-
-	/*
-	 * Copied from bgwriter
-	 */
-	CurrentResourceOwner = ResourceOwnerCreate(NULL, "Sweeper process");
-
-	/* Early initialization */
-	BaseInit();
-
-	/* See InitPostgres()... */
-	InitProcess();
-
-	SetProcessingMode(NormalProcessing);
-
-	/*
-	 * If an exception is encountered, processing resumes here.
-	 *
-	 * See notes in postgres.c about the design of this coding.
-	 */
-	if (sigsetjmp(local_sigjmp_buf, 1) != 0)
-	{
-		/* Prevents interrupts while cleaning up */
-		HOLD_INTERRUPTS();
-
-		/* Report the error to the server log */
-		EmitErrorReport();
-
-		/*
-		 * We can now go away.  Note that because we'll call InitProcess, a
-		 * callback will be registered to do ProcKill, which will clean up
-		 * necessary state.
-		 */
-		proc_exit(0);
-	}
-
-	/* We can now handle ereport(ERROR) */
-	PG_exception_stack = &local_sigjmp_buf;
-
-	PG_SETMASK(&UnBlockSig);
-
-	MyBackendId = InvalidBackendId;
+	/* We're now ready to receive signals */
+	BackgroundWorkerUnblockSignals();
 
 	/* main loop */
 	BackoffSweeperLoop();
@@ -1303,33 +1198,25 @@ BackoffSweeperLoop(void)
 {
 	for (;;)
 	{
-		CHECK_FOR_INTERRUPTS();
-
-		if (sweeperShutdownRequested)
-			break;
-
-		/* no need to live on if postmaster has died */
-		if (!PostmasterIsAlive(true))
-			exit(1);
+		int		rc;
 
 		if (gp_enable_resqueue_priority)
 			BackoffSweeper();
 
 		Assert(gp_resqueue_priority_sweeper_interval > 0.0);
+
 		/* Sleep a while. */
-		pg_usleep(gp_resqueue_priority_sweeper_interval * 1000.0);
+		rc = WaitLatch(&MyProc->procLatch,
+					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
+					   gp_resqueue_priority_sweeper_interval);
+		ResetLatch(&MyProc->procLatch);
+
+		/* emergency bailout if postmaster has died */
+		if (rc & WL_POSTMASTER_DEATH)
+			proc_exit(1);
 	}							/* end server loop */
 
 	return;
-}
-
-/**
- * Note the request to shut down.
- */
-static void
-BackoffRequestShutdown(SIGNAL_ARGS)
-{
-	sweeperShutdownRequested = true;
 }
 
 /**
@@ -1430,8 +1317,7 @@ gp_list_backend_priorities(PG_FUNCTION_ARGS)
 
 		Assert(priorityVal);
 
-		values[2] = DirectFunctionCall1(textin,
-										CStringGetDatum(priorityVal));
+		values[2] = CStringGetTextDatum(priorityVal);
 		Assert(se->weight > 0);
 		values[3] = Int32GetDatum((int32) se->weight);
 		tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
@@ -1449,8 +1335,8 @@ gp_list_backend_priorities(PG_FUNCTION_ARGS)
 /**
  * What is the weight assigned to superuser issued queries?
  */
-int
-BackoffSuperuserStatementWeight()
+static int
+BackoffSuperuserStatementWeight(void)
 {
 	int			wt = -1;
 
@@ -1463,8 +1349,8 @@ BackoffSuperuserStatementWeight()
 /**
  * Integer value for default weight.
  */
-int
-BackoffDefaultWeight()
+static int
+BackoffDefaultWeight(void)
 {
 	int			wt = BackoffPriorityValueToInt(gp_resqueue_priority_default_value);
 
@@ -1474,15 +1360,25 @@ BackoffDefaultWeight()
 
 /**
  * Get weight associated with queue. See queue.c.
- * TODO: tidy up interface.
+ *
+ * Attention is paid in order to avoid catalog lookups when not allowed.  The
+ * superuser() function performs catalog lookups in certain cases. Also the
+ * GetResqueueCapabilityEntry will always  do a catalog lookup. In such cases
+ * use the default weight.
  */
-int
+static int
 ResourceQueueGetPriorityWeight(Oid queueId)
 {
 	List	   *capabilitiesList = NULL;
 	List	   *entry = NULL;
 	ListCell   *le = NULL;
 	int			weight = BackoffDefaultWeight();
+
+	if (!IsTransactionState())
+		return weight;
+
+	if (superuser())
+		return BackoffSuperuserStatementWeight();
 
 	if (queueId == InvalidOid)
 		return weight;
@@ -1589,19 +1485,17 @@ BackoffPriorityIntToValue(int weight)
 /*
  * Helper method that verifies setting of default priority guc.
  */
-const char *
-gpvars_assign_gp_resqueue_priority_default_value(const char *newval,
-												 bool doit,
-									GucSource source __attribute__((unused)))
+bool
+gpvars_check_gp_resqueue_priority_default_value (char **newval,void **extra,
+												GucSource source)
 {
-	if (doit)
-	{
-		int			wt;
+	int			wt;
 
-		wt = BackoffPriorityValueToInt(newval); /* This will throw an error if
-												 * bad value is specified */
-		Assert(wt > 0);
-	}
+	wt = BackoffPriorityValueToInt(*newval); /* This will throw an error if * bad value is specified */
 
-	return newval;
+	if (wt > 0)
+		return true;
+
+	GUC_check_errmsg("invalid value for gp_resqueue_priority_default_value: \"%s\"", *newval);
+	return false;
 }

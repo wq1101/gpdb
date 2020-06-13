@@ -9,11 +9,11 @@ CREATE TABLE REG_REGION (R_REGIONKEY INT, R_NAME CHAR(25), R_COMMENT VARCHAR(152
 -- 'gpfdist' protocol
 -- --------------------------------------
 CREATE EXTERNAL WEB TABLE gpfdist2_start (x text)
-execute E'((@bindir@/gpfdist -p 7070 -d @abs_srcdir@/data  </dev/null >/dev/null 2>&1 &); sleep 1; echo "starting...") '
+execute E'((@bindir@/gpfdist -p 7070 -d @abs_srcdir@/data  </dev/null >/dev/null 2>&1 &); for i in `seq 1 30`; do curl 127.0.0.1:7070 >/dev/null 2>&1 && break; sleep 1; done; echo "starting...") '
 on SEGMENT 0
 FORMAT 'text' (delimiter '|');
 CREATE EXTERNAL WEB TABLE gpfdist2_stop (x text)
-execute E'(ps -A |grep [g]pfdist |awk \'{print $1;}\' |xargs kill) > /dev/null 2>&1; echo "stopping..."'
+execute E'(ps -A -o pid,comm |grep [g]pfdist |grep -v postgres: |awk \'{print $1;}\' |xargs kill) > /dev/null 2>&1; echo "stopping..."'
 on SEGMENT 0
 FORMAT 'text' (delimiter '|');
 -- start_ignore
@@ -34,7 +34,7 @@ select * from gpfdist2_start;
 drop table if exists lineitem;
 NOTICE:  table "lineitem" does not exist, skipping
 drop external table if exists ext_lineitem;
-NOTICE:  table "ext_lineitem" does not exist, skipping
+NOTICE:  foreign table "ext_lineitem" does not exist, skipping
 -- end_ignore
 -- test 1 using a .gz file
 CREATE EXTERNAL TABLE ext_lineitem (
@@ -153,8 +153,8 @@ CREATE EXTERNAL TABLE ext_lineitem (
                 L_SHIPDATE date,
                 L_COMMITDATE date,
                 L_RECEIPTDATE date,
-                L_SHIPINSTRUCT CHAR(2),
-                L_SHIPMODE CHAR(1)
+                L_SHIPINSTRUCT CHAR(25),
+                L_SHIPMODE CHAR(10)
                 )
 LOCATION
 (
@@ -183,8 +183,8 @@ CREATE EXTERNAL TABLE ext_lineitem (
                 L_SHIPDATE date,
                 L_COMMITDATE date,
                 L_RECEIPTDATE date,
-                L_SHIPINSTRUCT CHAR(2),
-                L_SHIPMODE CHAR(1),
+                L_SHIPINSTRUCT CHAR(25),
+                L_SHIPMODE CHAR(10),
                 L_COMMENT VARCHAR(44),
                 L_BLAH CHAR(1)
                 )
@@ -341,8 +341,9 @@ FORMAT 'csv'
         HEADER
 )
 ;
-NOTICE:  HEADER means that each one of the data files has a header row.
+NOTICE:  HEADER means that each one of the data files has a header row
 SELECT count(*) FROM ext_lineitem;
+NOTICE:  HEADER means that each one of the data files has a header row
  count 
 -------
    255
@@ -379,8 +380,9 @@ FORMAT 'text'
 LOG ERRORS SEGMENT REJECT LIMIT 2
 ;
 SELECT count(*) FROM ext_lineitem;
-ERROR:  Segment reject limit reached. Aborting operation. Last error was: invalid input syntax for integer: "a68", column l_partkey  (seg1 slice1 172.17.0.4:25433 pid=36416)
-DETAIL:  External table ext_lineitem, line 2 of gpfdist://@hostname@:7070/gpfdist2/bad_data/lineitem.tbl.bad, column l_partkey
+ERROR:  segment reject limit reached, aborting operation
+DETAIL:  Last error was: invalid input syntax for integer: "a68", column l_partkey  (seg1 slice1 172.17.0.4:25433 pid=36416)
+CONTEXT:  External table ext_lineitem, line 2 of gpfdist://@hostname@:7070/gpfdist2/bad_data/lineitem.tbl.bad, column l_partkey
 DROP EXTERNAL TABLE ext_lineitem;
 -- test 11
 CREATE EXTERNAL TABLE ext_lineitem (
@@ -478,8 +480,8 @@ FORMAT 'text'
 )
 ;
 SELECT count(*) FROM ext_lineitem;
-ERROR:  missing data for column "l_partkey"  (seg0 slice1 172.17.0.4:25432 pid=36415)
-DETAIL:  External table ext_lineitem, line 1 of gpfdist://@hostname@:7070/gpfdist2/lineitem.tbl.*: "HEADER"
+ERROR:  invalid input syntax for integer: "HEADER"  (seg0 slice1 127.0.0.1:25435 pid=67886)
+DETAIL:  External table ext_lineitem, line 1 of gpfdist://@hostname@:7070/gpfdist2/lineitem.tbl.*, column l_orderkey
 DROP EXTERNAL TABLE ext_lineitem;
 -- test 14
 CREATE EXTERNAL TABLE ext_lineitem (
@@ -511,7 +513,7 @@ FORMAT 'text'
 LOG ERRORS SEGMENT REJECT LIMIT 200
 ;
 SELECT count(*) FROM ext_lineitem;
-NOTICE:  Found 4 data formatting errors (4 or more input rows). Rejected related input data.
+NOTICE:  found 4 data formatting errors (4 or more input rows), rejected related input data
  count 
 -------
     28
@@ -579,15 +581,15 @@ FORMAT 'text'
 )
 ;
 CREATE INDEX index ON ext_lineitem (L_ORDERKEY);
-ERROR:  cannot create indexes on external tables.
+ERROR:  cannot create index on foreign table "ext_lineitem"
 TRUNCATE ext_lineitem;
-ERROR:  "ext_lineitem" is an external relation and can't be truncated
+ERROR:  "ext_lineitem" is not a table
 DELETE FROM ext_lineitem where L_ORDERKEY > 10;
-ERROR:  cannot update or delete from external relation "ext_lineitem"
+ERROR:  cannot delete from foreign table "ext_lineitem"
 UPDATE ext_lineitem SET L_ORDERKEY = 10 where L_ORDERKEY > 10;
-ERROR:  cannot update or delete from external relation "ext_lineitem"
-INSERT INTO ext_lineitem VALUES (1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1);
-ERROR:  cannot change a readable external table "ext_lineitem"
+ERROR:  cannot update foreign table "ext_lineitem"
+INSERT INTO ext_lineitem VALUES (1,1,1,1,1,1,1,1,1,1,null,null,null,1,1,1);
+ERROR:  foreign table "ext_lineitem" does not allow inserts
 DROP EXTERNAL TABLE ext_lineitem;
 -- test 17 different delimiter
 CREATE EXTERNAL TABLE ext_lineitem (
@@ -713,8 +715,9 @@ FORMAT 'csv'
         HEADER
 )
 ;
-NOTICE:  HEADER means that each one of the data files has a header row.
+NOTICE:  HEADER means that each one of the data files has a header row
 SELECT count(*) FROM ext_lineitem;
+NOTICE:  HEADER means that each one of the data files has a header row
    255
 
 DROP EXTERNAL TABLE ext_lineitem;
@@ -748,8 +751,8 @@ FORMAT 'csv'
 )
 ;
 SELECT count(*) FROM ext_lineitem;
-ERROR:  missing data for column "l_partkey"  (seg1 slice1 172.17.0.4:25433 pid=36416)
-DETAIL:  External table ext_lineitem, line 1 of gpfdist://@hostname@:7070/gpfdist2/lineitem.tbl.csv.header: "HEADER"
+ERROR:  invalid input syntax for integer: "HEADER"  (seg1 slice1 127.0.0.1:25433 pid=67887)
+DETAIL:  External table ext_lineitem, line 1 of gpfdist://@hostname@:7070/gpfdist2/lineitem.tbl.csv.header, column l_orderkey
 DROP EXTERNAL TABLE ext_lineitem;
 -- test 20 without header row and header is not defined in format clause
 CREATE EXTERNAL TABLE ext_lineitem (
@@ -890,13 +893,13 @@ FORMAT 'text'
         FORCE NOT NULL L_COMMENT
 )
 ;
-ERROR:  force not null available only in CSV mode
+ERROR:  COPY force not null available only in CSV mode
 SELECT count(*) FROM ext_lineitem;
 ERROR:  relation "ext_lineitem" does not exist
 LINE 1: SELECT count(*) FROM ext_lineitem;
                              ^
 DROP EXTERNAL TABLE ext_lineitem;
-ERROR:  table "ext_lineitem" does not exist
+ERROR:  foreign table "ext_lineitem" does not exist
 -- test 24 inherit external table
 CREATE EXTERNAL TABLE ext_lineitem (
                 L_ORDERKEY INT8,
@@ -1003,7 +1006,7 @@ LOCATION
 FORMAT 'csv'
 (
         DELIMITER AS '|'
-      NEWLINE 'CR'
+        NEWLINE 'CR'
 )
 ;
 SELECT count(*) FROM ext_lineitem;

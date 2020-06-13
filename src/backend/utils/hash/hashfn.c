@@ -4,12 +4,12 @@
  *		Hash functions for use in dynahash.c hashtables
  *
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/hash/hashfn.c,v 1.32 2008/01/01 19:45:53 momjian Exp $
+ *	  src/backend/utils/hash/hashfn.c
  *
  * NOTES
  *	  It is expected that every bit of a hash function's 32-bit result is
@@ -28,11 +28,11 @@
 #include "postgres.h"
 
 #include "access/hash.h"
-#include "nodes/bitmapset.h"
+#include "utils/hsearch.h"
 
 
 /*
- * string_hash: hash function for keys that are null-terminated strings.
+ * string_hash: hash function for keys that are NUL-terminated strings.
  *
  * NOTE: this is the default hash function if none is specified.
  */
@@ -62,15 +62,15 @@ tag_hash(const void *key, Size keysize)
 }
 
 /*
- * oid_hash: hash function for keys that are OIDs
+ * uint32_hash: hash function for keys that are uint32 or int32
  *
  * (tag_hash works for this case too, but is slower)
  */
 uint32
-oid_hash(const void *key, Size keysize)
+uint32_hash(const void *key, Size keysize)
 {
-	Assert(keysize == sizeof(Oid));
-	return DatumGetUInt32(hash_uint32((uint32) *((const Oid *) key)));
+	Assert(keysize == sizeof(uint32));
+	return DatumGetUInt32(hash_uint32(*((const uint32 *) key)));
 }
 
 /*

@@ -17,9 +17,12 @@
 #ifndef AOSEG_H
 #define AOSEG_H
 
+#include "storage/lock.h"
+
 /*
  * aoseg.c prototypes
  */
-extern void AlterTableCreateAoSegTable(Oid relOid, bool is_part_child);
+extern void AlterTableCreateAoSegTable(Oid relOid, bool is_part_child,
+									   bool is_part_parent);
 
 #endif   /* AOSEG_H */

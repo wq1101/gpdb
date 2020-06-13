@@ -5,7 +5,7 @@
  *
  * This file is included by like.c four times, to provide matching code for
  * (1) single-byte encodings, (2) UTF8, (3) other multi-byte encodings,
- * and (4) case insensitive matches in single byte encodings.
+ * and (4) case insensitive matches in single-byte encodings.
  * (UTF8 is a special case because we can use a much more efficient version
  * of NextChar than can be used for general multi-byte encodings.)
  *
@@ -14,12 +14,12 @@
  * NextChar
  * MatchText - to name of function wanted
  * do_like_escape - name of function if wanted - needs CHAREQ and CopyAdvChar
- * MATCH_LOWER - define for case (4), using to_lower on single-byte chars
+ * MATCH_LOWER - define for case (4) to specify case folding for 1-byte chars
  *
- * Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Copyright (c) 1996-2016, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
- *	$PostgreSQL: pgsql/src/backend/utils/adt/like_match.c,v 1.21 2008/03/01 03:26:34 tgl Exp $
+ *	src/backend/utils/adt/like_match.c
  *
  *-------------------------------------------------------------------------
  */
@@ -42,7 +42,7 @@
  *
  *	Keith Parks. <keith@mtcc.demon.co.uk>
  *
- *	SQL92 lets you specify the escape character by saying
+ *	SQL lets you specify the escape character by saying
  *	LIKE <pattern> ESCAPE <escape character>. We are a small operation
  *	so we force you to use '\'. - ay 7/95
  *
@@ -70,17 +70,21 @@
  */
 
 #ifdef MATCH_LOWER
-#define GETCHAR(t) ((char) tolower((unsigned char) (t)))
+#define GETCHAR(t) MATCH_LOWER(t)
 #else
 #define GETCHAR(t) (t)
 #endif
 
 static int
-MatchText(char *t, int tlen, char *p, int plen)
+MatchText(char *t, int tlen, char *p, int plen,
+		  pg_locale_t locale, bool locale_is_c)
 {
 	/* Fast path for match-everything pattern */
 	if (plen == 1 && *p == '%')
 		return LIKE_TRUE;
+
+	/* Since this function recurses, it could be driven to stack overflow */
+	check_stack_depth();
 
 	/*
 	 * In this loop, we advance by char when matching wildcards (and thus on
@@ -96,7 +100,12 @@ MatchText(char *t, int tlen, char *p, int plen)
 		{
 			/* Next pattern byte must match literally, whatever it is */
 			NextByte(p, plen);
-			if (plen <= 0 || GETCHAR(*p) != GETCHAR(*t))
+			/* ... and there had better be one, per SQL standard */
+			if (plen <= 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_ESCAPE_SEQUENCE),
+				 errmsg("LIKE pattern must not end with escape character")));
+			if (GETCHAR(*p) != GETCHAR(*t))
 				return LIKE_FALSE;
 		}
 		else if (*p == '%')
@@ -111,10 +120,10 @@ MatchText(char *t, int tlen, char *p, int plen)
 			 * If there are wildcards immediately following the %, we can skip
 			 * over them first, using the idea that any sequence of N _'s and
 			 * one or more %'s is equivalent to N _'s and one % (ie, it will
-			 * match any sequence of at least N text characters).  In this
-			 * way we will always run the recursive search loop using a
-			 * pattern fragment that begins with a literal character-to-match,
-			 * thereby not recursing more than we have to.
+			 * match any sequence of at least N text characters).  In this way
+			 * we will always run the recursive search loop using a pattern
+			 * fragment that begins with a literal character-to-match, thereby
+			 * not recursing more than we have to.
 			 */
 			NextByte(p, plen);
 
@@ -153,7 +162,9 @@ MatchText(char *t, int tlen, char *p, int plen)
 			if (*p == '\\')
 			{
 				if (plen < 2)
-					return LIKE_FALSE; /* XXX should throw error */
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_ESCAPE_SEQUENCE),
+							 errmsg("LIKE pattern must not end with escape character")));
 				firstpat = GETCHAR(p[1]);
 			}
 			else
@@ -163,10 +174,11 @@ MatchText(char *t, int tlen, char *p, int plen)
 			{
 				if (GETCHAR(*t) == firstpat)
 				{
-					int			matched = MatchText(t, tlen, p, plen);
+					int			matched = MatchText(t, tlen, p, plen,
+													locale, locale_is_c);
 
 					if (matched != LIKE_FALSE)
-						return matched;		/* TRUE or ABORT */
+						return matched; /* TRUE or ABORT */
 				}
 
 				NextChar(t, tlen);

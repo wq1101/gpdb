@@ -23,13 +23,14 @@
 #include "utils/guc.h"
 
 void
-AlterTableCreateAoVisimapTable(Oid relOid, bool is_part_child)
+AlterTableCreateAoVisimapTable(Oid relOid, bool is_part_child, bool is_part_parent)
 {
 	Relation	rel;
 	IndexInfo  *indexInfo;
 	TupleDesc	tupdesc;
 	Oid			classObjectId[2];
 	int16		coloptions[2];
+	List	   *indexColNames;
 
 	elogif(Debug_appendonly_print_visimap, LOG,
 		   "Create visimap for relation %d",
@@ -45,7 +46,7 @@ AlterTableCreateAoVisimapTable(Oid relOid, bool is_part_child)
 	else
 		rel = heap_open(relOid, AccessExclusiveLock);
 
-	if (!RelationIsAoRows(rel) && !RelationIsAoCols(rel))
+	if (!RelationIsAppendOptimized(rel))
 	{
 		heap_close(rel, NoLock);
 		return;
@@ -87,6 +88,8 @@ AlterTableCreateAoVisimapTable(Oid relOid, bool is_part_child)
 	indexInfo->ii_Unique = true;
 	indexInfo->ii_Concurrent = false;
 
+	indexColNames = list_make2("segno", "first_row_no");
+
 	classObjectId[0] = INT4_BTREE_OPS_OID;
 	classObjectId[1] = INT8_BTREE_OPS_OID;
 
@@ -96,7 +99,10 @@ AlterTableCreateAoVisimapTable(Oid relOid, bool is_part_child)
 	(void) CreateAOAuxiliaryTable(rel,
 								  "pg_aovisimap",
 								  RELKIND_AOVISIMAP,
-								  tupdesc, indexInfo, classObjectId, coloptions);
+								  tupdesc,
+								  indexInfo, indexColNames,
+								  classObjectId, coloptions,
+								  is_part_parent);
 
 	heap_close(rel, NoLock);
 }

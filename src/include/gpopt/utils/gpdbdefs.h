@@ -19,14 +19,10 @@
 extern "C" {
 
 #include "postgres.h"
-#include <string.h>
+
 #include "nodes/nodes.h"
 #include "nodes/plannodes.h"
-#include "nodes/execnodes.h"
-#include "nodes/print.h"
 #include "nodes/pg_list.h"
-#include "executor/execdesc.h"
-#include "executor/nodeMotion.h"
 #include "parser/parsetree.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
@@ -41,7 +37,6 @@ extern "C" {
 #include "parser/parse_oper.h"
 
 #include "catalog/namespace.h"
-#include "catalog/pg_exttable.h"
 #include "cdb/cdbpartition.h"
 #include "cdb/partitionselection.h"
 #include "cdb/cdbhash.h"
@@ -58,8 +53,6 @@ extern "C" {
 #include "utils/elog.h"
 #include "utils/rel.h"
 #include "utils/uri.h"
-#include "access/relscan.h"
-#include "access/heapam.h"
 #include "catalog/pg_proc.h"
 #include "tcop/dest.h"
 #include "commands/trigger.h"
@@ -67,45 +60,6 @@ extern "C" {
 #include "utils/selfuncs.h"
 #include "utils/faultinjector.h"
 #include "funcapi.h"
-
-extern
-Query *preprocess_query_optimizer(Query *pquery, ParamListInfo boundParams);
-
-extern
-List *pg_parse_and_rewrite(const char *query_string, Oid *paramTypes, int iNumParams);
-
-extern
-PlannedStmt *pg_plan_query(Query *pqueryTree, ParamListInfo boundParams);
-
-extern
-char * get_rel_name(Oid relid);
-
-extern
-Relation RelationIdGetRelation(Oid relationId);
-
-extern
-void RelationClose(Relation relation);
-
-extern
-Oid get_atttype(Oid relid, AttrNumber attnum);
-
-extern
-RegProcedure get_opcode(Oid opid);
-
-extern
-void ExecutorStart(QueryDesc *pqueryDesc, int iEFlags);
-
-extern
-TupleTableSlot *ExecutorRun(QueryDesc *pqueryDesc, ScanDirection direction, long lCount);
-
-extern
-void ExecutorEnd(QueryDesc *pqueryDesc);
-
-extern
-void ExecCheckRTPerms(List *rangeTable);
-
-extern
-void ExecCheckRTEPerms(RangeTblEntry *rte);
 
 } // end extern C
 

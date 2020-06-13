@@ -23,6 +23,7 @@
 #include "access/sdir.h"
 #include "access/tupmacs.h"
 #include "access/xlogutils.h"
+#include "access/xlog.h"
 #include "access/appendonly_visimap.h"
 #include "executor/tuptable.h"
 #include "nodes/primnodes.h"
@@ -31,11 +32,9 @@
 #include "storage/lmgr.h"
 #include "utils/rel.h"
 #include "utils/tqual.h"
-#include "storage/gp_compress.h"
 
 #include "access/appendonlytid.h"
 
-#include "cdb/cdbvarblock.h"
 #include "cdb/cdbbufferedappend.h"
 #include "cdb/cdbbufferedread.h"
 #include "cdb/cdbvarblock.h"
@@ -66,8 +65,8 @@ typedef struct AppendOnlyInsertDescData
 	File			appendFile;
 	int				appendFilePathNameMaxLen;
 	char			*appendFilePathName;
-	float8			insertCount;
-	float8			varblockCount;
+	int64			insertCount;
+	int64			varblockCount;
 	int64           rowCount; /* total row count before insert */
 	int64           numSequences; /* total number of available sequences */
 	int64           lastSequence; /* last used sequence */
@@ -338,9 +337,9 @@ extern AppendOnlyScanDesc appendonly_beginrangescan(Relation relation,
 		int nkeys, ScanKey keys);
 extern void appendonly_rescan(AppendOnlyScanDesc scan, ScanKey key);
 extern void appendonly_endscan(AppendOnlyScanDesc scan);
-extern MemTuple appendonly_getnext(AppendOnlyScanDesc scan, 
-									ScanDirection direction,
-									TupleTableSlot *slot);
+extern bool appendonly_getnext(AppendOnlyScanDesc scan,
+							   ScanDirection direction,
+							   TupleTableSlot *slot);
 extern AppendOnlyFetchDesc appendonly_fetch_init(
 	Relation 	relation,
 	Snapshot    snapshot,
@@ -351,10 +350,10 @@ extern bool appendonly_fetch(
 	TupleTableSlot *slot);
 extern void appendonly_fetch_finish(AppendOnlyFetchDesc aoFetchDesc);
 extern AppendOnlyInsertDesc appendonly_insert_init(Relation rel, int segno, bool update_mode);
-extern void appendonly_insert(
+extern Oid appendonly_insert(
 		AppendOnlyInsertDesc aoInsertDesc, 
 		MemTuple instup, 
-		Oid *tupleOid, 
+		Oid tupleOid,
 		AOTupleId *aoTupleId);
 extern void appendonly_insert_finish(AppendOnlyInsertDesc aoInsertDesc);
 extern BlockNumber RelationGuessNumberOfBlocks(double totalbytes);
@@ -371,24 +370,6 @@ extern HTSU_Result appendonly_update(
 		MemTuple memTuple,
 		AOTupleId* aoTupleId,
 		AOTupleId* newAoTupleId);
-
-#ifdef USE_SEGWALREP
-#define XLOG_APPENDONLY_INSERT    0x00
-
-typedef struct xl_ao_insert
-{
-	/* meta data about the inserted block of AO data*/
-	RelFileNode node;
-	uint		segment_filenum;
-	int64		offset;
-		/* BLOCK DATA FOLLOWS AT END OF STRUCT */
-} xl_ao_insert;
-
-#define SizeOfAOInsert (offsetof(xl_ao_insert, offset) + sizeof(int64))
-
-extern void appendonly_redo(XLogRecPtr beginLoc, XLogRecPtr lsn, XLogRecord *record);
-extern void appendonly_desc(StringInfo buf, XLogRecPtr beginLoc, XLogRecord *record);
-#endif  /* USE_SEGWALREP */
 
 extern void appendonly_update_finish(AppendOnlyUpdateDesc aoUpdateDesc);
 

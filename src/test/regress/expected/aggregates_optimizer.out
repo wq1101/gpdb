@@ -1,16 +1,19 @@
 --
 -- AGGREGATES
 --
+-- start_ignore
+SET optimizer_trace_fallback to on;
+-- end_ignore
 SELECT avg(four) AS avg_1 FROM onek;
- avg_1 
--------
-   1.5
+       avg_1        
+--------------------
+ 1.5000000000000000
 (1 row)
 
 SELECT avg(a) AS avg_32 FROM aggtest WHERE a < 100;
-      avg_32      
-------------------
- 32.6666666666667
+       avg_32        
+---------------------
+ 32.6666666666666667
 (1 row)
 
 -- In 7.1, avg(float4) is computed using float8 arithmetic.
@@ -22,6 +25,8 @@ SELECT avg(b)::numeric(10,3) AS avg_107_943 FROM aggtest;
 (1 row)
 
 SELECT avg(gpa) AS avg_3_4 FROM ONLY student;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: ONLY in the FROM clause
  avg_3_4 
 ---------
      3.4
@@ -46,6 +51,8 @@ SELECT sum(b) AS avg_431_773 FROM aggtest;
 (1 row)
 
 SELECT sum(gpa) AS avg_6_8 FROM ONLY student;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: ONLY in the FROM clause
  avg_6_8 
 ---------
      6.8
@@ -70,6 +77,8 @@ SELECT max(aggtest.b) AS max_324_78 FROM aggtest;
 (1 row)
 
 SELECT max(student.gpa) AS max_3_7 FROM student;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Inherited tables
  max_3_7 
 ---------
      3.7
@@ -135,6 +144,67 @@ SELECT stddev_pop(3.0::numeric), stddev_samp(4.0::numeric);
  stddev_pop | stddev_samp 
 ------------+-------------
           0 |            
+(1 row)
+
+-- verify correct results for null and NaN inputs
+select sum(null::int4) from generate_series(1,3);
+ sum 
+-----
+    
+(1 row)
+
+select sum(null::int8) from generate_series(1,3);
+ sum 
+-----
+    
+(1 row)
+
+select sum(null::numeric) from generate_series(1,3);
+ sum 
+-----
+    
+(1 row)
+
+select sum(null::float8) from generate_series(1,3);
+ sum 
+-----
+    
+(1 row)
+
+select avg(null::int4) from generate_series(1,3);
+ avg 
+-----
+    
+(1 row)
+
+select avg(null::int8) from generate_series(1,3);
+ avg 
+-----
+    
+(1 row)
+
+select avg(null::numeric) from generate_series(1,3);
+ avg 
+-----
+    
+(1 row)
+
+select avg(null::float8) from generate_series(1,3);
+ avg 
+-----
+    
+(1 row)
+
+select sum('NaN'::numeric) from generate_series(1,3);
+ sum 
+-----
+ NaN
+(1 row)
+
+select avg('NaN'::numeric) from generate_series(1,3);
+ avg 
+-----
+ NaN
 (1 row)
 
 -- SQL2003 binary aggregates
@@ -222,6 +292,8 @@ group by ten order by ten;
 
 select ten, count(four), sum(DISTINCT four) from onek
 group by ten order by ten;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: GPDB_96_MERGE_FIXME: Intermediate aggregate stage not implemented not supported in DXL
  ten | count | sum 
 -----+-------+-----
    0 |   100 |   2
@@ -238,9 +310,9 @@ group by ten order by ten;
 
 -- user-defined aggregates
 SELECT newavg(four) AS avg_1 FROM onek;
- avg_1 
--------
-   1.5
+       avg_1        
+--------------------
+ 1.5000000000000000
 (1 row)
 
 SELECT newsum(four) AS sum_1500 FROM onek;
@@ -268,6 +340,9 @@ SELECT oldcnt(*) AS cnt_1000 FROM onek;
 (1 row)
 
 SELECT sum2(q1,q2) FROM int8_tbl;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Query Parameter not supported in DXL
+CONTEXT:  SQL function "sum3" during startup
        sum2        
 -------------------
  18271560493827981
@@ -292,7 +367,7 @@ select ten, sum(distinct four) from onek a
 group by ten
 having exists (select 1 from onek b
                where sum(distinct a.four + b.four) = b.four);
-ERROR:  aggregates not allowed in WHERE clause
+ERROR:  aggregate functions are not allowed in WHERE
 LINE 4:                where sum(distinct a.four + b.four) = b.four)...
                              ^
 -- Test handling of sublinks within outer-level aggregates.
@@ -300,10 +375,99 @@ LINE 4:                where sum(distinct a.four + b.four) = b.four)...
 select
   (select max((select i.unique2 from tenk1 i where i.unique1 = o.unique1)))
 from tenk1 o;
- ?column? 
-----------
-     9999
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Query-to-DXL Translation: No variable entry found due to incorrect normalization of query
+ max  
+------
+ 9999
 (1 row)
+
+-- Test handling of Params within aggregate arguments in hashed aggregation.
+-- Per bug report from Jeevan Chalke.
+explain (verbose, costs off)
+select s1, s2, sm
+from generate_series(1, 3) s1,
+     lateral (select s2, sum(s1 + s2) sm
+              from generate_series(1, 3) s2 group by s2) ss
+order by 1, 2;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: LATERAL
+                               QUERY PLAN                               
+------------------------------------------------------------------------
+ Sort
+   Output: s1.s1, s2.s2, (sum((s1.s1 + s2.s2)))
+   Sort Key: s1.s1, s2.s2
+   ->  Nested Loop
+         Output: s1.s1, s2.s2, (sum((s1.s1 + s2.s2)))
+         ->  Function Scan on pg_catalog.generate_series s1
+               Output: s1.s1
+               Function Call: generate_series(1, 3)
+         ->  Materialize
+               Output: s2.s2, (sum((s1.s1 + s2.s2)))
+               ->  HashAggregate
+                     Output: s2.s2, sum((s1.s1 + s2.s2))
+                     Group Key: s2.s2
+                     ->  Function Scan on pg_catalog.generate_series s2
+                           Output: s2.s2
+                           Function Call: generate_series(1, 3)
+ Optimizer: Postgres query optimizer
+(17 rows)
+
+select s1, s2, sm
+from generate_series(1, 3) s1,
+     lateral (select s2, sum(s1 + s2) sm
+              from generate_series(1, 3) s2 group by s2) ss
+order by 1, 2;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: LATERAL
+ s1 | s2 | sm 
+----+----+----
+  1 |  1 |  2
+  1 |  2 |  3
+  1 |  3 |  4
+  2 |  1 |  3
+  2 |  2 |  4
+  2 |  3 |  5
+  3 |  1 |  4
+  3 |  2 |  5
+  3 |  3 |  6
+(9 rows)
+
+explain (verbose, costs off)
+select array(select sum(x+y) s
+            from generate_series(1,3) y group by y order by s)
+  from generate_series(1,3) x;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Non-Scalar Subquery
+                            QUERY PLAN                             
+-------------------------------------------------------------------
+ Function Scan on pg_catalog.generate_series x
+   Output: (SubPlan 1)
+   Function Call: generate_series(1, 3)
+   SubPlan 1
+     ->  Sort
+           Output: (sum((x.x + y.y))), y.y
+           Sort Key: (sum((x.x + y.y)))
+           ->  HashAggregate
+                 Output: sum((x.x + y.y)), y.y
+                 Group Key: y.y
+                 ->  Function Scan on pg_catalog.generate_series y
+                       Output: y.y
+                       Function Call: generate_series(1, 3)
+ Optimizer: Postgres query optimizer
+(14 rows)
+
+select array(select sum(x+y) s
+            from generate_series(1,3) y group by y order by s)
+  from generate_series(1,3) x;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Non-Scalar Subquery
+  array  
+---------
+ {2,3,4}
+ {3,4,5}
+ {4,5,6}
+(3 rows)
 
 --
 -- test for bitwise integer aggregates
@@ -319,7 +483,7 @@ CREATE TEMPORARY TABLE bitwise_test(
 NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'i2' as the Greenplum Database data distribution key for this table.
 HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
 -- empty case
-SELECT 
+SELECT
   BIT_AND(i2) AS "?",
   BIT_OR(i4)  AS "?"
 FROM bitwise_test;
@@ -388,7 +552,7 @@ SELECT
  t | t | t | t | t | t | t | t | t
 (1 row)
 
-CREATE TEMPORARY TABLE bool_test(  
+CREATE TEMPORARY TABLE bool_test(
   b1 BOOL,
   b2 BOOL,
   b3 BOOL,
@@ -446,16 +610,55 @@ FROM bool_test;
 (1 row)
 
 --
--- Test several cases that should be optimized into indexscans instead of
--- the generic aggregate implementation.  We can't actually verify that they
--- are done as indexscans, but we can check that the results are correct.
+-- Test cases that should be optimized into indexscans instead of
+-- the generic aggregate implementation.
 --
 -- Basic cases
+explain (costs off)
+  select min(unique1) from tenk1;
+                   QUERY PLAN                   
+------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on tenk1
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.55.21
+(5 rows)
+
+select min(unique1) from tenk1;
+ min 
+-----
+   0
+(1 row)
+
+explain (costs off)
+  select max(unique1) from tenk1;
+                   QUERY PLAN                   
+------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on tenk1
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.55.21
+(5 rows)
+
 select max(unique1) from tenk1;
  max  
 ------
  9999
 (1 row)
+
+explain (costs off)
+  select max(unique1) from tenk1 where unique1 < 42;
+                        QUERY PLAN                         
+-----------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Index Scan using tenk1_unique1 on tenk1
+                     Index Cond: (unique1 < 42)
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.55.21
+(6 rows)
 
 select max(unique1) from tenk1 where unique1 < 42;
  max 
@@ -463,11 +666,44 @@ select max(unique1) from tenk1 where unique1 < 42;
   41
 (1 row)
 
+explain (costs off)
+  select max(unique1) from tenk1 where unique1 > 42;
+                   QUERY PLAN                   
+------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Index Scan using tenk1_unique1 on tenk1
+                     Index Cond: (unique1 > 42)
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.55.21
+(6 rows)
+
 select max(unique1) from tenk1 where unique1 > 42;
  max  
 ------
  9999
 (1 row)
+
+-- the planner may choose a generic aggregate here if parallel query is
+-- enabled, since that plan will be parallel safe and the "optimized"
+-- plan, which has almost identical cost, will not be.  we want to test
+-- the optimized plan, so temporarily disable parallel query.
+begin;
+set local max_parallel_workers_per_gather = 0;
+-- In GPDB, we also need to disable seqscans and bitmap scans.
+set local enable_seqscan=off;
+set local enable_bitmapscan=off;
+explain (costs off)
+  select max(unique1) from tenk1 where unique1 > 42000;
+                        QUERY PLAN                         
+-----------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Index Scan using tenk1_unique1 on tenk1
+                     Index Cond: (unique1 > 42000)
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.55.21
+(6 rows)
 
 select max(unique1) from tenk1 where unique1 > 42000;
  max 
@@ -475,12 +711,37 @@ select max(unique1) from tenk1 where unique1 > 42000;
     
 (1 row)
 
+rollback;
 -- multi-column index (uses tenk1_thous_tenthous)
+explain (costs off)
+  select max(tenthous) from tenk1 where thousand = 33;
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Index Scan using tenk1_thous_tenthous on tenk1
+                     Index Cond: (thousand = 33)
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.55.21
+(6 rows)
+
 select max(tenthous) from tenk1 where thousand = 33;
  max  
 ------
  9033
 (1 row)
+
+explain (costs off)
+  select min(tenthous) from tenk1 where thousand = 33;
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Index Scan using tenk1_thous_tenthous on tenk1
+                     Index Cond: (thousand = 33)
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.55.21
+(6 rows)
 
 select min(tenthous) from tenk1 where thousand = 33;
  min 
@@ -489,8 +750,28 @@ select min(tenthous) from tenk1 where thousand = 33;
 (1 row)
 
 -- check parameter propagation into an indexscan subquery
+-- In GPDB, this cannot use the MIN/MAX optimization, because the subplan
+-- parameter cannot be pushed through a Motion node.
+explain (costs off)
+  select f1, (select min(unique1) from tenk1 where unique1 > f1) AS gt
+    from int4_tbl;
+                             QUERY PLAN                             
+--------------------------------------------------------------------
+ Result
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Seq Scan on int4_tbl
+   SubPlan 1
+     ->  Aggregate
+           ->  Result
+                 Filter: (tenk1.unique1 > int4_tbl.f1)
+                 ->  Materialize
+                       ->  Gather Motion 3:1  (slice2; segments: 3)
+                             ->  Seq Scan on tenk1
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.55.21
+(11 rows)
+
 select f1, (select min(unique1) from tenk1 where unique1 > f1) AS gt
-from int4_tbl;
+  from int4_tbl;
      f1      | gt 
 -------------+----
       123456 |   
@@ -501,11 +782,35 @@ from int4_tbl;
 (5 rows)
 
 -- check some cases that were handled incorrectly in 8.3.0
+explain (costs off)
+  select distinct max(unique2) from tenk1;
+                   QUERY PLAN                   
+------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on tenk1
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.55.21
+(5 rows)
+
 select distinct max(unique2) from tenk1;
  max  
 ------
  9999
 (1 row)
+
+explain (costs off)
+  select max(unique2) from tenk1 order by 1;
+                      QUERY PLAN                      
+------------------------------------------------------
+ Sort
+   Sort Key: (max(unique2))
+   ->  Finalize Aggregate
+         ->  Gather Motion 3:1  (slice1; segments: 3)
+               ->  Partial Aggregate
+                     ->  Seq Scan on tenk1
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.55.21
+(7 rows)
 
 select max(unique2) from tenk1 order by 1;
  max  
@@ -513,11 +818,38 @@ select max(unique2) from tenk1 order by 1;
  9999
 (1 row)
 
+explain (costs off)
+  select max(unique2) from tenk1 order by max(unique2);
+                      QUERY PLAN                      
+------------------------------------------------------
+ Sort
+   Sort Key: (max(unique2))
+   ->  Finalize Aggregate
+         ->  Gather Motion 3:1  (slice1; segments: 3)
+               ->  Partial Aggregate
+                     ->  Seq Scan on tenk1
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.55.21
+(7 rows)
+
 select max(unique2) from tenk1 order by max(unique2);
  max  
 ------
  9999
 (1 row)
+
+explain (costs off)
+  select max(unique2) from tenk1 order by max(unique2)+1;
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Result
+   ->  Sort
+         Sort Key: ((max(unique2) + 1))
+         ->  Finalize Aggregate
+               ->  Gather Motion 3:1  (slice1; segments: 3)
+                     ->  Partial Aggregate
+                           ->  Seq Scan on tenk1
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.83.0
+(8 rows)
 
 select max(unique2) from tenk1 order by max(unique2)+1;
  max  
@@ -525,7 +857,20 @@ select max(unique2) from tenk1 order by max(unique2)+1;
  9999
 (1 row)
 
--- MPP: This works in Postgres
+explain (costs off)
+  select max(unique2), generate_series(1,3) as g from tenk1 order by g desc;
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Sort
+   Sort Key: (generate_series(1, 3)) DESC
+   ->  Result
+         ->  Finalize Aggregate
+               ->  Gather Motion 3:1  (slice1; segments: 3)
+                     ->  Partial Aggregate
+                           ->  Seq Scan on tenk1
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.55.21
+(8 rows)
+
 select max(unique2), generate_series(1,3) as g from tenk1 order by g desc;
  max  | g 
 ------+---
@@ -534,11 +879,216 @@ select max(unique2), generate_series(1,3) as g from tenk1 order by g desc;
  9999 | 1
 (3 rows)
 
+-- interesting corner case: constant gets optimized into a seqscan
+explain (costs off)
+  select max(100) from tenk1;
+                      QUERY PLAN                      
+------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on tenk1
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.78.0
+(5 rows)
+
+select max(100) from tenk1;
+ max 
+-----
+ 100
+(1 row)
+
+-- try it on an inheritance tree
+create table minmaxtest(f1 int);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'f1' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+create table minmaxtest1() inherits (minmaxtest);
+NOTICE:  table has parent, setting distribution columns to match parent table
+create table minmaxtest2() inherits (minmaxtest);
+NOTICE:  table has parent, setting distribution columns to match parent table
+create table minmaxtest3() inherits (minmaxtest);
+NOTICE:  table has parent, setting distribution columns to match parent table
+create index minmaxtesti on minmaxtest(f1);
+create index minmaxtest1i on minmaxtest1(f1);
+create index minmaxtest2i on minmaxtest2(f1 desc);
+create index minmaxtest3i on minmaxtest3(f1) where f1 is not null;
+insert into minmaxtest values(11), (12);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Inherited tables
+insert into minmaxtest1 values(13), (14);
+insert into minmaxtest2 values(15), (16);
+insert into minmaxtest3 values(17), (18);
+set enable_seqscan=off;
+explain (costs off)
+  select min(f1), max(f1) from minmaxtest;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Inherited tables
+                                             QUERY PLAN                                             
+----------------------------------------------------------------------------------------------------
+ Result
+   InitPlan 1 (returns $0)  (slice1)
+     ->  Limit
+           ->  Gather Motion 3:1  (slice2; segments: 3)
+                 Merge Key: minmaxtest.f1
+                 ->  Merge Append
+                       Sort Key: minmaxtest.f1
+                       ->  Index Only Scan using minmaxtesti on minmaxtest
+                             Index Cond: (f1 IS NOT NULL)
+                       ->  Index Only Scan using minmaxtest1i on minmaxtest1
+                             Index Cond: (f1 IS NOT NULL)
+                       ->  Index Only Scan Backward using minmaxtest2i on minmaxtest2
+                             Index Cond: (f1 IS NOT NULL)
+                       ->  Index Only Scan using minmaxtest3i on minmaxtest3
+   InitPlan 2 (returns $1)  (slice3)
+     ->  Limit
+           ->  Gather Motion 3:1  (slice4; segments: 3)
+                 Merge Key: minmaxtest_1.f1
+                 ->  Merge Append
+                       Sort Key: minmaxtest_1.f1 DESC
+                       ->  Index Only Scan Backward using minmaxtesti on minmaxtest minmaxtest_1
+                             Index Cond: (f1 IS NOT NULL)
+                       ->  Index Only Scan Backward using minmaxtest1i on minmaxtest1 minmaxtest1_1
+                             Index Cond: (f1 IS NOT NULL)
+                       ->  Index Only Scan using minmaxtest2i on minmaxtest2 minmaxtest2_1
+                             Index Cond: (f1 IS NOT NULL)
+                       ->  Index Only Scan Backward using minmaxtest3i on minmaxtest3 minmaxtest3_1
+ Optimizer: Postgres query optimizer
+(30 rows)
+
+select min(f1), max(f1) from minmaxtest;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Inherited tables
+ min | max 
+-----+-----
+  11 |  18
+(1 row)
+
+reset enable_seqscan;
+-- DISTINCT doesn't do anything useful here, but it shouldn't fail
+explain (costs off)
+  select distinct min(f1), max(f1) from minmaxtest;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Inherited tables
+                          QUERY PLAN                          
+--------------------------------------------------------------
+ Unique
+   Group Key: (min(minmaxtest.f1)), (max(minmaxtest.f1))
+   ->  Sort
+         Sort Key: (min(minmaxtest.f1)), (max(minmaxtest.f1))
+         ->  Finalize Aggregate
+               ->  Gather Motion 3:1  (slice1; segments: 3)
+                     ->  Partial Aggregate
+                           ->  Append
+                                 ->  Seq Scan on minmaxtest
+                                 ->  Seq Scan on minmaxtest1
+                                 ->  Seq Scan on minmaxtest2
+                                 ->  Seq Scan on minmaxtest3
+ Optimizer: Postgres query optimizer
+(13 rows)
+
+select distinct min(f1), max(f1) from minmaxtest;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Inherited tables
+ min | max 
+-----+-----
+  11 |  18
+(1 row)
+
+drop table minmaxtest cascade;
+NOTICE:  drop cascades to 3 other objects
+DETAIL:  drop cascades to table minmaxtest1
+drop cascades to table minmaxtest2
+drop cascades to table minmaxtest3
+-- check for correct detection of nested-aggregate errors
+select max(min(unique1)) from tenk1;
+ERROR:  aggregate function calls cannot be nested
+LINE 1: select max(min(unique1)) from tenk1;
+                   ^
+select (select max(min(unique1)) from int8_tbl) from tenk1;
+ERROR:  aggregate function calls cannot be nested
+LINE 1: select (select max(min(unique1)) from int8_tbl) from tenk1;
+                           ^
+--
+-- Test removal of redundant GROUP BY columns
+--
+create temp table t1 (a int, b int, c int, d int, primary key (a, b));
+create temp table t2 (x int, y int, z int, primary key (x, y));
+create temp table t3 (a int, b int, c int, primary key(a, b) deferrable);
+-- Non-primary-key columns can be removed from GROUP BY
+explain (costs off) select * from t1 group by a,b,c,d;
+                      QUERY PLAN                      
+------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Seq Scan on t1
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.78.0
+(3 rows)
+
+-- No removal can happen if the complete PK is not present in GROUP BY
+explain (costs off) select a,c from t1 group by a,c,d;
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  GroupAggregate
+         Group Key: a, c, d
+         ->  Sort
+               Sort Key: a, c, d
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: a, c, d
+                     ->  Seq Scan on t1
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.83.0
+(9 rows)
+
+-- Test removal across multiple relations
+explain (costs off) select *
+from t1 inner join t2 on t1.a = t2.x and t1.b = t2.y
+group by t1.a,t1.b,t1.c,t1.d,t2.x,t2.y,t2.z;
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Nested Loop
+         Join Filter: true
+         ->  Seq Scan on t2
+         ->  Index Scan using t1_pkey on t1
+               Index Cond: ((a = t2.x) AND (b = t2.y))
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.78.0
+(7 rows)
+
+-- Test case where t1 can be optimized but not t2
+explain (costs off) select t1.*,t2.x,t2.z
+from t1 inner join t2 on t1.a = t2.x and t1.b = t2.y
+group by t1.a,t1.b,t1.c,t1.d,t2.x,t2.z;
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Nested Loop
+         Join Filter: true
+         ->  Seq Scan on t2
+         ->  Index Scan using t1_pkey on t1
+               Index Cond: ((a = t2.x) AND (b = t2.y))
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.78.0
+(7 rows)
+
+-- Cannot optimize when PK is deferrable
+-- start_ignore
+-- GPDB_96_MERGE_FIXME: ORCA does it anyway.
+-- end_ignore
+explain (costs off) select * from t3 group by a,b,c;
+                      QUERY PLAN                      
+------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Seq Scan on t3
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.78.0
+(3 rows)
+
+drop table t1;
+drop table t2;
+drop table t3;
 --
 -- Test combinations of DISTINCT and/or ORDER BY
 --
 select array_agg(a order by b)
   from (values (1,4),(2,3),(3,1),(4,2)) v(a,b);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
  array_agg 
 -----------
  {3,4,2,1}
@@ -546,6 +1096,8 @@ select array_agg(a order by b)
 
 select array_agg(a order by a)
   from (values (1,4),(2,3),(3,1),(4,2)) v(a,b);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
  array_agg 
 -----------
  {1,2,3,4}
@@ -553,6 +1105,8 @@ select array_agg(a order by a)
 
 select array_agg(a order by a desc)
   from (values (1,4),(2,3),(3,1),(4,2)) v(a,b);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
  array_agg 
 -----------
  {4,3,2,1}
@@ -560,6 +1114,8 @@ select array_agg(a order by a desc)
 
 select array_agg(b order by a desc)
   from (values (1,4),(2,3),(3,1),(4,2)) v(a,b);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
  array_agg 
 -----------
  {2,1,3,4}
@@ -572,18 +1128,39 @@ select array_agg(distinct a)
  {1,2,3,NULL}
 (1 row)
 
--- TODO: support distinct + order by
-/*
 select array_agg(distinct a order by a)
   from (values (1),(2),(1),(3),(null),(2)) v(a);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+  array_agg   
+--------------
+ {1,2,3,NULL}
+(1 row)
+
 select array_agg(distinct a order by a desc)
   from (values (1),(2),(1),(3),(null),(2)) v(a);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+  array_agg   
+--------------
+ {NULL,3,2,1}
+(1 row)
+
 select array_agg(distinct a order by a desc nulls last)
   from (values (1),(2),(1),(3),(null),(2)) v(a);
-*/
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+  array_agg   
+--------------
+ {3,2,1,NULL}
+(1 row)
+
 -- multi-arg aggs, strict/nonstrict, distinct/order by
 select aggfstr(a,b,c)
   from (values (1,3,'foo'),(0,null,null),(2,2,'bar'),(3,1,'baz')) v(a,b,c);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: ROW EXPRESSION
+CONTEXT:  SQL function "aggf_trans" during startup
                 aggfstr                
 ---------------------------------------
  {"(1,3,foo)","(2,2,bar)","(3,1,baz)"}
@@ -591,41 +1168,119 @@ select aggfstr(a,b,c)
 
 select aggfns(a,b,c)
   from (values (1,3,'foo'),(0,null,null),(2,2,'bar'),(3,1,'baz')) v(a,b,c);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: ROW EXPRESSION
+CONTEXT:  SQL function "aggfns_trans" during startup
                     aggfns                     
 -----------------------------------------------
  {"(1,3,foo)","(0,,)","(2,2,bar)","(3,1,baz)"}
 (1 row)
 
-/*
 select aggfstr(distinct a,b,c)
   from (values (1,3,'foo'),(0,null,null),(2,2,'bar'),(3,1,'baz')) v(a,b,c),
        generate_series(1,3) i;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: DISTINCT is supported only for single-argument aggregates
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: ROW EXPRESSION
+CONTEXT:  SQL function "aggf_trans" during startup
+                aggfstr                
+---------------------------------------
+ {"(1,3,foo)","(2,2,bar)","(3,1,baz)"}
+(1 row)
+
 select aggfns(distinct a,b,c)
   from (values (1,3,'foo'),(0,null,null),(2,2,'bar'),(3,1,'baz')) v(a,b,c),
        generate_series(1,3) i;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: DISTINCT is supported only for single-argument aggregates
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: ROW EXPRESSION
+CONTEXT:  SQL function "aggfns_trans" during startup
+                    aggfns                     
+-----------------------------------------------
+ {"(0,,)","(1,3,foo)","(2,2,bar)","(3,1,baz)"}
+(1 row)
 
 select aggfstr(distinct a,b,c order by b)
   from (values (1,3,'foo'),(0,null,null),(2,2,'bar'),(3,1,'baz')) v(a,b,c),
        generate_series(1,3) i;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: ROW EXPRESSION
+CONTEXT:  SQL function "aggf_trans" during startup
+                aggfstr                
+---------------------------------------
+ {"(3,1,baz)","(2,2,bar)","(1,3,foo)"}
+(1 row)
+
 select aggfns(distinct a,b,c order by b)
   from (values (1,3,'foo'),(0,null,null),(2,2,'bar'),(3,1,'baz')) v(a,b,c),
        generate_series(1,3) i;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: ROW EXPRESSION
+CONTEXT:  SQL function "aggfns_trans" during startup
+                    aggfns                     
+-----------------------------------------------
+ {"(3,1,baz)","(2,2,bar)","(1,3,foo)","(0,,)"}
+(1 row)
 
 -- test specific code paths
-
 select aggfns(distinct a,a,c order by c using ~<~,a)
   from (values (1,3,'foo'),(0,null,null),(2,2,'bar'),(3,1,'baz')) v(a,b,c),
        generate_series(1,2) i;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: ROW EXPRESSION
+CONTEXT:  SQL function "aggfns_trans" during startup
+                     aggfns                     
+------------------------------------------------
+ {"(2,2,bar)","(3,3,baz)","(1,1,foo)","(0,0,)"}
+(1 row)
+
 select aggfns(distinct a,a,c order by c using ~<~)
   from (values (1,3,'foo'),(0,null,null),(2,2,'bar'),(3,1,'baz')) v(a,b,c),
        generate_series(1,2) i;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: ROW EXPRESSION
+CONTEXT:  SQL function "aggfns_trans" during startup
+                     aggfns                     
+------------------------------------------------
+ {"(2,2,bar)","(3,3,baz)","(1,1,foo)","(0,0,)"}
+(1 row)
+
 select aggfns(distinct a,a,c order by a)
   from (values (1,3,'foo'),(0,null,null),(2,2,'bar'),(3,1,'baz')) v(a,b,c),
        generate_series(1,2) i;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: ROW EXPRESSION
+CONTEXT:  SQL function "aggfns_trans" during startup
+                     aggfns                     
+------------------------------------------------
+ {"(0,0,)","(1,1,foo)","(2,2,bar)","(3,3,baz)"}
+(1 row)
+
 select aggfns(distinct a,b,c order by a,c using ~<~,b)
   from (values (1,3,'foo'),(0,null,null),(2,2,'bar'),(3,1,'baz')) v(a,b,c),
        generate_series(1,2) i;
-*/
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: ROW EXPRESSION
+CONTEXT:  SQL function "aggfns_trans" during startup
+                    aggfns                     
+-----------------------------------------------
+ {"(0,,)","(1,3,foo)","(2,2,bar)","(3,1,baz)"}
+(1 row)
+
 -- check node I/O via view creation and usage, also deparsing logic
 create view agg_view1 as
   select aggfns(a,b,c)
@@ -637,9 +1292,10 @@ select * from agg_view1;
 (1 row)
 
 select pg_get_viewdef('agg_view1'::regclass);
-                                                                     pg_get_viewdef                                                                     
---------------------------------------------------------------------------------------------------------------------------------------------------------
- SELECT aggfns(v.a, v.b, v.c) AS aggfns FROM (VALUES (1,3,'foo'::text), (0,NULL::integer,NULL::text), (2,2,'bar'::text), (3,1,'baz'::text)) v(a, b, c);
+                                                   pg_get_viewdef                                                    
+---------------------------------------------------------------------------------------------------------------------
+  SELECT aggfns(v.a, v.b, v.c) AS aggfns                                                                            +
+    FROM ( VALUES (1,3,'foo'::text), (0,NULL::integer,NULL::text), (2,2,'bar'::text), (3,1,'baz'::text)) v(a, b, c);
 (1 row)
 
 create or replace view agg_view1 as
@@ -647,23 +1303,37 @@ create or replace view agg_view1 as
     from (values (1,3,'foo'),(0,null,null),(2,2,'bar'),(3,1,'baz')) v(a,b,c),
          generate_series(1,3) i;
 select * from agg_view1;
-ERROR:  DISTINCT is supported only for single-argument aggregates
-select pg_get_viewdef('agg_view1'::regclass);
-                                                                                       pg_get_viewdef                                                                                        
----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- SELECT aggfns(DISTINCT v.a, v.b, v.c) AS aggfns FROM (VALUES (1,3,'foo'::text), (0,NULL::integer,NULL::text), (2,2,'bar'::text), (3,1,'baz'::text)) v(a, b, c), generate_series(1, 3) i(i);
+                    aggfns                     
+-----------------------------------------------
+ {"(0,,)","(1,3,foo)","(2,2,bar)","(3,1,baz)"}
 (1 row)
 
--- TODO: support distinct + order by
-/*
+select pg_get_viewdef('agg_view1'::regclass);
+                                                   pg_get_viewdef                                                    
+---------------------------------------------------------------------------------------------------------------------
+  SELECT aggfns(DISTINCT v.a, v.b, v.c) AS aggfns                                                                   +
+    FROM ( VALUES (1,3,'foo'::text), (0,NULL::integer,NULL::text), (2,2,'bar'::text), (3,1,'baz'::text)) v(a, b, c),+
+     generate_series(1, 3) i(i);
+(1 row)
+
 create or replace view agg_view1 as
   select aggfns(distinct a,b,c order by b)
     from (values (1,3,'foo'),(0,null,null),(2,2,'bar'),(3,1,'baz')) v(a,b,c),
          generate_series(1,3) i;
-
 select * from agg_view1;
+                    aggfns                     
+-----------------------------------------------
+ {"(3,1,baz)","(2,2,bar)","(1,3,foo)","(0,,)"}
+(1 row)
+
 select pg_get_viewdef('agg_view1'::regclass);
-*/
+                                                   pg_get_viewdef                                                    
+---------------------------------------------------------------------------------------------------------------------
+  SELECT aggfns(DISTINCT v.a, v.b, v.c ORDER BY v.b) AS aggfns                                                      +
+    FROM ( VALUES (1,3,'foo'::text), (0,NULL::integer,NULL::text), (2,2,'bar'::text), (3,1,'baz'::text)) v(a, b, c),+
+     generate_series(1, 3) i(i);
+(1 row)
+
 create or replace view agg_view1 as
   select aggfns(a,b,c order by b+1)
     from (values (1,3,'foo'),(0,null,null),(2,2,'bar'),(3,1,'baz')) v(a,b,c);
@@ -674,9 +1344,10 @@ select * from agg_view1;
 (1 row)
 
 select pg_get_viewdef('agg_view1'::regclass);
-                                                                              pg_get_viewdef                                                                               
----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- SELECT aggfns(v.a, v.b, v.c ORDER BY (v.b + 1)) AS aggfns FROM (VALUES (1,3,'foo'::text), (0,NULL::integer,NULL::text), (2,2,'bar'::text), (3,1,'baz'::text)) v(a, b, c);
+                                                   pg_get_viewdef                                                    
+---------------------------------------------------------------------------------------------------------------------
+  SELECT aggfns(v.a, v.b, v.c ORDER BY (v.b + 1)) AS aggfns                                                         +
+    FROM ( VALUES (1,3,'foo'::text), (0,NULL::integer,NULL::text), (2,2,'bar'::text), (3,1,'baz'::text)) v(a, b, c);
 (1 row)
 
 create or replace view agg_view1 as
@@ -689,9 +1360,10 @@ select * from agg_view1;
 (1 row)
 
 select pg_get_viewdef('agg_view1'::regclass);
-                                                                           pg_get_viewdef                                                                            
----------------------------------------------------------------------------------------------------------------------------------------------------------------------
- SELECT aggfns(v.a, v.a, v.c ORDER BY v.b) AS aggfns FROM (VALUES (1,3,'foo'::text), (0,NULL::integer,NULL::text), (2,2,'bar'::text), (3,1,'baz'::text)) v(a, b, c);
+                                                   pg_get_viewdef                                                    
+---------------------------------------------------------------------------------------------------------------------
+  SELECT aggfns(v.a, v.a, v.c ORDER BY v.b) AS aggfns                                                               +
+    FROM ( VALUES (1,3,'foo'::text), (0,NULL::integer,NULL::text), (2,2,'bar'::text), (3,1,'baz'::text)) v(a, b, c);
 (1 row)
 
 create or replace view agg_view1 as
@@ -704,54 +1376,53 @@ select * from agg_view1;
 (1 row)
 
 select pg_get_viewdef('agg_view1'::regclass);
-                                                                                pg_get_viewdef                                                                                 
-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- SELECT aggfns(v.a, v.b, v.c ORDER BY v.c USING ~<~ NULLS LAST) AS aggfns FROM (VALUES (1,3,'foo'::text), (0,NULL::integer,NULL::text), (2,2,'bar'::text), (3,1,'baz'::text)) v(a, b, c);
+                                                   pg_get_viewdef                                                    
+---------------------------------------------------------------------------------------------------------------------
+  SELECT aggfns(v.a, v.b, v.c ORDER BY v.c USING ~<~ NULLS LAST) AS aggfns                                          +
+    FROM ( VALUES (1,3,'foo'::text), (0,NULL::integer,NULL::text), (2,2,'bar'::text), (3,1,'baz'::text)) v(a, b, c);
 (1 row)
 
--- TODO: support distinct + order by
-/*
 create or replace view agg_view1 as
   select aggfns(distinct a,b,c order by a,c using ~<~,b)
     from (values (1,3,'foo'),(0,null,null),(2,2,'bar'),(3,1,'baz')) v(a,b,c),
          generate_series(1,2) i;
-
 select * from agg_view1;
-select pg_get_viewdef('agg_view1'::regclass);
-*/
-drop view agg_view1;
--- incorrect DISTINCT usage errors
-select array_agg(distinct a,b,c order by i)
-  from (values (1,1,'foo')) v(a,b,c), generate_series(1,2) i;
-ERROR:  function array_agg(integer, integer, text) does not exist
-LINE 1: select array_agg(distinct a,b,c order by i)
-               ^
-HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
-select array_agg(distinct a,b,c order by a,b+1)
-  from (values (1,1,'foo')) v(a,b,c), generate_series(1,2) i;
-ERROR:  function array_agg(integer, integer, text) does not exist
-LINE 1: select array_agg(distinct a,b,c order by a,b+1)
-               ^
-HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
-select array_agg(distinct a,b,c order by a,b,i,c)
-  from (values (1,1,'foo')) v(a,b,c), generate_series(1,2) i;
-ERROR:  function array_agg(integer, integer, text) does not exist
-LINE 1: select array_agg(distinct a,b,c order by a,b,i,c)
-               ^
-HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
-select array_agg(distinct a,a,c order by a,b)
-  from (values (1,1,'foo')) v(a,b,c), generate_series(1,2) i;
-ERROR:  function array_agg(integer, integer, text) does not exist
-LINE 1: select array_agg(distinct a,a,c order by a,b)
-               ^
-HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
--- string_agg tests
-select string_agg(a) from (values('aaaa'),('bbbb'),('cccc')) g(a);
-  string_agg  
---------------
- aaaabbbbcccc
+                    aggfns                     
+-----------------------------------------------
+ {"(0,,)","(1,3,foo)","(2,2,bar)","(3,1,baz)"}
 (1 row)
 
+select pg_get_viewdef('agg_view1'::regclass);
+                                                   pg_get_viewdef                                                    
+---------------------------------------------------------------------------------------------------------------------
+  SELECT aggfns(DISTINCT v.a, v.b, v.c ORDER BY v.a, v.c USING ~<~ NULLS LAST, v.b) AS aggfns                       +
+    FROM ( VALUES (1,3,'foo'::text), (0,NULL::integer,NULL::text), (2,2,'bar'::text), (3,1,'baz'::text)) v(a, b, c),+
+     generate_series(1, 2) i(i);
+(1 row)
+
+drop view agg_view1;
+-- incorrect DISTINCT usage errors
+select aggfns(distinct a,b,c order by i)
+  from (values (1,1,'foo')) v(a,b,c), generate_series(1,2) i;
+ERROR:  in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list
+LINE 1: select aggfns(distinct a,b,c order by i)
+                                              ^
+select aggfns(distinct a,b,c order by a,b+1)
+  from (values (1,1,'foo')) v(a,b,c), generate_series(1,2) i;
+ERROR:  in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list
+LINE 1: select aggfns(distinct a,b,c order by a,b+1)
+                                                ^
+select aggfns(distinct a,b,c order by a,b,i,c)
+  from (values (1,1,'foo')) v(a,b,c), generate_series(1,2) i;
+ERROR:  in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list
+LINE 1: select aggfns(distinct a,b,c order by a,b,i,c)
+                                                  ^
+select aggfns(distinct a,a,c order by a,b)
+  from (values (1,1,'foo')) v(a,b,c), generate_series(1,2) i;
+ERROR:  in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list
+LINE 1: select aggfns(distinct a,a,c order by a,b)
+                                                ^
+-- string_agg tests
 select string_agg(a,',') from (values('aaaa'),('bbbb'),('cccc')) g(a);
    string_agg   
 ----------------
@@ -764,10 +1435,10 @@ select string_agg(a,',') from (values('aaaa'),(null),('bbbb'),('cccc')) g(a);
  aaaa,bbbb,cccc
 (1 row)
 
-select string_agg(a,',') from (values(null),(null),('bbbb'),('cccc')) g(a);
+select string_agg(a,'AB') from (values(null),(null),('bbbb'),('cccc')) g(a);
  string_agg 
 ------------
- bbbb,cccc
+ bbbbABcccc
 (1 row)
 
 select string_agg(a,',') from (values(null),(null)) g(a);
@@ -776,253 +1447,1226 @@ select string_agg(a,',') from (values(null),(null)) g(a);
  
 (1 row)
 
--- array_agg tests
-SELECT array_agg(a order by a) as a_by_a from aggtest;
-    a_by_a     
----------------
- {0,42,56,100}
+-- check some implicit casting cases, as per bug #5564
+select string_agg(distinct f1, ',' order by f1) from varchar_tbl;  -- ok
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ string_agg 
+------------
+ a,ab,abcd
 (1 row)
 
-SELECT array_agg(b order by b) as b_by_b from aggtest;
-           b_by_b            
------------------------------
- {0.09561,7.8,99.097,324.78}
+select string_agg(distinct f1::text, ',' order by f1) from varchar_tbl;  -- not ok
+ERROR:  in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list
+LINE 1: select string_agg(distinct f1::text, ',' order by f1) from v...
+                                                          ^
+select string_agg(distinct f1, ',' order by f1::text) from varchar_tbl;  -- not ok
+ERROR:  in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list
+LINE 1: select string_agg(distinct f1, ',' order by f1::text) from v...
+                                                    ^
+select string_agg(distinct f1::text, ',' order by f1::text) from varchar_tbl;  -- ok
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ string_agg 
+------------
+ a,ab,abcd
 (1 row)
 
-SELECT array_agg(a order by a) as a_by_a, 
-       array_agg(a order by b) as a_by_b,
-       array_agg(b order by a) as b_by_a,
-       array_agg(b order by b) as b_by_b 
-  FROM aggtest;
-    a_by_a     |    a_by_b     |           b_by_a            |           b_by_b            
----------------+---------------+-----------------------------+-----------------------------
- {0,42,56,100} | {0,56,100,42} | {0.09561,324.78,7.8,99.097} | {0.09561,7.8,99.097,324.78}
-(1 row)
-
--- Negative test cases for ordered aggregate syntax
-SELECT count(order by a) from aggtest;       -- zero parameter aggregate
-ERROR:  syntax error at or near "order"
-LINE 1: SELECT count(order by a) from aggtest;
-                     ^
-SELECT count(a order by a) from aggtest;     -- regular (non-orderd) aggregate
-ERROR:  ORDER BY specified, but count is not an ordered aggregate function
-LINE 1: SELECT count(a order by a) from aggtest;
-               ^
-SELECT abs(a order by a) from aggtest;       -- regular function
-ERROR:  ORDER BY specified, but abs is not an ordered aggregate function
-LINE 1: SELECT abs(a order by a) from aggtest;
-               ^
-SELECT a(aggtest order by a) from aggtest;   -- function-like column reference
-ERROR:  function a(aggtest) does not exist
-LINE 1: SELECT a(aggtest order by a) from aggtest;
-               ^
-HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
-SELECT nosuchagg(a order by a) FROM aggtest; -- no such function
-ERROR:  function nosuchagg(smallint) does not exist
-LINE 1: SELECT nosuchagg(a order by a) FROM aggtest;
-               ^
-HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
-SELECT lag(a order by a) from aggtest;       -- window function (no window clause)
-ERROR:  window function call requires an OVER clause
-LINE 1: SELECT lag(a order by a) from aggtest;
-               ^
-SELECT lag(a order by a) over (order by a) FROM aggtest;  -- window function
-ERROR:  aggregate ORDER BY is not implemented for window functions
-LINE 1: SELECT lag(a order by a) over (order by a) FROM aggtest;
-               ^
-SELECT count(a order by a) over (order by a) FROM aggtest;  -- window derived aggregate
-ERROR:  aggregate ORDER BY is not implemented for window functions
-LINE 1: SELECT count(a order by a) over (order by a) FROM aggtest;
-               ^
-SELECT array_agg(a order by a) over (order by a) FROM aggtest; -- window derived ordered aggregate
-ERROR:  aggregate ORDER BY is not implemented for window functions
-LINE 1: SELECT array_agg(a order by a) over (order by a) FROM aggtes...
-               ^
--- check for mpp-2687
-CREATE TEMPORARY TABLE mpp2687t (
-    dk text,
-    gk text
-) DISTRIBUTED BY (dk);
-CREATE VIEW mpp2687v AS
-    SELECT DISTINCT gk
-    FROM mpp2687t 
-    GROUP BY gk;
-NOTICE:  view "mpp2687v" will be a temporary view
-SELECT * FROM mpp2687v;
- gk 
-----
-(0 rows)
-
--- MPP-4617
-select case when ten < 5 then ten else ten * 2 end, count(distinct two), count(distinct four) from tenk1 group by 1;
- case | count | count 
-------+-------+-------
-    2 |     1 |     2
-   12 |     1 |     2
-   18 |     1 |     2
-   16 |     1 |     2
-   14 |     1 |     2
-    0 |     1 |     2
-   10 |     1 |     2
-    4 |     1 |     2
-    3 |     1 |     2
-    1 |     1 |     2
-(10 rows)
-
-select ten, ten, count(distinct two), count(distinct four) from tenk1 group by 1,2;
- ten | ten | count | count 
------+-----+-------+-------
-   3 |   3 |     1 |     2
-   5 |   5 |     1 |     2
-   4 |   4 |     1 |     2
-   0 |   0 |     1 |     2
-   8 |   8 |     1 |     2
-   9 |   9 |     1 |     2
-   7 |   7 |     1 |     2
-   6 |   6 |     1 |     2
-   1 |   1 |     1 |     2
-   2 |   2 |     1 |     2
-(10 rows)
-
---MPP-20151: distinct is transformed to a group-by
-select distinct two from tenk1 order by two;
- two 
+-- FILTER tests
+select min(unique1) filter (where unique1 > 100) from tenk1;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Aggregate functions with FILTER
+ min 
 -----
-   0
-   1
-(2 rows)
-
-select distinct two, four from tenk1 order by two, four;
- two | four 
------+------
-   0 |    0
-   0 |    2
-   1 |    1
-   1 |    3
-(4 rows)
-
-select distinct two, max(two) over() from tenk1 order by two;
- two | max 
------+-----
-   0 |   1
-   1 |   1
-(2 rows)
-
-select distinct two, sum(four) over() from tenk1 order by two;
- two |  sum  
------+-------
-   0 | 15000
-   1 | 15000
-(2 rows)
-
-select distinct two, sum(four) from tenk1 group by two order by two;
- two |  sum  
------+-------
-   0 |  5000
-   1 | 10000
-(2 rows)
-
-select distinct two, sum(four) from tenk1 group by two having sum(four) > 5000;
- two |  sum  
------+-------
-   1 | 10000
+ 101
 (1 row)
 
-select distinct t1.two, t2.two, t1.four, t2.four from tenk1 t1, tenk1 t2 where t1.hundred=t2.hundred order by t1.two, t1.four;
- two | two | four | four 
------+-----+------+------
-   0 |   0 |    0 |    0
-   0 |   0 |    2 |    2
-   1 |   1 |    1 |    1
-   1 |   1 |    3 |    3
-(4 rows)
+select ten, sum(distinct four) filter (where four::text ~ '123') from onek a
+group by ten;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Aggregate functions with FILTER
+ ten | sum 
+-----+-----
+   0 |    
+   1 |    
+   2 |    
+   3 |    
+   4 |    
+   5 |    
+   6 |    
+   7 |    
+   8 |    
+   9 |    
+(10 rows)
 
--- Test for a planner bug we used to have, when this query gets planned
--- as a merge join. This should perform a merge join between 'l' and 'ps',
--- using both pk and sk as the merge keys. Due to the bug, the planner
--- used mix up the columns in the path keys, and used incorrect columns
--- as the merge keys. (This is a modified version of a TPC-H query)
-create table l (ok bigint, pk integer, sk integer, quantity numeric) distributed by (ok);
-create table ps (pk integer, sk integer, availqty integer) distributed by (pk);
-insert into l select g%5, 50-g, g, 5 from generate_series(1, 50) g;
-insert into ps select g, 50-g, 10 from generate_series(1, 25) g;
-select  g.pk, g.sk, ps.availqty
-from ps,
-     (select sum(l.quantity) as qty_sum, l.pk, l.sk
-      from l
-      group by l.pk, l.sk ) g
-where g.pk = ps.pk and g.sk = ps.sk
-and ps.availqty > g.qty_sum ;
- pk | sk | availqty 
-----+----+----------
-  6 | 44 |       10
-  3 | 47 |       10
- 21 | 29 |       10
- 15 | 35 |       10
- 20 | 30 |       10
- 25 | 25 |       10
- 13 | 37 |       10
- 22 | 28 |       10
-  7 | 43 |       10
- 16 | 34 |       10
- 24 | 26 |       10
- 10 | 40 |       10
- 19 | 31 |       10
-  8 | 42 |       10
-  9 | 41 |       10
-  4 | 46 |       10
- 14 | 36 |       10
-  5 | 45 |       10
- 11 | 39 |       10
- 18 | 32 |       10
- 12 | 38 |       10
-  2 | 48 |       10
- 23 | 27 |       10
-  1 | 49 |       10
- 17 | 33 |       10
-(25 rows)
+select ten, sum(distinct four) filter (where four > 10) from onek a
+group by ten
+having exists (select 1 from onek b where sum(distinct a.four) = b.four);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Aggregate functions with FILTER
+ ten | sum 
+-----+-----
+   0 |    
+   2 |    
+   4 |    
+   6 |    
+   8 |    
+(5 rows)
 
--- the same, but force a merge join and sorted agg.
-set enable_hashagg=off;
-set enable_hashjoin=off;
-set enable_mergejoin=on;
-select  g.pk, g.sk, ps.availqty
-from ps,
-     (select sum(l.quantity) as qty_sum, l.pk, l.sk
-      from l
-      group by l.pk, l.sk ) g
-where g.pk = ps.pk and g.sk = ps.sk
-and ps.availqty > g.qty_sum ;
- pk | sk | availqty 
-----+----+----------
-  1 | 49 |       10
-  2 | 48 |       10
-  3 | 47 |       10
-  4 | 46 |       10
-  5 | 45 |       10
-  6 | 44 |       10
-  7 | 43 |       10
-  8 | 42 |       10
-  9 | 41 |       10
- 10 | 40 |       10
- 11 | 39 |       10
- 12 | 38 |       10
- 13 | 37 |       10
- 14 | 36 |       10
- 15 | 35 |       10
- 16 | 34 |       10
- 17 | 33 |       10
- 18 | 32 |       10
- 19 | 31 |       10
- 20 | 30 |       10
- 21 | 29 |       10
- 22 | 28 |       10
- 23 | 27 |       10
- 24 | 26 |       10
- 25 | 25 |       10
-(25 rows)
+select max(foo COLLATE "C") filter (where (bar collate "POSIX") > '0')
+from (values ('a', 'b')) AS v(foo,bar);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Non-default collation
+ max 
+-----
+ a
+(1 row)
 
-reset enable_hashagg;
-reset enable_hashjoin;
-reset enable_mergejoin;
-drop table l, ps;
+-- outer reference in FILTER (PostgreSQL extension)
+select (select count(*)
+        from (values (1)) t0(inner_c))
+from (values (2),(3)) t1(outer_c); -- inner query is aggregation query
+ count 
+-------
+     1
+     1
+(2 rows)
+
+select (select count(*) filter (where outer_c <> 0)
+        from (values (1)) t0(inner_c))
+from (values (2),(3)) t1(outer_c); -- outer query is aggregation query
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Aggregate functions with FILTER
+ count 
+-------
+     2
+(1 row)
+
+select (select count(inner_c) filter (where outer_c <> 0)
+        from (values (1)) t0(inner_c))
+from (values (2),(3)) t1(outer_c); -- inner query is aggregation query
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Aggregate functions with FILTER
+ count 
+-------
+     1
+     1
+(2 rows)
+
+select
+  (select max((select i.unique2 from tenk1 i where i.unique1 = o.unique1))
+     filter (where o.unique1 < 10))
+from tenk1 o;					-- outer query is aggregation query
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Aggregate functions with FILTER
+ max  
+------
+ 9998
+(1 row)
+
+-- subquery in FILTER clause (PostgreSQL extension)
+select sum(unique1) FILTER (WHERE
+  unique1 IN (SELECT unique1 FROM onek where unique1 < 100)) FROM tenk1;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Aggregate functions with FILTER
+ sum  
+------
+ 4950
+(1 row)
+
+-- exercise lots of aggregate parts with FILTER
+select aggfns(distinct a,b,c order by a,c using ~<~,b) filter (where a > 1)
+    from (values (1,3,'foo'),(0,null,null),(2,2,'bar'),(3,1,'baz')) v(a,b,c),
+    generate_series(1,2) i;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: ROW EXPRESSION
+CONTEXT:  SQL function "aggfns_trans" during startup
+          aggfns           
+---------------------------
+ {"(2,2,bar)","(3,1,baz)"}
+(1 row)
+
+-- ordered-set aggregates
+select p, percentile_cont(p) within group (order by x::float8)
+from generate_series(1,5) x,
+     (values (0::float8),(0.1),(0.25),(0.4),(0.5),(0.6),(0.75),(0.9),(1)) v(p)
+group by p order by p;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+  p   | percentile_cont 
+------+-----------------
+    0 |               1
+  0.1 |             1.4
+ 0.25 |               2
+  0.4 |             2.6
+  0.5 |               3
+  0.6 |             3.4
+ 0.75 |               4
+  0.9 |             4.6
+    1 |               5
+(9 rows)
+
+select p, percentile_cont(p order by p) within group (order by x)  -- error
+from generate_series(1,5) x,
+     (values (0::float8),(0.1),(0.25),(0.4),(0.5),(0.6),(0.75),(0.9),(1)) v(p)
+group by p order by p;
+ERROR:  cannot use multiple ORDER BY clauses with WITHIN GROUP
+LINE 1: select p, percentile_cont(p order by p) within group (order ...
+                                                ^
+select p, sum() within group (order by x::float8)  -- error
+from generate_series(1,5) x,
+     (values (0::float8),(0.1),(0.25),(0.4),(0.5),(0.6),(0.75),(0.9),(1)) v(p)
+group by p order by p;
+ERROR:  sum is not an ordered-set aggregate, so it cannot have WITHIN GROUP
+LINE 1: select p, sum() within group (order by x::float8)  
+                  ^
+select p, percentile_cont(p,p)  -- error
+from generate_series(1,5) x,
+     (values (0::float8),(0.1),(0.25),(0.4),(0.5),(0.6),(0.75),(0.9),(1)) v(p)
+group by p order by p;
+ERROR:  WITHIN GROUP is required for ordered-set aggregate percentile_cont
+LINE 1: select p, percentile_cont(p,p)  
+                  ^
+select percentile_cont(0.5) within group (order by b) from aggtest;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ percentile_cont  
+------------------
+ 53.4485001564026
+(1 row)
+
+select percentile_cont(0.5) within group (order by b), sum(b) from aggtest;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ percentile_cont  |   sum   
+------------------+---------
+ 53.4485001564026 | 431.773
+(1 row)
+
+select percentile_cont(0.5) within group (order by thousand) from tenk1;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ percentile_cont 
+-----------------
+           499.5
+(1 row)
+
+select percentile_disc(0.5) within group (order by thousand) from tenk1;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ percentile_disc 
+-----------------
+             499
+(1 row)
+
+select rank(3) within group (order by x)
+from (values (1),(1),(2),(2),(3),(3),(4)) v(x);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ rank 
+------
+    5
+(1 row)
+
+select cume_dist(3) within group (order by x)
+from (values (1),(1),(2),(2),(3),(3),(4)) v(x);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ cume_dist 
+-----------
+     0.875
+(1 row)
+
+select percent_rank(3) within group (order by x)
+from (values (1),(1),(2),(2),(3),(3),(4),(5)) v(x);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ percent_rank 
+--------------
+          0.5
+(1 row)
+
+select dense_rank(3) within group (order by x)
+from (values (1),(1),(2),(2),(3),(3),(4)) v(x);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ dense_rank 
+------------
+          3
+(1 row)
+
+select percentile_disc(array[0,0.1,0.25,0.5,0.75,0.9,1]) within group (order by thousand)
+from tenk1;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+      percentile_disc       
+----------------------------
+ {0,99,249,499,749,899,999}
+(1 row)
+
+select percentile_cont(array[0,0.25,0.5,0.75,1]) within group (order by thousand)
+from tenk1;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+       percentile_cont       
+-----------------------------
+ {0,249.75,499.5,749.25,999}
+(1 row)
+
+select percentile_disc(array[[null,1,0.5],[0.75,0.25,null]]) within group (order by thousand)
+from tenk1;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+         percentile_disc         
+---------------------------------
+ {{NULL,999,499},{749,249,NULL}}
+(1 row)
+
+select percentile_cont(array[0,1,0.25,0.75,0.5,1]) within group (order by x)
+from generate_series(1,6) x;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+    percentile_cont    
+-----------------------
+ {1,6,2.25,4.75,3.5,6}
+(1 row)
+
+select ten, mode() within group (order by string4) from tenk1 group by ten order by ten;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ ten |  mode  
+-----+--------
+   0 | HHHHxx
+   1 | OOOOxx
+   2 | VVVVxx
+   3 | OOOOxx
+   4 | HHHHxx
+   5 | HHHHxx
+   6 | OOOOxx
+   7 | AAAAxx
+   8 | VVVVxx
+   9 | VVVVxx
+(10 rows)
+
+select percentile_disc(array[0.25,0.5,0.75]) within group (order by x)
+from unnest('{fred,jim,fred,jack,jill,fred,jill,jim,jim,sheila,jim,sheila}'::text[]) u(x);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ percentile_disc 
+-----------------
+ {fred,jill,jim}
+(1 row)
+
+-- check collation propagates up in suitable cases:
+select pg_collation_for(percentile_disc(1) within group (order by x collate "POSIX"))
+  from (values ('fred'),('jim')) v(x);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Non-default collation
+ pg_collation_for 
+------------------
+ "POSIX"
+(1 row)
+
+-- ordered-set aggs created with CREATE AGGREGATE
+select test_rank(3) within group (order by x)
+from (values (1),(1),(2),(2),(3),(3),(4)) v(x);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ test_rank 
+-----------
+         5
+(1 row)
+
+select test_percentile_disc(0.5) within group (order by thousand) from tenk1;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ test_percentile_disc 
+----------------------
+                  499
+(1 row)
+
+-- ordered-set aggs can't use ungrouped vars in direct args:
+select rank(x) within group (order by x) from generate_series(1,5) x;
+ERROR:  column "x.x" must appear in the GROUP BY clause or be used in an aggregate function
+LINE 1: select rank(x) within group (order by x) from generate_serie...
+                    ^
+DETAIL:  Direct arguments of an ordered-set aggregate must use only grouped columns.
+-- outer-level agg can't use a grouped arg of a lower level, either:
+select array(select percentile_disc(a) within group (order by x)
+               from (values (0.3),(0.7)) v(a) group by a)
+  from generate_series(1,5) g(x);
+ERROR:  outer-level aggregate cannot contain a lower-level variable in its direct arguments
+LINE 1: select array(select percentile_disc(a) within group (order b...
+                                            ^
+-- agg in the direct args is a grouping violation, too:
+select rank(sum(x)) within group (order by x) from generate_series(1,5) x;
+ERROR:  aggregate function calls cannot be nested
+LINE 1: select rank(sum(x)) within group (order by x) from generate_...
+                    ^
+-- hypothetical-set type unification and argument-count failures:
+select rank(3) within group (order by x) from (values ('fred'),('jim')) v(x);
+ERROR:  WITHIN GROUP types text and integer cannot be matched
+LINE 1: select rank(3) within group (order by x) from (values ('fred...
+                    ^
+select rank(3) within group (order by stringu1,stringu2) from tenk1;
+ERROR:  function rank(integer, name, name) does not exist
+LINE 1: select rank(3) within group (order by stringu1,stringu2) fro...
+               ^
+HINT:  To use the hypothetical-set aggregate rank, the number of hypothetical direct arguments (here 1) must match the number of ordering columns (here 2).
+select rank('fred') within group (order by x) from generate_series(1,5) x;
+ERROR:  invalid input syntax for integer: "fred"
+LINE 1: select rank('fred') within group (order by x) from generate_...
+                    ^
+select rank('adam'::text collate "C") within group (order by x collate "POSIX")
+  from (values ('fred'),('jim')) v(x);
+ERROR:  collation mismatch between explicit collations "C" and "POSIX"
+LINE 1: ...adam'::text collate "C") within group (order by x collate "P...
+                                                             ^
+-- hypothetical-set type unification successes:
+select rank('adam'::varchar) within group (order by x) from (values ('fred'),('jim')) v(x);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ rank 
+------
+    1
+(1 row)
+
+select rank('3') within group (order by x) from generate_series(1,5) x;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ rank 
+------
+    3
+(1 row)
+
+-- divide by zero check
+select percent_rank(0) within group (order by x) from generate_series(1,0) x;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ percent_rank 
+--------------
+            0
+(1 row)
+
+-- deparse and multiple features:
+create view aggordview1 as
+select ten,
+       percentile_disc(0.5) within group (order by thousand) as p50,
+       percentile_disc(0.5) within group (order by thousand) filter (where hundred=1) as px,
+       rank(5,'AZZZZ',50) within group (order by hundred, string4 desc, hundred)
+  from tenk1
+ group by ten order by ten;
+select pg_get_viewdef('aggordview1');
+                                                        pg_get_viewdef                                                         
+-------------------------------------------------------------------------------------------------------------------------------
+  SELECT tenk1.ten,                                                                                                           +
+     percentile_disc((0.5)::double precision) WITHIN GROUP (ORDER BY tenk1.thousand) AS p50,                                  +
+     percentile_disc((0.5)::double precision) WITHIN GROUP (ORDER BY tenk1.thousand) FILTER (WHERE (tenk1.hundred = 1)) AS px,+
+     rank(5, 'AZZZZ'::name, 50) WITHIN GROUP (ORDER BY tenk1.hundred, tenk1.string4 DESC, tenk1.hundred) AS rank              +
+    FROM tenk1                                                                                                                +
+   GROUP BY tenk1.ten                                                                                                         +
+   ORDER BY tenk1.ten;
+(1 row)
+
+select * from aggordview1 order by ten;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ ten | p50 | px  | rank 
+-----+-----+-----+------
+   0 | 490 |     |  101
+   1 | 491 | 401 |  101
+   2 | 492 |     |  101
+   3 | 493 |     |  101
+   4 | 494 |     |  101
+   5 | 495 |     |   67
+   6 | 496 |     |    1
+   7 | 497 |     |    1
+   8 | 498 |     |    1
+   9 | 499 |     |    1
+(10 rows)
+
+drop view aggordview1;
+-- variadic aggregates
+select least_agg(q1,q2) from int8_tbl;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Query Parameter not supported in DXL
+CONTEXT:  SQL function "least_accum" during startup
+     least_agg     
+-------------------
+ -4567890123456789
+(1 row)
+
+select least_agg(variadic array[q1,q2]) from int8_tbl;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Query Parameter not supported in DXL
+     least_agg     
+-------------------
+ -4567890123456789
+(1 row)
+
+-- string_agg bytea tests
+create table bytea_test_table(gpDistKey int, v bytea);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'gpdistkey' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+select string_agg(v, '') from bytea_test_table;
+ string_agg 
+------------
+ 
+(1 row)
+
+insert into bytea_test_table(v) values(decode('ff','hex'));
+select string_agg(v, '') from bytea_test_table;
+ string_agg 
+------------
+ \xff
+(1 row)
+
+insert into bytea_test_table(v) values(decode('aa','hex'));
+select string_agg(v, '') from bytea_test_table;
+ string_agg 
+------------
+ \xffaa
+(1 row)
+
+select string_agg(v, NULL) from bytea_test_table;
+ string_agg 
+------------
+ \xffaa
+(1 row)
+
+select string_agg(v, decode('ee', 'hex')) from bytea_test_table;
+ string_agg 
+------------
+ \xffeeaa
+(1 row)
+
+drop table bytea_test_table;
+-- FILTER tests
+select min(unique1) filter (where unique1 > 100) from tenk1;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Aggregate functions with FILTER
+ min 
+-----
+ 101
+(1 row)
+
+select ten, sum(distinct four) filter (where four::text ~ '123') from onek a
+group by ten;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Aggregate functions with FILTER
+ ten | sum 
+-----+-----
+   0 |    
+   1 |    
+   2 |    
+   3 |    
+   4 |    
+   5 |    
+   6 |    
+   7 |    
+   8 |    
+   9 |    
+(10 rows)
+
+select ten, sum(distinct four) filter (where four > 10) from onek a
+group by ten
+having exists (select 1 from onek b where sum(distinct a.four) = b.four);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Aggregate functions with FILTER
+ ten | sum 
+-----+-----
+   0 |    
+   2 |    
+   4 |    
+   6 |    
+   8 |    
+(5 rows)
+
+select max(foo COLLATE "C") filter (where (bar collate "POSIX") > '0')
+from (values ('a', 'b')) AS v(foo,bar);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Non-default collation
+ max 
+-----
+ a
+(1 row)
+
+-- outer reference in FILTER (PostgreSQL extension)
+select (select count(*)
+        from (values (1)) t0(inner_c))
+from (values (2),(3)) t1(outer_c); -- inner query is aggregation query
+ count 
+-------
+     1
+     1
+(2 rows)
+
+select (select count(*) filter (where outer_c <> 0)
+        from (values (1)) t0(inner_c))
+from (values (2),(3)) t1(outer_c); -- outer query is aggregation query
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Aggregate functions with FILTER
+ count 
+-------
+     2
+(1 row)
+
+select (select count(inner_c) filter (where outer_c <> 0)
+        from (values (1)) t0(inner_c))
+from (values (2),(3)) t1(outer_c); -- inner query is aggregation query
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Aggregate functions with FILTER
+ count 
+-------
+     1
+     1
+(2 rows)
+
+select
+  (select max((select i.unique2 from tenk1 i where i.unique1 = o.unique1))
+     filter (where o.unique1 < 10))
+from tenk1 o;					-- outer query is aggregation query
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Aggregate functions with FILTER
+ max  
+------
+ 9998
+(1 row)
+
+-- subquery in FILTER clause (PostgreSQL extension)
+select sum(unique1) FILTER (WHERE
+  unique1 IN (SELECT unique1 FROM onek where unique1 < 100)) FROM tenk1;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Aggregate functions with FILTER
+ sum  
+------
+ 4950
+(1 row)
+
+-- exercise lots of aggregate parts with FILTER
+select aggfns(distinct a,b,c order by a,c using ~<~,b) filter (where a > 1)
+    from (values (1,3,'foo'),(0,null,null),(2,2,'bar'),(3,1,'baz')) v(a,b,c),
+    generate_series(1,2) i;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: ROW EXPRESSION
+CONTEXT:  SQL function "aggfns_trans" during startup
+          aggfns           
+---------------------------
+ {"(2,2,bar)","(3,1,baz)"}
+(1 row)
+
+-- ordered-set aggregates
+select p, percentile_cont(p) within group (order by x::float8)
+from generate_series(1,5) x,
+     (values (0::float8),(0.1),(0.25),(0.4),(0.5),(0.6),(0.75),(0.9),(1)) v(p)
+group by p order by p;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+  p   | percentile_cont 
+------+-----------------
+    0 |               1
+  0.1 |             1.4
+ 0.25 |               2
+  0.4 |             2.6
+  0.5 |               3
+  0.6 |             3.4
+ 0.75 |               4
+  0.9 |             4.6
+    1 |               5
+(9 rows)
+
+select p, percentile_cont(p order by p) within group (order by x)  -- error
+from generate_series(1,5) x,
+     (values (0::float8),(0.1),(0.25),(0.4),(0.5),(0.6),(0.75),(0.9),(1)) v(p)
+group by p order by p;
+ERROR:  cannot use multiple ORDER BY clauses with WITHIN GROUP
+LINE 1: select p, percentile_cont(p order by p) within group (order ...
+                                                ^
+select p, sum() within group (order by x::float8)  -- error
+from generate_series(1,5) x,
+     (values (0::float8),(0.1),(0.25),(0.4),(0.5),(0.6),(0.75),(0.9),(1)) v(p)
+group by p order by p;
+ERROR:  sum is not an ordered-set aggregate, so it cannot have WITHIN GROUP
+LINE 1: select p, sum() within group (order by x::float8)  
+                  ^
+select p, percentile_cont(p,p)  -- error
+from generate_series(1,5) x,
+     (values (0::float8),(0.1),(0.25),(0.4),(0.5),(0.6),(0.75),(0.9),(1)) v(p)
+group by p order by p;
+ERROR:  WITHIN GROUP is required for ordered-set aggregate percentile_cont
+LINE 1: select p, percentile_cont(p,p)  
+                  ^
+select percentile_cont(0.5) within group (order by b) from aggtest;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ percentile_cont  
+------------------
+ 53.4485001564026
+(1 row)
+
+select percentile_cont(0.5) within group (order by b), sum(b) from aggtest;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ percentile_cont  |   sum   
+------------------+---------
+ 53.4485001564026 | 431.773
+(1 row)
+
+select percentile_cont(0.5) within group (order by thousand) from tenk1;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ percentile_cont 
+-----------------
+           499.5
+(1 row)
+
+select percentile_disc(0.5) within group (order by thousand) from tenk1;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ percentile_disc 
+-----------------
+             499
+(1 row)
+
+select rank(3) within group (order by x)
+from (values (1),(1),(2),(2),(3),(3),(4)) v(x);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ rank 
+------
+    5
+(1 row)
+
+select cume_dist(3) within group (order by x)
+from (values (1),(1),(2),(2),(3),(3),(4)) v(x);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ cume_dist 
+-----------
+     0.875
+(1 row)
+
+select percent_rank(3) within group (order by x)
+from (values (1),(1),(2),(2),(3),(3),(4),(5)) v(x);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ percent_rank 
+--------------
+          0.5
+(1 row)
+
+select dense_rank(3) within group (order by x)
+from (values (1),(1),(2),(2),(3),(3),(4)) v(x);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ dense_rank 
+------------
+          3
+(1 row)
+
+select percentile_disc(array[0,0.1,0.25,0.5,0.75,0.9,1]) within group (order by thousand)
+from tenk1;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+      percentile_disc       
+----------------------------
+ {0,99,249,499,749,899,999}
+(1 row)
+
+select percentile_cont(array[0,0.25,0.5,0.75,1]) within group (order by thousand)
+from tenk1;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+       percentile_cont       
+-----------------------------
+ {0,249.75,499.5,749.25,999}
+(1 row)
+
+select percentile_disc(array[[null,1,0.5],[0.75,0.25,null]]) within group (order by thousand)
+from tenk1;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+         percentile_disc         
+---------------------------------
+ {{NULL,999,499},{749,249,NULL}}
+(1 row)
+
+select percentile_cont(array[0,1,0.25,0.75,0.5,1,0.3,0.32,0.35,0.38,0.4]) within group (order by x)
+from generate_series(1,6) x;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+             percentile_cont              
+------------------------------------------
+ {1,6,2.25,4.75,3.5,6,2.5,2.6,2.75,2.9,3}
+(1 row)
+
+select ten, mode() within group (order by string4) from tenk1 group by ten;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ ten |  mode  
+-----+--------
+   0 | HHHHxx
+   1 | OOOOxx
+   2 | VVVVxx
+   3 | OOOOxx
+   4 | HHHHxx
+   5 | HHHHxx
+   6 | OOOOxx
+   7 | AAAAxx
+   8 | VVVVxx
+   9 | VVVVxx
+(10 rows)
+
+select percentile_disc(array[0.25,0.5,0.75]) within group (order by x)
+from unnest('{fred,jim,fred,jack,jill,fred,jill,jim,jim,sheila,jim,sheila}'::text[]) u(x);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ percentile_disc 
+-----------------
+ {fred,jill,jim}
+(1 row)
+
+-- check collation propagates up in suitable cases:
+select pg_collation_for(percentile_disc(1) within group (order by x collate "POSIX"))
+  from (values ('fred'),('jim')) v(x);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Non-default collation
+ pg_collation_for 
+------------------
+ "POSIX"
+(1 row)
+
+-- ordered-set aggs created with CREATE AGGREGATE
+select test_rank(3) within group (order by x)
+from (values (1),(1),(2),(2),(3),(3),(4)) v(x);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ test_rank 
+-----------
+         5
+(1 row)
+
+select test_percentile_disc(0.5) within group (order by thousand) from tenk1;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ test_percentile_disc 
+----------------------
+                  499
+(1 row)
+
+-- ordered-set aggs can't use ungrouped vars in direct args:
+select rank(x) within group (order by x) from generate_series(1,5) x;
+ERROR:  column "x.x" must appear in the GROUP BY clause or be used in an aggregate function
+LINE 1: select rank(x) within group (order by x) from generate_serie...
+                    ^
+DETAIL:  Direct arguments of an ordered-set aggregate must use only grouped columns.
+-- outer-level agg can't use a grouped arg of a lower level, either:
+select array(select percentile_disc(a) within group (order by x)
+               from (values (0.3),(0.7)) v(a) group by a)
+  from generate_series(1,5) g(x);
+ERROR:  outer-level aggregate cannot contain a lower-level variable in its direct arguments
+LINE 1: select array(select percentile_disc(a) within group (order b...
+                                            ^
+-- agg in the direct args is a grouping violation, too:
+select rank(sum(x)) within group (order by x) from generate_series(1,5) x;
+ERROR:  aggregate function calls cannot be nested
+LINE 1: select rank(sum(x)) within group (order by x) from generate_...
+                    ^
+-- hypothetical-set type unification and argument-count failures:
+select rank(3) within group (order by x) from (values ('fred'),('jim')) v(x);
+ERROR:  WITHIN GROUP types text and integer cannot be matched
+LINE 1: select rank(3) within group (order by x) from (values ('fred...
+                    ^
+select rank(3) within group (order by stringu1,stringu2) from tenk1;
+ERROR:  function rank(integer, name, name) does not exist
+LINE 1: select rank(3) within group (order by stringu1,stringu2) fro...
+               ^
+HINT:  To use the hypothetical-set aggregate rank, the number of hypothetical direct arguments (here 1) must match the number of ordering columns (here 2).
+select rank('fred') within group (order by x) from generate_series(1,5) x;
+ERROR:  invalid input syntax for integer: "fred"
+LINE 1: select rank('fred') within group (order by x) from generate_...
+                    ^
+select rank('adam'::text collate "C") within group (order by x collate "POSIX")
+  from (values ('fred'),('jim')) v(x);
+ERROR:  collation mismatch between explicit collations "C" and "POSIX"
+LINE 1: ...adam'::text collate "C") within group (order by x collate "P...
+                                                             ^
+-- hypothetical-set type unification successes:
+select rank('adam'::varchar) within group (order by x) from (values ('fred'),('jim')) v(x);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ rank 
+------
+    1
+(1 row)
+
+select rank('3') within group (order by x) from generate_series(1,5) x;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ rank 
+------
+    3
+(1 row)
+
+-- divide by zero check
+select percent_rank(0) within group (order by x) from generate_series(1,0) x;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ percent_rank 
+--------------
+            0
+(1 row)
+
+-- deparse and multiple features:
+create view aggordview1 as
+select ten,
+       percentile_disc(0.5) within group (order by thousand) as p50,
+       percentile_disc(0.5) within group (order by thousand) filter (where hundred=1) as px,
+       rank(5,'AZZZZ',50) within group (order by hundred, string4 desc, hundred)
+  from tenk1
+ group by ten order by ten;
+select pg_get_viewdef('aggordview1');
+                                                        pg_get_viewdef                                                         
+-------------------------------------------------------------------------------------------------------------------------------
+  SELECT tenk1.ten,                                                                                                           +
+     percentile_disc((0.5)::double precision) WITHIN GROUP (ORDER BY tenk1.thousand) AS p50,                                  +
+     percentile_disc((0.5)::double precision) WITHIN GROUP (ORDER BY tenk1.thousand) FILTER (WHERE (tenk1.hundred = 1)) AS px,+
+     rank(5, 'AZZZZ'::name, 50) WITHIN GROUP (ORDER BY tenk1.hundred, tenk1.string4 DESC, tenk1.hundred) AS rank              +
+    FROM tenk1                                                                                                                +
+   GROUP BY tenk1.ten                                                                                                         +
+   ORDER BY tenk1.ten;
+(1 row)
+
+select * from aggordview1 order by ten;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ ten | p50 | px  | rank 
+-----+-----+-----+------
+   0 | 490 |     |  101
+   1 | 491 | 401 |  101
+   2 | 492 |     |  101
+   3 | 493 |     |  101
+   4 | 494 |     |  101
+   5 | 495 |     |   67
+   6 | 496 |     |    1
+   7 | 497 |     |    1
+   8 | 498 |     |    1
+   9 | 499 |     |    1
+(10 rows)
+
+drop view aggordview1;
+-- variadic aggregates
+select least_agg(q1,q2) from int8_tbl;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Query Parameter not supported in DXL
+CONTEXT:  SQL function "least_accum" during startup
+     least_agg     
+-------------------
+ -4567890123456789
+(1 row)
+
+select least_agg(variadic array[q1,q2]) from int8_tbl;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Query Parameter not supported in DXL
+     least_agg     
+-------------------
+ -4567890123456789
+(1 row)
+
+-- test aggregates with common transition functions share the same states
+begin work;
+create type avg_state as (total bigint, count bigint);
+create or replace function avg_transfn(state avg_state, n int) returns avg_state as
+$$
+declare new_state avg_state;
+begin
+	raise notice 'avg_transfn called with %', n;
+	if state is null then
+		if n is not null then
+			new_state.total := n;
+			new_state.count := 1;
+			return new_state;
+		end if;
+		return null;
+	elsif n is not null then
+		state.total := state.total + n;
+		state.count := state.count + 1;
+		return state;
+	end if;
+
+	return null;
+end
+$$ language plpgsql;
+create function avg_finalfn(state avg_state) returns int4 as
+$$
+begin
+	if state is null then
+		return NULL;
+	else
+		return state.total / state.count;
+	end if;
+end
+$$ language plpgsql;
+create function sum_finalfn(state avg_state) returns int4 as
+$$
+begin
+	if state is null then
+		return NULL;
+	else
+		return state.total;
+	end if;
+end
+$$ language plpgsql;
+create aggregate my_avg(int4)
+(
+   stype = avg_state,
+   sfunc = avg_transfn,
+   finalfunc = avg_finalfn
+);
+create aggregate my_sum(int4)
+(
+   stype = avg_state,
+   sfunc = avg_transfn,
+   finalfunc = sum_finalfn
+);
+-- aggregate state should be shared as aggs are the same.
+select my_avg(one),my_avg(one) from (values(1),(3)) t(one);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Query Parameter not supported in DXL
+NOTICE:  avg_transfn called with 1
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Query Parameter not supported in DXL
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Query Parameter not supported in DXL
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Query Parameter not supported in DXL
+NOTICE:  avg_transfn called with 3
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Query Parameter not supported in DXL
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Query Parameter not supported in DXL
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Query Parameter not supported in DXL
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Query Parameter not supported in DXL
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Query Parameter not supported in DXL
+ my_avg | my_avg 
+--------+--------
+      2 |      2
+(1 row)
+
+-- aggregate state should be shared as transfn is the same for both aggs.
+select my_avg(one),my_sum(one) from (values(1),(3)) t(one);
+NOTICE:  avg_transfn called with 1
+NOTICE:  avg_transfn called with 3
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Query Parameter not supported in DXL
+ my_avg | my_sum 
+--------+--------
+      2 |      4
+(1 row)
+
+-- same as previous one, but with DISTINCT, which requires sorting the input.
+select my_avg(distinct one),my_sum(distinct one) from (values(1),(3),(1)) t(one);
+NOTICE:  avg_transfn called with 1
+NOTICE:  avg_transfn called with 3
+ my_avg | my_sum 
+--------+--------
+      2 |      4
+(1 row)
+
+-- shouldn't share states due to the distinctness not matching.
+select my_avg(distinct one),my_sum(one) from (values(1),(3)) t(one);
+NOTICE:  avg_transfn called with 1
+NOTICE:  avg_transfn called with 3
+NOTICE:  avg_transfn called with 1
+NOTICE:  avg_transfn called with 3
+ my_avg | my_sum 
+--------+--------
+      2 |      4
+(1 row)
+
+-- shouldn't share states due to the filter clause not matching.
+select my_avg(one) filter (where one > 1),my_sum(one) from (values(1),(3)) t(one);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Aggregate functions with FILTER
+NOTICE:  avg_transfn called with 1
+NOTICE:  avg_transfn called with 3
+NOTICE:  avg_transfn called with 3
+ my_avg | my_sum 
+--------+--------
+      3 |      4
+(1 row)
+
+-- this should not share the state due to different input columns.
+select my_avg(one),my_sum(two) from (values(1,2),(3,4)) t(one,two);
+NOTICE:  avg_transfn called with 2
+NOTICE:  avg_transfn called with 1
+NOTICE:  avg_transfn called with 4
+NOTICE:  avg_transfn called with 3
+ my_avg | my_sum 
+--------+--------
+      2 |      6
+(1 row)
+
+-- ideally these would share state, but we have to fix the OSAs first.
+select
+  percentile_cont(0.5) within group (order by a),
+  percentile_disc(0.5) within group (order by a)
+from (values(1::float8),(3),(5),(7)) t(a);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ percentile_cont | percentile_disc 
+-----------------+-----------------
+               4 |               3
+(1 row)
+
+select
+  rank(4) within group (order by a),
+  dense_rank(4) within group (order by a)
+from (values(1),(3),(5),(7)) t(a);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Ordered aggregates not supported in DXL
+ rank | dense_rank 
+------+------------
+    3 |          3
+(1 row)
+
+-- test that aggs with the same sfunc and initcond share the same agg state
+create aggregate my_sum_init(int4)
+(
+   stype = avg_state,
+   sfunc = avg_transfn,
+   finalfunc = sum_finalfn,
+   initcond = '(10,0)'
+);
+create aggregate my_avg_init(int4)
+(
+   stype = avg_state,
+   sfunc = avg_transfn,
+   finalfunc = avg_finalfn,
+   initcond = '(10,0)'
+);
+create aggregate my_avg_init2(int4)
+(
+   stype = avg_state,
+   sfunc = avg_transfn,
+   finalfunc = avg_finalfn,
+   initcond = '(4,0)'
+);
+-- state should be shared if INITCONDs are matching
+select my_sum_init(one),my_avg_init(one) from (values(1),(3)) t(one);
+NOTICE:  avg_transfn called with 1
+NOTICE:  avg_transfn called with 3
+ my_sum_init | my_avg_init 
+-------------+-------------
+          14 |           7
+(1 row)
+
+-- Varying INITCONDs should cause the states not to be shared.
+select my_sum_init(one),my_avg_init2(one) from (values(1),(3)) t(one);
+NOTICE:  avg_transfn called with 1
+NOTICE:  avg_transfn called with 1
+NOTICE:  avg_transfn called with 3
+NOTICE:  avg_transfn called with 3
+ my_sum_init | my_avg_init2 
+-------------+--------------
+          14 |            4
+(1 row)
+
+rollback;
+-- test aggregate state sharing to ensure it works if one aggregate has a
+-- finalfn and the other one has none.
+begin work;
+create or replace function sum_transfn(state int4, n int4) returns int4 as
+$$
+declare new_state int4;
+begin
+	raise notice 'sum_transfn called with %', n;
+	if state is null then
+		if n is not null then
+			new_state := n;
+			return new_state;
+		end if;
+		return null;
+	elsif n is not null then
+		state := state + n;
+		return state;
+	end if;
+
+	return null;
+end
+$$ language plpgsql;
+create function halfsum_finalfn(state int4) returns int4 as
+$$
+begin
+	if state is null then
+		return NULL;
+	else
+		return state / 2;
+	end if;
+end
+$$ language plpgsql;
+create aggregate my_sum(int4)
+(
+   stype = int4,
+   sfunc = sum_transfn
+);
+create aggregate my_half_sum(int4)
+(
+   stype = int4,
+   sfunc = sum_transfn,
+   finalfunc = halfsum_finalfn
+);
+-- Agg state should be shared even though my_sum has no finalfn
+select my_sum(one),my_half_sum(one) from (values(1),(2),(3),(4)) t(one);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Query Parameter not supported in DXL
+NOTICE:  sum_transfn called with 1
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Query Parameter not supported in DXL
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Query Parameter not supported in DXL
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Query Parameter not supported in DXL
+NOTICE:  sum_transfn called with 2
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Query Parameter not supported in DXL
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Query Parameter not supported in DXL
+NOTICE:  sum_transfn called with 3
+NOTICE:  sum_transfn called with 4
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Query Parameter not supported in DXL
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  GPDB Expression type: Query Parameter not supported in DXL
+ my_sum | my_half_sum 
+--------+-------------
+     10 |           5
+(1 row)
+
+rollback;
+-- check collation-sensitive matching between grouping expressions
+select v||'a', case v||'a' when 'aa' then 1 else 0 end, count(*)
+  from unnest(array['a','b']) u(v)
+ group by v||'a' order by 1;
+ ?column? | case | count 
+----------+------+-------
+ aa       |    1 |     1
+ ba       |    0 |     1
+(2 rows)
+
+select v||'a', case when v||'a' = 'aa' then 1 else 0 end, count(*)
+  from unnest(array['a','b']) u(v)
+ group by v||'a' order by 1;
+ ?column? | case | count 
+----------+------+-------
+ aa       |    1 |     1
+ ba       |    0 |     1
+(2 rows)
+

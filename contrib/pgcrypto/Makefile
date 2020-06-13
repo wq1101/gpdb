@@ -1,6 +1,4 @@
-#
-# $PostgreSQL: pgsql/contrib/pgcrypto/Makefile,v 1.27 2007/11/10 23:59:51 momjian Exp $
-#
+# contrib/pgcrypto/Makefile
 
 INT_SRCS = md5.c sha1.c sha2.c internal.c internal-sha2.c blf.c rijndael.c \
 		fortuna.c random.c pgp-mpi-internal.c imath.c
@@ -25,10 +23,12 @@ SRCS		= pgcrypto.c px.c px-hmac.c px-crypt.c \
 		pgp-pgsql.c
 
 MODULE_big	= pgcrypto
-OBJS		= $(SRCS:.c=.o)
-DATA_built	= pgcrypto.sql
-DATA		= uninstall_pgcrypto.sql
-EXTRA_CLEAN	= gen-rtab
+OBJS		= $(SRCS:.c=.o) $(WIN32RES)
+
+EXTENSION = pgcrypto
+DATA = pgcrypto--1.3.sql pgcrypto--1.2--1.3.sql pgcrypto--1.1--1.2.sql \
+	pgcrypto--1.0--1.1.sql pgcrypto--unpackaged--1.0.sql
+PGFILEDESC = "pgcrypto - cryptographic functions"
 
 REGRESS_OPTS = --dbname=$(CONTRIB_TESTDB) --init-file=$(top_builddir)/src/test/regress/init_file 
 
@@ -38,6 +38,7 @@ REGRESS = init md5 sha1 hmac-md5 hmac-sha1 blowfish rijndael \
 	pgp-armor pgp-decrypt pgp-encrypt $(CF_PGP_TESTS) \
 	pgp-pubkey-decrypt pgp-pubkey-encrypt pgp-info
 
+EXTRA_CLEAN = gen-rtab
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config
@@ -57,7 +58,7 @@ SHLIB_LINK += $(filter -lcrypto -lz, $(LIBS))
 ifeq ($(PORTNAME), win32)
 SHLIB_LINK += $(filter -leay32, $(LIBS))
 # those must be at the end
-SHLIB_LINK += -lwsock32 -lws2_32
+SHLIB_LINK += -lws2_32
 endif
 
 rijndael.o: rijndael.tbl
@@ -65,10 +66,3 @@ rijndael.o: rijndael.tbl
 rijndael.tbl:
 	$(CC) $(CPPFLAGS) $(CFLAGS) -DPRINT_TABS rijndael.c -o gen-rtab
 	./gen-rtab > rijndael.tbl
-
-installcheck: prepare_pgcrypto_sql
-
-prepare_pgcrypto_sql:
-	cp $(GPHOME)/share/postgresql/contrib/pgcrypto.sql ./pgcrypto.sql
-
-.PHONY: prepare_pgcrypto_sql

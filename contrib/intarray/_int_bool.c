@@ -1,20 +1,20 @@
+/*
+ * contrib/intarray/_int_bool.c
+ */
+#include "postgres.h"
+
+#include "miscadmin.h"
+#include "utils/builtins.h"
+
 #include "_int.h"
 
 #include "miscadmin.h"
 
 PG_FUNCTION_INFO_V1(bqarr_in);
 PG_FUNCTION_INFO_V1(bqarr_out);
-Datum		bqarr_in(PG_FUNCTION_ARGS);
-Datum		bqarr_out(PG_FUNCTION_ARGS);
-
 PG_FUNCTION_INFO_V1(boolop);
-Datum		boolop(PG_FUNCTION_ARGS);
-
 PG_FUNCTION_INFO_V1(rboolop);
-Datum		rboolop(PG_FUNCTION_ARGS);
-
 PG_FUNCTION_INFO_V1(querytree);
-Datum		querytree(PG_FUNCTION_ARGS);
 
 
 /* parser's states */
@@ -28,27 +28,27 @@ Datum		querytree(PG_FUNCTION_ARGS);
  */
 typedef struct NODE
 {
-	int4		type;
-	int4		val;
+	int32		type;
+	int32		val;
 	struct NODE *next;
 } NODE;
 
 typedef struct
 {
 	char	   *buf;
-	int4		state;
-	int4		count;
+	int32		state;
+	int32		count;
 	/* reverse polish notation in list (for temporary usage) */
 	NODE	   *str;
 	/* number in str */
-	int4		num;
-}	WORKSTATE;
+	int32		num;
+} WORKSTATE;
 
 /*
  * get token from query string
  */
-static int4
-gettoken(WORKSTATE * state, int4 *val)
+static int32
+gettoken(WORKSTATE *state, int32 *val)
 {
 	char		nnn[16];
 	int			innn;
@@ -73,7 +73,7 @@ gettoken(WORKSTATE * state, int4 *val)
 				else if (*(state->buf) == '!')
 				{
 					(state->buf)++;
-					*val = (int4) '!';
+					*val = (int32) '!';
 					return OPR;
 				}
 				else if (*(state->buf) == '(')
@@ -92,12 +92,12 @@ gettoken(WORKSTATE * state, int4 *val)
 				}
 				else
 				{
-					long	lval;
+					long		lval;
 
 					nnn[innn] = '\0';
 					errno = 0;
 					lval = strtol(nnn, NULL, 0);
-					*val = (int4) lval;
+					*val = (int32) lval;
 					if (errno != 0 || (long) *val != lval)
 						return ERR;
 					state->state = WAITOPERATOR;
@@ -109,7 +109,7 @@ gettoken(WORKSTATE * state, int4 *val)
 				if (*(state->buf) == '&' || *(state->buf) == '|')
 				{
 					state->state = WAITOPERAND;
-					*val = (int4) *(state->buf);
+					*val = (int32) *(state->buf);
 					(state->buf)++;
 					return OPR;
 				}
@@ -130,14 +130,13 @@ gettoken(WORKSTATE * state, int4 *val)
 		}
 		(state->buf)++;
 	}
-	return END;
 }
 
 /*
  * push new one in polish notation reverse view
  */
 static void
-pushquery(WORKSTATE * state, int4 type, int4 val)
+pushquery(WORKSTATE *state, int32 type, int32 val)
 {
 	NODE	   *tmp = (NODE *) palloc(sizeof(NODE));
 
@@ -153,13 +152,13 @@ pushquery(WORKSTATE * state, int4 type, int4 val)
 /*
  * make polish notation of query
  */
-static int4
-makepol(WORKSTATE * state)
+static int32
+makepol(WORKSTATE *state)
 {
-	int4		val,
+	int32		val,
 				type;
-	int4		stack[STACKDEPTH];
-	int4		lenstack = 0;
+	int32		stack[STACKDEPTH];
+	int32		lenstack = 0;
 
 	/* since this function recurses, it could be driven to stack overflow */
 	check_stack_depth();
@@ -170,15 +169,15 @@ makepol(WORKSTATE * state)
 		{
 			case VAL:
 				pushquery(state, type, val);
-				while (lenstack && (stack[lenstack - 1] == (int4) '&' ||
-									stack[lenstack - 1] == (int4) '!'))
+				while (lenstack && (stack[lenstack - 1] == (int32) '&' ||
+									stack[lenstack - 1] == (int32) '!'))
 				{
 					lenstack--;
 					pushquery(state, OPR, stack[lenstack]);
 				}
 				break;
 			case OPR:
-				if (lenstack && val == (int4) '|')
+				if (lenstack && val == (int32) '|')
 					pushquery(state, OPR, val);
 				else
 				{
@@ -193,8 +192,8 @@ makepol(WORKSTATE * state)
 			case OPEN:
 				if (makepol(state) == ERR)
 					return ERR;
-				while (lenstack && (stack[lenstack - 1] == (int4) '&' ||
-									stack[lenstack - 1] == (int4) '!'))
+				while (lenstack && (stack[lenstack - 1] == (int32) '&' ||
+									stack[lenstack - 1] == (int32) '!'))
 				{
 					lenstack--;
 					pushquery(state, OPR, stack[lenstack]);
@@ -228,19 +227,19 @@ makepol(WORKSTATE * state)
 
 typedef struct
 {
-	int4	   *arrb;
-	int4	   *arre;
+	int32	   *arrb;
+	int32	   *arre;
 } CHKVAL;
 
 /*
  * is there value 'val' in (sorted) array or not ?
  */
 static bool
-checkcondition_arr(void *checkval, ITEM * item)
+checkcondition_arr(void *checkval, ITEM *item)
 {
-	int4	   *StopLow = ((CHKVAL *) checkval)->arrb;
-	int4	   *StopHigh = ((CHKVAL *) checkval)->arre;
-	int4	   *StopMiddle;
+	int32	   *StopLow = ((CHKVAL *) checkval)->arrb;
+	int32	   *StopHigh = ((CHKVAL *) checkval)->arre;
+	int32	   *StopMiddle;
 
 	/* Loop invariant: StopLow <= val < StopHigh */
 
@@ -258,7 +257,7 @@ checkcondition_arr(void *checkval, ITEM * item)
 }
 
 static bool
-checkcondition_bit(void *checkval, ITEM * item)
+checkcondition_bit(void *checkval, ITEM *item)
 {
 	return GETBIT(checkval, HASHVAL(item->val));
 }
@@ -275,13 +274,13 @@ execute(ITEM *curitem, void *checkval, bool calcnot,
 
 	if (curitem->type == VAL)
 		return (*chkcond) (checkval, curitem);
-	else if (curitem->val == (int4) '!')
+	else if (curitem->val == (int32) '!')
 	{
 		return (calcnot) ?
 			((execute(curitem - 1, checkval, calcnot, chkcond)) ? false : true)
 			: true;
 	}
-	else if (curitem->val == (int4) '&')
+	else if (curitem->val == (int32) '&')
 	{
 		if (execute(curitem + curitem->left, checkval, calcnot, chkcond))
 			return execute(curitem - 1, checkval, calcnot, chkcond);
@@ -295,14 +294,13 @@ execute(ITEM *curitem, void *checkval, bool calcnot,
 		else
 			return execute(curitem - 1, checkval, calcnot, chkcond);
 	}
-	return false;
 }
 
 /*
  * signconsistent & execconsistent called by *_consistent
  */
 bool
-signconsistent(QUERYTYPE * query, BITVEC sign, bool calcnot)
+signconsistent(QUERYTYPE *query, BITVEC sign, bool calcnot)
 {
 	return execute(GETQUERY(query) + query->size - 1,
 				   (void *) sign, calcnot,
@@ -311,7 +309,7 @@ signconsistent(QUERYTYPE * query, BITVEC sign, bool calcnot)
 
 /* Array must be sorted! */
 bool
-execconsistent(QUERYTYPE * query, ArrayType *array, bool calcnot)
+execconsistent(QUERYTYPE *query, ArrayType *array, bool calcnot)
 {
 	CHKVAL		chkval;
 
@@ -330,7 +328,7 @@ typedef struct
 } GinChkVal;
 
 static bool
-checkcondition_gin(void *checkval, ITEM * item)
+checkcondition_gin(void *checkval, ITEM *item)
 {
 	GinChkVal  *gcv = (GinChkVal *) checkval;
 
@@ -348,10 +346,10 @@ gin_bool_consistent(QUERYTYPE *query, bool *check)
 	if (query->size <= 0)
 		return FALSE;
 
- 	/*
- 	 * Set up data for checkcondition_gin.  This must agree with the
- 	 * query extraction code in ginint4_queryextract.
- 	 */
+	/*
+	 * Set up data for checkcondition_gin.  This must agree with the query
+	 * extraction code in ginint4_queryextract.
+	 */
 	gcv.first = items;
 	gcv.mapped_check = (bool *) palloc(sizeof(bool) * query->size);
 	for (i = 0; i < query->size; i++)
@@ -373,7 +371,7 @@ contains_required_value(ITEM *curitem)
 
 	if (curitem->type == VAL)
 		return true;
-	else if (curitem->val == (int4) '!')
+	else if (curitem->val == (int32) '!')
 	{
 		/*
 		 * Assume anything under a NOT is non-required.  For some cases with
@@ -382,7 +380,7 @@ contains_required_value(ITEM *curitem)
 		 */
 		return false;
 	}
-	else if (curitem->val == (int4) '&')
+	else if (curitem->val == (int32) '&')
 	{
 		/* If either side has a required value, we're good */
 		if (contains_required_value(curitem + curitem->left))
@@ -398,7 +396,6 @@ contains_required_value(ITEM *curitem)
 		else
 			return false;
 	}
-	return false;
 }
 
 bool
@@ -424,8 +421,8 @@ rboolop(PG_FUNCTION_ARGS)
 Datum
 boolop(PG_FUNCTION_ARGS)
 {
-	ArrayType  *val = (ArrayType *) PG_GETARG_ARRAYTYPE_P_COPY(0);
-	QUERYTYPE  *query = (QUERYTYPE *) PG_GETARG_QUERYTYPE_P(1);
+	ArrayType  *val = PG_GETARG_ARRAYTYPE_P_COPY(0);
+	QUERYTYPE  *query = PG_GETARG_QUERYTYPE_P(1);
 	CHKVAL		chkval;
 	bool		result;
 
@@ -443,8 +440,11 @@ boolop(PG_FUNCTION_ARGS)
 }
 
 static void
-findoprnd(ITEM * ptr, int4 *pos)
+findoprnd(ITEM *ptr, int32 *pos)
 {
+	/* since this function recurses, it could be driven to stack overflow. */
+	check_stack_depth();
+
 #ifdef BS_DEBUG
 	elog(DEBUG3, (ptr[*pos].type == OPR) ?
 		 "%d  %c" : "%d  %d", *pos, ptr[*pos].val);
@@ -454,7 +454,7 @@ findoprnd(ITEM * ptr, int4 *pos)
 		ptr[*pos].left = 0;
 		(*pos)--;
 	}
-	else if (ptr[*pos].val == (int4) '!')
+	else if (ptr[*pos].val == (int32) '!')
 	{
 		ptr[*pos].left = -1;
 		(*pos)--;
@@ -463,7 +463,7 @@ findoprnd(ITEM * ptr, int4 *pos)
 	else
 	{
 		ITEM	   *curitem = &ptr[*pos];
-		int4		tmp = *pos;
+		int32		tmp = *pos;
 
 		(*pos)--;
 		findoprnd(ptr, pos);
@@ -481,12 +481,12 @@ bqarr_in(PG_FUNCTION_ARGS)
 {
 	char	   *buf = (char *) PG_GETARG_POINTER(0);
 	WORKSTATE	state;
-	int4		i;
+	int32		i;
 	QUERYTYPE  *query;
-	int4		commonlen;
+	int32		commonlen;
 	ITEM	   *ptr;
 	NODE	   *tmp;
-	int4		pos = 0;
+	int32		pos = 0;
 
 #ifdef BS_DEBUG
 	StringInfoData pbuf;
@@ -505,7 +505,13 @@ bqarr_in(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("empty query")));
 
+	if (state.num > QUERYTYPEMAXITEMS)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+		errmsg("number of query items (%d) exceeds the maximum allowed (%d)",
+			   state.num, (int) QUERYTYPEMAXITEMS)));
 	commonlen = COMPUTESIZE(state.num);
+
 	query = (QUERYTYPE *) palloc(commonlen);
 	SET_VARSIZE(query, commonlen);
 	query->size = state.num;
@@ -547,11 +553,11 @@ typedef struct
 	ITEM	   *curpol;
 	char	   *buf;
 	char	   *cur;
-	int4		buflen;
+	int32		buflen;
 } INFIX;
 
 #define RESIZEBUF(inf,addsize) while( ( (inf)->cur - (inf)->buf ) + (addsize) + 1 >= (inf)->buflen ) { \
-	int4 len = inf->cur - inf->buf; \
+	int32 len = inf->cur - inf->buf; \
 	inf->buflen *= 2; \
 	inf->buf = (char*) repalloc( (void*)inf->buf, inf->buflen ); \
 	inf->cur = inf->buf + len; \
@@ -560,6 +566,9 @@ typedef struct
 static void
 infix(INFIX *in, bool first)
 {
+	/* since this function recurses, it could be driven to stack overflow. */
+	check_stack_depth();
+
 	if (in->curpol->type == VAL)
 	{
 		RESIZEBUF(in, 11);
@@ -567,7 +576,7 @@ infix(INFIX *in, bool first)
 		in->cur = strchr(in->cur, '\0');
 		in->curpol--;
 	}
-	else if (in->curpol->val == (int4) '!')
+	else if (in->curpol->val == (int32) '!')
 	{
 		bool		isopr = false;
 
@@ -593,11 +602,11 @@ infix(INFIX *in, bool first)
 	}
 	else
 	{
-		int4		op = in->curpol->val;
+		int32		op = in->curpol->val;
 		INFIX		nrm;
 
 		in->curpol--;
-		if (op == (int4) '|' && !first)
+		if (op == (int32) '|' && !first)
 		{
 			RESIZEBUF(in, 2);
 			sprintf(in->cur, "( ");
@@ -621,7 +630,7 @@ infix(INFIX *in, bool first)
 		in->cur = strchr(in->cur, '\0');
 		pfree(nrm.buf);
 
-		if (op == (int4) '|' && !first)
+		if (op == (int32) '|' && !first)
 		{
 			RESIZEBUF(in, 2);
 			sprintf(in->cur, " )");
@@ -634,7 +643,7 @@ infix(INFIX *in, bool first)
 Datum
 bqarr_out(PG_FUNCTION_ARGS)
 {
-	QUERYTYPE  *query = (QUERYTYPE *) PG_GETARG_QUERYTYPE_P(0);
+	QUERYTYPE  *query = PG_GETARG_QUERYTYPE_P(0);
 	INFIX		nrm;
 
 	if (query->size == 0)
@@ -652,178 +661,11 @@ bqarr_out(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(nrm.buf);
 }
 
-static int4
-countdroptree(ITEM * q, int4 pos)
-{
-	if (q[pos].type == VAL)
-		return 1;
-	else if (q[pos].val == (int4) '!')
-		return 1 + countdroptree(q, pos - 1);
-	else
-		return 1 + countdroptree(q, pos - 1) + countdroptree(q, pos + q[pos].left);
-}
 
-/*
- * common algorithm:
- * result of all '!' will be = 'true', so
- * we can modify query tree for clearing
- */
-int4
-shorterquery(ITEM * q, int4 len)
-{
-	int4		index,
-				posnot,
-				poscor;
-	bool		notisleft = false;
-	int4		drop,
-				i;
-
-	/* out all '!' */
-	do
-	{
-		index = 0;
-		drop = 0;
-		/* find ! */
-		for (posnot = 0; posnot < len; posnot++)
-			if (q[posnot].type == OPR && q[posnot].val == (int4) '!')
-			{
-				index = 1;
-				break;
-			}
-
-		if (posnot == len)
-			return len;
-
-		/* last operator is ! */
-		if (posnot == len - 1)
-			return 0;
-
-		/* find operator for this operand */
-		for (poscor = posnot + 1; poscor < len; poscor++)
-		{
-			if (q[poscor].type == OPR)
-			{
-				if (poscor == posnot + 1)
-				{
-					notisleft = false;
-					break;
-				}
-				else if (q[poscor].left + poscor == posnot)
-				{
-					notisleft = true;
-					break;
-				}
-			}
-		}
-		if (q[poscor].val == (int4) '!')
-		{
-			drop = countdroptree(q, poscor);
-			q[poscor - 1].type = VAL;
-			for (i = poscor + 1; i < len; i++)
-				if (q[i].type == OPR && q[i].left + i <= poscor)
-					q[i].left += drop - 2;
-			memcpy((void *) &q[poscor - drop + 1],
-				   (void *) &q[poscor - 1],
-				   sizeof(ITEM) * (len - (poscor - 1)));
-			len -= drop - 2;
-		}
-		else if (q[poscor].val == (int4) '|')
-		{
-			drop = countdroptree(q, poscor);
-			q[poscor - 1].type = VAL;
-			q[poscor].val = (int4) '!';
-			q[poscor].left = -1;
-			for (i = poscor + 1; i < len; i++)
-				if (q[i].type == OPR && q[i].left + i < poscor)
-					q[i].left += drop - 2;
-			memcpy((void *) &q[poscor - drop + 1],
-				   (void *) &q[poscor - 1],
-				   sizeof(ITEM) * (len - (poscor - 1)));
-			len -= drop - 2;
-		}
-		else
-		{						/* &-operator */
-			if (
-				(notisleft && q[poscor - 1].type == OPR &&
-				 q[poscor - 1].val == (int4) '!') ||
-				(!notisleft && q[poscor + q[poscor].left].type == OPR &&
-				 q[poscor + q[poscor].left].val == (int4) '!')
-				)
-			{					/* drop subtree */
-				drop = countdroptree(q, poscor);
-				q[poscor - 1].type = VAL;
-				q[poscor].val = (int4) '!';
-				q[poscor].left = -1;
-				for (i = poscor + 1; i < len; i++)
-					if (q[i].type == OPR && q[i].left + i < poscor)
-						q[i].left += drop - 2;
-				memcpy((void *) &q[poscor - drop + 1],
-					   (void *) &q[poscor - 1],
-					   sizeof(ITEM) * (len - (poscor - 1)));
-				len -= drop - 2;
-			}
-			else
-			{					/* drop only operator */
-				int4		subtreepos = (notisleft) ?
-				poscor - 1 : poscor + q[poscor].left;
-				int4		subtreelen = countdroptree(q, subtreepos);
-
-				drop = countdroptree(q, poscor);
-				for (i = poscor + 1; i < len; i++)
-					if (q[i].type == OPR && q[i].left + i < poscor)
-						q[i].left += drop - subtreelen;
-				memcpy((void *) &q[subtreepos + 1],
-					   (void *) &q[poscor + 1],
-					   sizeof(ITEM) * (len - (poscor - 1)));
-				memcpy((void *) &q[poscor - drop + 1],
-					   (void *) &q[subtreepos - subtreelen + 1],
-					   sizeof(ITEM) * (len - (drop - subtreelen)));
-				len -= drop - subtreelen;
-			}
-		}
-	} while (index);
-	return len;
-}
-
-
+/* Useless old "debugging" function for a fundamentally wrong algorithm */
 Datum
 querytree(PG_FUNCTION_ARGS)
 {
-	QUERYTYPE  *query = (QUERYTYPE *) PG_GETARG_QUERYTYPE_P_COPY(0);
-	INFIX		nrm;
-	text	   *res;
-	ITEM	   *q;
-	int4		len;
-
-	if (query->size == 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("empty query")));
-
-	q = (ITEM *) palloc(sizeof(ITEM) * query->size);
-	memcpy((void *) q, GETQUERY(query), sizeof(ITEM) * query->size);
-	len = shorterquery(q, query->size);
-	PG_FREE_IF_COPY(query, 0);
-
-	if (len == 0)
-	{
-		res = (text *) palloc(1 + VARHDRSZ);
-		SET_VARSIZE(res, 1 + VARHDRSZ);
-		*((char *) VARDATA(res)) = 'T';
-	}
-	else
-	{
-		nrm.curpol = q + len - 1;
-		nrm.buflen = 32;
-		nrm.cur = nrm.buf = (char *) palloc(sizeof(char) * nrm.buflen);
-		*(nrm.cur) = '\0';
-		infix(&nrm, true);
-
-		res = (text *) palloc(nrm.cur - nrm.buf + VARHDRSZ);
-		SET_VARSIZE(res, nrm.cur - nrm.buf + VARHDRSZ);
-		memcpy(VARDATA(res), nrm.buf, nrm.cur - nrm.buf);
-	}
-	pfree(q);
-
-	PG_RETURN_POINTER(res);
+	elog(ERROR, "querytree is no longer implemented");
+	PG_RETURN_NULL();
 }

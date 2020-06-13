@@ -1,5 +1,6 @@
 # -*-makefile-*-
-# $PostgreSQL: pgsql/src/Makefile.global.in,v 1.241 2008/02/17 16:36:43 petere Exp $
+# src/Makefile.global.in
+# @configure_input@
 
 #------------------------------------------------------------------------------
 # All PostgreSQL makefiles include this file and use the variables it sets,
@@ -18,8 +19,11 @@
 #
 # Meta configuration
 
-.PHONY: all install install-strip installdirs uninstall clean distclean maintainer-clean distprep check installcheck maintainer-check coverage installcheck-good
-.SILENT: installdirs
+standard_targets = all install installdirs uninstall distprep clean distclean maintainer-clean coverage check installcheck init-po update-po
+# these targets should recurse even into subdirectories not being built:
+standard_always_targets = distprep clean distclean maintainer-clean
+
+.PHONY: $(standard_targets) install-strip html man installcheck-parallel maintainer-check installcheck-good
 
 # make `all' the default target
 all:
@@ -31,18 +35,38 @@ all:
 # BLD_ARCH
 BLD_ARCH = @BLD_ARCH@
 
+# Never delete any intermediate files automatically.
+.SECONDARY:
+
 # PostgreSQL version number
 PG_VERSION = @PG_PACKAGE_VERSION@
 PG_MAJORVERSION = @PG_MAJORVERSION@
+VERSION_NUM = @PG_VERSION_NUM@
 
 # GPDB version number
 GP_VERSION = @GP_VERSION_SHORT@
 GP_MAJORVERSION = @GP_MAJORVERSION@
 
-ADDON_DIR = @ADDON_DIR@
+# Set top_srcdir, srcdir, and VPATH.
+ifdef PGXS
+top_srcdir = $(top_builddir)
 
-# Support for VPATH builds
+# If VPATH is set or Makefile is not in current directory we are building
+# the extension with VPATH so we set the variable here.
+ifdef VPATH
+srcdir = $(VPATH)
+else
+ifeq ($(CURDIR),$(dir $(firstword $(MAKEFILE_LIST))))
+srcdir = .
+VPATH =
+else
+srcdir = $(dir $(firstword $(MAKEFILE_LIST)))
+VPATH = $(srcdir)
+endif
+endif
+else # not PGXS
 vpath_build = @vpath_build@
+abs_top_builddir = @abs_top_builddir@
 abs_top_srcdir = @abs_top_srcdir@
 
 ifneq ($(vpath_build),yes)
@@ -53,6 +77,7 @@ top_srcdir = $(abs_top_srcdir)
 srcdir = $(top_srcdir)/$(subdir)
 VPATH = $(srcdir)
 endif
+endif # not PGXS
 
 vpathsearch = `for f in $(addsuffix /$(1),$(subst :, ,. $(VPATH))); do test -r $$f && echo $$f && break; done`
 
@@ -82,6 +107,8 @@ exec_prefix := @exec_prefix@
 datarootdir := @datarootdir@
 
 bindir := @bindir@
+sbindir := @sbindir@
+libexecdir := @libexecdir@
 
 datadir := @datadir@
 ifeq "$(findstring pgsql, $(datadir))" ""
@@ -154,8 +181,6 @@ includedir_server = $(pkgincludedir)/server
 includedir_internal = $(pkgincludedir)/internal
 pgxsdir = $(pkglibdir)/pgxs
 
-sqlmansect_dummy = l
-
 
 ##########################################################################
 #
@@ -167,15 +192,15 @@ with_perl	= @with_perl@
 with_python	= @with_python@
 with_tcl	= @with_tcl@
 with_openssl	= @with_openssl@
-with_ossp_uuid	= @with_ossp_uuid@
+with_selinux	= @with_selinux@
+with_systemd	= @with_systemd@
 with_libxml	= @with_libxml@
 with_libxslt	= @with_libxslt@
 with_system_tzdata = @with_system_tzdata@
+with_uuid	= @with_uuid@
 with_zlib	= @with_zlib@
 with_libbz2	= @with_libbz2@
 with_apr_config	= @with_apr_config@
-with_apu_config	= @with_apu_config@
-with_libsigar	= @with_libsigar@
 enable_shared	= @enable_shared@
 enable_rpath	= @enable_rpath@
 # NLS is not supported in Greenplum, see comment documenting
@@ -184,33 +209,30 @@ enable_rpath	= @enable_rpath@
 enable_debug	= @enable_debug@
 enable_dtrace	= @enable_dtrace@
 enable_coverage	= @enable_coverage@
+enable_tap_tests	= @enable_tap_tests@
 enable_thread_safety	= @enable_thread_safety@
+enable_strong_random	= @enable_strong_random@
 enable_largefile	= @enable_largefile@
 enable_orca		= @enable_orca@
-enable_codegen		= @enable_codegen@
 enable_gpfdist		= @enable_gpfdist@
 enable_pxf			= @enable_pxf@
-enable_snmp			= @enable_snmp@
-enable_ddboost	    = @enable_ddboost@
-enable_netbackup	= @enable_netbackup@
+enable_debug_extensions = @enable_debug_extensions@
+enable_orafce		= @enable_orafce@
 enable_mapreduce    = @enable_mapreduce@
 enable_gpcloud 	    = @enable_gpcloud@
-enable_gpperfmon    = @enable_gpperfmon@
 
-enable_segwalrep    = @enable_segwalrep@
 enable_tap_tests = @enable_tap_tests@
 
 python_includespec	= @python_includespec@
 python_libdir		= @python_libdir@
 python_libspec		= @python_libspec@
 python_additional_libs	= @python_additional_libs@
-python_configdir	= @python_configdir@
+python_majorversion	= @python_majorversion@
 python_version		= @python_version@
 
 krb_srvtab = @krb_srvtab@
 
 TCLSH			= @TCLSH@
-TCL_LIB_FILE		= @TCL_LIB_FILE@
 TCL_LIBS		= @TCL_LIBS@
 TCL_LIB_SPEC		= @TCL_LIB_SPEC@
 TCL_INCLUDE_SPEC	= @TCL_INCLUDE_SPEC@
@@ -221,9 +243,10 @@ PTHREAD_CFLAGS		= @PTHREAD_CFLAGS@
 PTHREAD_LIBS		= @PTHREAD_LIBS@
 
 have_yaml 		= @have_yaml@
-have_docbook	= @have_docbook@
-DOCBOOKSTYLE	= @DOCBOOKSTYLE@
-COLLATEINDEX	= @COLLATEINDEX@
+YAML_LIBS		= @YAML_LIBS@
+with_zstd 		= @with_zstd@
+with_quicklz		= @with_quicklz@
+EVENT_LIBS		= @EVENT_LIBS@
 
 
 ##########################################################################
@@ -234,6 +257,7 @@ COLLATEINDEX	= @COLLATEINDEX@
 
 CPP = @CPP@
 CPPFLAGS = @CPPFLAGS@
+PG_SYSROOT = @PG_SYSROOT@
 
 ifdef PGXS
 override CPPFLAGS := -I$(includedir_server) -I$(includedir_internal) $(CPPFLAGS)
@@ -272,27 +296,36 @@ DLLWRAP = @DLLWRAP@
 LIBS = @LIBS@
 LDAP_LIBS_FE = @LDAP_LIBS_FE@
 LDAP_LIBS_BE = @LDAP_LIBS_BE@
-OSSP_UUID_LIBS = @OSSP_UUID_LIBS@
+UUID_LIBS = @UUID_LIBS@
+UUID_EXTRA_OBJS = @UUID_EXTRA_OBJS@
 LD = @LD@
 with_gnu_ld = @with_gnu_ld@
 ld_R_works = @ld_R_works@
 
-# We want -L for libpgport.a to be first in LDFLAGS.  We also need LDFLAGS
-# to be a "recursively expanded" variable, else adjustments to rpathdir
-# don't work right.  So we must NOT do LDFLAGS := something, meaning this has
-# to be done first and elsewhere we must only do LDFLAGS += something.
+# It's critical that within LDFLAGS, all -L switches pointing to build-tree
+# directories come before any -L switches pointing to external directories.
+# Otherwise it's possible for, e.g., a platform-provided copy of libpq.so
+# to get linked in place of the one we've built.  Therefore we adopt the
+# convention that the first component of LDFLAGS is an extra variable
+# LDFLAGS_INTERNAL, and -L and -l switches for PG's own libraries must be
+# put into LDFLAGS_INTERNAL, so they will appear ahead of those for external
+# libraries.
+#
+# We need LDFLAGS and LDFLAGS_INTERNAL to be "recursively expanded" variables,
+# else adjustments to, e.g., rpathdir don't work right.  So we must NOT do
+# "LDFLAGS := something" anywhere, ditto for LDFLAGS_INTERNAL.
+# These initial assignments must be "=" type, and elsewhere we must only do
+# "LDFLAGS += something" or "LDFLAGS_INTERNAL += something".
 ifdef PGXS
-  LDFLAGS = -L$(libdir)
+  LDFLAGS_INTERNAL = -L$(libdir)
 else
-  LDFLAGS = -L$(top_builddir)/src/port
+  LDFLAGS_INTERNAL = -L$(top_builddir)/src/port -L$(top_builddir)/src/common
 endif
-LDFLAGS += @LDFLAGS@
+LDFLAGS = $(LDFLAGS_INTERNAL) @LDFLAGS@
 
 LDFLAGS_EX = @LDFLAGS_EX@
 # LDFLAGS_SL might have already been assigned by calling makefile
 LDFLAGS_SL += @LDFLAGS_SL@
-
-
 LDREL = -r
 LDOUT = -o
 RANLIB = @RANLIB@
@@ -303,13 +336,15 @@ X = @EXEEXT@
 
 ifneq (@PERL@,)
     # quoted to protect pathname with spaces
-    PERL		= "@PERL@"
+    PERL		= '@PERL@'
 else
     PERL		= $(missing) perl
 endif
 perl_archlibexp		= @perl_archlibexp@
 perl_privlibexp		= @perl_privlibexp@
+perl_includespec	= @perl_includespec@
 perl_useshrplib		= @perl_useshrplib@
+perl_embed_ccflags	= @perl_embed_ccflags@
 perl_embed_ldflags	= @perl_embed_ldflags@
 
 # apr-1-config
@@ -320,16 +355,12 @@ apr_link_ld_libs	= @apr_link_ld_libs@
 apr_cflags			= @apr_cflags@
 apr_cppflags		= @apr_cppflags@
 
-# apu-1-config
-APU_1_CONFIG		= @APU_1_CONFIG@
-apu_includes		= @apu_includes@
-apu_link_ld_libs	= @apu_link_ld_libs@
-
 # Miscellaneous
 
 AWK	= @AWK@
 LN_S	= @LN_S@
 MSGFMT  = @MSGFMT@
+MSGFMT_FLAGS = @MSGFMT_FLAGS@
 MSGMERGE = @MSGMERGE@
 PYTHON	= @PYTHON@
 TAR	= @TAR@
@@ -338,15 +369,27 @@ XGETTEXT = @XGETTEXT@
 GZIP	= gzip
 BZIP2	= bzip2
 
-PL_TESTDB = pl_regression
-CONTRIB_TESTDB = contrib_regression
-
 # Testing
+
+NO_TEMP_INSTALL = yes # GPDB: We assume a GPDB cluster is running (gpdemo)
 
 abs_top_builddir = @abs_top_builddir@
 abs_top_srcdir = @abs_top_srcdir@
 
-check:
+check: temp-install
+
+.PHONY: temp-install
+temp-install:
+ifndef NO_TEMP_INSTALL
+ifneq ($(abs_top_builddir),)
+ifeq ($(MAKELEVEL),0)
+	rm -rf '$(abs_top_builddir)'/tmp_install
+	$(MKDIR_P) '$(abs_top_builddir)'/tmp_install/log
+	$(MAKE) -C '$(top_builddir)' DESTDIR='$(abs_top_builddir)'/tmp_install install >'$(abs_top_builddir)'/tmp_install/log/install.log 2>&1
+endif
+	$(if $(EXTRA_INSTALL),for extra in $(EXTRA_INSTALL); do $(MAKE) -C '$(top_builddir)'/$$extra DESTDIR='$(abs_top_builddir)'/tmp_install install >>'$(abs_top_builddir)'/tmp_install/log/install.log || exit; done)
+endif
+endif
 
 PROVE = @PROVE@
 # There are common routines in src/test/perl, and some test suites have
@@ -355,15 +398,25 @@ PG_PROVE_FLAGS = -I $(top_srcdir)/src/test/perl/ -I $(srcdir)
 # User-supplied prove flags such as --verbose can be provided in PROVE_FLAGS.
 PROVE_FLAGS =
 
+# prepend to path if already set, else just set it
+define add_to_path
+$(1)="$(if $($(1)),$(2):$$$(1),$(2))"
+endef
+
+# platform-specific environment variable to set shared library path
+define ld_library_path_var
+$(if $(filter $(PORTNAME),darwin),DYLD_LIBRARY_PATH,$(if $(filter $(PORTNAME),aix),LIBPATH,LD_LIBRARY_PATH))
+endef
+
 ifeq ($(enable_tap_tests),yes)
 define prove_installcheck
 rm -rf $(CURDIR)/tmp_check/log
-cd $(srcdir) && TESTDIR='$(CURDIR)' PATH="$(bindir):$$PATH" top_builddir='$(CURDIR)/$(top_builddir)' PG_REGRESS='$(CURDIR)/$(top_builddir)/src/test/regress/pg_regress' $(PROVE) $(PG_PROVE_FLAGS) $(PROVE_FLAGS) $(if $(PROVE_TESTS),$(PROVE_TESTS),t/*.pl)
+cd $(srcdir) && TESTDIR='$(CURDIR)' PATH="$(bindir):$$PATH" PGPORT='6$(DEF_PGPORT)' top_builddir='$(CURDIR)/$(top_builddir)' PG_REGRESS='$(CURDIR)/$(top_builddir)/src/test/regress/pg_regress' $(PROVE) $(PG_PROVE_FLAGS) $(PROVE_FLAGS) $(if $(PROVE_TESTS),$(PROVE_TESTS),t/*.pl)
 endef
 
 define prove_check
 rm -rf $(CURDIR)/tmp_check/log
-cd $(srcdir) && TESTDIR='$(CURDIR)' $(with_temp_install) top_builddir='$(CURDIR)/$(top_builddir)' PG_REGRESS='$(CURDIR)/$(top_builddir)/src/test/regress/pg_regress' $(PROVE) $(PG_PROVE_FLAGS) $(PROVE_FLAGS) $(if $(PROVE_TESTS),$(PROVE_TESTS),t/*.pl)
+cd $(srcdir) && TESTDIR='$(CURDIR)' $(with_temp_install) PGPORT='6$(DEF_PGPORT)' PG_REGRESS='$(CURDIR)/$(top_builddir)/src/test/regress/pg_regress' $(PROVE) $(PG_PROVE_FLAGS) $(PROVE_FLAGS) $(if $(PROVE_TESTS),$(PROVE_TESTS),t/*.pl)
 endef
 
 else
@@ -373,7 +426,9 @@ endif
 
 # Installation.
 
-INSTALL	= $(SHELL) $(top_srcdir)/config/install-sh -c
+install_bin = @install_bin@
+install_sh = $(SHELL) $(top_srcdir)/config/install-sh -c
+INSTALL = $(if $(use_install_sh),$(install_sh),$(if $(install_bin),$(install_bin),$(install_sh)))
 
 INSTALL_SCRIPT_MODE	= 755
 INSTALL_DATA_MODE	= 644
@@ -387,7 +442,6 @@ INSTALL_SHLIB_OPTS = -m 755
 
 MKDIR_P = @MKDIR_P@
 
-mkinstalldirs	= $(SHELL) $(top_srcdir)/config/mkinstalldirs
 missing		= $(SHELL) $(top_srcdir)/config/missing
 
 STRIP		= @STRIP@
@@ -396,9 +450,15 @@ STRIP_SHARED_LIB = @STRIP_SHARED_LIB@
 
 # Documentation
 
-JADE	= @JADE@
-NSGMLS	= @NSGMLS@
-SGMLSPL	= @SGMLSPL@
+have_docbook	= @have_docbook@
+COLLATEINDEX	= @COLLATEINDEX@
+DBTOEPUB	= @DBTOEPUB@
+DOCBOOKSTYLE	= @DOCBOOKSTYLE@
+JADE			= @JADE@
+NSGMLS			= @NSGMLS@
+OSX				= @OSX@
+XMLLINT			= @XMLLINT@
+XSLTPROC		= @XSLTPROC@
 
 # Code coverage
 
@@ -437,15 +497,15 @@ host_cpu = @host_cpu@
 # Make HAVE_IPV6 available for initdb script creation
 HAVE_IPV6= @HAVE_IPV6@
 
-# The HP-UX port makefile, for one, needs access to this symbol
-HAVE_POSIX_SIGNALS= @HAVE_POSIX_SIGNALS@
-
 # This is mainly for use on FreeBSD, where we have both a.out and elf
 # systems now.  May be applicable to other systems to?
 ELF_SYSTEM= @ELF_SYS@
 
 # Backend stack size limit has to be hard-wired on Windows (it's in bytes)
 WIN32_STACK_RLIMIT=4194304
+
+# Set if we have a working win32 crashdump header
+have_win32_dbghelp = @have_win32_dbghelp@
 
 # Pull in platform-specific magic
 include $(top_builddir)/src/Makefile.port
@@ -476,35 +536,82 @@ endif
 # isn't created with the same link flags as libpq, it can't be used.)
 libpq = -L$(libpq_builddir) -lpq
 
-# If doing static linking, shared library dependency info isn't available,
-# so add in the libraries that libpq depends on.
-ifeq ($(enable_shared), no)
-libpq += $(filter -lintl -lssl -lcrypto -lkrb5 -lcrypt, $(LIBS)) \
-	$(LDAP_LIBS_FE) $(PTHREAD_LIBS)
-endif
-
 # This macro is for use by client executables (not libraries) that use libpq.
-# We force clients to pull symbols from the non-shared library libpgport
-# rather than pulling some libpgport symbols from libpq just because
-# libpq uses those functions too.  This makes applications less
+# We force clients to pull symbols from the non-shared libraries libpgport
+# and libpgcommon rather than pulling some libpgport symbols from libpq just
+# because libpq uses those functions too.  This makes applications less
 # dependent on changes in libpq's usage of pgport.  To do this we link to
 # pgport before libpq.  This does cause duplicate -lpgport's to appear
 # on client link lines.
 ifdef PGXS
-libpq_pgport = -L$(libdir) -lpgport $(libpq)
+libpq_pgport = -L$(libdir) -lpgcommon -lpgport $(libpq)
 else
-libpq_pgport = -L$(top_builddir)/src/port -lpgport $(libpq)
+libpq_pgport = -L$(top_builddir)/src/common -lpgcommon -L$(top_builddir)/src/port -lpgport $(libpq)
 endif
 
+# Cygwin seems to need ldap libraries to be mentioned here, too
+ifeq ($(PORTNAME),cygwin)
+libpq_pgport += $(LDAP_LIBS_FE)
+endif
+
+
+##########################################################################
+#
+# Commonly used submake targets
 
 submake-libpq:
 	$(MAKE) -C $(libpq_builddir) all
 
 submake-libpgport:
 	$(MAKE) -C $(top_builddir)/src/port all
+	$(MAKE) -C $(top_builddir)/src/common all
 
-.PHONY: submake-libpq submake-libpgport
+submake-libpgfeutils:
+	$(MAKE) -C $(top_builddir)/src/port all
+	$(MAKE) -C $(top_builddir)/src/common all
+	$(MAKE) -C $(top_builddir)/src/fe_utils all
 
+submake-generated-headers:
+	$(MAKE) -C $(top_builddir)/src/backend generated-headers
+
+.PHONY: submake-libpq submake-libpgport submake-libpgfeutils submake-generated-headers
+
+
+##########################################################################
+#
+# Testing support
+
+PL_TESTDB = pl_regression
+CONTRIB_TESTDB = contrib_regression
+ifneq ($(MODULE_big),)
+  CONTRIB_TESTDB_MODULE = contrib_regression_$(MODULE_big)
+else
+  ifneq ($(MODULES),)
+    CONTRIB_TESTDB_MODULE = contrib_regression_$(MODULES)
+  else
+    CONTRIB_TESTDB_MODULE = contrib_regression
+  endif
+endif
+
+ifdef NO_LOCALE
+NOLOCALE += --no-locale
+endif
+
+# file with extra config for temp build
+TEMP_CONF =
+ifdef TEMP_CONFIG
+TEMP_CONF += --temp-config=$(TEMP_CONFIG)
+endif
+
+pg_regress_locale_flags = $(if $(ENCODING),--encoding=$(ENCODING)) $(NOLOCALE)
+
+pg_regress_check = $(with_temp_install) $(top_builddir)/src/test/regress/pg_regress --inputdir=$(srcdir) --temp-instance=./tmp_check $(TEMP_CONF) --bindir= $(pg_regress_locale_flags) $(EXTRA_REGRESS_OPTS)
+pg_regress_installcheck = $(top_builddir)/src/test/regress/pg_regress --inputdir=$(srcdir) --bindir='$(bindir)' $(pg_regress_locale_flags) $(EXTRA_REGRESS_OPTS)
+
+pg_regress_clean_files = results/ regression.diffs regression.out tmp_check/ log/
+
+pg_isolation_regress_check = $(with_temp_install) $(top_builddir)/src/test/isolation/pg_isolation_regress --inputdir=$(srcdir) --temp-instance=./tmp_check $(TEMP_CONF) --bindir= $(pg_regress_locale_flags) $(EXTRA_REGRESS_OPTS)
+pg_isolation_regress_installcheck = $(top_builddir)/src/test/isolation/pg_isolation_regress --inputdir=$(srcdir) $(pg_regress_locale_flags) $(EXTRA_REGRESS_OPTS)
 
 ##########################################################################
 #
@@ -534,6 +641,11 @@ ifneq ($(CUSTOM_COPT),)
   COPT= $(CUSTOM_COPT)
 endif
 
+#
+# These variables are meant to be set in the environment of "make"
+# to add flags to whatever configure picked.  Unlike the ones above,
+# they are documented.
+#
 ifdef COPT
    CFLAGS += $(COPT)
    LDFLAGS += $(COPT)
@@ -548,22 +660,16 @@ endif
 ##########################################################################
 #
 # substitute implementations of C library routines (see src/port/)
+# note we already included -L.../src/port in LDFLAGS above
 
 LIBOBJS = @LIBOBJS@
 
 # files needed for the chosen CRC-32C implementation
 PG_CRC32C_OBJS = @PG_CRC32C_OBJS@
 
-LIBS := -lpgport $(LIBS)
-# add location of libpgport.a to LDFLAGS
-ifdef PGXS
-override LDFLAGS := -L$(libdir) $(LDFLAGS)
-else
-override LDFLAGS := -L$(top_builddir)/src/port $(LDFLAGS)
-endif
+LIBS := -lpgcommon -lpgport $(LIBS)
 
-# to make ws2_32.lib the last library, and always link with shfolder,
-# so SHGetFolderName isn't picked up from shell32.dll
+# to make ws2_32.lib the last library
 ifeq ($(PORTNAME),win32)
 LIBS += -lws2_32 -lshfolder
 override LDFLAGS := -L$(top_builddir)/gpAux/ext/win32/kfw-3-2-2/lib $(LDFLAGS)
@@ -578,6 +684,22 @@ TAS         = @TAS@
 #
 # Global targets and rules
 
+%.c: %.l
+ifdef FLEX
+	$(FLEX) $(if $(FLEX_NO_BACKUP),-b) $(FLEXFLAGS) -o'$@' $<
+	@$(if $(FLEX_NO_BACKUP),if [ `wc -l <lex.backup` -eq 1 ]; then rm lex.backup; else echo "Scanner requires backup; see lex.backup." 1>&2; exit 1; fi)
+else
+	@$(missing) flex $< '$@'
+endif
+
+%.c: %.y
+	$(if $(BISON_CHECK_CMD),$(BISON_CHECK_CMD))
+ifdef BISON
+	$(BISON) $(BISONFLAGS) -o $@ $<
+else
+	@$(missing) bison $< $@
+endif
+
 %.i: %.c
 	$(CPP) $(CPPFLAGS) -o $@ $<
 
@@ -587,24 +709,11 @@ TAS         = @TAS@
 %.bz2: %
 	$(BZIP2) -c $< >$@
 
-ifeq ($(PORTNAME),win32)
-# Build rules to add versioninfo resources to win32 binaries
-WIN32RES += win32ver.o
-ifeq ($(PGFILESHLIB),1)
-PGFTYPE=VFT_DLL
-else
-PGFTYPE=VFT_APP
-endif
-ifneq (,$(PGAPPICON))
-PGICOSTR=$(subst /,\/,IDI_ICON ICON \"$(top_builddir)/src/port/$(PGAPPICON).ico\")
-endif
-win32ver.rc: $(top_builddir)/src/port/win32ver.rc
-	sed -e 's;FILEDESC;$(PGFILEDESC);' -e 's;VFT_APP;$(PGFTYPE);' -e 's;_ICO_;$(PGICOSTR);' -e 's;\(VERSION.*\),0 *$$;\1,'`date '+%y%j' | sed 's/^0*//'`';' $(top_builddir)/src/port/win32ver.rc > win32ver.rc
-win32ver.o: $(top_builddir)/src/port/win32ver.rc
-	sed -e 's;FILEDESC;$(PGFILEDESC);' -e 's;VFT_APP;$(PGFTYPE);' -e 's;_ICO_;$(PGICOSTR);' -e 's;\(VERSION.*\),0 *$$;\1,'`date '+%y%j' | sed 's/^0*//'`';' $(top_builddir)/src/port/win32ver.rc > win32ver.rc
-	/usr/bin/i686-pc-mingw32-windres -i win32ver.rc -o win32ver.o --include-dir=$(top_builddir)/src/include
-	rm -f win32ver.rc
-endif
+# Direct builds of foo.c -> foo are disabled to avoid generating
+# *.dSYM junk on Macs.  All builds should normally go through the
+# foo.c -> foo.o -> foo steps.  This also ensures that dependency
+# tracking (see below) is used.
+%: %.c
 
 ifndef PGXS
 
@@ -619,20 +728,28 @@ $(top_builddir)/src/Makefile.global: $(top_srcdir)/src/Makefile.global.in $(top_
 # config.status will not change the timestamp on pg_config.h if it
 # doesn't change, so as to avoid recompiling the entire tree
 # unnecessarily. Therefore we make config.status update a timestamp file
-# stamp-h everytime it runs, so that we don't trigger this rule everytime.
-# (We do trigger the null rule for stamp-h to pg_config.h everytime; so it's
-# important for that rule to be null!)
+# stamp-h every time it runs, so that we don't trigger this rule every time.
+# (We do trigger the null rule for stamp-h to pg_config.h every time; so it's
+# important for that rule to be empty!)
 #
 # Of course you need to turn on dependency tracking to get any
 # dependencies on pg_config.h.
-$(top_builddir)/src/include/pg_config.h: $(top_builddir)/src/include/stamp-h
+$(top_builddir)/src/include/pg_config.h: $(top_builddir)/src/include/stamp-h ;
 
 $(top_builddir)/src/include/stamp-h: $(top_srcdir)/src/include/pg_config.h.in $(top_builddir)/config.status
 	cd $(top_builddir) && ./config.status src/include/pg_config.h
 
-# Also remake ecpg_config.h from ecpg_config.h.in if the latter changed. Values in it can
-# only change if pg_config.h has changed, so include this file to its dependencies.
-$(top_builddir)/src/interfaces/ecpg/include/ecpg_config.h: $(top_builddir)/src/include/pg_config.h $(top_builddir)/src/interfaces/ecpg/include/ecpg_config.h.in $(top_builddir)/config.status
+# Also remake pg_config_ext.h from pg_config_ext.h.in, same logic as above.
+$(top_builddir)/src/include/pg_config_ext.h: $(top_builddir)/src/include/stamp-ext-h ;
+
+$(top_builddir)/src/include/stamp-ext-h: $(top_srcdir)/src/include/pg_config_ext.h.in $(top_builddir)/config.status
+	cd $(top_builddir) && ./config.status src/include/pg_config_ext.h
+
+# Also remake ecpg_config.h from ecpg_config.h.in if the latter changed, same
+# logic as above.
+$(top_builddir)/src/interfaces/ecpg/include/ecpg_config.h: $(top_builddir)/src/interfaces/ecpg/include/stamp-h ;
+
+ $(top_builddir)/src/interfaces/ecpg/include/stamp-h: $(top_builddir)/src/interfaces/ecpg/include/ecpg_config.h.in $(top_builddir)/config.status
 	cd $(top_builddir) && ./config.status src/interfaces/ecpg/include/ecpg_config.h
 
 # When configure changes, rerun configure with the same options as
@@ -644,11 +761,68 @@ endif # not PGXS
 
 
 install-strip:
-	@$(MAKE) INSTALL_PROGRAM_ENV="STRIPPROG='$(STRIP)'" \
+# install-strip always uses install-sh, so that strip options can be
+# passed.
+	$(MAKE) use_install_sh=yes \
+	    INSTALL_PROGRAM_ENV="STRIPPROG='$(STRIP)'" \
 	    INSTALL_STLIB_ENV="STRIPPROG='$(STRIP_STATIC_LIB)'" \
 	    INSTALL_SHLIB_ENV="STRIPPROG='$(STRIP_SHARED_LIB)'" \
 	    INSTALL_STRIP_FLAG=-s \
 	    install
+
+
+##########################################################################
+#
+# Recursive make support
+# ----------------------
+# Instead of recursing through subdirectories with a for loop or
+# repeated $(MAKE) -C whatever calls, this is a little smarter: it
+# allows parallel make across directories and lets make -k and -q work
+# correctly.
+
+# We need the $(eval) function and order-only prerequisites, which are
+# available in GNU make 3.80.  That also happens to be the version
+# where the .VARIABLES variable was introduced, so this is a simple check.
+ifndef .VARIABLES
+$(error GNU make 3.80 or newer is required.  You are using version $(MAKE_VERSION))
+endif
+
+# This function is only for internal use below.  It should be called
+# using $(eval).  It will set up a target so that it recurses into
+# a given subdirectory.  Note that to avoid a nasty bug in make 3.80,
+# this function has to avoid using any complicated constructs (like
+# multiple targets on a line) and also not contain any lines that expand
+# to more than about 200 bytes.  This is why we make it apply to just one
+# subdirectory at a time, rather than to a list of subdirectories.
+# $1: target name, e.g., all
+# $2: subdir name
+# $3: target to run in subdir, usually same as $1
+define _create_recursive_target
+.PHONY: $(1)-$(2)-recurse
+$(1): $(1)-$(2)-recurse
+$(1)-$(2)-recurse: $(if $(filter check, $(3)), temp-install)
+	$$(MAKE) -C $(2) $(3)
+endef
+# Note that the use of $$ on the last line above is important; we want
+# $(MAKE) to be evaluated when the rule is run, not when the $(eval) is run
+# to create the rule.  This is necessary to get make -q working.
+
+# Call this function in a makefile that needs to recurse into subdirectories.
+# In the normal case all arguments can be defaulted.
+# $1: targets to make recursive (defaults to list of standard targets)
+# $2: list of subdirs (defaults to SUBDIRS variable)
+# $3: target to run in subdir (defaults to current element of $1)
+recurse = $(foreach target,$(if $1,$1,$(standard_targets)),$(foreach subdir,$(if $2,$2,$(SUBDIRS)),$(eval $(call _create_recursive_target,$(target),$(subdir),$(if $3,$3,$(target))))))
+
+# If a makefile's list of SUBDIRS varies depending on configuration, then
+# any subdirectories excluded from SUBDIRS should instead be added to
+# ALWAYS_SUBDIRS, and then it must call recurse_always as well as recurse.
+# This ensures that distprep, distclean, etc will apply to all subdirectories.
+# In the normal case all arguments will be defaulted.
+# $1: targets to make recursive (defaults to standard_always_targets)
+# $2: list of subdirs (defaults to ALWAYS_SUBDIRS variable)
+# $3: target to run in subdir (defaults to current element of $1)
+recurse_always = $(foreach target,$(if $1,$1,$(standard_always_targets)),$(foreach subdir,$(if $2,$2,$(ALWAYS_SUBDIRS)),$(eval $(call _create_recursive_target,$(target),$(subdir),$(if $3,$3,$(target))))))
 
 
 ##########################################################################
@@ -670,6 +844,10 @@ ifndef COMPILE.c
 COMPILE.c = $(CC) $(CFLAGS) $(CPPFLAGS) -c
 endif
 
+ifndef COMPILE.cxx
+COMPILE.cxx = $(CXX) $(CXXFLAGS) $(CPPFLAGS) -c
+endif
+
 DEPDIR = .deps
 
 ifeq ($(GCC), yes)
@@ -679,12 +857,19 @@ ifeq ($(GCC), yes)
 	@if test ! -d $(DEPDIR); then mkdir -p $(DEPDIR); fi
 	$(COMPILE.c) -o $@ $< -MMD -MP -MF $(DEPDIR)/$(*F).Po
 
+%.o : %.cpp
+	@if test ! -d $(DEPDIR); then mkdir -p $(DEPDIR); fi
+	$(COMPILE.cxx) -o $@ $< -MMD -MP -MF $(DEPDIR)/$(*F).Po
+
 endif # GCC
 
 # Include all the dependency files generated for the current
-# directory. List /dev/null as dummy because if the wildcard expands
-# to nothing then make would complain.
--include $(wildcard $(DEPDIR)/*.Po) /dev/null
+# directory. Note that make would complain if include was called with
+# no arguments.
+Po_files := $(wildcard $(DEPDIR)/*.Po)
+ifneq (,$(Po_files))
+include $(Po_files)
+endif
 
 # hook for clean-up
 clean distclean maintainer-clean: clean-deps
@@ -736,10 +921,18 @@ gcda_files := $(wildcard *.gcda)
 
 lcov.info: $(gcda_files)
 	rm -f *.gcov
-	$(if $^,$(LCOV) -d . -c -o $@ $(LCOVFLAGS))
+	$(if $^,$(LCOV) -d . -c -o $@ $(LCOVFLAGS) --gcov-tool $(GCOV))
 
 %.c.gcov: %.gcda | lcov.info
 	$(GCOV) -b -f -p -o . $(GCOVFLAGS) $*.c >$*.c.gcov.out
+
+coverage: $(gcda_files:.gcda=.c.gcov) lcov.info
+
+.PHONY: coverage-html
+coverage-html: coverage
+	rm -rf coverage
+	mkdir coverage
+	$(GENHTML) --show-details --legend --output-directory=coverage --title=PostgreSQL --num-spaces=4 --prefix=$(abs_top_srcdir) `find . -name lcov.info -print`
 
 
 # hook for clean-up
@@ -747,6 +940,7 @@ clean distclean maintainer-clean: clean-coverage
 
 .PHONY: clean-coverage
 clean-coverage:
+	rm -rf coverage
 	rm -f *.gcda *.gcno lcov.info *.gcov *.gcov.out
 
 

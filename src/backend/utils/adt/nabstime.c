@@ -5,12 +5,12 @@
  *	  Functions for the built-in type "RelativeTime".
  *	  Functions for the built-in type "TimeInterval".
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/adt/nabstime.c,v 1.153 2008/02/17 02:09:28 tgl Exp $
+ *	  src/backend/utils/adt/nabstime.c
  *
  *-------------------------------------------------------------------------
  */
@@ -25,6 +25,7 @@
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
+#include "utils/datetime.h"
 #include "utils/nabstime.h"
 
 #define MIN_DAYNUM (-24856)		/* December 13, 1901 */
@@ -99,18 +100,13 @@ abstime2tm(AbsoluteTime _time, int *tzp, struct pg_tm * tm, char **tzn)
 	pg_time_t	time = (pg_time_t) _time;
 	struct pg_tm *tx;
 
-	/*
-	 * If HasCTZSet is true then we have a brute force time zone specified. Go
-	 * ahead and rotate to the local time zone since we will later bypass any
-	 * calls which adjust the tm fields.
-	 */
-	if (HasCTZSet && (tzp != NULL))
-		time -= CTimeZone;
-
-	if (!HasCTZSet && tzp != NULL)
+	if (tzp != NULL)
 		tx = pg_localtime(&time, session_timezone);
 	else
 		tx = pg_gmtime(&time);
+
+	if (tx == NULL)
+		elog(ERROR, "could not convert abstime to timestamp: %m");
 
 	tm->tm_year = tx->tm_year + 1900;
 	tm->tm_mon = tx->tm_mon + 1;
@@ -125,41 +121,23 @@ abstime2tm(AbsoluteTime _time, int *tzp, struct pg_tm * tm, char **tzn)
 
 	if (tzp != NULL)
 	{
-		/*
-		 * We have a brute force time zone per SQL99? Then use it without
-		 * change since we have already rotated to the time zone.
-		 */
-		if (HasCTZSet)
-		{
-			*tzp = CTimeZone;
-			tm->tm_gmtoff = CTimeZone;
-			tm->tm_isdst = 0;
-			tm->tm_zone = NULL;
-			if (tzn != NULL)
-				*tzn = NULL;
-		}
-		else
-		{
-			*tzp = -tm->tm_gmtoff;		/* tm_gmtoff is Sun/DEC-ism */
+		*tzp = -tm->tm_gmtoff;	/* tm_gmtoff is Sun/DEC-ism */
 
+		/*
+		 * XXX FreeBSD man pages indicate that this should work - tgl 97/04/23
+		 */
+		if (tzn != NULL)
+		{
 			/*
-			 * XXX FreeBSD man pages indicate that this should work - tgl
-			 * 97/04/23
+			 * Copy no more than MAXTZLEN bytes of timezone to tzn, in case it
+			 * contains an error message, which doesn't fit in the buffer
 			 */
-			if (tzn != NULL)
-			{
-				/*
-				 * Copy no more than MAXTZLEN bytes of timezone to tzn, in
-				 * case it contains an error message, which doesn't fit in the
-				 * buffer
-				 */
-				StrNCpy(*tzn, tm->tm_zone, MAXTZLEN + 1);
-				if (strlen(tm->tm_zone) > MAXTZLEN)
-					ereport(WARNING,
-							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							 errmsg("invalid time zone name: \"%s\"",
-									tm->tm_zone)));
-			}
+			StrNCpy(*tzn, tm->tm_zone, MAXTZLEN + 1);
+			if (strlen(tm->tm_zone) > MAXTZLEN)
+				ereport(WARNING,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("invalid time zone name: \"%s\"",
+								tm->tm_zone)));
 		}
 	}
 	else
@@ -179,13 +157,13 @@ tm2abstime(struct pg_tm * tm, int tz)
 
 	/* validate, before going out of range on some members */
 	if (tm->tm_year < 1901 || tm->tm_year > 2038 ||
-		tm->tm_mon < 1 || tm->tm_mon > 12 ||
+		tm->tm_mon < 1 || tm->tm_mon > MONTHS_PER_YEAR ||
 		tm->tm_mday < 1 || tm->tm_mday > 31 ||
 		tm->tm_hour < 0 ||
-		tm->tm_hour > 24 ||		/* test for > 24:00:00 */
-		(tm->tm_hour == 24 && (tm->tm_min > 0 || tm->tm_sec > 0)) ||
-		tm->tm_min < 0 || tm->tm_min > 59 ||
-		tm->tm_sec < 0 || tm->tm_sec > 60)
+		tm->tm_hour > HOURS_PER_DAY ||	/* test for > 24:00:00 */
+	  (tm->tm_hour == HOURS_PER_DAY && (tm->tm_min > 0 || tm->tm_sec > 0)) ||
+		tm->tm_min < 0 || tm->tm_min > MINS_PER_HOUR - 1 ||
+		tm->tm_sec < 0 || tm->tm_sec > SECS_PER_MINUTE)
 		return INVALID_ABSTIME;
 
 	day = date2j(tm->tm_year, tm->tm_mon, tm->tm_mday) - UNIX_EPOCH_JDATE;
@@ -198,7 +176,7 @@ tm2abstime(struct pg_tm * tm, int tz)
 	sec = tm->tm_sec + tz + (tm->tm_min + (day * HOURS_PER_DAY + tm->tm_hour) * MINS_PER_HOUR) * SECS_PER_MINUTE;
 
 	/*
-	 * check for overflow.	We need a little slop here because the H/M/S plus
+	 * check for overflow.  We need a little slop here because the H/M/S plus
 	 * TZ offset could add up to more than 1 day.
 	 */
 	if ((day >= MAX_DAYNUM - 10 && sec < 0) ||
@@ -310,7 +288,7 @@ abstimeout(PG_FUNCTION_ARGS)
 			break;
 		default:
 			abstime2tm(time, &tz, tm, &tzn);
-			EncodeDateTime(tm, fsec, &tz, &tzn, DateStyle, buf);
+			EncodeDateTime(tm, fsec, true, tz, tzn, DateStyle, buf);
 			break;
 	}
 
@@ -786,19 +764,24 @@ tintervalrecv(PG_FUNCTION_ARGS)
 {
 	StringInfo	buf = (StringInfo) PG_GETARG_POINTER(0);
 	TimeInterval tinterval;
+	int32		status;
 
 	tinterval = (TimeInterval) palloc(sizeof(TimeIntervalData));
 
 	tinterval->status = pq_getmsgint(buf, sizeof(tinterval->status));
+	tinterval->data[0] = pq_getmsgint(buf, sizeof(tinterval->data[0]));
+	tinterval->data[1] = pq_getmsgint(buf, sizeof(tinterval->data[1]));
 
-	if (!(tinterval->status == T_INTERVAL_INVAL ||
-		  tinterval->status == T_INTERVAL_VALID))
+	if (tinterval->data[0] == INVALID_ABSTIME ||
+		tinterval->data[1] == INVALID_ABSTIME)
+		status = T_INTERVAL_INVAL;		/* undefined  */
+	else
+		status = T_INTERVAL_VALID;
+
+	if (status != tinterval->status)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
 				 errmsg("invalid status in external \"tinterval\" value")));
-
-	tinterval->data[0] = pq_getmsgint(buf, sizeof(tinterval->data[0]));
-	tinterval->data[1] = pq_getmsgint(buf, sizeof(tinterval->data[1]));
 
 	PG_RETURN_TIMEINTERVAL(tinterval);
 }
@@ -1150,9 +1133,22 @@ tintervalsame(PG_FUNCTION_ARGS)
 /*
  * tinterval comparison routines
  *
- * Note: comparison is based on the lengths of the tintervals, not on
- * endpoint value.	This is pretty bogus, but since it's only a legacy
- * datatype I'm not going to propose changing it.
+ * Note: comparison is based only on the lengths of the tintervals, not on
+ * endpoint values (as long as they're not INVALID).  This is pretty bogus,
+ * but since it's only a legacy datatype, we're not going to change it.
+ *
+ * Some other bogus things that won't be changed for compatibility reasons:
+ * 1. The interval length computations overflow at 2^31 seconds, causing
+ * intervals longer than that to sort oddly compared to those shorter.
+ * 2. infinity and minus infinity (NOEND_ABSTIME and NOSTART_ABSTIME) are
+ * just ordinary integers.  Since this code doesn't handle them specially,
+ * it's possible for [a b] to be considered longer than [c infinity] for
+ * finite abstimes a, b, c.  In combination with the previous point, the
+ * interval [-infinity infinity] is treated as being shorter than many finite
+ * intervals :-(
+ *
+ * If tinterval is ever reimplemented atop timestamp, it'd be good to give
+ * some consideration to avoiding these problems.
  */
 static int
 tinterval_cmp_internal(TimeInterval a, TimeInterval b)

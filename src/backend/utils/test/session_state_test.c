@@ -5,9 +5,6 @@
 
 #include "postgres.h"
 
-static Size add_size(Size s1, Size s2);
-static Size mul_size(Size s1, Size s2);
-
 #include "../session_state.c"
 
 /*
@@ -20,17 +17,6 @@ static Size mul_size(Size s1, Size s2);
 	expect_any(ExceptionalCondition,fileName); \
 	expect_any(ExceptionalCondition,lineNumber); \
     will_be_called_with_sideeffect(ExceptionalCondition, &_ExceptionalCondition, NULL);\
-
-/*
- * This sets up an expected exception that will be completely ignored
- * (i.e., execution continues as if nothing happened)
- */
-#define EXPECT_EXCEPTION_CONTINUE_EXECUTION()     \
-	expect_any(ExceptionalCondition,conditionName); \
-	expect_any(ExceptionalCondition,errorType); \
-	expect_any(ExceptionalCondition,fileName); \
-	expect_any(ExceptionalCondition,lineNumber); \
-	will_be_called(ExceptionalCondition);\
 
 #define EXPECT_EREPORT(LOG_LEVEL)     \
 	expect_any(errstart, elevel); \
@@ -47,6 +33,7 @@ static Size mul_size(Size s1, Size s2);
     	will_return_with_sideeffect(errstart, false, &_ExceptionalCondition, NULL);\
     } \
 
+#undef PG_RE_THROW
 #define PG_RE_THROW() siglongjmp(*PG_exception_stack, 1)
 
 /*
@@ -54,54 +41,10 @@ static Size mul_size(Size s1, Size s2);
  * function by re-throwing the exception, essentially falling
  * back to the next available PG_CATCH();
  */
-void
+static void
 _ExceptionalCondition()
 {
      PG_RE_THROW();
-}
-
-static Size
-GetSessionStateArrayHeaderSize()
-{
-	return sizeof(int) /* numSession */ +
-				sizeof(int) /* maxSession*/ + sizeof(SessionState *) /* freeList */ +
-				sizeof(SessionState *) /* usedList */+ sizeof(SessionState *) /* sessions */;
-}
-
-/*
- * Add two Size values, checking for overflow
- */
-static Size
-add_size(Size s1, Size s2)
-{
-	Size		result;
-
-	result = s1 + s2;
-	/* We are assuming Size is an unsigned type here... */
-	if (result < s1 || result < s2)
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("requested shared memory size overflows size_t")));
-	return result;
-}
-
-/*
- * Multiply two Size values, checking for overflow
- */
-static Size
-mul_size(Size s1, Size s2)
-{
-	Size		result;
-
-	if (s1 == 0 || s2 == 0)
-		return 0;
-	result = s1 * s2;
-	/* We are assuming Size is an unsigned type here... */
-	if (result / s2 != s1)
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("requested shared memory size overflows size_t")));
-	return result;
 }
 
 /* Creates a SessionStateArray of the specified number of entry */
@@ -136,7 +79,7 @@ static void
 DestroySessionStateArray()
 {
 	assert_true(NULL != AllSessionStateEntries);
-	free(AllSessionStateEntries);
+	free((void *)AllSessionStateEntries);
 	AllSessionStateEntries = NULL;
 }
 
@@ -144,14 +87,14 @@ DestroySessionStateArray()
  * Acquires a SessionState entry for the specified sessionid. If an existing entry
  * is found, this method reuses that entry
  */
-static SessionState*
+static SessionState *
 AcquireSessionState(int sessionId, int loglevel)
 {
 	will_be_called_count(LWLockAcquire, 1);
 	will_be_called_count(LWLockRelease, 1);
-	expect_any_count(LWLockAcquire, lockid, 1);
+	expect_any_count(LWLockAcquire, lock, 1);
 	expect_any_count(LWLockAcquire, mode, 1);
-	expect_any_count(LWLockRelease, lockid, 1);
+	expect_any_count(LWLockRelease, lock, 1);
 
 	/* Keep the assertions happy */
 	gp_session_id = sessionId;
@@ -160,7 +103,7 @@ AcquireSessionState(int sessionId, int loglevel)
 
 	EXPECT_EREPORT(loglevel);
 	SessionState_Init();
-	return MySessionState;
+	return (SessionState *) MySessionState;
 }
 
 /* Releases a SessionState entry for the specified sessionId */
@@ -171,9 +114,9 @@ ReleaseSessionState(int sessionId)
 	will_be_called_count(LWLockAcquire, 2);
 	will_be_called_count(LWLockRelease, 2);
 
-	expect_any_count(LWLockAcquire, lockid, 2);
+	expect_any_count(LWLockAcquire, lock, 2);
 	expect_any_count(LWLockAcquire, mode, 2);
-	expect_any_count(LWLockRelease, lockid, 2);
+	expect_any_count(LWLockRelease, lock, 2);
 
 	gp_session_id = sessionId;
 	/* First find the previously allocated session state */
@@ -209,47 +152,10 @@ ReleaseSessionState(int sessionId)
 }
 
 /*
- * Checks if the SessionStateArray struct layout is as expected
- */
-void
-test__SessionState_ShmemSize__StructLayout(void **state)
-{
-	const int headerEndOffset = offsetof(SessionStateArray, data);
-	/*
-	 * Make sure the data field is the last field.
-	 */
-	assert_true(headerEndOffset == sizeof(SessionStateArray) - sizeof(void*));
-
-	Size actualSize = sizeof(SessionStateArray);
-	Size calculatedSize = GetSessionStateArrayHeaderSize() +
-			sizeof(void *) /* the start pointer of the entries */;
-	assert_true(actualSize == calculatedSize);
-}
-
-/*
- * Checks if the SessionState_ShmemSize calculates correct size
- */
-void
-test__SessionState_ShmemSize__CalculatesCorrectSize(void **state)
-{
-	const Size headerSize = GetSessionStateArrayHeaderSize();
-
-	MaxBackends = 0;
-	assert_true(headerSize == SessionState_ShmemSize());
-
-	MaxBackends = 10;
-	assert_true(headerSize + 10 * sizeof(SessionState) == SessionState_ShmemSize());
-
-	/* Current maximum value for Maxbackends is INT_MAX / BLCKSZ */
-	MaxBackends = MAX_MAX_BACKENDS;
-	assert_true(headerSize + (MAX_MAX_BACKENDS) * sizeof(SessionState) == SessionState_ShmemSize());
-}
-
-/*
  * Checks if SessionState_ShmemInit does nothing under postmaster.
  * Note, it is *only* expected to re-attach with an existing array.
  */
-void
+static void
 test__SessionState_ShmemInit__NoOpUnderPostmaster(void **state)
 {
 	AllSessionStateEntries = NULL;
@@ -259,7 +165,6 @@ test__SessionState_ShmemInit__NoOpUnderPostmaster(void **state)
 	/* Initilize with some non-zero values */
 	fakeSessionStateArray.maxSession = 0;
 	fakeSessionStateArray.numSession = 0;
-	fakeSessionStateArray.sessions = NULL;
 	fakeSessionStateArray.freeList = NULL;
 	fakeSessionStateArray.usedList = NULL;
 
@@ -277,7 +182,6 @@ test__SessionState_ShmemInit__NoOpUnderPostmaster(void **state)
 	/* All the struct properties should be unchanged */
 	assert_true(AllSessionStateEntries->maxSession == 0);
 	assert_true(AllSessionStateEntries->numSession == 0);
-	assert_true(AllSessionStateEntries->sessions == NULL);
 	assert_true(AllSessionStateEntries->freeList == NULL &&
 			AllSessionStateEntries->usedList == NULL);
 
@@ -289,12 +193,15 @@ test__SessionState_ShmemInit__NoOpUnderPostmaster(void **state)
  * Checks if SessionState_ShmemInit initializes the SessionState entries
  * when postmaster
  */
-void
+static void
 test__SessionState_ShmemInit__InitializesWhenPostmaster(void **state)
 {
 	IsUnderPostmaster = false;
 
-	int allMaxBackends[] = {1, 100, MAX_MAX_BACKENDS};
+	/* The intention is that MAX_BACKENDS here would match the value in guc.c */
+#define MAX_BACKENDS 0x7fffff
+
+	int allMaxBackends[] = {1, 100, MAX_BACKENDS};
 
 	for (int i = 0; i < sizeof(allMaxBackends) / sizeof(int); i++)
 	{
@@ -303,14 +210,13 @@ test__SessionState_ShmemInit__InitializesWhenPostmaster(void **state)
 		/* All the struct properties should be unchanged */
 		assert_true(AllSessionStateEntries->maxSession == MaxBackends);
 		assert_true(AllSessionStateEntries->numSession == 0);
-		assert_true(AllSessionStateEntries->sessions == &AllSessionStateEntries->data);
 		assert_true(AllSessionStateEntries->freeList == AllSessionStateEntries->sessions &&
 				AllSessionStateEntries->usedList == NULL);
 
 		SessionState *prev = NULL;
 		for (int j = 0; j < MaxBackends; j++)
 		{
-			SessionState *cur = &AllSessionStateEntries->sessions[j];
+			SessionState *cur = (SessionState *) &AllSessionStateEntries->sessions[j];
 			assert_true(cur->sessionId == INVALID_SESSION_ID);
 			assert_true(cur->cleanupCountdown == CLEANUP_COUNTDOWN_BEFORE_RUNAWAY);
 			assert_true(cur->runawayStatus == RunawayStatus_NotRunaway);
@@ -338,7 +244,7 @@ test__SessionState_ShmemInit__InitializesWhenPostmaster(void **state)
  * Checks if SessionState_ShmemInit initializes the usedList and freeList
  * properly
  */
-void
+static void
 test__SessionState_ShmemInit__LinkedListSanity(void **state)
 {
 	/* Only 3 entries to test the linked list sanity */
@@ -356,7 +262,7 @@ test__SessionState_ShmemInit__LinkedListSanity(void **state)
 /*
  * Checks if SessionState_Init initializes a SessionState entry after acquiring
  */
-void
+static void
 test__SessionState_Init__AcquiresAndInitializes(void **state)
 {
 	/* Only 2 entry to test initialization */
@@ -374,10 +280,6 @@ test__SessionState_Init__AcquiresAndInitializes(void **state)
 	/* Mark it as acquired and see if it is released */
 	SpinLockAcquire(&theEntry->spinLock);
 	assert_true(theEntry->spinLock == 1);
-
-#ifdef USE_ASSERT_CHECKING
-	EXPECT_EXCEPTION_CONTINUE_EXECUTION();
-#endif
 
 	/* These should be new */
 	SessionState *first = AcquireSessionState(1, gp_sessionstate_loglevel);
@@ -400,7 +302,7 @@ test__SessionState_Init__AcquiresAndInitializes(void **state)
  * Checks if SessionState_Init initializes the global variables
  * such as MySessionState and sessionStateInited properly
  */
-void
+static void
 test__SessionState_Init__TestSideffects(void **state)
 {
 	/* Only 2 entry to test initialization */
@@ -408,9 +310,9 @@ test__SessionState_Init__TestSideffects(void **state)
 
 	will_be_called_count(LWLockAcquire, 1);
 	will_be_called_count(LWLockRelease, 1);
-	expect_any_count(LWLockAcquire, lockid, 1);
+	expect_any_count(LWLockAcquire, lock, 1);
 	expect_any_count(LWLockAcquire, mode, 1);
-	expect_any_count(LWLockRelease, lockid, 1);
+	expect_any_count(LWLockRelease, lock, 1);
 
 	assert_true(MySessionState == NULL);
 	assert_true(sessionStateInited == false);
@@ -429,7 +331,7 @@ test__SessionState_Init__TestSideffects(void **state)
  * Checks if SessionState_Init acquires a new entry as well as
  * reuse an existing entry whenever possible
  */
-void
+static void
 test__SessionState_Init__AcquiresWithReuse(void **state)
 {
 	/* Only 3 entries to test the reuse */
@@ -457,21 +359,21 @@ test__SessionState_Init__AcquiresWithReuse(void **state)
  * Checks if SessionState_Init fails when no more SessionState entry
  * is available to satisfy a new request
  */
-void
+static void
 test__SessionState_Init__FailsIfNoFreeSessionStateEntry(void **state)
 {
 	/* Only 3 entries to exhaust the entries */
 	CreateSessionStateArray(3);
 
 	/* These should be new */
-	SessionState *first = AcquireSessionState(1, gp_sessionstate_loglevel);
-	SessionState *second = AcquireSessionState(2, gp_sessionstate_loglevel);
-	SessionState *third = AcquireSessionState(3, gp_sessionstate_loglevel);
+	AcquireSessionState(1, gp_sessionstate_loglevel);
+	AcquireSessionState(2, gp_sessionstate_loglevel);
+	AcquireSessionState(3, gp_sessionstate_loglevel);
 
 	PG_TRY();
 	{
 		/* No more SessionState entry to satisfy this request */
-		SessionState *fourth = AcquireSessionState(4, FATAL);
+		AcquireSessionState(4, FATAL);
 		assert_false("No ereport(FATAL, ...) was called");
 	}
 	PG_CATCH();
@@ -488,7 +390,7 @@ test__SessionState_Init__FailsIfNoFreeSessionStateEntry(void **state)
  * SessionState entry as appropriate. The usedList, freeList and
  * sessions array are also checked for sanity
  */
-void
+static void
 test__SessionState_Shutdown__ReleaseSessionEntry(void **state)
 {
 	/* Only 3 entries to test the reuse */
@@ -553,7 +455,7 @@ test__SessionState_Shutdown__ReleaseSessionEntry(void **state)
  * Checks if SessionState_Shutdown marks the session clean when the pinCount
  * drops to 0 (i.e., releasing the entry back to the freeList)
  */
-void
+static void
 test__SessionState_Shutdown__MarksSessionCleanUponRelease(void **state)
 {
 	/* Only 3 entries to test the reuse */
@@ -575,9 +477,9 @@ test__SessionState_Shutdown__MarksSessionCleanUponRelease(void **state)
 
 	will_be_called_count(LWLockAcquire, 1);
 	will_be_called_count(LWLockRelease, 1);
-	expect_any_count(LWLockAcquire, lockid, 1);
+	expect_any_count(LWLockAcquire, lock, 1);
 	expect_any_count(LWLockAcquire, mode, 1);
-	expect_any_count(LWLockRelease, lockid, 1);
+	expect_any_count(LWLockRelease, lock, 1);
 
 	/* Bypass assertion */
 	MySessionState = first;
@@ -603,8 +505,6 @@ main(int argc, char* argv[])
 	gp_sessionstate_loglevel = LOG;
 
 	const UnitTest tests[] = {
-		unit_test(test__SessionState_ShmemSize__StructLayout),
-		unit_test(test__SessionState_ShmemSize__CalculatesCorrectSize),
 		unit_test(test__SessionState_ShmemInit__NoOpUnderPostmaster),
 		unit_test(test__SessionState_ShmemInit__InitializesWhenPostmaster),
 		unit_test(test__SessionState_ShmemInit__LinkedListSanity),

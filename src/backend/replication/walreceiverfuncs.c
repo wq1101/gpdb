@@ -6,7 +6,7 @@
  * with the walreceiver process. Functions implementing walreceiver itself
  * are in walreceiver.c.
  *
- * Portions Copyright (c) 2010-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2016, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -24,6 +24,7 @@
 #include <signal.h>
 
 #include "access/xlog_internal.h"
+#include "postmaster/startup.h"
 #include "replication/walreceiver.h"
 #include "storage/pmsignal.h"
 #include "storage/shmem.h"
@@ -31,6 +32,8 @@
 #include "utils/guc.h"
 
 WalRcvData *WalRcv = NULL;
+
+extern volatile bool *pm_launch_walreceiver;
 
 /*
  * How long to wait for walreceiver to start up after requesting
@@ -45,6 +48,7 @@ WalRcvShmemSize(void)
 	Size		size = 0;
 
 	size = add_size(size, sizeof(WalRcvData));
+	size = add_size(size, sizeof(*pm_launch_walreceiver));
 
 	return size;
 }
@@ -57,6 +61,7 @@ WalRcvShmemInit(void)
 
 	WalRcv = (WalRcvData *)
 		ShmemInitStruct("Wal Receiver Ctl", WalRcvShmemSize(), &found);
+	pm_launch_walreceiver = (bool *) (WalRcv + 1);
 
 	if (!found)
 	{
@@ -64,15 +69,17 @@ WalRcvShmemInit(void)
 		MemSet(WalRcv, 0, WalRcvShmemSize());
 		WalRcv->walRcvState = WALRCV_STOPPED;
 		SpinLockInit(&WalRcv->mutex);
+		InitSharedLatch(&WalRcv->latch);
+
+		*pm_launch_walreceiver = false;
 	}
 }
 
-/* Is walreceiver in progress (or starting up)? */
+/* Is walreceiver running (or starting up)? */
 bool
-WalRcvInProgress(void)
+WalRcvRunning(void)
 {
-	/* use volatile pointer to prevent code rearrangement */
-	volatile WalRcvData *walrcv = WalRcv;
+	WalRcvData *walrcv = WalRcv;
 	WalRcvState state;
 	pg_time_t	startTime;
 
@@ -118,14 +125,59 @@ WalRcvInProgress(void)
 }
 
 /*
+ * Is walreceiver running and streaming (or at least attempting to connect,
+ * or starting up)?
+ */
+bool
+WalRcvStreaming(void)
+{
+	WalRcvData *walrcv = WalRcv;
+	WalRcvState state;
+	pg_time_t	startTime;
+
+	SpinLockAcquire(&walrcv->mutex);
+
+	state = walrcv->walRcvState;
+	startTime = walrcv->startTime;
+
+	SpinLockRelease(&walrcv->mutex);
+
+	/*
+	 * If it has taken too long for walreceiver to start up, give up. Setting
+	 * the state to STOPPED ensures that if walreceiver later does start up
+	 * after all, it will see that it's not supposed to be running and die
+	 * without doing anything.
+	 */
+	if (state == WALRCV_STARTING)
+	{
+		pg_time_t	now = (pg_time_t) time(NULL);
+
+		if ((now - startTime) > WALRCV_STARTUP_TIMEOUT)
+		{
+			SpinLockAcquire(&walrcv->mutex);
+
+			if (walrcv->walRcvState == WALRCV_STARTING)
+				state = walrcv->walRcvState = WALRCV_STOPPED;
+
+			SpinLockRelease(&walrcv->mutex);
+		}
+	}
+
+	if (state == WALRCV_STREAMING || state == WALRCV_STARTING ||
+		state == WALRCV_RESTARTING)
+		return true;
+	else
+		return false;
+}
+
+/*
  * Stop walreceiver (if running) and wait for it to die.
  * Executed by the Startup process.
  */
 void
 ShutdownWalRcv(void)
 {
-	/* use volatile pointer to prevent code rearrangement */
-	volatile WalRcvData *walrcv = WalRcv;
+	WalRcvData *walrcv = WalRcv;
 	pid_t		walrcvpid = 0;
 
 	elogif(debug_xlog_record_read, LOG,
@@ -146,7 +198,9 @@ ShutdownWalRcv(void)
 			walrcv->walRcvState = WALRCV_STOPPED;
 			break;
 
-		case WALRCV_RUNNING:
+		case WALRCV_STREAMING:
+		case WALRCV_WAITING:
+		case WALRCV_RESTARTING:
 			walrcv->walRcvState = WALRCV_STOPPING;
 			/* fall through */
 		case WALRCV_STOPPING:
@@ -165,7 +219,7 @@ ShutdownWalRcv(void)
 	 * Wait for walreceiver to acknowledge its death by setting state to
 	 * WALRCV_STOPPED.
 	 */
-	while (WalRcvInProgress())
+	while (WalRcvRunning())
 	{
 		/*
 		 * This possibly-long loop needs to handle interrupts of startup
@@ -184,27 +238,17 @@ ShutdownWalRcv(void)
 /*
  * Request postmaster to start walreceiver.
  *
- * recptr indicates the position where streaming should begin, and conninfo
- * is a libpq connection string to use.
+ * recptr indicates the position where streaming should begin, conninfo
+ * is a libpq connection string to use, and slotname is, optionally, the name
+ * of a replication slot to acquire.
  */
 void
-RequestXLogStreaming(XLogRecPtr recptr, const char *conninfo)
+RequestXLogStreaming(TimeLineID tli, XLogRecPtr recptr, const char *conninfo,
+					 const char *slotname)
 {
-	/* use volatile pointer to prevent code rearrangement */
-	volatile WalRcvData *walrcv = WalRcv;
+	WalRcvData *walrcv = WalRcv;
+	bool		launch = false;
 	pg_time_t	now = (pg_time_t) time(NULL);
-
-	/*
-	 * If it's not stopped, nothing to do.
-	 */
-	if (walrcv->walRcvState != WALRCV_STOPPED)
-	{
-		elogif(debug_xlog_record_read, LOG,
-			   "request streaming -- walreceiver state is %s. Hence, no need "
-			   "to request streaming.", WalRcvGetStateString(walrcv->walRcvState));
-
-		return;
-	}
 
 	/*
 	 * We always start at the beginning of the segment. That prevents a broken
@@ -212,74 +256,115 @@ RequestXLogStreaming(XLogRecPtr recptr, const char *conninfo)
 	 * being created by XLOG streaming, which might cause trouble later on if
 	 * the segment is e.g archived.
 	 */
-	if (recptr.xrecoff % XLogSegSize != 0)
-		recptr.xrecoff -= recptr.xrecoff % XLogSegSize;
+	if (recptr % XLogSegSize != 0)
+		recptr -= recptr % XLogSegSize;
 
 	SpinLockAcquire(&walrcv->mutex);
 
-	/* It better be stopped before we try to restart it */
-	Assert(walrcv->walRcvState == WALRCV_STOPPED);
+	/* It better be stopped if we try to restart it */
+	Assert(walrcv->walRcvState == WALRCV_STOPPED ||
+		   walrcv->walRcvState == WALRCV_WAITING);
 
 	if (conninfo != NULL)
 		strlcpy((char *) walrcv->conninfo, conninfo, MAXCONNINFO);
 	else
 		walrcv->conninfo[0] = '\0';
-	walrcv->walRcvState = WALRCV_STARTING;
+
+	if (slotname != NULL)
+		strlcpy((char *) walrcv->slotname, slotname, NAMEDATALEN);
+	else
+		walrcv->slotname[0] = '\0';
+
+	if (walrcv->walRcvState == WALRCV_STOPPED)
+	{
+		launch = true;
+		walrcv->walRcvState = WALRCV_STARTING;
+	}
+	else
+		walrcv->walRcvState = WALRCV_RESTARTING;
 	walrcv->startTime = now;
 
 	/*
-	 * If this is the first startup of walreceiver, we initialize receivedUpto
-	 * and latestChunkStart to receiveStart.
+	 * If this is the first startup of walreceiver (on this timeline),
+	 * initialize receivedUpto and latestChunkStart to the starting point.
 	 */
-	if (walrcv->receiveStart.xlogid == 0 &&
-		walrcv->receiveStart.xrecoff == 0)
+	if (walrcv->receiveStart == 0 || walrcv->receivedTLI != tli)
 	{
 		walrcv->receivedUpto = recptr;
+		walrcv->receivedTLI = tli;
 		walrcv->latestChunkStart = recptr;
 	}
 	walrcv->receiveStart = recptr;
+	walrcv->receiveStartTLI = tli;
 
 	SpinLockRelease(&walrcv->mutex);
 
-	SendPostmasterSignal(PMSIGNAL_START_WALRECEIVER);
-
-	elogif(debug_xlog_record_read, LOG,
-		   "request streaming -- spawning walreceiver requested with "
-		   "receivestart = %X/%X",
-		   walrcv->receiveStart.xlogid, walrcv->receiveStart.xrecoff);
-
+	if (launch)
+		SendPostmasterSignal(PMSIGNAL_START_WALRECEIVER);
+	else
+		SetLatch(&walrcv->latch);
 }
 
 /*
  * Returns the last+1 byte position that walreceiver has written.
  *
  * Optionally, returns the previous chunk start, that is the first byte
- * written in the most recent walreceiver flush cycle.	Callers not
- * interested in that value may pass NULL for latestChunkStart.
+ * written in the most recent walreceiver flush cycle.  Callers not
+ * interested in that value may pass NULL for latestChunkStart. Same for
+ * receiveTLI.
  */
 XLogRecPtr
-GetWalRcvWriteRecPtr(XLogRecPtr *latestChunkStart)
+GetWalRcvWriteRecPtr(XLogRecPtr *latestChunkStart, TimeLineID *receiveTLI)
 {
-	/* use volatile pointer to prevent code rearrangement */
-	volatile WalRcvData *walrcv = WalRcv;
+	WalRcvData *walrcv = WalRcv;
 	XLogRecPtr	recptr;
 
 	SpinLockAcquire(&walrcv->mutex);
 	recptr = walrcv->receivedUpto;
 	if (latestChunkStart)
 		*latestChunkStart = walrcv->latestChunkStart;
+	if (receiveTLI)
+		*receiveTLI = walrcv->receivedTLI;
 	SpinLockRelease(&walrcv->mutex);
 
 	return recptr;
 }
 
 /*
- * Returns the replication apply delay in ms
+ * Returns the replication apply delay in ms or -1
+ * if the apply delay info is not available
  */
 int
 GetReplicationApplyDelay(void)
 {
-	return 0;
+	WalRcvData *walrcv = WalRcv;
+	XLogRecPtr	receivePtr;
+	XLogRecPtr	replayPtr;
+
+	long		secs;
+	int			usecs;
+
+	TimestampTz	chunkReplayStartTime;
+
+	SpinLockAcquire(&walrcv->mutex);
+	receivePtr = walrcv->receivedUpto;
+	SpinLockRelease(&walrcv->mutex);
+
+	replayPtr = GetXLogReplayRecPtr(NULL);
+
+	if (receivePtr == replayPtr)
+		return 0;
+
+	chunkReplayStartTime = GetCurrentChunkReplayStartTime();
+
+	if (chunkReplayStartTime == 0)
+		return -1;
+
+	TimestampDifference(chunkReplayStartTime,
+						GetCurrentTimestamp(),
+						&secs, &usecs);
+
+	return (((int) secs * 1000) + (usecs / 1000));
 }
 
 /*
@@ -289,8 +374,7 @@ GetReplicationApplyDelay(void)
 int
 GetReplicationTransferLatency(void)
 {
-	/* use volatile pointer to prevent code rearrangement */
-	volatile WalRcvData *walrcv = WalRcv;
+	WalRcvData *walrcv = WalRcv;
 
 	TimestampTz lastMsgSendTime;
 	TimestampTz lastMsgReceiptTime;

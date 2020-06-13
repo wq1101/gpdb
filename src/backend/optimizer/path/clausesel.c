@@ -5,24 +5,24 @@
  *
  * Portions Copyright (c) 2006-2008, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/optimizer/path/clausesel.c,v 1.94 2008/10/04 21:56:53 tgl Exp $
+ *	  src/backend/optimizer/path/clausesel.c
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
-#include "catalog/pg_operator.h"
+#include <math.h>
+
 #include "nodes/makefuncs.h"
 #include "optimizer/clauses.h"
 #include "optimizer/cost.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/plancat.h"
-#include "parser/parsetree.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/selfuncs.h"
@@ -82,7 +82,7 @@ cmpSelectivity
  * See clause_selectivity() for the meaning of the additional parameters.
  *
  * Our basic approach is to take the product of the selectivities of the
- * subclauses.	However, that's only right if the subclauses have independent
+ * subclauses.  However, that's only right if the subclauses have independent
  * probabilities, and in reality they are often NOT independent.  So,
  * we want to be smarter where we can.
 
@@ -99,12 +99,12 @@ cmpSelectivity
  * see that hisel is the fraction of the range below the high bound, while
  * losel is the fraction above the low bound; so hisel can be interpreted
  * directly as a 0..1 value but we need to convert losel to 1-losel before
- * interpreting it as a value.	Then the available range is 1-losel to hisel.
+ * interpreting it as a value.  Then the available range is 1-losel to hisel.
  * However, this calculation double-excludes nulls, so really we need
  * hisel + losel + null_frac - 1.)
  *
  * If either selectivity is exactly DEFAULT_INEQ_SEL, we forget this equation
- * and instead use DEFAULT_RANGE_INEQ_SEL.	The same applies if the equation
+ * and instead use DEFAULT_RANGE_INEQ_SEL.  The same applies if the equation
  * yields an impossible (negative) result.
  *
  * A free side-effect is that we can recognize redundant inequalities such
@@ -118,6 +118,7 @@ clauselist_selectivity(PlannerInfo *root,
 					   List *clauses,
 					   int varRelid,
 					   JoinType jointype,
+					   SpecialJoinInfo *sjinfo,
 					   bool use_damping)
 {
 	Selectivity s1 = 1.0;
@@ -132,12 +133,12 @@ clauselist_selectivity(PlannerInfo *root,
 	rgsel = (Selectivity *) palloc(sizeof(Selectivity) * list_length(clauses));
 
 	/*
-	 * If there's exactly one clause, then no use in trying to match up
-	 * pairs, so just go directly to clause_selectivity().
+	 * If there's exactly one clause, then no use in trying to match up pairs,
+	 * so just go directly to clause_selectivity().
 	 */
 	if (list_length(clauses) == 1)
 		return clause_selectivity(root, (Node *) linitial(clauses),
-								  varRelid, jointype, use_damping);
+								  varRelid, jointype, sjinfo, use_damping);
 
 	/*
 	 * Initial scan over clauses.  Anything that doesn't look like a potential
@@ -151,7 +152,7 @@ clauselist_selectivity(PlannerInfo *root,
 		Selectivity s2;
 
 		/* Always compute the selectivity using clause_selectivity */
-		s2 = clause_selectivity(root, clause, varRelid, jointype, use_damping);
+		s2 = clause_selectivity(root, clause, varRelid, jointype, sjinfo, use_damping);
 
 		/*
 		 * Check for being passed a RestrictInfo.
@@ -205,7 +206,7 @@ clauselist_selectivity(PlannerInfo *root,
 			{
 				/*
 				 * If it's not a "<" or ">" operator, just merge the
-				 * selectivity in generically.	But if it's the right oprrest,
+				 * selectivity in generically.  But if it's the right oprrest,
 				 * add the clause to rqlist for later processing.
 				 */
 				switch (get_oprrest(expr->opno))
@@ -258,9 +259,8 @@ clauselist_selectivity(PlannerInfo *root,
 				s2 = rqlist->hibound + rqlist->lobound - 1.0;
 
 				/* Adjust for double-exclusion of NULLs */
-				/* HACK: disable nulltestsel's special outer-join logic */
 				s2 += nulltestsel(root, IS_NULL, rqlist->var,
-								  varRelid, JOIN_INNER);
+								  varRelid, jointype, sjinfo);
 
 				/*
 				 * A zero or slightly negative s2 should be converted into a
@@ -335,7 +335,7 @@ clauselist_selectivity(PlannerInfo *root,
 	 * For Anti Semi Join, selectivity is determined by the fraction of 
 	 * tuples that do no match 
 	 */
-	if (JOIN_LASJ == jointype || JOIN_LASJ_NOTIN == jointype)
+	if (JOIN_ANTI == jointype || JOIN_LASJ_NOTIN == jointype)
 	{
 		s1 = (1 - s1);
 	}
@@ -461,6 +461,50 @@ bms_is_subset_singleton(const Bitmapset *s, int x)
 	return false;
 }
 
+/*
+ * treat_as_join_clause -
+ *	  Decide whether an operator clause is to be handled by the
+ *	  restriction or join estimator.  Subroutine for clause_selectivity().
+ */
+static inline bool
+treat_as_join_clause(Node *clause, RestrictInfo *rinfo,
+					 int varRelid, SpecialJoinInfo *sjinfo)
+{
+	if (varRelid != 0)
+	{
+		/*
+		 * Caller is forcing restriction mode (eg, because we are examining an
+		 * inner indexscan qual).
+		 */
+		return false;
+	}
+	else if (sjinfo == NULL)
+	{
+		/*
+		 * It must be a restriction clause, since it's being evaluated at a
+		 * scan node.
+		 */
+		return false;
+	}
+	else
+	{
+		/*
+		 * Otherwise, it's a join if there's more than one relation used. We
+		 * can optimize this calculation if an rinfo was passed.
+		 *
+		 * XXX	Since we know the clause is being evaluated at a join, the
+		 * only way it could be single-relation is if it was delayed by outer
+		 * joins.  Although we can make use of the restriction qual estimators
+		 * anyway, it seems likely that we ought to account for the
+		 * probability of injected nulls somehow.
+		 */
+		if (rinfo)
+			return (bms_membership(rinfo->clause_relids) == BMS_MULTIPLE);
+		else
+			return (NumRelids(clause) > 1);
+	}
+}
+
 
 /*
  * clause_selectivity -
@@ -479,17 +523,33 @@ bms_is_subset_singleton(const Bitmapset *s, int x)
  * nestloop join's inner relation --- varRelid should then be the ID of the
  * inner relation.
  *
- * When varRelid is 0, all variables are treated as variables.	This
+ * When varRelid is 0, all variables are treated as variables.  This
  * is appropriate for ordinary join clauses and restriction clauses.
  *
  * jointype is the join type, if the clause is a join clause.  Pass JOIN_INNER
- * if the clause isn't a join clause or the context is uncertain.
+ * if the clause isn't a join clause.
+ *
+ * sjinfo is NULL for a non-join clause, otherwise it provides additional
+ * context information about the join being performed.  There are some
+ * special cases:
+ *	1. For a special (not INNER) join, sjinfo is always a member of
+ *	   root->join_info_list.
+ *	2. For an INNER join, sjinfo is just a transient struct, and only the
+ *	   relids and jointype fields in it can be trusted.
+ * It is possible for jointype to be different from sjinfo->jointype.
+ * This indicates we are considering a variant join: either with
+ * the LHS and RHS switched, or with one input unique-ified.
+ *
+ * Note: when passing nonzero varRelid, it's normally appropriate to set
+ * jointype == JOIN_INNER, sjinfo == NULL, even if the clause is really a
+ * join clause; because we aren't treating it as a join clause.
  */
 Selectivity
 clause_selectivity(PlannerInfo *root,
 				   Node *clause,
 				   int varRelid,
 				   JoinType jointype,
+				   SpecialJoinInfo *sjinfo,
 				   bool use_damping)
 {
 	Selectivity s1 = 0.5;		/* default for any unhandled clause type */
@@ -506,7 +566,7 @@ clause_selectivity(PlannerInfo *root,
 		/*
 		 * If the clause is marked pseudoconstant, then it will be used as a
 		 * gating qual and should not affect selectivity estimates; hence
-		 * return 1.0.	The only exception is that a constant FALSE may be
+		 * return 1.0.  The only exception is that a constant FALSE may be
 		 * taken as having selectivity 0.0, since it will surely mean no rows
 		 * out of the plan.  This case is simple enough that we need not
 		 * bother caching the result.
@@ -520,42 +580,35 @@ clause_selectivity(PlannerInfo *root,
 		/*
 		 * If the clause is marked redundant, always return 1.0.
 		 */
-		if (rinfo->this_selec > 1)
+		if (rinfo->norm_selec > 1)
 			return (Selectivity) 1.0;
 
 		/*
 		 * If possible, cache the result of the selectivity calculation for
-		 * the clause.	We can cache if varRelid is zero or the clause
+		 * the clause.  We can cache if varRelid is zero or the clause
 		 * contains only vars of that relid --- otherwise varRelid will affect
-		 * the result, so mustn't cache.  We also have to be careful about the
-		 * jointype.  It's OK to cache when jointype is JOIN_INNER or one of
-		 * the outer join types (any given outer-join clause should always be
-		 * examined with the same jointype, so result won't change). It's not
-		 * OK to cache when jointype is one of the special types associated
-		 * with IN processing, because the same clause may be examined with
-		 * different jointypes and the result should vary.
+		 * the result, so mustn't cache.  Outer join quals might be examined
+		 * with either their join's actual jointype or JOIN_INNER, so we need
+		 * two cache variables to remember both cases.  Note: we assume the
+		 * result won't change if we are switching the input relations or
+		 * considering a unique-ified case, so we only need one cache variable
+		 * for all non-JOIN_INNER cases.
 		 */
 		if (varRelid == 0 ||
 			bms_is_subset_singleton(rinfo->clause_relids, varRelid))
 		{
-			switch (jointype)
+			/* Cacheable --- do we already have the result? */
+			if (jointype == JOIN_INNER)
 			{
-				case JOIN_INNER:
-				case JOIN_LEFT:
-				case JOIN_LASJ:
-				case JOIN_LASJ_NOTIN:
-				case JOIN_FULL:
-				case JOIN_RIGHT:
-					/* Cacheable --- do we already have the result? */
-					if (rinfo->this_selec >= 0)
-						return rinfo->this_selec;
-					cacheable = true;
-					break;
-
-                default:
-					/* unsafe to cache */
-					break;
+				if (rinfo->norm_selec >= 0)
+					return rinfo->norm_selec;
 			}
+			else
+			{
+				if (rinfo->outer_selec >= 0)
+					return rinfo->outer_selec;
+			}
+			cacheable = true;
 		}
 
 		/*
@@ -580,17 +633,8 @@ clause_selectivity(PlannerInfo *root,
 		if (var->varlevelsup == 0 &&
 			(varRelid == 0 || varRelid == (int) var->varno))
 		{
-			/*
-			 * A Var at the top of a clause must be a bool Var. This is
-			 * equivalent to the clause reln.attribute = 't', so we
-			 * compute the selectivity as if that is what we have.
-			 */
-			s1 = restriction_selectivity(root,
-										 BooleanEqualOperator,
-										 list_make2(var,
-													makeBoolConst(true,
-																  false)),
-										 varRelid);
+			/* Use the restriction selectivity function for a bool Var */
+			s1 = boolvarsel(root, (Node *) var, varRelid);
 		}
 	}
 	else if (IsA(clause, Const))
@@ -626,6 +670,7 @@ clause_selectivity(PlannerInfo *root,
 								  (Node *) get_notclausearg((Expr *) clause),
 									  varRelid,
 									  jointype,
+									  sjinfo,
 									  use_damping);
 	}
 	else if (and_clause(clause))
@@ -635,6 +680,7 @@ clause_selectivity(PlannerInfo *root,
 									((BoolExpr *) clause)->args,
 									varRelid,
 									jointype,
+									sjinfo,
 									use_damping);
 	}
 	else if (or_clause(clause))
@@ -654,6 +700,7 @@ clause_selectivity(PlannerInfo *root,
 												(Node *) lfirst(arg),
 												varRelid,
 												jointype,
+												sjinfo,
 												use_damping);
 
 			s1 = s1 + s2 - s1 * s2;
@@ -661,43 +708,24 @@ clause_selectivity(PlannerInfo *root,
 	}
 	else if (is_opclause(clause) || IsA(clause, DistinctExpr))
 	{
-		Oid			opno = ((OpExpr *) clause)->opno;
-		bool		is_join_clause;
+		OpExpr	   *opclause = (OpExpr *) clause;
+		Oid			opno = opclause->opno;
 
-		if (varRelid != 0)
-		{
-			/*
-			 * If we are considering a nestloop join then all clauses are
-			 * restriction clauses, since we are only interested in the one
-			 * relation.
-			 */
-			is_join_clause = false;
-		}
-		else
-		{
-			/*
-			 * Otherwise, it's a join if there's more than one relation used.
-			 * We can optimize this calculation if an rinfo was passed.
-			 */
-			if (rinfo)
-				is_join_clause = (bms_membership(rinfo->clause_relids) ==
-								  BMS_MULTIPLE);
-			else
-				is_join_clause = (NumRelids(clause) > 1);
-		}
-
-		if (is_join_clause)
+		if (treat_as_join_clause(clause, rinfo, varRelid, sjinfo))
 		{
 			/* Estimate selectivity for a join clause. */
 			s1 = join_selectivity(root, opno,
-								  ((OpExpr *) clause)->args,
-								  jointype);
+								  opclause->args,
+								  opclause->inputcollid,
+								  jointype,
+								  sjinfo);
 		}
 		else
 		{
 			/* Estimate selectivity for a restriction clause. */
 			s1 = restriction_selectivity(root, opno,
-										 ((OpExpr *) clause)->args,
+										 opclause->args,
+										 opclause->inputcollid,
 										 varRelid);
 		}
 
@@ -710,57 +738,16 @@ clause_selectivity(PlannerInfo *root,
 		if (IsA(clause, DistinctExpr))
 			s1 = 1.0 - s1;
 	}
-	else if (is_funcclause(clause))
-	{
-		/*
-		 * This is not an operator, so we guess at the selectivity. THIS IS A
-		 * HACK TO GET V4 OUT THE DOOR.  FUNCS SHOULD BE ABLE TO HAVE
-		 * SELECTIVITIES THEMSELVES.	   -- JMH 7/9/92
-		 */
-		s1 = (Selectivity) 0.3333333;
-	}
-#ifdef NOT_USED
-	else if (is_subplan(clause))
-	{
-		/*
-		 * Just for the moment! FIX ME! - vadim 02/04/98
-		 */
-		s1 = (Selectivity) 0.5;
-	}
-#endif
 	else if (IsA(clause, ScalarArrayOpExpr))
 	{
-		/* First, decide if it's a join clause, same as for OpExpr */
-		bool		is_join_clause;
-
-		if (varRelid != 0)
-		{
-			/*
-			 * If we are considering a nestloop join then all clauses are
-			 * restriction clauses, since we are only interested in the one
-			 * relation.
-			 */
-			is_join_clause = false;
-		}
-		else
-		{
-			/*
-			 * Otherwise, it's a join if there's more than one relation used.
-			 * We can optimize this calculation if an rinfo was passed.
-			 */
-			if (rinfo)
-				is_join_clause = (bms_membership(rinfo->clause_relids) ==
-								  BMS_MULTIPLE);
-			else
-				is_join_clause = (NumRelids(clause) > 1);
-		}
-
 		/* Use node specific selectivity calculation function */
 		s1 = scalararraysel(root,
 							(ScalarArrayOpExpr *) clause,
-							is_join_clause,
+							treat_as_join_clause(clause, rinfo,
+												 varRelid, sjinfo),
 							varRelid,
-							jointype);
+							jointype,
+							sjinfo);
 	}
 	else if (IsA(clause, RowCompareExpr))
 	{
@@ -768,7 +755,8 @@ clause_selectivity(PlannerInfo *root,
 		s1 = rowcomparesel(root,
 						   (RowCompareExpr *) clause,
 						   varRelid,
-						   jointype);
+						   jointype,
+						   sjinfo);
 	}
 	else if (IsA(clause, NullTest))
 	{
@@ -777,7 +765,8 @@ clause_selectivity(PlannerInfo *root,
 						 ((NullTest *) clause)->nulltesttype,
 						 (Node *) ((NullTest *) clause)->arg,
 						 varRelid,
-						 jointype);
+						 jointype,
+						 sjinfo);
 	}
 	else if (IsA(clause, BooleanTest))
 	{
@@ -786,7 +775,8 @@ clause_selectivity(PlannerInfo *root,
 						 ((BooleanTest *) clause)->booltesttype,
 						 (Node *) ((BooleanTest *) clause)->arg,
 						 varRelid,
-						 jointype);
+						 jointype,
+						 sjinfo);
 	}
 	else if (IsA(clause, CurrentOfExpr))
 	{
@@ -804,6 +794,7 @@ clause_selectivity(PlannerInfo *root,
 								(Node *) ((RelabelType *) clause)->arg,
 								varRelid,
 								jointype,
+								sjinfo,
 								use_damping);
 	}
 	else if (IsA(clause, CoerceToDomain))
@@ -813,12 +804,29 @@ clause_selectivity(PlannerInfo *root,
 								(Node *) ((CoerceToDomain *) clause)->arg,
 								varRelid,
 								jointype,
+								sjinfo,
 								use_damping);
+	}
+	else
+	{
+		/*
+		 * For anything else, see if we can consider it as a boolean variable.
+		 * This only works if it's an immutable expression in Vars of a single
+		 * relation; but there's no point in us checking that here because
+		 * boolvarsel() will do it internally, and return a suitable default
+		 * selectivity if not.
+		 */
+		s1 = boolvarsel(root, clause, varRelid);
 	}
 
 	/* Cache the result if possible */
 	if (cacheable)
-		rinfo->this_selec = s1;
+	{
+		if (jointype == JOIN_INNER)
+			rinfo->norm_selec = s1;
+		else
+			rinfo->outer_selec = s1;
+	}
 
 #ifdef SELECTIVITY_DEBUG
 	elog(DEBUG4, "clause_selectivity: s1 %f", s1);

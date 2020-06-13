@@ -6,10 +6,10 @@
  * NOTE: for historical reasons, this does not correspond to pqcomm.c.
  * pqcomm.c's routines are declared in libpq.h.
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/libpq/pqcomm.h,v 1.111 2010/01/02 16:58:04 momjian Exp $
+ * src/include/libpq/pqcomm.h
  *
  *-------------------------------------------------------------------------
  */
@@ -105,6 +105,10 @@ typedef struct
 #define PG_PROTOCOL_MINOR(v)	((v) & 0x0000ffff)
 #define PG_PROTOCOL(m,n)	(((m) << 16) | (n))
 
+/* GPDB specific */
+#define GPDB_INTERNAL_PROTOCOL(m, n)    PG_PROTOCOL((m) | 0x7000, (n))
+#define IS_GPDB_INTERNAL_PROTOCOL(v)    (((v) >> 28) == 7)
+
 /* The earliest and latest frontend/backend protocol version supported. */
 
 #define PG_PROTOCOL_EARLIEST	PG_PROTOCOL(1,0)
@@ -153,7 +157,7 @@ extern bool Db_user_namespace;
 
 /*
  * In protocol 3.0 and later, the startup packet length is not fixed, but
- * we set an arbitrary limit on it anyway.	This is just to prevent simple
+ * we set an arbitrary limit on it anyway.  This is just to prevent simple
  * denial-of-service attacks via sending enough data to run the server
  * out of memory.
  */
@@ -164,7 +168,7 @@ extern bool Db_user_namespace;
 
 #define AUTH_REQ_OK			0	/* User is authenticated  */
 #define AUTH_REQ_KRB4		1	/* Kerberos V4. Not supported any more. */
-#define AUTH_REQ_KRB5		2	/* Kerberos V5 */
+#define AUTH_REQ_KRB5		2	/* Kerberos V5. Not supported any more. */
 #define AUTH_REQ_PASSWORD	3	/* Password */
 #define AUTH_REQ_CRYPT		4	/* crypt password. Not supported any more. */
 #define AUTH_REQ_MD5		5	/* md5 password */
@@ -172,6 +176,8 @@ extern bool Db_user_namespace;
 #define AUTH_REQ_GSS		7	/* GSSAPI without wrap() */
 #define AUTH_REQ_GSS_CONT	8	/* Continue GSS exchanges */
 #define AUTH_REQ_SSPI		9	/* SSPI negotiate without wrap() */
+#define AUTH_REQ_SASL	   10	/* SASL authentication. Not supported before
+								 * libpq version 10. */
 
 typedef uint32 AuthRequest;
 
@@ -210,21 +216,13 @@ typedef struct CancelRequestPacket
  */
 #define NEGOTIATE_SSL_CODE PG_PROTOCOL(1234,5679)
 
-/*
- * Filerep Add a pre-startup message primary-mirror-transition-request,
- * and a primary-mirror-transition-query
- */
-#define PRIMARY_MIRROR_TRANSITION_REQUEST_CODE PG_PROTOCOL(1234,5680)
-#define PRIMARY_MIRROR_TRANSITION_QUERY_CODE PG_PROTOCOL(1234,5681)
-
-typedef struct PrimaryMirrorTransitionPacket
-{
-	MsgType protocolCode;
-	uint32 dataLength;
-} PrimaryMirrorTransitionPacket;
-
 /* the number of times trying to acquire the send mutex for the front
  * end connection after detecting process is exitting */
 #define PQ_BUSY_TEST_COUNT_IN_EXITING 5
+
+#define GPCONN_TYPE "gpconntype"
+#define GPCONN_TYPE_FTS "fts"
+#define GPCONN_TYPE_FAULT "fault"
+#define GPCONN_TYPE_INTERNAL "internal"
 
 #endif   /* PQCOMM_H */

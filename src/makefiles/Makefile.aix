@@ -9,18 +9,18 @@ AROPT = crs
 libpath := $(shell echo $(subst -L,:,$(filter -L/%,$(LDFLAGS))) | sed -e's/ //g'):/usr/lib:/lib
 
 ifeq ($(host_os), aix3.2.5)
-	rpath = -L$(rpathdir)
+	rpath = -L'$(rpathdir)'
 else
-	rpath = -Wl,-blibpath:$(rpathdir)$(libpath)
+	rpath = -Wl,-blibpath:'$(rpathdir)$(libpath)'
 endif
 
 DLSUFFIX = .so
 ifeq ($(host_os), aix3.2.5)
 ifneq ($(GCC), yes)
-	LDFLAGS_SL = -e _nostart -H512 -bM:SRE
+	LDFLAGS_SL += -e _nostart -H512 -bM:SRE
 endif
 else
-	LDFLAGS_SL = -Wl,-bnoentry -Wl,-H512 -Wl,-bM:SRE
+	LDFLAGS_SL += -Wl,-bnoentry -Wl,-H512 -Wl,-bM:SRE
 endif
 
 
@@ -32,13 +32,12 @@ else
 BE_DLLLIBS= -Wl,-bI:$(top_builddir)/src/backend/$(POSTGRES_IMP)
 endif
 
-MKLDEXPORT=$(top_srcdir)/src/backend/port/aix/mkldexport.sh
-EXPSUFF=.exp
+MKLDEXPORT_DIR=src/backend/port/aix
+MKLDEXPORT=$(top_srcdir)/$(MKLDEXPORT_DIR)/mkldexport.sh
 
 %.exp: %.o
 	$(MKLDEXPORT) $^ >$@
 
+# Rule for building a shared library from a single .o file
 %$(DLSUFFIX): %.o %.exp
-	$(CC) $(CFLAGS) $(LDFLAGS) $(LDFLAGS_SL) -o $@ $*.o -Wl,-bE:$*.exp $(SHLIB_LINK)
-
-sqlmansect = 7
+	$(CC) $(CFLAGS) $(LDFLAGS) $(LDFLAGS_SL) -o $@ $*.o -Wl,-bE:$*.exp $(BE_DLLLIBS)

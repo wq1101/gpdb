@@ -23,7 +23,6 @@ drop table ow_vendor;
 drop table ow_product;
 drop table ow_sale;
 drop table ow_sale_ord;
-drop table ow_util;
 
 create table ow_customer 
 (
@@ -82,14 +81,6 @@ create table ow_sale_ord
 	
 ) distributed by (cn,vn,pn);
 
-create table ow_util
-(
-	xn int not null,
-	
-	primary key (xn)
-	
-) distributed by (xn);
-
 -- Customers
 insert into ow_customer values 
   ( 1, 'Macbeth', 'Inverness'),
@@ -146,14 +137,6 @@ insert into ow_sale_ord values
   ( 10,3, 30, 600, '1401-6-1', 12, 5),
   ( 11,4, 40, 700, '1401-6-1', 1, 1),
   ( 12,4, 40, 800, '1401-6-1', 1, 1);
-
--- ow_util
-
-insert into ow_util values 
-  (1),
-  (20),
-  (300);
-
 -- end_ignore
 
 set datestyle="ISO, MDY";
@@ -23888,7 +23871,7 @@ select cn,vn,ntile(qty) over(partition by cn order by vn) from ow_sale;
 select cn,vn,ntile(cn) over(partition by cn+vn order by vn) from ow_sale;
 select cn,vn,ntile(cn+vn) over(partition by cn+vn order by vn) from ow_sale; --mvd 1,2->3
 
-select ow_count_operator('select * from ow_sale order by first_value(NULL) over (partition by cn order by case when 1=1 then pn else vn end);', 'Window') > 0;
+select ow_count_operator('select * from ow_sale order by first_value(NULL::text) over (partition by cn order by case when 1=1 then pn else vn end);', 'Window') > 0;
 
 drop table if exists tab12773_test;
 
@@ -24037,9 +24020,6 @@ SELECT a,color,sum(a) over (partition by member_id,color) FROM tab12773_test ord
 SELECT member_id,a,color,sum(a) over (partition by member_id,color) FROM tab12773_test order by member_id,name;
 
 -- This is a test for a bug in parallel window planning in the GPDB postgres planner
-SET gp_enable_sequential_window_plans = off;
-SELECT avg(vn) OVER (PARTITION BY cn) FROM ow_sale;
-SET gp_enable_sequential_window_plans = on;
 SELECT avg(vn) OVER (PARTITION BY cn) FROM ow_sale;
 
 -- start_ignore
@@ -24050,6 +24030,5 @@ drop table ow_vendor;
 drop table ow_product;
 drop table ow_sale;
 drop table ow_sale_ord;
-drop table ow_util;
-drop function ow_count_operator;
+drop function ow_count_operator(text, text);
 -- end_ignore

@@ -3,12 +3,12 @@
  * oid.c
  *	  Functions for the built-in type Oid ... also oidvector.
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/adt/oid.c,v 1.73 2008/01/01 19:45:52 momjian Exp $
+ *	  src/backend/utils/adt/oid.c
  *
  *-------------------------------------------------------------------------
  */
@@ -40,7 +40,8 @@ oidin_subr(const char *s, char **endloc)
 	if (*s == '\0')
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-				 errmsg("invalid input syntax for type oid: \"%s\"",s)));
+				 errmsg("invalid input syntax for type oid: \"%s\"",
+						s)));
 
 	errno = 0;
 	cvt = strtoul(s, &endptr, 10);
@@ -53,12 +54,14 @@ oidin_subr(const char *s, char **endloc)
 	if (errno && errno != ERANGE && errno != EINVAL)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-				 errmsg("invalid input syntax for type oid: \"%s\"",s)));
+				 errmsg("invalid input syntax for type oid: \"%s\"",
+						s)));
 
 	if (endptr == s && *s != '\0')
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-				 errmsg("invalid input syntax for type oid: \"%s\"",s)));
+				 errmsg("invalid input syntax for type oid: \"%s\"",
+						s)));
 
 	if (errno == ERANGE)
 		ereport(ERROR,
@@ -78,7 +81,8 @@ oidin_subr(const char *s, char **endloc)
 		if (*endptr)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-					 errmsg("invalid input syntax for type oid: \"%s\"",s)));
+					 errmsg("invalid input syntax for type oid: \"%s\"",
+							s)));
 	}
 
 	result = (Oid) cvt;
@@ -259,7 +263,8 @@ oidvectorrecv(PG_FUNCTION_ARGS)
 	 * fcinfo->flinfo->fn_extra.  So we need to pass it our own flinfo
 	 * parameter.
 	 */
-	InitFunctionCallInfoData(locfcinfo, fcinfo->flinfo, 3, NULL, NULL);
+	InitFunctionCallInfoData(locfcinfo, fcinfo->flinfo, 3,
+							 InvalidOid, NULL, NULL);
 
 	locfcinfo.arg[0] = PointerGetDatum(buf);
 	locfcinfo.arg[1] = ObjectIdGetDatum(OIDOID);
@@ -272,13 +277,21 @@ oidvectorrecv(PG_FUNCTION_ARGS)
 
 	Assert(!locfcinfo.isnull);
 
-	/* sanity checks: oidvector must be 1-D, no nulls */
+	/* sanity checks: oidvector must be 1-D, 0-based, no nulls */
 	if (ARR_NDIM(result) != 1 ||
 		ARR_HASNULL(result) ||
-		ARR_ELEMTYPE(result) != OIDOID)
+		ARR_ELEMTYPE(result) != OIDOID ||
+		ARR_LBOUND(result)[0] != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
 				 errmsg("invalid oidvector data")));
+
+	/* check length for consistency with oidvectorin() */
+	if (ARR_DIMS(result)[0] > FUNC_MAX_ARGS)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("oidvector has too many elements")));
+
 	PG_RETURN_POINTER(result);
 }
 
@@ -289,6 +302,30 @@ Datum
 oidvectorsend(PG_FUNCTION_ARGS)
 {
 	return array_send(fcinfo);
+}
+
+/*
+ *		oidparse				- get OID from IConst/FConst node
+ */
+Oid
+oidparse(Node *node)
+{
+	switch (nodeTag(node))
+	{
+		case T_Integer:
+			return intVal(node);
+		case T_Float:
+
+			/*
+			 * Values too large for int4 will be represented as Float
+			 * constants by the lexer.  Accept these if they are valid OID
+			 * strings.
+			 */
+			return oidin_subr(strVal(node), NULL);
+		default:
+			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(node));
+	}
+	return InvalidOid;			/* keep compiler quiet */
 }
 
 

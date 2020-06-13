@@ -23,40 +23,24 @@ class GPCatalogException(Exception):
 
 # Hard coded since "master only" is not defined in the catalog
 MASTER_ONLY_TABLES = [
-    'gp_configuration',
     'gp_configuration_history',
-    'gp_distribution_policy',
-    'gp_db_interfaces',
-    'gp_interfaces',
     'gp_segment_configuration',
+    'pg_auth_time_constraint',
     'pg_description',
-    'pg_listener',  # ???
     'pg_partition',
+    'pg_partition_encoding',
     'pg_partition_rule',
     'pg_shdescription',
     'pg_stat_last_operation',
     'pg_stat_last_shoperation',
     'pg_statistic',
-    'pg_filespace_entry',
-    'pg_partition_encoding',
-    'pg_auth_time_constraint',
-    ]
-
-# Hard coded since "persistent" is not defined in the catalog
-PERSISTENT_TABLES = [
-    'gp_global_sequence',
-    'gp_persistent_database_node',
-    'gp_persistent_filespace_node',
-    'gp_persistent_relation_node',
-    'gp_persistent_tablespace_node',
-    'gp_relation_node',
     ]
 
 # Hard coded tables that have different values on every segment
 SEGMENT_LOCAL_TABLES = [
+    'gp_fastsequence', # AO segment row id allocations
     'gp_id',
     'pg_shdepend', # (not if we fix oid inconsistencies)
-    'gp_fastsequence', # AO segment row id allocations
     'pg_statistic',
     ]
 
@@ -69,7 +53,6 @@ DEPENDENCY_EXCLUSION = [
     'pg_conversion',
     'pg_database',
     'pg_enum',
-    'pg_filespace',
     'pg_namespace',
     'pg_partition',
     'pg_partition_rule',
@@ -174,7 +157,7 @@ class GPCatalog():
         for [relname, relisshared] in curs.getresult():
             self._tables[relname] = GPCatalogTable(self, relname)
             # Note: stupid API returns t/f for boolean value
-            self._tables[relname]._setShared(relisshared is 't')
+            self._tables[relname]._setShared(relisshared == 't')
         
         # The tidycat.pl utility has been used to generate a json file 
         # describing aspects of the catalog that we can not currently
@@ -213,10 +196,9 @@ class GPCatalog():
 
     def _markMasterOnlyTables(self):
         """
-        We mark three types of catalog tables as "master only"
+        We mark two types of catalog tables as "master only"
           - True "master only" tables
           - Tables we know to have different contents on master/segment
-          - Persistent Tables
 
         While the later two are not technically "master only" they have
         the property that we cannot validate cross segment consistency,
@@ -230,10 +212,6 @@ class GPCatalog():
                 self._tables[name]._setMasterOnly()
 
         for name in SEGMENT_LOCAL_TABLES:
-            if name in self._tables:
-                self._tables[name]._setMasterOnly()
-
-        for name in PERSISTENT_TABLES:
             if name in self._tables:
                 self._tables[name]._setMasterOnly()
 
@@ -309,7 +287,7 @@ class GPCatalog():
         Some catalogs have columns that, for one reason or another, we
         need to mark as being different between the segments and the master.
         
-        These fall into two catagories:
+        These fall into two categories:
            - Bugs (marked with the appropriate jiras)
            - A small number of "special" columns
         """
@@ -320,19 +298,19 @@ class GPCatalog():
         
         # pg_class:
         #   - relfilenode should generally be consistent, but may not be (jira?)
-        #   - relpages/reltuples/relfrozenxid are all vacumm/analyze related
+        #   - relpages/reltuples/relfrozenxid/relminmxid are all vacumm/analyze related
         #   - relhasindex/relhaspkey are only cleared when vacuum completes
         #   - relowner has its own checks:
         #       => may want to separate out "owner" columns like acl and oid
         self._tables['pg_class']._setKnownDifferences(
-            "relfilenode relpages reltuples relhasindex relhaspkey relowner relfrozenxid")
+            "relfilenode relpages reltuples relhasindex relhaspkey relowner relfrozenxid relminmxid relallvisible")
 
         # pg_type: typowner has its own checks:
         #       => may want to separate out "owner" columns like acl and oid
         self._tables['pg_type']._setKnownDifferences("typowner")
 
-        # pg_database: datfrozenxid = vacuum related
-        self._tables['pg_database']._setKnownDifferences("datfrozenxid")
+        # pg_database: datfrozenxid and datminmxid are vacuum related
+        self._tables['pg_database']._setKnownDifferences("datfrozenxid datminmxid")
 
         # -------------
         # Issues still present in the product
@@ -445,7 +423,7 @@ class GPCatalogTable():
         By default excludes the "known differences" columns, to include them
         pass [] as the excluding list.
         '''
-        if excluding == None:
+        if excluding is None:
             excluding = self._excluding
         else:
             excluding = set(excluding)
@@ -526,7 +504,7 @@ class GPCatalogTable():
             self._coltypes[attname] = typname
 
         # If a primary key was not specified try to locate a unique index
-        # If a table has mutiple matching indexes, we'll pick the first index 
+        # If a table has multiple matching indexes, we'll pick the first index
         # order by indkey to avoid the issue of MPP-16663. 
         if self._pkey == []:
             qry = """

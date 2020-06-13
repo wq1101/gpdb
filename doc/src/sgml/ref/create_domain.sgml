@@ -1,11 +1,16 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/create_domain.sgml,v 1.31 2007/02/01 00:28:18 momjian Exp $
+doc/src/sgml/ref/create_domain.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-CREATEDOMAIN">
+ <indexterm zone="sql-createdomain">
+  <primary>CREATE DOMAIN</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="sql-createdomain-title">CREATE DOMAIN</refentrytitle>
+  <refentrytitle>CREATE DOMAIN</refentrytitle>
+  <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
 
@@ -14,17 +19,14 @@ PostgreSQL documentation
   <refpurpose>define a new domain</refpurpose>
  </refnamediv>
 
- <indexterm zone="sql-createdomain">
-  <primary>CREATE DOMAIN</primary>
- </indexterm>
-
  <refsynopsisdiv>
 <synopsis>
 CREATE DOMAIN <replaceable class="parameter">name</replaceable> [ AS ] <replaceable class="parameter">data_type</replaceable>
+    [ COLLATE <replaceable>collation</replaceable> ]
     [ DEFAULT <replaceable>expression</replaceable> ]
     [ <replaceable class="PARAMETER">constraint</replaceable> [ ... ] ]
 
-where <replaceable class="PARAMETER">constraint</replaceable> is:
+<phrase>where <replaceable class="PARAMETER">constraint</replaceable> is:</phrase>
 
 [ CONSTRAINT <replaceable class="PARAMETER">constraint_name</replaceable> ]
 { NOT NULL | NULL | CHECK (<replaceable class="PARAMETER">expression</replaceable>) }
@@ -57,6 +59,11 @@ where <replaceable class="PARAMETER">constraint</replaceable> is:
    Define a domain rather than setting up each table's constraint
    individually.
   </para>
+
+  <para>
+   To be able to create a domain, you must have <literal>USAGE</literal>
+   privilege on the underlying type.
+  </para>
  </refsect1>
 
  <refsect1>
@@ -78,6 +85,18 @@ where <replaceable class="PARAMETER">constraint</replaceable> is:
        <para>
         The underlying data type of the domain. This can include array
         specifiers.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><replaceable>collation</replaceable></term>
+      <listitem>
+       <para>
+        An optional collation for the domain.  If no collation is
+        specified, the underlying data type's default collation is used.
+        The underlying type must be collatable if <literal>COLLATE</>
+        is specified.
        </para>
       </listitem>
      </varlistentry>
@@ -120,7 +139,8 @@ where <replaceable class="PARAMETER">constraint</replaceable> is:
       <term><literal>NOT NULL</literal></term>
       <listitem>
        <para>
-        Values of this domain are not allowed to be null.
+        Values of this domain are prevented from being null
+        (but see notes below).
        </para>
       </listitem>
      </varlistentry>
@@ -143,21 +163,57 @@ where <replaceable class="PARAMETER">constraint</replaceable> is:
    <varlistentry>
     <term><literal>CHECK (<replaceable class="PARAMETER">expression</replaceable>)</literal></term>
     <listitem>
-     <para>
-      <literal>CHECK</literal> clauses specify integrity constraints or tests
+     <para><literal>CHECK</> clauses specify integrity constraints or tests
       which values of the domain must satisfy.
       Each constraint must be an expression
       producing a Boolean result.  It should use the key word <literal>VALUE</literal>
-      to refer to the value being tested.
+      to refer to the value being tested.  Expressions evaluating
+      to TRUE or UNKNOWN succeed.  If the expression produces a FALSE result,
+      an error is reported and the value is not allowed to be converted
+      to the domain type.
      </para>
 
      <para>
       Currently, <literal>CHECK</literal> expressions cannot contain
       subqueries nor refer to variables other than <literal>VALUE</literal>.
      </para>
+
+     <para>
+      When a domain has multiple <literal>CHECK</literal> constraints,
+      they will be tested in alphabetical order by name.
+      (<productname>PostgreSQL</> versions before 9.5 did not honor any
+      particular firing order for <literal>CHECK</literal> constraints.)
+     </para>
     </listitem>
    </varlistentry>
   </variablelist>
+ </refsect1>
+
+ <refsect1>
+  <title>Notes</title>
+
+  <para>
+   Domain constraints, particularly <literal>NOT NULL</>, are checked when
+   converting a value to the domain type.  It is possible for a column that
+   is nominally of the domain type to read as null despite there being such
+   a constraint.  For example, this can happen in an outer-join query, if
+   the domain column is on the nullable side of the outer join.  A more
+   subtle example is
+<programlisting>
+INSERT INTO tab (domcol) VALUES ((SELECT domcol FROM tab WHERE false));
+</programlisting>
+   The empty scalar sub-SELECT will produce a null value that is considered
+   to be of the domain type, so no further constraint checking is applied
+   to it, and the insertion will succeed.
+  </para>
+
+  <para>
+   It is very difficult to avoid such problems, because of SQL's general
+   assumption that a null value is a valid value of every data type.  Best practice
+   therefore is to design a domain's constraints so that a null value is allowed,
+   and then to apply column <literal>NOT NULL</> constraints to columns of
+   the domain type as needed, rather than directly to the domain type.
+  </para>
  </refsect1>
 
  <refsect1>
@@ -171,8 +227,8 @@ where <replaceable class="PARAMETER">constraint</replaceable> is:
 <programlisting>
 CREATE DOMAIN us_postal_code AS TEXT
 CHECK(
-   VALUE ~ '^\\d{5}$'
-OR VALUE ~ '^\\d{5}-\\d{4}$'
+   VALUE ~ '^\d{5}$'
+OR VALUE ~ '^\d{5}-\d{4}$'
 );
 
 CREATE TABLE us_snail_addy (
@@ -183,8 +239,7 @@ CREATE TABLE us_snail_addy (
   city TEXT NOT NULL,
   postal us_postal_code NOT NULL
 );
-</programlisting>
-  </para>
+</programlisting></para>
  </refsect1>
 
  <refsect1 id="SQL-CREATEDOMAIN-compatibility">
@@ -200,8 +255,8 @@ CREATE TABLE us_snail_addy (
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-alterdomain" endterm="sql-alterdomain-title"></member>
-   <member><xref linkend="sql-dropdomain" endterm="sql-dropdomain-title"></member>
+   <member><xref linkend="sql-alterdomain"></member>
+   <member><xref linkend="sql-dropdomain"></member>
   </simplelist>
  </refsect1>
 

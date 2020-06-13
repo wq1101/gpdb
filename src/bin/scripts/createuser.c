@@ -2,17 +2,18 @@
  *
  * createuser
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/bin/scripts/createuser.c,v 1.43 2009/02/26 16:20:55 petere Exp $
+ * src/bin/scripts/createuser.c
  *
  *-------------------------------------------------------------------------
  */
 
 #include "postgres_fe.h"
 #include "common.h"
-#include "dumputils.h"
+#include "fe_utils/simple_list.h"
+#include "fe_utils/string_utils.h"
 
 
 static void help(const char *progname);
@@ -24,6 +25,7 @@ main(int argc, char *argv[])
 		{"host", required_argument, NULL, 'h'},
 		{"port", required_argument, NULL, 'p'},
 		{"username", required_argument, NULL, 'U'},
+		{"role", required_argument, NULL, 'g'},
 		{"no-password", no_argument, NULL, 'w'},
 		{"password", no_argument, NULL, 'W'},
 		{"echo", no_argument, NULL, 'e'},
@@ -37,6 +39,9 @@ main(int argc, char *argv[])
 		{"no-inherit", no_argument, NULL, 'I'},
 		{"login", no_argument, NULL, 'l'},
 		{"no-login", no_argument, NULL, 'L'},
+		{"replication", no_argument, NULL, 1},
+		{"no-replication", no_argument, NULL, 2},
+		{"interactive", no_argument, NULL, 3},
 		/* adduser is obsolete, undocumented spelling of superuser */
 		{"adduser", no_argument, NULL, 'a'},
 		{"no-adduser", no_argument, NULL, 'A'},
@@ -50,12 +55,14 @@ main(int argc, char *argv[])
 	const char *progname;
 	int			optindex;
 	int			c;
-	char	   *newuser = NULL;
+	const char *newuser = NULL;
 	char	   *host = NULL;
 	char	   *port = NULL;
 	char	   *username = NULL;
+	SimpleStringList roles = {NULL, NULL};
 	enum trivalue prompt_password = TRI_DEFAULT;
 	bool		echo = false;
+	bool		interactive = false;
 	char	   *conn_limit = NULL;
 	bool		pwprompt = false;
 	char	   *newpassword = NULL;
@@ -66,6 +73,7 @@ main(int argc, char *argv[])
 				createrole = TRI_DEFAULT,
 				inherit = TRI_DEFAULT,
 				login = TRI_DEFAULT,
+				replication = TRI_DEFAULT,
 				encrypted = TRI_DEFAULT;
 
 	PQExpBufferData sql;
@@ -78,19 +86,22 @@ main(int argc, char *argv[])
 
 	handle_help_version_opts(argc, argv, "createuser", help);
 
-	while ((c = getopt_long(argc, argv, "h:p:U:wWedDsSaArRiIlLc:PEN",
+	while ((c = getopt_long(argc, argv, "h:p:U:g:wWedDsSaArRiIlLc:PEN",
 							long_options, &optindex)) != -1)
 	{
 		switch (c)
 		{
 			case 'h':
-				host = optarg;
+				host = pg_strdup(optarg);
 				break;
 			case 'p':
-				port = optarg;
+				port = pg_strdup(optarg);
 				break;
 			case 'U':
-				username = optarg;
+				username = pg_strdup(optarg);
+				break;
+			case 'g':
+				simple_string_list_append(&roles, optarg);
 				break;
 			case 'w':
 				prompt_password = TRI_NO;
@@ -134,7 +145,7 @@ main(int argc, char *argv[])
 				login = TRI_NO;
 				break;
 			case 'c':
-				conn_limit = optarg;
+				conn_limit = pg_strdup(optarg);
 				break;
 			case 'P':
 				pwprompt = true;
@@ -144,6 +155,15 @@ main(int argc, char *argv[])
 				break;
 			case 'N':
 				encrypted = TRI_NO;
+				break;
+			case 1:
+				replication = TRI_YES;
+				break;
+			case 2:
+				replication = TRI_NO;
+				break;
+			case 3:
+				interactive = true;
 				break;
 			default:
 				fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
@@ -166,7 +186,17 @@ main(int argc, char *argv[])
 	}
 
 	if (newuser == NULL)
-		newuser = simple_prompt("Enter name of role to add: ", 128, true);
+	{
+		if (interactive)
+			newuser = simple_prompt("Enter name of role to add: ", 128, true);
+		else
+		{
+			if (getenv("PGUSER"))
+				newuser = getenv("PGUSER");
+			else
+				newuser = get_user_name_or_exit(progname);
+		}
+	}
 
 	if (pwprompt)
 	{
@@ -186,7 +216,7 @@ main(int argc, char *argv[])
 
 	if (superuser == 0)
 	{
-		if (yesno_prompt("Shall the new role be a superuser?"))
+		if (interactive && yesno_prompt("Shall the new role be a superuser?"))
 			superuser = TRI_YES;
 		else
 			superuser = TRI_NO;
@@ -201,7 +231,7 @@ main(int argc, char *argv[])
 
 	if (createdb == 0)
 	{
-		if (yesno_prompt("Shall the new role be allowed to create databases?"))
+		if (interactive && yesno_prompt("Shall the new role be allowed to create databases?"))
 			createdb = TRI_YES;
 		else
 			createdb = TRI_NO;
@@ -209,7 +239,7 @@ main(int argc, char *argv[])
 
 	if (createrole == 0)
 	{
-		if (yesno_prompt("Shall the new role be allowed to create more new roles?"))
+		if (interactive && yesno_prompt("Shall the new role be allowed to create more new roles?"))
 			createrole = TRI_YES;
 		else
 			createrole = TRI_NO;
@@ -221,7 +251,8 @@ main(int argc, char *argv[])
 	if (login == 0)
 		login = TRI_YES;
 
-	conn = connectDatabase("postgres", host, port, username, prompt_password, progname);
+	conn = connectDatabase("postgres", host, port, username, prompt_password,
+						   progname, echo, false, false);
 
 	initPQExpBuffer(&sql);
 
@@ -229,10 +260,10 @@ main(int argc, char *argv[])
 	if (newpassword)
 	{
 		if (encrypted == TRI_YES)
-			appendPQExpBuffer(&sql, " ENCRYPTED");
+			appendPQExpBufferStr(&sql, " ENCRYPTED");
 		if (encrypted == TRI_NO)
-			appendPQExpBuffer(&sql, " UNENCRYPTED");
-		appendPQExpBuffer(&sql, " PASSWORD ");
+			appendPQExpBufferStr(&sql, " UNENCRYPTED");
+		appendPQExpBufferStr(&sql, " PASSWORD ");
 
 		if (encrypted != TRI_NO)
 		{
@@ -252,31 +283,49 @@ main(int argc, char *argv[])
 			appendStringLiteralConn(&sql, newpassword, conn);
 	}
 	if (superuser == TRI_YES)
-		appendPQExpBuffer(&sql, " SUPERUSER");
+		appendPQExpBufferStr(&sql, " SUPERUSER");
 	if (superuser == TRI_NO)
-		appendPQExpBuffer(&sql, " NOSUPERUSER");
+		appendPQExpBufferStr(&sql, " NOSUPERUSER");
 	if (createdb == TRI_YES)
-		appendPQExpBuffer(&sql, " CREATEDB");
+		appendPQExpBufferStr(&sql, " CREATEDB");
 	if (createdb == TRI_NO)
-		appendPQExpBuffer(&sql, " NOCREATEDB");
+		appendPQExpBufferStr(&sql, " NOCREATEDB");
 	if (createrole == TRI_YES)
-		appendPQExpBuffer(&sql, " CREATEROLE");
+		appendPQExpBufferStr(&sql, " CREATEROLE");
 	if (createrole == TRI_NO)
-		appendPQExpBuffer(&sql, " NOCREATEROLE");
+		appendPQExpBufferStr(&sql, " NOCREATEROLE");
 	if (inherit == TRI_YES)
-		appendPQExpBuffer(&sql, " INHERIT");
+		appendPQExpBufferStr(&sql, " INHERIT");
 	if (inherit == TRI_NO)
-		appendPQExpBuffer(&sql, " NOINHERIT");
+		appendPQExpBufferStr(&sql, " NOINHERIT");
 	if (login == TRI_YES)
-		appendPQExpBuffer(&sql, " LOGIN");
+		appendPQExpBufferStr(&sql, " LOGIN");
 	if (login == TRI_NO)
-		appendPQExpBuffer(&sql, " NOLOGIN");
+		appendPQExpBufferStr(&sql, " NOLOGIN");
+	if (replication == TRI_YES)
+		appendPQExpBufferStr(&sql, " REPLICATION");
+	if (replication == TRI_NO)
+		appendPQExpBufferStr(&sql, " NOREPLICATION");
 	if (conn_limit != NULL)
 		appendPQExpBuffer(&sql, " CONNECTION LIMIT %s", conn_limit);
-	appendPQExpBuffer(&sql, ";\n");
+	if (roles.head != NULL)
+	{
+		SimpleStringListCell *cell;
+
+		appendPQExpBufferStr(&sql, " IN ROLE ");
+
+		for (cell = roles.head; cell; cell = cell->next)
+		{
+			if (cell->next)
+				appendPQExpBuffer(&sql, "%s,", fmtId(cell->val));
+			else
+				appendPQExpBuffer(&sql, "%s", fmtId(cell->val));
+		}
+	}
+	appendPQExpBufferChar(&sql, ';');
 
 	if (echo)
-		printf("%s", sql.data);
+		printf("%s\n", sql.data);
 	result = PQexec(conn, sql.data);
 
 	if (PQresultStatus(result) != PGRES_COMMAND_OK)
@@ -302,9 +351,10 @@ help(const char *progname)
 	printf(_("\nOptions:\n"));
 	printf(_("  -c, --connection-limit=N  connection limit for role (default: no limit)\n"));
 	printf(_("  -d, --createdb            role can create new databases\n"));
-	printf(_("  -D, --no-createdb         role cannot create databases\n"));
+	printf(_("  -D, --no-createdb         role cannot create databases (default)\n"));
 	printf(_("  -e, --echo                show the commands being sent to the server\n"));
 	printf(_("  -E, --encrypted           encrypt stored password\n"));
+	printf(_("  -g, --role=ROLE           new role will be a member of this role\n"));
 	printf(_("  -i, --inherit             role inherits privileges of roles it is a\n"
 			 "                            member of (default)\n"));
 	printf(_("  -I, --no-inherit          role does not inherit privileges\n"));
@@ -313,18 +363,20 @@ help(const char *progname)
 	printf(_("  -N, --unencrypted         do not encrypt stored password\n"));
 	printf(_("  -P, --pwprompt            assign a password to new role\n"));
 	printf(_("  -r, --createrole          role can create new roles\n"));
-	printf(_("  -R, --no-createrole       role cannot create roles\n"));
+	printf(_("  -R, --no-createrole       role cannot create roles (default)\n"));
 	printf(_("  -s, --superuser           role will be superuser\n"));
-	printf(_("  -S, --no-superuser        role will not be superuser\n"));
-	printf(_("  --help                    show this help, then exit\n"));
-	printf(_("  --version                 output version information, then exit\n"));
+	printf(_("  -S, --no-superuser        role will not be superuser (default)\n"));
+	printf(_("  -V, --version             output version information, then exit\n"));
+	printf(_("  --interactive             prompt for missing role name and attributes rather\n"
+			 "                            than using defaults\n"));
+	printf(_("  --replication             role can initiate replication\n"));
+	printf(_("  --no-replication          role cannot initiate replication\n"));
+	printf(_("  -?, --help                show this help, then exit\n"));
 	printf(_("\nConnection options:\n"));
 	printf(_("  -h, --host=HOSTNAME       database server host or socket directory\n"));
 	printf(_("  -p, --port=PORT           database server port\n"));
 	printf(_("  -U, --username=USERNAME   user name to connect as (not the one to create)\n"));
 	printf(_("  -w, --no-password         never prompt for password\n"));
 	printf(_("  -W, --password            force password prompt\n"));
-	printf(_("\nIf one of -d, -D, -r, -R, -s, -S, and ROLENAME is not specified, you will\n"
-			 "be prompted interactively.\n"));
 	printf(_("\nReport bugs to <bugs@greenplum.org>.\n"));
 }

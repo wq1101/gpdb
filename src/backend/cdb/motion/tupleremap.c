@@ -34,9 +34,9 @@
 #include "utils/array.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/rangetypes.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
-
 
 /*
  * When a tuple is received on the motion receiver, the typmod of RECORDOID
@@ -78,7 +78,7 @@ typedef struct ArrayRemapInfo
 	int16		typlen;			/* array element type's storage properties */
 	bool		typbyval;
 	char		typalign;
-	TupleRemapInfo *element_remap;		/* array element type's remap info */
+	TupleRemapInfo *element_remap;	/* array element type's remap info */
 } ArrayRemapInfo;
 
 typedef struct RangeRemapInfo
@@ -96,7 +96,7 @@ typedef struct RecordRemapInfo
 	int32		localtypmod;
 	/* If no fields of the record require remapping, these are NULL: */
 	TupleDesc	tupledesc;		/* copy of record's tupdesc */
-	TupleRemapInfo **field_remap;		/* each field's remap info */
+	TupleRemapInfo **field_remap;	/* each field's remap info */
 } RecordRemapInfo;
 
 struct TupleRemapInfo
@@ -107,7 +107,7 @@ struct TupleRemapInfo
 		ArrayRemapInfo arr;
 		RangeRemapInfo rng;
 		RecordRemapInfo rec;
-	} u;
+	}			u;
 };
 
 /*
@@ -129,28 +129,23 @@ struct TupleRemapper
 	bool		remap_needed;	/* is remap needed */
 };
 
-static HeapTuple TRRemapTuple(TupleRemapper *remapper,
+static GenericTuple TRRemapTuple(TupleRemapper *remapper,
 			 TupleDesc tupledesc,
 			 TupleRemapInfo **field_remapinfo,
-			 HeapTuple tuple);
+			 GenericTuple tuple);
 static Datum TRRemap(TupleRemapper *remapper, TupleRemapInfo *remapinfo,
 		Datum value, bool *changed);
 static Datum TRRemapArray(TupleRemapper *remapper, ArrayRemapInfo *remapinfo,
 			 Datum value, bool *changed);
-#ifdef TYPTYPE_RANGE
-/* GPDB_92_MERGE_FIXME remove these ifdef when range type is supported */
 static Datum TRRemapRange(TupleRemapper *remapper, RangeRemapInfo *remapinfo,
 			 Datum value, bool *changed);
-#endif
 static Datum TRRemapRecord(TupleRemapper *remapper, RecordRemapInfo *remapinfo,
 			  Datum value, bool *changed);
 static TupleRemapInfo *BuildTupleRemapInfo(Oid typid, MemoryContext mycontext);
 static TupleRemapInfo *BuildArrayRemapInfo(Oid elemtypid,
 					MemoryContext mycontext);
-#ifdef TYPTYPE_RANGE
 static TupleRemapInfo *BuildRangeRemapInfo(Oid rngtypid,
 					MemoryContext mycontext);
-#endif
 static TupleRemapInfo **BuildFieldRemapInfo(TupleDesc tupledesc,
 					MemoryContext mycontext);
 
@@ -192,8 +187,8 @@ DestroyTupleRemapper(TupleRemapper *remapper)
  *
  * Form a new tuple with all the remote typmods remapped to local typmods.
  */
-HeapTuple
-TRCheckAndRemap(TupleRemapper *remapper, TupleDesc tupledesc, HeapTuple tuple)
+GenericTuple
+TRCheckAndRemap(TupleRemapper *remapper, TupleDesc tupledesc, GenericTuple tuple)
 {
 	if (!remapper->remap_needed)
 		return tuple;
@@ -201,9 +196,13 @@ TRCheckAndRemap(TupleRemapper *remapper, TupleDesc tupledesc, HeapTuple tuple)
 	if (!remapper->field_remapinfo)
 	{
 		Assert(remapper->tupledesc == NULL);
-		remapper->tupledesc = tupledesc;
 		remapper->field_remapinfo = BuildFieldRemapInfo(tupledesc,
 														remapper->mycontext);
+		if (remapper->field_remapinfo != NULL)
+		{
+			/* Remapping is required. Save a copy of the tupledesc */
+			remapper->tupledesc = tupledesc;
+		}
 	}
 
 	return TRRemapTuple(remapper, tupledesc, remapper->field_remapinfo, tuple);
@@ -217,9 +216,9 @@ TRCheckAndRemap(TupleRemapper *remapper, TupleDesc tupledesc, HeapTuple tuple)
 void
 TRHandleTypeLists(TupleRemapper *remapper, List *typelist)
 {
-	int j;
-	ListCell *cell;
-	int mapsize = remapper->typmodmapsize + list_length(typelist);
+	int			j;
+	ListCell   *cell;
+	int			mapsize = remapper->typmodmapsize + list_length(typelist);
 
 	if (remapper->typmodmap)
 		remapper->typmodmap = repalloc(remapper->typmodmap, mapsize * sizeof(int32));
@@ -233,11 +232,14 @@ TRHandleTypeLists(TupleRemapper *remapper, List *typelist)
 
 	foreach(cell, typelist)
 	{
-		int32 local_typmod;
-		TupleDescNode * descnode = (TupleDescNode *) lfirst(cell);
-		int32 remote_typmod = descnode->tuple->tdtypmod;
+		int32		local_typmod;
+		TupleDescNode *descnode = (TupleDescNode *) lfirst(cell);
+		int32		remote_typmod = descnode->tuple->tdtypmod;
 
-		/* assign_record_type_typmod() will update tdtypmod to the local typmod */
+		/*
+		 * assign_record_type_typmod() will update tdtypmod to the local
+		 * typmod
+		 */
 		assign_record_type_typmod(descnode->tuple);
 
 		local_typmod = descnode->tuple->tdtypmod;
@@ -253,14 +255,37 @@ TRHandleTypeLists(TupleRemapper *remapper, List *typelist)
 	}
 }
 
+
+/*
+ * Remap a single Datum, which can be a RECORD datum using the remote system's
+ * typmods.
+ */
+Datum
+TRRemapDatum(TupleRemapper *remapper, Oid typeid, Datum value)
+{
+	TupleRemapInfo *remapinfo;
+	bool		changed;
+
+	remapinfo = BuildTupleRemapInfo(typeid, remapper->mycontext);
+
+	if (!remapinfo)
+		return value;
+
+	value = TRRemap(remapper, remapinfo, value, &changed);
+
+	pfree(remapinfo);
+
+	return value;
+}
+
 /*
  * Copy the given tuple, remapping any transient typmods contained in it.
  */
-static HeapTuple
+static GenericTuple
 TRRemapTuple(TupleRemapper *remapper,
 			 TupleDesc tupledesc,
 			 TupleRemapInfo **field_remapinfo,
-			 HeapTuple tuple)
+			 GenericTuple tuple)
 {
 	Datum	   *values;
 	bool	   *isnull;
@@ -279,14 +304,15 @@ TRRemapTuple(TupleRemapper *remapper,
 	isnull = (bool *) palloc(tupledesc->natts * sizeof(bool));
 
 	/* CDB */
-	if (is_heaptuple_memtuple(tuple))
+	if (is_memtuple(tuple))
 	{
 		MemTupleBinding *pbind = create_memtuple_binding(tupledesc);
+
 		memtuple_deform((MemTuple) tuple, pbind, values, isnull);
 	}
 	else
 	{
-		heap_deform_tuple(tuple, tupledesc, values, isnull);
+		heap_deform_tuple((HeapTuple) tuple, tupledesc, values, isnull);
 	}
 
 	/* Recursively process each interesting non-NULL attribute. */
@@ -299,7 +325,7 @@ TRRemapTuple(TupleRemapper *remapper,
 
 	/* Reconstruct the modified tuple, if anything was modified. */
 	if (changed)
-		return heap_form_tuple(tupledesc, values, isnull);
+		return (GenericTuple) heap_form_tuple(tupledesc, values, isnull);
 	else
 		return tuple;
 }
@@ -325,11 +351,7 @@ TRRemap(TupleRemapper *remapper, TupleRemapInfo *remapinfo,
 			return TRRemapArray(remapper, &remapinfo->u.arr, value, changed);
 
 		case TUPLE_REMAP_RANGE:
-#ifdef TYPTYPE_RANGE
 			return TRRemapRange(remapper, &remapinfo->u.rng, value, changed);
-#else
-			return value;
-#endif
 
 		case TUPLE_REMAP_RECORD:
 			return TRRemapRecord(remapper, &remapinfo->u.rec, value, changed);
@@ -376,7 +398,7 @@ TRRemapArray(TupleRemapper *remapper, ArrayRemapInfo *remapinfo,
 		/* Reconstruct and return the array.  */
 		*changed = true;
 		arr = construct_md_array(elem_values, elem_nulls,
-							   ARR_NDIM(arr), ARR_DIMS(arr), ARR_LBOUND(arr),
+								 ARR_NDIM(arr), ARR_DIMS(arr), ARR_LBOUND(arr),
 								 typid, remapinfo->typlen,
 								 remapinfo->typbyval, remapinfo->typalign);
 		return PointerGetDatum(arr);
@@ -390,7 +412,6 @@ TRRemapArray(TupleRemapper *remapper, ArrayRemapInfo *remapinfo,
  * Process the given range datum and replace any transient record typmods
  * contained in it.  Set *changed to TRUE if we actually changed the datum.
  */
-#ifdef TYPTYPE_RANGE
 static Datum
 TRRemapRange(TupleRemapper *remapper, RangeRemapInfo *remapinfo,
 			 Datum value, bool *changed)
@@ -427,7 +448,6 @@ TRRemapRange(TupleRemapper *remapper, RangeRemapInfo *remapinfo,
 	/* Else just return the value as-is. */
 	return value;
 }
-#endif
 
 /*
  * Process the given record datum and replace any transient record typmods
@@ -530,10 +550,10 @@ TRRemapRecord(TupleRemapper *remapper, RecordRemapInfo *remapinfo,
 		ItemPointerSetInvalid(&htup.t_self);
 		htup.t_len = HeapTupleHeaderGetDatumLength(tup);
 		htup.t_data = tup;
-		atup = TRRemapTuple(remapper,
-							remapinfo->tupledesc,
-							remapinfo->field_remap,
-							&htup);
+		atup = (HeapTuple) TRRemapTuple(remapper,
+										remapinfo->tupledesc,
+										remapinfo->field_remap,
+										(GenericTuple) &htup);
 
 		/* Apply the correct labeling for a local Datum. */
 		HeapTupleHeaderSetTypeId(atup->t_data, typid);
@@ -583,14 +603,12 @@ restart:
 		return BuildArrayRemapInfo(typid, mycontext);
 	}
 
-#ifdef TYPTYPE_RANGE
 	/* Similarly, deal with ranges appropriately. */
 	if (typ->typtype == TYPTYPE_RANGE)
 	{
 		ReleaseSysCache(tup);
 		return BuildRangeRemapInfo(typid, mycontext);
 	}
-#endif
 
 	/*
 	 * If it's a composite type (including RECORD), set up for remapping.  We
@@ -641,7 +659,6 @@ BuildArrayRemapInfo(Oid elemtypid, MemoryContext mycontext)
 	return remapinfo;
 }
 
-#ifdef TYPTYPE_RANGE
 static TupleRemapInfo *
 BuildRangeRemapInfo(Oid rngtypid, MemoryContext mycontext)
 {
@@ -671,7 +688,6 @@ BuildRangeRemapInfo(Oid rngtypid, MemoryContext mycontext)
 	remapinfo->u.rng.bound_remap = bound_remapinfo;
 	return remapinfo;
 }
-#endif
 
 /*
  * Build remap info for fields of the type described by the given tupdesc.

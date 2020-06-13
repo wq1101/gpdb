@@ -1,11 +1,15 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/abort.sgml,v 1.18 2008/11/14 10:22:45 petere Exp $
+doc/src/sgml/ref/abort.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-ABORT">
+ <indexterm zone="sql-abort">
+  <primary>ABORT</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="sql-abort-title">ABORT</refentrytitle>
+  <refentrytitle>ABORT</refentrytitle>
   <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
@@ -14,10 +18,6 @@ PostgreSQL documentation
   <refname>ABORT</refname>
   <refpurpose>abort the current transaction</refpurpose>
  </refnamediv>
-
- <indexterm zone="sql-abort">
-  <primary>ABORT</primary>
- </indexterm>
 
  <refsynopsisdiv>
 <synopsis>
@@ -30,10 +30,10 @@ ABORT [ WORK | TRANSACTION ]
 
   <para>
    <command>ABORT</command> rolls back the current transaction and causes
-   all the updates made by the transaction to be discarded. 
+   all the updates made by the transaction to be discarded.
    This command is identical
    in behavior to the standard <acronym>SQL</acronym> command
-   <xref linkend="SQL-ROLLBACK" endterm="SQL-ROLLBACK-TITLE">,
+   <xref linkend="SQL-ROLLBACK">,
    and is present only for historical reasons.
   </para>
  </refsect1>
@@ -58,13 +58,13 @@ ABORT [ WORK | TRANSACTION ]
   <title>Notes</title>
 
   <para>
-   Use <xref linkend="SQL-COMMIT" endterm="SQL-COMMIT-TITLE"> to
+   Use <xref linkend="SQL-COMMIT"> to
    successfully terminate a transaction.
   </para>
 
   <para>
-   Issuing <command>ABORT</> when not inside a transaction does
-   no harm, but it will provoke a warning message.
+   Issuing <command>ABORT</> outside of a transaction block
+   emits a warning and otherwise has no effect.
   </para>
  </refsect1>
 
@@ -75,8 +75,7 @@ ABORT [ WORK | TRANSACTION ]
    To abort all changes:
 <programlisting>
 ABORT;
-</programlisting>
-  </para>
+</programlisting></para>
  </refsect1>
 
  <refsect1>
@@ -93,9 +92,9 @@ ABORT;
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-begin" endterm="sql-begin-title"></member>
-   <member><xref linkend="sql-commit" endterm="sql-commit-title"></member>
-   <member><xref linkend="sql-rollback" endterm="sql-rollback-title"></member>
+   <member><xref linkend="sql-begin"></member>
+   <member><xref linkend="sql-commit"></member>
+   <member><xref linkend="sql-rollback"></member>
   </simplelist>
  </refsect1>
 </refentry>

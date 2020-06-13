@@ -7,7 +7,7 @@
  *
  * We use tuplesort.c to sort the given index tuples into order.
  * Then we scan the index tuples in order and build the btree pages
- * for each level.	We load source tuples into leaf-level pages.
+ * for each level.  We load source tuples into leaf-level pages.
  * Whenever we fill a page at one level, we add a link to it to its
  * parent level (starting a new parent level if necessary).  When
  * done, we write out each final page on each level, adding it to
@@ -42,36 +42,39 @@
  *
  * Since the index will never be used unless it is completely built,
  * from a crash-recovery point of view there is no need to WAL-log the
- * steps of the build.	After completing the index build, we can just sync
+ * steps of the build.  After completing the index build, we can just sync
  * the whole file to disk using smgrimmedsync() before exiting this module.
  * This can be seen to be sufficient for crash recovery by considering that
  * it's effectively equivalent to what would happen if a CHECKPOINT occurred
- * just after the index build.	However, it is clearly not sufficient if the
+ * just after the index build.  However, it is clearly not sufficient if the
  * DBA is using the WAL log for PITR or replication purposes, since another
  * machine would not be able to reconstruct the index from WAL.  Therefore,
  * we log the completed index pages to WAL if and only if WAL archiving is
  * active.
  *
+ * This code isn't concerned about the FSM at all. The caller is responsible
+ * for initializing that.
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/access/nbtree/nbtsort.c,v 1.114 2008/01/01 19:45:46 momjian Exp $
+ *	  src/backend/access/nbtree/nbtsort.c
  *
  *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
 
-#include "access/heapam.h"
 #include "access/nbtree.h"
+#include "access/xlog.h"
+#include "access/xloginsert.h"
 #include "miscadmin.h"
 #include "storage/smgr.h"
+#include "tcop/tcopprot.h"
+#include "utils/rel.h"
+#include "utils/sortsupport.h"
 #include "utils/tuplesort.h"
-#include "utils/tuplesort_mk.h"
-
-#include "cdb/cdbvars.h"
 
 
 /*
@@ -82,12 +85,13 @@
 struct BTSpool
 {
 	void *sortstate;	/* state data for tuplesort.c */
+	Relation	heap;
 	Relation	index;
 	bool		isunique;
 };
 
 /*
- * Status record for a btree page being built.	We have one of these
+ * Status record for a btree page being built.  We have one of these
  * for each active tree level.
  *
  * The reason we need to store a copy of the minimum key is that we'll
@@ -115,6 +119,7 @@ typedef struct BTPageState
  */
 typedef struct BTWriteState
 {
+	Relation	heap;
 	Relation	index;
 	bool		btws_use_wal;	/* dump pages to WAL? */
 	BlockNumber btws_pages_alloced;		/* # pages allocated */
@@ -144,11 +149,12 @@ static void _bt_load(BTWriteState *wstate,
  * create and initialize a spool structure
  */
 BTSpool *
-_bt_spoolinit(Relation index, bool isunique, bool isdead)
+_bt_spoolinit(Relation heap, Relation index, bool isunique, bool isdead)
 {
 	BTSpool    *btspool = (BTSpool *) palloc0(sizeof(BTSpool));
 	int			btKbytes;
 
+	btspool->heap = heap;
 	btspool->index = index;
 	btspool->isunique = isunique;
 
@@ -156,15 +162,13 @@ _bt_spoolinit(Relation index, bool isunique, bool isdead)
 	 * We size the sort area as maintenance_work_mem rather than work_mem to
 	 * speed index creation.  This should be OK since a single backend can't
 	 * run multiple index creations in parallel.  Note that creation of a
-	 * unique index actually requires two BTSpool objects.	We expect that the
+	 * unique index actually requires two BTSpool objects.  We expect that the
 	 * second one (for dead tuples) won't get very full, so we give it only
 	 * work_mem.
 	 */
 	btKbytes = isdead ? work_mem : maintenance_work_mem;
-	if(gp_enable_mk_sort)
-		btspool->sortstate = tuplesort_begin_index_mk(index, isunique, btKbytes, false);
-	else
-		btspool->sortstate = tuplesort_begin_index(index, isunique, btKbytes, false);
+	btspool->sortstate = tuplesort_begin_index_btree(heap, index, isunique,
+													 btKbytes, false);
 
 	return btspool;
 }
@@ -175,10 +179,7 @@ _bt_spoolinit(Relation index, bool isunique, bool isdead)
 void
 _bt_spooldestroy(BTSpool *btspool)
 {
-	if(gp_enable_mk_sort)
-		tuplesort_end_mk((Tuplesortstate_mk *) btspool->sortstate);
-	else
-		tuplesort_end((Tuplesortstate *) btspool->sortstate);
+	tuplesort_end(btspool->sortstate);
 	pfree(btspool);
 }
 
@@ -186,12 +187,10 @@ _bt_spooldestroy(BTSpool *btspool)
  * spool an index entry into the sort file.
  */
 void
-_bt_spool(IndexTuple itup, BTSpool *btspool)
+_bt_spool(BTSpool *btspool, ItemPointer self, Datum *values, bool *isnull)
 {
-	if(gp_enable_mk_sort)
-		tuplesort_putindextuple_mk((Tuplesortstate_mk *) btspool->sortstate, itup);
-	else
-		tuplesort_putindextuple((Tuplesortstate *) btspool->sortstate, itup);
+	tuplesort_putindextuplevalues(btspool->sortstate, btspool->index,
+								  self, values, isnull);
 }
 
 /*
@@ -211,27 +210,18 @@ _bt_leafbuild(BTSpool *btspool, BTSpool *btspool2)
 	}
 #endif   /* BTREE_BUILD_STATS */
 
-	if(gp_enable_mk_sort)
-	{
-		tuplesort_performsort_mk((Tuplesortstate_mk *) btspool->sortstate);
-		if (btspool2)
-			tuplesort_performsort_mk((Tuplesortstate_mk *) btspool2->sortstate);
-	}
-	else
-	{
-		tuplesort_performsort((Tuplesortstate *) btspool->sortstate);
-		if (btspool2)
-			tuplesort_performsort((Tuplesortstate *) btspool2->sortstate);
-	}
+	tuplesort_performsort(btspool->sortstate);
+	if (btspool2)
+		tuplesort_performsort(btspool2->sortstate);
 
-
+	wstate.heap = btspool->heap;
 	wstate.index = btspool->index;
 
 	/*
-	 * We need to log index creation in WAL iff WAL archiving is enabled AND
-	 * it's not a temp index.
+	 * We need to log index creation in WAL iff WAL archiving/streaming is
+	 * enabled UNLESS the index isn't WAL-logged anyway.
 	 */
-	wstate.btws_use_wal = !XLog_UnconvertedCanBypassWal() && !wstate.index->rd_istemp;
+	wstate.btws_use_wal = XLogIsNeeded() && RelationNeedsWAL(wstate.index);
 
 	/* reserve the metapage */
 	wstate.btws_pages_alloced = BTREE_METAPAGE + 1;
@@ -280,9 +270,6 @@ _bt_blnewpage(uint32 level)
 static void
 _bt_blwritepage(BTWriteState *wstate, Page page, BlockNumber blkno)
 {
-	// Fetch gp_persistent_relation_node information that will be added to XLOG record.
-	RelationFetchGpRelationNodeForXLog(wstate->index);
-
 	/* Ensure rd_smgr is open (could have been closed by relcache flush!) */
 	RelationOpenSmgr(wstate->index);
 
@@ -290,7 +277,7 @@ _bt_blwritepage(BTWriteState *wstate, Page page, BlockNumber blkno)
 	if (wstate->btws_use_wal)
 	{
 		/* We use the heap NEWPAGE record type for this */
-		log_newpage_rel(wstate->index, blkno, page);
+		log_newpage(&wstate->index->rd_node, MAIN_FORKNUM, blkno, page, true);
 	}
 
 	/*
@@ -304,45 +291,32 @@ _bt_blwritepage(BTWriteState *wstate, Page page, BlockNumber blkno)
 	{
 		if (!wstate->btws_zeropage)
 			wstate->btws_zeropage = (Page) palloc0(BLCKSZ);
-
-		// -------- MirroredLock ----------
-		// UNDONE: Unfortunately, I think we write temp relations to the mirror...
-		LWLockAcquire(MirroredLock, LW_SHARED);
-
 		/* don't set checksum for all-zero page */
-		smgrextend(wstate->index->rd_smgr, wstate->btws_pages_written++,
+		smgrextend(wstate->index->rd_smgr, MAIN_FORKNUM,
+				   wstate->btws_pages_written++,
 				   (char *) wstate->btws_zeropage,
 				   true);
-
-		LWLockRelease(MirroredLock);
-		// -------- MirroredLock ----------
 	}
 
-
-	// -------- MirroredLock ----------
-	// UNDONE: Unfortunately, I think we write temp relations to the mirror...
-	LWLockAcquire(MirroredLock, LW_SHARED);
 	PageSetChecksumInplace(page, blkno);
 
 	/*
-	 * Now write the page.	We say isTemp = true even if it's not a temp
-	 * index, because there's no need for smgr to schedule an fsync for this
-	 * write; we'll do it ourselves before ending the build.
+	 * Now write the page.  There's no need for smgr to schedule an fsync for
+	 * this write; we'll do it ourselves before ending the build.
 	 */
 	if (blkno == wstate->btws_pages_written)
 	{
 		/* extending the file... */
-		smgrextend(wstate->index->rd_smgr, blkno, (char *) page, true);
+		smgrextend(wstate->index->rd_smgr, MAIN_FORKNUM, blkno,
+				   (char *) page, true);
 		wstate->btws_pages_written++;
 	}
 	else
 	{
 		/* overwriting a block we zero-filled before */
-		smgrwrite(wstate->index->rd_smgr, blkno, (char *) page, true);
+		smgrwrite(wstate->index->rd_smgr, MAIN_FORKNUM, blkno,
+				  (char *) page, true);
 	}
-
-	LWLockRelease(MirroredLock);
-	// -------- MirroredLock ----------
 
 	pfree(page);
 }
@@ -452,14 +426,14 @@ _bt_sortaddtup(Page page,
  * A leaf page being built looks like:
  *
  * +----------------+---------------------------------+
- * | PageHeaderData | linp0 linp1 linp2 ...			  |
+ * | PageHeaderData | linp0 linp1 linp2 ...           |
  * +-----------+----+---------------------------------+
  * | ... linpN |									  |
  * +-----------+--------------------------------------+
  * |	 ^ last										  |
  * |												  |
  * +-------------+------------------------------------+
- * |			 | itemN ...						  |
+ * |			 | itemN ...                          |
  * +-------------+------------------+-----------------+
  * |		  ... item3 item2 item1 | "special space" |
  * +--------------------------------+-----------------+
@@ -511,17 +485,19 @@ _bt_buildadd(BTWriteState *wstate, BTPageState *state, IndexTuple itup)
 	if (itupsz > BTMaxItemSize(npage))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("index row size %lu exceeds btree maximum, %lu",
-						(unsigned long) itupsz,
-						(unsigned long) BTMaxItemSize(npage)),
+			errmsg("index row size %zu exceeds maximum %zu for index \"%s\"",
+				   itupsz, BTMaxItemSize(npage),
+				   RelationGetRelationName(wstate->index)),
 		errhint("Values larger than 1/3 of a buffer page cannot be indexed.\n"
 				"Consider a function index of an MD5 hash of the value, "
-				"or use full text indexing.")));
+				"or use full text indexing."),
+				 errtableconstraint(wstate->heap,
+									RelationGetRelationName(wstate->index))));
 
 	/*
-	 * Check to see if page is "full".	It's definitely full if the item won't
+	 * Check to see if page is "full".  It's definitely full if the item won't
 	 * fit.  Otherwise, compare to the target freespace derived from the
-	 * fillfactor.	However, we must put at least two items on each page, so
+	 * fillfactor.  However, we must put at least two items on each page, so
 	 * disregard fillfactor if we don't have that many.
 	 */
 	if (pgspc < itupsz || (pgspc < state->btps_full && last_off > P_FIRSTKEY))
@@ -594,7 +570,7 @@ _bt_buildadd(BTWriteState *wstate, BTPageState *state, IndexTuple itup)
 		}
 
 		/*
-		 * Write out the old page.	We never need to touch it again, so we can
+		 * Write out the old page.  We never need to touch it again, so we can
 		 * free the opage workspace too.
 		 */
 		_bt_blwritepage(wstate, opage, oblkno);
@@ -711,6 +687,7 @@ _bt_load(BTWriteState *wstate, BTSpool *btspool, BTSpool *btspool2)
 	int			i,
 				keysz = RelationGetNumberOfAttributes(wstate->index);
 	ScanKey		indexScanKey = NULL;
+	SortSupport sortKeys;
 
 	if (merge)
 	{
@@ -720,18 +697,38 @@ _bt_load(BTWriteState *wstate, BTSpool *btspool, BTSpool *btspool2)
 		 */
 
 		/* the preparation of merge */
-		if(gp_enable_mk_sort)
+		itup = tuplesort_getindextuple(btspool->sortstate,
+									   true, &should_free);
+		itup2 = tuplesort_getindextuple(btspool2->sortstate,
+										true, &should_free2);
+		indexScanKey = _bt_mkscankey_nodata(wstate->index);
+
+		/* Prepare SortSupport data for each column */
+		sortKeys = (SortSupport) palloc0(keysz * sizeof(SortSupportData));
+
+		for (i = 0; i < keysz; i++)
 		{
-			itup = tuplesort_getindextuple_mk((Tuplesortstate_mk *) btspool->sortstate, true, &should_free); 
-			itup2 = tuplesort_getindextuple_mk((Tuplesortstate_mk *) btspool2->sortstate, true, &should_free2);
-		}
-		else
-		{
-			itup = tuplesort_getindextuple((Tuplesortstate *) btspool->sortstate, true, &should_free); 
-			itup2 = tuplesort_getindextuple((Tuplesortstate *) btspool2->sortstate, true, &should_free2);
+			SortSupport sortKey = sortKeys + i;
+			ScanKey		scanKey = indexScanKey + i;
+			int16		strategy;
+
+			sortKey->ssup_cxt = CurrentMemoryContext;
+			sortKey->ssup_collation = scanKey->sk_collation;
+			sortKey->ssup_nulls_first =
+				(scanKey->sk_flags & SK_BT_NULLS_FIRST) != 0;
+			sortKey->ssup_attno = scanKey->sk_attno;
+			/* Abbreviation is not supported here */
+			sortKey->abbreviate = false;
+
+			AssertState(sortKey->ssup_attno != 0);
+
+			strategy = (scanKey->sk_flags & SK_BT_DESC) != 0 ?
+				BTGreaterStrategyNumber : BTLessStrategyNumber;
+
+			PrepareSortSupportFromIndexRel(wstate->index, strategy, sortKey);
 		}
 
-		indexScanKey = _bt_mkscankey_nodata(wstate->index);
+		_bt_freeskey(indexScanKey);
 
 		for (;;)
 		{
@@ -745,41 +742,20 @@ _bt_load(BTWriteState *wstate, BTSpool *btspool, BTSpool *btspool2)
 			{
 				for (i = 1; i <= keysz; i++)
 				{
-					ScanKey		entry;
+					SortSupport entry;
 					Datum		attrDatum1,
 								attrDatum2;
 					bool		isNull1,
 								isNull2;
 					int32		compare;
 
-					entry = indexScanKey + i - 1;
+					entry = sortKeys + i - 1;
 					attrDatum1 = index_getattr(itup, i, tupdes, &isNull1);
 					attrDatum2 = index_getattr(itup2, i, tupdes, &isNull2);
-					if (isNull1)
-					{
-						if (isNull2)
-							compare = 0;		/* NULL "=" NULL */
-						else if (entry->sk_flags & SK_BT_NULLS_FIRST)
-							compare = -1;		/* NULL "<" NOT_NULL */
-						else
-							compare = 1;		/* NULL ">" NOT_NULL */
-					}
-					else if (isNull2)
-					{
-						if (entry->sk_flags & SK_BT_NULLS_FIRST)
-							compare = 1;		/* NOT_NULL ">" NULL */
-						else
-							compare = -1;		/* NOT_NULL "<" NULL */
-					}
-					else
-					{
-						compare = DatumGetInt32(FunctionCall2(&entry->sk_func,
-															  attrDatum1,
-															  attrDatum2));
 
-						if (entry->sk_flags & SK_BT_DESC)
-							compare = -compare;
-					}
+					compare = ApplySortComparator(attrDatum1, isNull1,
+												  attrDatum2, isNull2,
+												  entry);
 					if (compare > 0)
 					{
 						load1 = false;
@@ -801,38 +777,25 @@ _bt_load(BTWriteState *wstate, BTSpool *btspool, BTSpool *btspool2)
 				_bt_buildadd(wstate, state, itup);
 				if (should_free)
 					pfree(itup);
-				if(gp_enable_mk_sort)
-					itup = tuplesort_getindextuple_mk((Tuplesortstate_mk *)btspool->sortstate, true, &should_free);
-				else
-					itup = tuplesort_getindextuple((Tuplesortstate *) btspool->sortstate, true, &should_free);
+				itup = tuplesort_getindextuple(btspool->sortstate,
+											   true, &should_free);
 			}
 			else
 			{
 				_bt_buildadd(wstate, state, itup2);
 				if (should_free2)
 					pfree(itup2);
-				if(gp_enable_mk_sort)
-					itup2 = tuplesort_getindextuple_mk((Tuplesortstate_mk *) btspool2->sortstate,
-							true, &should_free2);
-				else
-					itup2 = tuplesort_getindextuple((Tuplesortstate *) btspool2->sortstate,
-							true, &should_free2);
+				itup2 = tuplesort_getindextuple(btspool2->sortstate,
+												true, &should_free2);
 			}
 		}
-		_bt_freeskey(indexScanKey);
+		pfree(sortKeys);
 	}
 	else
 	{
 		/* merge is unnecessary */
-		while ((itup = (
-				gp_enable_mk_sort ? 
-				tuplesort_getindextuple_mk((Tuplesortstate_mk *) btspool->sortstate, 
-						true, &should_free)
-				:
-				tuplesort_getindextuple((Tuplesortstate *) btspool->sortstate, 
-						true, &should_free)
-				))
-			!= NULL)
+		while ((itup = tuplesort_getindextuple(btspool->sortstate,
+											   true, &should_free)) != NULL)
 		{
 			/* When we see first tuple, create first index page */
 			if (state == NULL)
@@ -848,9 +811,9 @@ _bt_load(BTWriteState *wstate, BTSpool *btspool, BTSpool *btspool2)
 	_bt_uppershutdown(wstate, state);
 
 	/*
-	 * If the index isn't temp, we must fsync it down to disk before it's safe
-	 * to commit the transaction.  (For a temp index we don't care since the
-	 * index will be uninteresting after a crash anyway.)
+	 * If the index is WAL-logged, we must fsync it down to disk before it's
+	 * safe to commit the transaction.  (For a non-WAL-logged index we don't
+	 * care since the index will be uninteresting after a crash anyway.)
 	 *
 	 * It's obvious that we must do this when not WAL-logging the build. It's
 	 * less obvious that we have to do it even if we did WAL-log the index
@@ -862,9 +825,9 @@ _bt_load(BTWriteState *wstate, BTSpool *btspool, BTSpool *btspool2)
 	 * fsync those pages here, they might still not be on disk when the crash
 	 * occurs.
 	 */
-	if (!wstate->index->rd_istemp)
+	if (RelationNeedsWAL(wstate->index))
 	{
 		RelationOpenSmgr(wstate->index);
-		smgrimmedsync(wstate->index->rd_smgr);
+		smgrimmedsync(wstate->index->rd_smgr, MAIN_FORKNUM);
 	}
 }

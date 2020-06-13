@@ -10,10 +10,11 @@
       is out of date, the planner can generate inefficient plans.</p>
     <section>
       <title>Generating Statistics Selectively</title>
-      <p>Running <codeph>ANALYZE</codeph> with no arguments updates statistics for all tables in the
-        database. This can be a very long-running process and it is not recommended. You should
-          <codeph>ANALYZE</codeph> tables selectively when data has changed or use the
-          <codeph>analyzedb</codeph> utility. </p>
+      <p>Running <codeph><xref href="../ref_guide/sql_commands/ANALYZE.xml">ANALYZE</xref></codeph>
+        with no arguments updates statistics for all tables in the database. This can be a very
+        long-running process and it is not recommended. You should <codeph>ANALYZE</codeph> tables
+        selectively when data has changed or use the <codeph><xref
+            href="../utility_guide/ref/analyzedb.xml">analyzedb</xref></codeph> utility. </p>
       <p>Running <codeph>ANALYZE</codeph> on a large table can take a long time. If it is not
         feasible to run <codeph>ANALYZE</codeph> on all columns of a very large table, you can
         generate statistics for selected columns only using <codeph>ANALYZE table(column,
@@ -35,23 +36,14 @@
         quality, or accuracy, of the statistics. </p>
       <p>To allow large tables to be analyzed in a reasonable amount of time,
           <codeph>ANALYZE</codeph> takes a random sample of the table contents, rather than
-        examining every row. To increase sampling for all table columns adjust the
-          <codeph>default_statistics_target</codeph> configuration parameter. The target value
-        ranges from 1 to 1000; the default target value is 25. The
-          <codeph>default_statistics_target</codeph> variable applies to all columns by default. A
-        larger target value increases the time needed to perform the <codeph>ANALYZE</codeph>, but
-        may improve the quality of the query planner’s estimates. This is especially true for
-        columns with irregular data patterns. <codeph>default_statistics_target</codeph> can be set
-        at the master/session level and requires a reload. </p>
-      <p>The <codeph>gp_analyze_relative_error</codeph> configuration parameter affects the sampling
-        rate during statistics collection to determine cardinality in a column. For example, a value
-        of .5 is equivalent to an acceptable error of 50%. The default is .25. Use the
-          <codeph>gp_analyze_relative_error</codeph> parameter to set the acceptable estimated
-        relative error in the cardinality of a table. If statistics do not produce good estimates of
-        cardinality for a particular table attribute, decreasing the relative error fraction
-        (accepting less errors) tells the system to sample more rows. However, it is not recommended
-        to reduce this below 0.1 as it will increase <codeph>ANALYZE</codeph> time
-        substantially.</p>
+        examining every row. To increase the number of sample values for all table columns adjust
+        the <codeph>default_statistics_target</codeph> configuration parameter. The target value
+        ranges from 1 to 1000; the default target value is 100. The
+          <codeph>default_statistics_target</codeph> variable applies to all columns by default, and
+        specifies the number of values that are stored in the list of common values. A larger target
+        may improve the quality of the query planner’s estimates, especially for columns with
+        irregular data patterns. <codeph>default_statistics_target</codeph> can be set at the
+        master/session level and requires a reload. </p>
     </section>
     <section>
       <title>When to Run ANALYZE</title>

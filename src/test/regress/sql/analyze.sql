@@ -370,9 +370,9 @@ DROP TABLE IF EXISTS p3_sales;
 
 --
 -- Test statistics collection on very large datums. In the current implementation,
--- they are left out of the sample, to avoid running out of memory for the main relation 
+-- they are left out of the sample, to avoid running out of memory for the main relation
 -- statistics. In case of indexes on the relation, large datums are masked as NULLs in the sample
--- and are evaluated as NULL in index stats collection. 
+-- and are evaluated as NULL in index stats collection.
 -- Expression / partial indexes are not commonly used, and its rare to have them on wide columns, so the
 -- effect of considering them as NULL is minimal.
 --
@@ -396,3 +396,85 @@ INSERT INTO foo_stats values (repeat('b', 100000), 'bbbbb2', 'cccc2', 3);
 ANALYZE foo_stats;
 SELECT schemaname, tablename, attname, null_frac, avg_width, n_distinct, most_common_vals, most_common_freqs, histogram_bounds FROM pg_stats WHERE tablename='foo_stats' ORDER BY attname;
 DROP TABLE IF EXISTS foo_stats;
+
+
+--
+-- Test statistics collection with a "partially distributed" table. That is, with a table
+-- that has a smaller 'numsegments' in the distribution policy than the segment count
+-- of the cluster.
+--
+set allow_system_table_mods=true;
+
+create table twoseg_table(a int, b int, c int) distributed by (a);
+update gp_distribution_policy set numsegments=2 where localoid='twoseg_table'::regclass;
+insert into twoseg_table select i, i % 10, 0 from generate_series(1, 50) I;
+analyze twoseg_table;
+
+select relname, reltuples, relpages from pg_class where relname ='twoseg_table' order by relname;
+select attname, null_frac, avg_width, n_distinct, most_common_vals, most_common_freqs, histogram_bounds FROM pg_stats WHERE tablename='twoseg_table' ORDER BY attname;
+
+drop table twoseg_table;
+
+--
+-- Test statistics collection on a replicated table.
+--
+create table rep_table(a int, b int, c int) distributed replicated;
+insert into rep_table select i, i % 10, 0 from generate_series(1, 50) I;
+analyze rep_table;
+
+select relname, reltuples, relpages from pg_class where relname ='rep_table' order by relname;
+select attname, null_frac, avg_width, n_distinct, most_common_vals, most_common_freqs, histogram_bounds FROM pg_stats WHERE tablename='rep_table' ORDER BY attname;
+
+drop table rep_table;
+
+
+--
+-- Test relpages collection for AO tables.
+--
+
+-- use a lower target, so that the whole table doesn't fit in the sample.
+set default_statistics_target=10;
+
+create table ao_analyze_test (i int4) with (appendonly=true);
+insert into ao_analyze_test select g from generate_series(1, 100000) g;
+create index ao_analyze_test_idx on ao_analyze_test (i);
+analyze ao_analyze_test;
+select relname, reltuples from pg_class where relname like 'ao_analyze_test%' order by relname;
+
+-- and same for AOCS
+create table aocs_analyze_test (i int4) with (appendonly=true, orientation=column);
+insert into aocs_analyze_test select g from generate_series(1, 100000) g;
+create index aocs_analyze_test_idx on aocs_analyze_test (i);
+analyze aocs_analyze_test;
+select relname, reltuples from pg_class where relname like 'aocs_analyze_test%' order by relname;
+
+reset default_statistics_target;
+
+-- Test column name called totalrows
+create table test_tr (totalrows int4);
+analyze test_tr;
+drop table test_tr;
+
+--
+-- Test with both a dropped column and an oversized column
+-- (github issue https://github.com/greenplum-db/gpdb/issues/9503)
+--
+create table analyze_dropped_col (a text, b text, c text, d text);
+insert into analyze_dropped_col values('a','bbb', repeat('x', 5000), 'dddd');
+alter table analyze_dropped_col drop column b;
+analyze analyze_dropped_col;
+select attname, null_frac, avg_width, n_distinct from pg_stats where tablename ='analyze_dropped_col';
+-- Test analyze without USAGE privilege on schema
+create schema test_ns;
+revoke all on schema test_ns from public;
+create role nsuser1;
+grant create on schema test_ns to nsuser1;
+set search_path to 'test_ns';
+create extension citext;
+create table testid (id int , test citext);
+alter table testid owner to nsuser1;
+analyze testid;
+drop table testid;
+drop extension citext;
+drop schema test_ns;
+drop role nsuser1;

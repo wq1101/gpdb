@@ -1,3 +1,4 @@
+set bytea_output='escape';
 -- Basic RLE test
 create table rle_basic (i int encoding (compresstype=rle_type))
        with (appendonly=true, orientation=column);
@@ -11110,7 +11111,6 @@ a39 bit ENCODING (compresstype=RLE_TYPE,compresslevel=1,blocksize=8192),
 a40 bit varying(5) ENCODING (compresstype=RLE_TYPE,compresslevel=1,blocksize=8192),
 a41 smallint ENCODING (compresstype=RLE_TYPE,compresslevel=1,blocksize=8192),
 a42 int ENCODING (compresstype=RLE_TYPE,compresslevel=1,blocksize=8192)) WITH (appendonly=true, orientation=column) distributed randomly;
-NOTICE:  CREATE TABLE will create implicit sequence "co_1_create_table_storage_directive_rle_type_8192_1_id_seq" for serial column "co_1_create_table_storage_directive_rle_type_8192_1.id"
 -- 
 -- Create Indexes
 --

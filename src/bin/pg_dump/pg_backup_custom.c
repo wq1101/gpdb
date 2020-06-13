@@ -19,12 +19,15 @@
  *
  *
  * IDENTIFICATION
- *		$PostgreSQL: pgsql/src/bin/pg_dump/pg_backup_custom.c,v 1.40 2007/10/28 21:55:52 tgl Exp $
+ *		src/bin/pg_dump/pg_backup_custom.c
  *
  *-------------------------------------------------------------------------
  */
+#include "postgres_fe.h"
 
-#include "pg_backup_archiver.h"
+#include "compress_io.h"
+#include "parallel.h"
+#include "pg_backup_utils.h"
 
 /*--------
  * Routines in the format interface
@@ -33,14 +36,15 @@
 
 static void _ArchiveEntry(ArchiveHandle *AH, TocEntry *te);
 static void _StartData(ArchiveHandle *AH, TocEntry *te);
-static size_t _WriteData(ArchiveHandle *AH, const void *data, size_t dLen);
+static void _WriteData(ArchiveHandle *AH, const void *data, size_t dLen);
 static void _EndData(ArchiveHandle *AH, TocEntry *te);
 static int	_WriteByte(ArchiveHandle *AH, const int i);
 static int	_ReadByte(ArchiveHandle *);
-static size_t _WriteBuf(ArchiveHandle *AH, const void *buf, size_t len);
-static size_t _ReadBuf(ArchiveHandle *AH, void *buf, size_t len);
+static void _WriteBuf(ArchiveHandle *AH, const void *buf, size_t len);
+static void _ReadBuf(ArchiveHandle *AH, void *buf, size_t len);
 static void _CloseArchive(ArchiveHandle *AH);
-static void _PrintTocData(ArchiveHandle *AH, TocEntry *te, RestoreOptions *ropt);
+static void _ReopenArchive(ArchiveHandle *AH);
+static void _PrintTocData(ArchiveHandle *AH, TocEntry *te);
 static void _WriteExtraToc(ArchiveHandle *AH, TocEntry *te);
 static void _ReadExtraToc(ArchiveHandle *AH, TocEntry *te);
 static void _PrintExtraToc(ArchiveHandle *AH, TocEntry *te);
@@ -53,22 +57,17 @@ static void _StartBlobs(ArchiveHandle *AH, TocEntry *te);
 static void _StartBlob(ArchiveHandle *AH, TocEntry *te, Oid oid);
 static void _EndBlob(ArchiveHandle *AH, TocEntry *te, Oid oid);
 static void _EndBlobs(ArchiveHandle *AH, TocEntry *te);
-static void _LoadBlobs(ArchiveHandle *AH);
+static void _LoadBlobs(ArchiveHandle *AH, bool drop);
+static void _Clone(ArchiveHandle *AH);
+static void _DeClone(ArchiveHandle *AH);
 
-/*------------
- * Buffers used in zlib compression and extra data stored in archive and
- * in TOC entries.
- *------------
- */
-#define zlibOutSize 4096
-#define zlibInSize	4096
+static char *_MasterStartParallelItem(ArchiveHandle *AH, TocEntry *te, T_Action act);
+static int	_MasterEndParallelItem(ArchiveHandle *AH, TocEntry *te, const char *str, T_Action act);
+char	   *_WorkerJobRestoreCustom(ArchiveHandle *AH, TocEntry *te);
 
 typedef struct
 {
-	z_streamp	zp;
-	char	   *zlibOut;
-	char	   *zlibIn;
-	size_t		inSize;
+	CompressorState *cs;
 	int			hasSeek;
 	pgoff_t		filePos;
 	pgoff_t		dataStart;
@@ -86,11 +85,12 @@ typedef struct
  *------
  */
 static void _readBlockHeader(ArchiveHandle *AH, int *type, int *id);
-static void _StartDataCompressor(ArchiveHandle *AH, TocEntry *te);
-static void _EndDataCompressor(ArchiveHandle *AH, TocEntry *te);
 static pgoff_t _getFilePos(ArchiveHandle *AH, lclContext *ctx);
-static int	_DoDeflate(ArchiveHandle *AH, lclContext *ctx, int flush);
 
+static void _CustomWriteFunc(ArchiveHandle *AH, const char *buf, size_t len);
+static size_t _CustomReadFunc(ArchiveHandle *AH, char **buf, size_t *buflen);
+
+/* translator: this is a module name */
 static const char *modulename = gettext_noop("custom archiver");
 
 
@@ -120,6 +120,7 @@ InitArchiveFmt_Custom(ArchiveHandle *AH)
 	AH->WriteBufPtr = _WriteBuf;
 	AH->ReadBufPtr = _ReadBuf;
 	AH->ClosePtr = _CloseArchive;
+	AH->ReopenPtr = _ReopenArchive;
 	AH->PrintTocDataPtr = _PrintTocData;
 	AH->ReadExtraTocPtr = _ReadExtraToc;
 	AH->WriteExtraTocPtr = _WriteExtraToc;
@@ -129,39 +130,25 @@ InitArchiveFmt_Custom(ArchiveHandle *AH)
 	AH->StartBlobPtr = _StartBlob;
 	AH->EndBlobPtr = _EndBlob;
 	AH->EndBlobsPtr = _EndBlobs;
+	AH->ClonePtr = _Clone;
+	AH->DeClonePtr = _DeClone;
 
-	/*
-	 * Set up some special context used in compressing data.
-	 */
-	ctx = (lclContext *) calloc(1, sizeof(lclContext));
-	if (ctx == NULL)
-		die_horribly(AH, modulename, "out of memory\n");
+	AH->MasterStartParallelItemPtr = _MasterStartParallelItem;
+	AH->MasterEndParallelItemPtr = _MasterEndParallelItem;
+
+	/* no parallel dump in the custom archive, only parallel restore */
+	AH->WorkerJobDumpPtr = NULL;
+	AH->WorkerJobRestorePtr = _WorkerJobRestoreCustom;
+
+	/* Set up a private area. */
+	ctx = (lclContext *) pg_malloc0(sizeof(lclContext));
 	AH->formatData = (void *) ctx;
-
-	ctx->zp = (z_streamp) malloc(sizeof(z_stream));
-	if (ctx->zp == NULL)
-		die_horribly(AH, modulename, "out of memory\n");
 
 	/* Initialize LO buffering */
 	AH->lo_buf_size = LOBBUFSIZE;
-	AH->lo_buf = (void *) malloc(LOBBUFSIZE);
-	if (AH->lo_buf == NULL)
-		die_horribly(AH, modulename, "out of memory\n");
+	AH->lo_buf = (void *) pg_malloc(LOBBUFSIZE);
 
-	/*
-	 * zlibOutSize is the buffer size we tell zlib it can output to.  We
-	 * actually allocate one extra byte because some routines want to append a
-	 * trailing zero byte to the zlib output.  The input buffer is expansible
-	 * and is always of size ctx->inSize; zlibInSize is just the initial
-	 * default size for it.
-	 */
-	ctx->zlibOut = (char *) malloc(zlibOutSize + 1);
-	ctx->zlibIn = (char *) malloc(zlibInSize);
-	ctx->inSize = zlibInSize;
 	ctx->filePos = 0;
-
-	if (ctx->zlibOut == NULL || ctx->zlibIn == NULL)
-		die_horribly(AH, modulename, "out of memory\n");
 
 	/*
 	 * Now open the file
@@ -172,15 +159,15 @@ InitArchiveFmt_Custom(ArchiveHandle *AH)
 		{
 			AH->FH = fopen(AH->fSpec, PG_BINARY_W);
 			if (!AH->FH)
-				die_horribly(AH, modulename, "could not open output file \"%s\": %s\n",
-							 AH->fSpec, strerror(errno));
+				exit_horribly(modulename, "could not open output file \"%s\": %s\n",
+							  AH->fSpec, strerror(errno));
 		}
 		else
 		{
 			AH->FH = stdout;
 			if (!AH->FH)
-				die_horribly(AH, modulename, "could not open output file: %s\n",
-							 strerror(errno));
+				exit_horribly(modulename, "could not open output file: %s\n",
+							  strerror(errno));
 		}
 
 		ctx->hasSeek = checkSeek(AH->FH);
@@ -191,15 +178,15 @@ InitArchiveFmt_Custom(ArchiveHandle *AH)
 		{
 			AH->FH = fopen(AH->fSpec, PG_BINARY_R);
 			if (!AH->FH)
-				die_horribly(AH, modulename, "could not open input file \"%s\": %s\n",
-							 AH->fSpec, strerror(errno));
+				exit_horribly(modulename, "could not open input file \"%s\": %s\n",
+							  AH->fSpec, strerror(errno));
 		}
 		else
 		{
 			AH->FH = stdin;
 			if (!AH->FH)
-				die_horribly(AH, modulename, "could not open input file: %s\n",
-							 strerror(errno));
+				exit_horribly(modulename, "could not open input file: %s\n",
+							  strerror(errno));
 		}
 
 		ctx->hasSeek = checkSeek(AH->FH);
@@ -216,14 +203,14 @@ InitArchiveFmt_Custom(ArchiveHandle *AH)
  *
  * Optional.
  *
- * Set up extrac format-related TOC data.
+ * Set up extract format-related TOC data.
 */
 static void
 _ArchiveEntry(ArchiveHandle *AH, TocEntry *te)
 {
 	lclTocEntry *ctx;
 
-	ctx = (lclTocEntry *) calloc(1, sizeof(lclTocEntry));
+	ctx = (lclTocEntry *) pg_malloc0(sizeof(lclTocEntry));
 	if (te->dataDumper)
 		ctx->dataState = K_OFFSET_POS_NOT_SET;
 	else
@@ -254,18 +241,17 @@ _WriteExtraToc(ArchiveHandle *AH, TocEntry *te)
  *
  * Optional.
  *
- * Needs to match the order defined in _WriteExtraToc, and sould also
+ * Needs to match the order defined in _WriteExtraToc, and should also
  * use the Archiver input routines.
  */
 static void
 _ReadExtraToc(ArchiveHandle *AH, TocEntry *te)
 {
-	int			junk;
 	lclTocEntry *ctx = (lclTocEntry *) te->formatData;
 
 	if (ctx == NULL)
 	{
-		ctx = (lclTocEntry *) calloc(1, sizeof(lclTocEntry));
+		ctx = (lclTocEntry *) pg_malloc0(sizeof(lclTocEntry));
 		te->formatData = (void *) ctx;
 	}
 
@@ -276,7 +262,7 @@ _ReadExtraToc(ArchiveHandle *AH, TocEntry *te)
 	 * dump it at all.
 	 */
 	if (AH->version < K_VERS_1_7)
-		junk = ReadInt(AH);
+		ReadInt(AH);
 }
 
 /*
@@ -318,7 +304,7 @@ _StartData(ArchiveHandle *AH, TocEntry *te)
 	_WriteByte(AH, BLK_DATA);	/* Block type */
 	WriteInt(AH, te->dumpId);	/* For sanity check */
 
-	_StartDataCompressor(AH, te);
+	ctx->cs = AllocateCompressor(AH->compression, _CustomWriteFunc);
 }
 
 /*
@@ -330,21 +316,17 @@ _StartData(ArchiveHandle *AH, TocEntry *te)
  *
  * Mandatory.
  */
-static size_t
+static void
 _WriteData(ArchiveHandle *AH, const void *data, size_t dLen)
 {
 	lclContext *ctx = (lclContext *) AH->formatData;
-	z_streamp	zp = ctx->zp;
+	CompressorState *cs = ctx->cs;
 
-	zp->next_in = (void *) data;
-	zp->avail_in = dLen;
+	if (dLen > 0)
+		/* WriteDataToArchive() internally throws write errors */
+		WriteDataToArchive(AH, cs, data, dLen);
 
-	while (zp->avail_in != 0)
-	{
-		/* printf("Deflating %lu bytes\n", (unsigned long) dLen); */
-		_DoDeflate(AH, ctx, 0);
-	}
-	return dLen;
+	return;
 }
 
 /*
@@ -357,10 +339,11 @@ _WriteData(ArchiveHandle *AH, const void *data, size_t dLen)
 static void
 _EndData(ArchiveHandle *AH, TocEntry *te)
 {
-/*	lclContext *ctx = (lclContext *) AH->formatData; */
-/*	lclTocEntry *tctx = (lclTocEntry *) te->formatData; */
+	lclContext *ctx = (lclContext *) AH->formatData;
 
-	_EndDataCompressor(AH, te);
+	EndCompressor(AH, ctx->cs);
+	/* Send the end marker */
+	WriteInt(AH, 0);
 }
 
 /*
@@ -395,11 +378,14 @@ _StartBlobs(ArchiveHandle *AH, TocEntry *te)
 static void
 _StartBlob(ArchiveHandle *AH, TocEntry *te, Oid oid)
 {
+	lclContext *ctx = (lclContext *) AH->formatData;
+
 	if (oid == 0)
-		die_horribly(AH, modulename, "invalid OID for large object\n");
+		exit_horribly(modulename, "invalid OID for large object\n");
 
 	WriteInt(AH, oid);
-	_StartDataCompressor(AH, te);
+
+	ctx->cs = AllocateCompressor(AH->compression, _CustomWriteFunc);
 }
 
 /*
@@ -410,7 +396,11 @@ _StartBlob(ArchiveHandle *AH, TocEntry *te, Oid oid)
 static void
 _EndBlob(ArchiveHandle *AH, TocEntry *te, Oid oid)
 {
-	_EndDataCompressor(AH, te);
+	lclContext *ctx = (lclContext *) AH->formatData;
+
+	EndCompressor(AH, ctx->cs);
+	/* Send the end marker */
+	WriteInt(AH, 0);
 }
 
 /*
@@ -429,32 +419,27 @@ _EndBlobs(ArchiveHandle *AH, TocEntry *te)
  * Print data for a given TOC entry
  */
 static void
-_PrintTocData(ArchiveHandle *AH, TocEntry *te, RestoreOptions *ropt)
+_PrintTocData(ArchiveHandle *AH, TocEntry *te)
 {
 	lclContext *ctx = (lclContext *) AH->formatData;
-	int			id;
 	lclTocEntry *tctx = (lclTocEntry *) te->formatData;
 	int			blkType;
-	int			found = 0;
+	int			id;
 
 	if (tctx->dataState == K_OFFSET_NO_DATA)
 		return;
 
 	if (!ctx->hasSeek || tctx->dataState == K_OFFSET_POS_NOT_SET)
 	{
-		/* Skip over unnecessary blocks until we get the one we want. */
-
-		found = 0;
-
+		/*
+		 * We cannot seek directly to the desired block.  Instead, skip over
+		 * block headers until we find the one we want.  This could fail if we
+		 * are asked to restore items out-of-order.
+		 */
 		_readBlockHeader(AH, &blkType, &id);
 
-		while (id != te->dumpId)
+		while (blkType != EOF && id != te->dumpId)
 		{
-			if ((TocIDRequired(AH, id, ropt) & REQ_DATA) != 0)
-				die_horribly(AH, modulename,
-							 "dumping a specific TOC data block out of order is not supported"
-					  " without ID on this input stream (fseek required)\n");
-
 			switch (blkType)
 			{
 				case BLK_DATA:
@@ -466,9 +451,9 @@ _PrintTocData(ArchiveHandle *AH, TocEntry *te, RestoreOptions *ropt)
 					break;
 
 				default:		/* Always have a default */
-					die_horribly(AH, modulename,
-								 "unrecognized data block type (%d) while searching archive\n",
-								 blkType);
+					exit_horribly(modulename,
+								  "unrecognized data block type (%d) while searching archive\n",
+								  blkType);
 					break;
 			}
 			_readBlockHeader(AH, &blkType, &id);
@@ -478,15 +463,35 @@ _PrintTocData(ArchiveHandle *AH, TocEntry *te, RestoreOptions *ropt)
 	{
 		/* We can just seek to the place we need to be. */
 		if (fseeko(AH->FH, tctx->dataPos, SEEK_SET) != 0)
-			die_horribly(AH, modulename, "error during file seek: %s\n", strerror(errno));
+			exit_horribly(modulename, "error during file seek: %s\n",
+						  strerror(errno));
 
 		_readBlockHeader(AH, &blkType, &id);
 	}
 
+	/* Produce suitable failure message if we fell off end of file */
+	if (blkType == EOF)
+	{
+		if (tctx->dataState == K_OFFSET_POS_NOT_SET)
+			exit_horribly(modulename, "could not find block ID %d in archive -- "
+						  "possibly due to out-of-order restore request, "
+						  "which cannot be handled due to lack of data offsets in archive\n",
+						  te->dumpId);
+		else if (!ctx->hasSeek)
+			exit_horribly(modulename, "could not find block ID %d in archive -- "
+						  "possibly due to out-of-order restore request, "
+				  "which cannot be handled due to non-seekable input file\n",
+						  te->dumpId);
+		else	/* huh, the dataPos led us to EOF? */
+			exit_horribly(modulename, "could not find block ID %d in archive -- "
+						  "possibly corrupt archive\n",
+						  te->dumpId);
+	}
+
 	/* Are we sane? */
 	if (id != te->dumpId)
-		die_horribly(AH, modulename, "found unexpected block ID (%d) when reading data -- expected %d\n",
-					 id, te->dumpId);
+		exit_horribly(modulename, "found unexpected block ID (%d) when reading data -- expected %d\n",
+					  id, te->dumpId);
 
 	switch (blkType)
 	{
@@ -495,12 +500,12 @@ _PrintTocData(ArchiveHandle *AH, TocEntry *te, RestoreOptions *ropt)
 			break;
 
 		case BLK_BLOBS:
-			_LoadBlobs(AH);
+			_LoadBlobs(AH, AH->public.ropt->dropSchema);
 			break;
 
 		default:				/* Always have a default */
-			die_horribly(AH, modulename, "unrecognized data block type %d while restoring archive\n",
-						 blkType);
+			exit_horribly(modulename, "unrecognized data block type %d while restoring archive\n",
+						  blkType);
 			break;
 	}
 }
@@ -511,116 +516,11 @@ _PrintTocData(ArchiveHandle *AH, TocEntry *te, RestoreOptions *ropt)
 static void
 _PrintData(ArchiveHandle *AH)
 {
-	lclContext *ctx = (lclContext *) AH->formatData;
-	z_streamp	zp = ctx->zp;
-	size_t		blkLen;
-	char	   *in = ctx->zlibIn;
-	size_t		cnt;
-
-#ifdef HAVE_LIBZ
-	int			res;
-	char	   *out = ctx->zlibOut;
-#endif
-
-#ifdef HAVE_LIBZ
-
-	res = Z_OK;
-
-	if (AH->compression != 0)
-	{
-		zp->zalloc = Z_NULL;
-		zp->zfree = Z_NULL;
-		zp->opaque = Z_NULL;
-
-		if (inflateInit(zp) != Z_OK)
-			die_horribly(AH, modulename, "could not initialize compression library: %s\n", zp->msg);
-	}
-#endif
-
-	blkLen = ReadInt(AH);
-	while (blkLen != 0)
-	{
-		if (blkLen + 1 > ctx->inSize)
-		{
-			free(ctx->zlibIn);
-			ctx->zlibIn = NULL;
-			ctx->zlibIn = (char *) malloc(blkLen + 1);
-			if (!ctx->zlibIn)
-				die_horribly(AH, modulename, "out of memory\n");
-
-			ctx->inSize = blkLen + 1;
-			in = ctx->zlibIn;
-		}
-
-		cnt = fread(in, 1, blkLen, AH->FH);
-		if (cnt != blkLen)
-		{
-			if (feof(AH->FH))
-				die_horribly(AH, modulename,
-							 "could not read from input file: end of file\n");
-			else
-				die_horribly(AH, modulename,
-					"could not read from input file: %s\n", strerror(errno));
-		}
-
-		ctx->filePos += blkLen;
-
-		zp->next_in = (void *) in;
-		zp->avail_in = blkLen;
-
-#ifdef HAVE_LIBZ
-
-		if (AH->compression != 0)
-		{
-			while (zp->avail_in != 0)
-			{
-				zp->next_out = (void *) out;
-				zp->avail_out = zlibOutSize;
-				res = inflate(zp, 0);
-				if (res != Z_OK && res != Z_STREAM_END)
-					die_horribly(AH, modulename, "could not uncompress data: %s\n", zp->msg);
-
-				out[zlibOutSize - zp->avail_out] = '\0';
-				ahwrite(out, 1, zlibOutSize - zp->avail_out, AH);
-			}
-		}
-		else
-		{
-#endif
-			in[zp->avail_in] = '\0';
-			ahwrite(in, 1, zp->avail_in, AH);
-			zp->avail_in = 0;
-
-#ifdef HAVE_LIBZ
-		}
-#endif
-		blkLen = ReadInt(AH);
-	}
-
-#ifdef HAVE_LIBZ
-	if (AH->compression != 0)
-	{
-		zp->next_in = NULL;
-		zp->avail_in = 0;
-		while (res != Z_STREAM_END)
-		{
-			zp->next_out = (void *) out;
-			zp->avail_out = zlibOutSize;
-			res = inflate(zp, 0);
-			if (res != Z_OK && res != Z_STREAM_END)
-				die_horribly(AH, modulename, "could not uncompress data: %s\n", zp->msg);
-
-			out[zlibOutSize - zp->avail_out] = '\0';
-			ahwrite(out, 1, zlibOutSize - zp->avail_out, AH);
-		}
-		if (inflateEnd(zp) != Z_OK)
-			die_horribly(AH, modulename, "could not close compression library: %s\n", zp->msg);
-	}
-#endif
+	ReadDataFromArchive(AH, AH->compression, _CustomReadFunc);
 }
 
 static void
-_LoadBlobs(ArchiveHandle *AH)
+_LoadBlobs(ArchiveHandle *AH, bool drop)
 {
 	Oid			oid;
 
@@ -629,7 +529,7 @@ _LoadBlobs(ArchiveHandle *AH)
 	oid = ReadInt(AH);
 	while (oid != 0)
 	{
-		StartRestoreBlob(AH, oid);
+		StartRestoreBlob(AH, oid, drop);
 		_PrintData(AH);
 		EndRestoreBlob(AH, oid);
 		oid = ReadInt(AH);
@@ -667,27 +567,27 @@ _skipData(ArchiveHandle *AH)
 {
 	lclContext *ctx = (lclContext *) AH->formatData;
 	size_t		blkLen;
-	char	   *in = ctx->zlibIn;
+	char	   *buf = NULL;
+	int			buflen = 0;
 	size_t		cnt;
 
 	blkLen = ReadInt(AH);
 	while (blkLen != 0)
 	{
-		if (blkLen > ctx->inSize)
+		if (blkLen > buflen)
 		{
-			free(ctx->zlibIn);
-			ctx->zlibIn = (char *) malloc(blkLen);
-			ctx->inSize = blkLen;
-			in = ctx->zlibIn;
+			if (buf)
+				free(buf);
+			buf = (char *) pg_malloc(blkLen);
+			buflen = blkLen;
 		}
-		cnt = fread(in, 1, blkLen, AH->FH);
-		if (cnt != blkLen)
+		if ((cnt = fread(buf, 1, blkLen, AH->FH)) != blkLen)
 		{
 			if (feof(AH->FH))
-				die_horribly(AH, modulename,
-							 "could not read from input file: end of file\n");
+				exit_horribly(modulename,
+							"could not read from input file: end of file\n");
 			else
-				die_horribly(AH, modulename,
+				exit_horribly(modulename,
 					"could not read from input file: %s\n", strerror(errno));
 		}
 
@@ -695,6 +595,9 @@ _skipData(ArchiveHandle *AH)
 
 		blkLen = ReadInt(AH);
 	}
+
+	if (buf)
+		free(buf);
 }
 
 /*
@@ -703,8 +606,6 @@ _skipData(ArchiveHandle *AH)
  * Mandatory.
  *
  * Called by the archiver to do integer & byte output to the archive.
- * These routines are only used to read & write headers & TOC.
- *
  */
 static int
 _WriteByte(ArchiveHandle *AH, const int i)
@@ -712,12 +613,11 @@ _WriteByte(ArchiveHandle *AH, const int i)
 	lclContext *ctx = (lclContext *) AH->formatData;
 	int			res;
 
-	res = fputc(i, AH->FH);
-	if (res != EOF)
-		ctx->filePos += 1;
-	else
-		die_horribly(AH, modulename, "could not write byte: %s\n", strerror(errno));
-	return res;
+	if ((res = fputc(i, AH->FH)) == EOF)
+		WRITE_ERROR_EXIT;
+	ctx->filePos += 1;
+
+	return 1;
 }
 
 /*
@@ -726,7 +626,6 @@ _WriteByte(ArchiveHandle *AH, const int i)
  * Mandatory
  *
  * Called by the archiver to read bytes & integers from the archive.
- * These routines are only used to read & write headers & TOC.
  * EOF should be treated as a fatal error.
  */
 static int
@@ -737,7 +636,7 @@ _ReadByte(ArchiveHandle *AH)
 
 	res = getc(AH->FH);
 	if (res == EOF)
-		die_horribly(AH, modulename, "unexpected end of file\n");
+		READ_ERROR_EXIT(AH->FH);
 	ctx->filePos += 1;
 	return res;
 }
@@ -748,23 +647,17 @@ _ReadByte(ArchiveHandle *AH)
  * Mandatory.
  *
  * Called by the archiver to write a block of bytes to the archive.
- * These routines are only used to read & write headers & TOC.
- *
  */
-static size_t
+static void
 _WriteBuf(ArchiveHandle *AH, const void *buf, size_t len)
 {
 	lclContext *ctx = (lclContext *) AH->formatData;
-	size_t		res;
 
-	res = fwrite(buf, 1, len, AH->FH);
+	if (fwrite(buf, 1, len, AH->FH) != len)
+		WRITE_ERROR_EXIT;
+	ctx->filePos += len;
 
-	if (res != len)
-		die_horribly(AH, modulename,
-					 "could not write to output file: %s\n", strerror(errno));
-
-	ctx->filePos += res;
-	return res;
+	return;
 }
 
 /*
@@ -773,19 +666,17 @@ _WriteBuf(ArchiveHandle *AH, const void *buf, size_t len)
  * Mandatory.
  *
  * Called by the archiver to read a block of bytes from the archive
- * These routines are only used to read & write headers & TOC.
- *
  */
-static size_t
+static void
 _ReadBuf(ArchiveHandle *AH, void *buf, size_t len)
 {
 	lclContext *ctx = (lclContext *) AH->formatData;
-	size_t		res;
 
-	res = fread(buf, 1, len, AH->FH);
-	ctx->filePos += res;
+	if (fread(buf, 1, len, AH->FH) != len)
+		READ_ERROR_EXIT(AH->FH);
+	ctx->filePos += len;
 
-	return res;
+	return;
 }
 
 /*
@@ -797,7 +688,7 @@ _ReadBuf(ArchiveHandle *AH, void *buf, size_t len)
  * the process of saving it to files. No data should be written prior
  * to this point, since the user could sort the TOC after creating it.
  *
- * If an archive is to be written, this toutine must call:
+ * If an archive is to be written, this routine must call:
  *		WriteHead			to save the archive header
  *		WriteToc			to save the TOC entries
  *		WriteDataChunks		to save all DATA & BLOBs.
@@ -812,27 +703,182 @@ _CloseArchive(ArchiveHandle *AH)
 	if (AH->mode == archModeWrite)
 	{
 		WriteHead(AH);
+		/* Remember TOC's seek position for use below */
 		tpos = ftello(AH->FH);
+		if (tpos < 0 && ctx->hasSeek)
+			exit_horribly(modulename, "could not determine seek position in archive file: %s\n",
+						  strerror(errno));
 		WriteToc(AH);
 		ctx->dataStart = _getFilePos(AH, ctx);
-		WriteDataChunks(AH);
+		WriteDataChunks(AH, NULL);
 
 		/*
-		 * This is not an essential operation - it is really only needed if we
-		 * expect to be doing seeks to read the data back - it may be ok to
-		 * just use the existing self-consistent block formatting.
+		 * If possible, re-write the TOC in order to update the data offset
+		 * information.  This is not essential, as pg_restore can cope in most
+		 * cases without it; but it can make pg_restore significantly faster
+		 * in some situations (especially parallel restore).
 		 */
-		if (ctx->hasSeek)
-		{
-			fseeko(AH->FH, tpos, SEEK_SET);
+		if (ctx->hasSeek &&
+			fseeko(AH->FH, tpos, SEEK_SET) == 0)
 			WriteToc(AH);
-		}
 	}
 
 	if (fclose(AH->FH) != 0)
-		die_horribly(AH, modulename, "could not close archive file: %s\n", strerror(errno));
+		exit_horribly(modulename, "could not close archive file: %s\n", strerror(errno));
 
 	AH->FH = NULL;
+}
+
+/*
+ * Reopen the archive's file handle.
+ *
+ * We close the original file handle, except on Windows.  (The difference
+ * is because on Windows, this is used within a multithreading context,
+ * and we don't want a thread closing the parent file handle.)
+ */
+static void
+_ReopenArchive(ArchiveHandle *AH)
+{
+	lclContext *ctx = (lclContext *) AH->formatData;
+	pgoff_t		tpos;
+
+	if (AH->mode == archModeWrite)
+		exit_horribly(modulename, "can only reopen input archives\n");
+
+	/*
+	 * These two cases are user-facing errors since they represent unsupported
+	 * (but not invalid) use-cases.  Word the error messages appropriately.
+	 */
+	if (AH->fSpec == NULL || strcmp(AH->fSpec, "") == 0)
+		exit_horribly(modulename, "parallel restore from standard input is not supported\n");
+	if (!ctx->hasSeek)
+		exit_horribly(modulename, "parallel restore from non-seekable file is not supported\n");
+
+	tpos = ftello(AH->FH);
+	if (tpos < 0)
+		exit_horribly(modulename, "could not determine seek position in archive file: %s\n",
+					  strerror(errno));
+
+#ifndef WIN32
+	if (fclose(AH->FH) != 0)
+		exit_horribly(modulename, "could not close archive file: %s\n",
+					  strerror(errno));
+#endif
+
+	AH->FH = fopen(AH->fSpec, PG_BINARY_R);
+	if (!AH->FH)
+		exit_horribly(modulename, "could not open input file \"%s\": %s\n",
+					  AH->fSpec, strerror(errno));
+
+	if (fseeko(AH->FH, tpos, SEEK_SET) != 0)
+		exit_horribly(modulename, "could not set seek position in archive file: %s\n",
+					  strerror(errno));
+}
+
+/*
+ * Clone format-specific fields during parallel restoration.
+ */
+static void
+_Clone(ArchiveHandle *AH)
+{
+	lclContext *ctx = (lclContext *) AH->formatData;
+
+	AH->formatData = (lclContext *) pg_malloc(sizeof(lclContext));
+	memcpy(AH->formatData, ctx, sizeof(lclContext));
+	ctx = (lclContext *) AH->formatData;
+
+	/* sanity check, shouldn't happen */
+	if (ctx->cs != NULL)
+		exit_horribly(modulename, "compressor active\n");
+
+	/*
+	 * Note: we do not make a local lo_buf because we expect at most one BLOBS
+	 * entry per archive, so no parallelism is possible.  Likewise,
+	 * TOC-entry-local state isn't an issue because any one TOC entry is
+	 * touched by just one worker child.
+	 */
+}
+
+static void
+_DeClone(ArchiveHandle *AH)
+{
+	lclContext *ctx = (lclContext *) AH->formatData;
+
+	free(ctx);
+}
+
+/*
+ * This function is executed in the child of a parallel backup for the
+ * custom format archive and dumps the actual data.
+ */
+char *
+_WorkerJobRestoreCustom(ArchiveHandle *AH, TocEntry *te)
+{
+	/*
+	 * short fixed-size string + some ID so far, this needs to be malloc'ed
+	 * instead of static because we work with threads on windows
+	 */
+	const int	buflen = 64;
+	char	   *buf = (char *) pg_malloc(buflen);
+	ParallelArgs pargs;
+	int			status;
+
+	pargs.AH = AH;
+	pargs.te = te;
+
+	status = parallel_restore(&pargs);
+
+	snprintf(buf, buflen, "OK RESTORE %d %d %d", te->dumpId, status,
+			 status == WORKER_IGNORED_ERRORS ? AH->public.n_errors : 0);
+
+	return buf;
+}
+
+/*
+ * This function is executed in the parent process. Depending on the desired
+ * action (dump or restore) it creates a string that is understood by the
+ * _WorkerJobDump /_WorkerJobRestore functions of the dump format.
+ */
+static char *
+_MasterStartParallelItem(ArchiveHandle *AH, TocEntry *te, T_Action act)
+{
+	/*
+	 * A static char is okay here, even on Windows because we call this
+	 * function only from one process (the master).
+	 */
+	static char buf[64];		/* short fixed-size string + number */
+
+	/* no parallel dump in the custom archive format */
+	Assert(act == ACT_RESTORE);
+
+	snprintf(buf, sizeof(buf), "RESTORE %d", te->dumpId);
+
+	return buf;
+}
+
+/*
+ * This function is executed in the parent process. It analyzes the response of
+ * the _WorkerJobDump / _WorkerJobRestore functions of the dump format.
+ */
+static int
+_MasterEndParallelItem(ArchiveHandle *AH, TocEntry *te, const char *str, T_Action act)
+{
+	DumpId		dumpId;
+	int			nBytes,
+				status,
+				n_errors;
+
+	/* no parallel dump in the custom archive */
+	Assert(act == ACT_RESTORE);
+
+	sscanf(str, "%d %d %d%n", &dumpId, &status, &n_errors, &nBytes);
+
+	Assert(nBytes == strlen(str));
+	Assert(dumpId == te->dumpId);
+
+	AH->public.n_errors += n_errors;
+
+	return status;
 }
 
 /*--------------------------------------------------
@@ -850,16 +896,20 @@ _getFilePos(ArchiveHandle *AH, lclContext *ctx)
 
 	if (ctx->hasSeek)
 	{
+		/*
+		 * Prior to 1.7 (pg7.3) we relied on the internally maintained
+		 * pointer.  Now we rely on ftello() always, unless the file has been
+		 * found to not support it.  For debugging purposes, print a warning
+		 * if the internal pointer disagrees, so that we're more likely to
+		 * notice if something's broken about the internal position tracking.
+		 */
 		pos = ftello(AH->FH);
-		if (pos != ctx->filePos)
-		{
-			write_msg(modulename, "WARNING: ftell mismatch with expected position -- ftell used\n");
+		if (pos < 0)
+			exit_horribly(modulename, "could not determine seek position in archive file: %s\n",
+						  strerror(errno));
 
-			/*
-			 * Prior to 1.7 (pg7.3) we relied on the internally maintained
-			 * pointer. Now we rely on pgoff_t always. pos = ctx->filePos;
-			 */
-		}
+		if (pos != ctx->filePos)
+			write_msg(modulename, "WARNING: ftell mismatch with expected position -- ftell used\n");
 	}
 	else
 		pos = ctx->filePos;
@@ -868,155 +918,79 @@ _getFilePos(ArchiveHandle *AH, lclContext *ctx)
 
 /*
  * Read a data block header. The format changed in V1.3, so we
- * put the code here for simplicity.
+ * centralize the code here for simplicity.  Returns *type = EOF
+ * if at EOF.
  */
 static void
 _readBlockHeader(ArchiveHandle *AH, int *type, int *id)
 {
+	lclContext *ctx = (lclContext *) AH->formatData;
+	int			byt;
+
+	/*
+	 * Note: if we are at EOF with a pre-1.3 input file, we'll exit_horribly
+	 * inside ReadInt rather than returning EOF.  It doesn't seem worth
+	 * jumping through hoops to deal with that case better, because no such
+	 * files are likely to exist in the wild: only some 7.1 development
+	 * versions of pg_dump ever generated such files.
+	 */
 	if (AH->version < K_VERS_1_3)
 		*type = BLK_DATA;
 	else
-		*type = _ReadByte(AH);
+	{
+		byt = getc(AH->FH);
+		*type = byt;
+		if (byt == EOF)
+		{
+			*id = 0;			/* don't return an uninitialized value */
+			return;
+		}
+		ctx->filePos += 1;
+	}
 
 	*id = ReadInt(AH);
 }
 
 /*
- * If zlib is available, then startit up. This is called from
- * StartData & StartBlob. The buffers are setup in the Init routine.
+ * Callback function for WriteDataToArchive. Writes one block of (compressed)
+ * data to the archive.
  */
 static void
-_StartDataCompressor(ArchiveHandle *AH, TocEntry *te)
+_CustomWriteFunc(ArchiveHandle *AH, const char *buf, size_t len)
 {
-	lclContext *ctx = (lclContext *) AH->formatData;
-	z_streamp	zp = ctx->zp;
-
-#ifdef HAVE_LIBZ
-
-	if (AH->compression < 0 || AH->compression > 9)
-		AH->compression = Z_DEFAULT_COMPRESSION;
-
-	if (AH->compression != 0)
+	/* never write 0-byte blocks (this should not happen) */
+	if (len > 0)
 	{
-		zp->zalloc = Z_NULL;
-		zp->zfree = Z_NULL;
-		zp->opaque = Z_NULL;
-
-		if (deflateInit(zp, AH->compression) != Z_OK)
-			die_horribly(AH, modulename, "could not initialize compression library: %s\n", zp->msg);
+		WriteInt(AH, len);
+		_WriteBuf(AH, buf, len);
 	}
-#else
-
-	AH->compression = 0;
-#endif
-
-	/* Just be paranoid - maybe End is called after Start, with no Write */
-	zp->next_out = (void *) ctx->zlibOut;
-	zp->avail_out = zlibOutSize;
+	return;
 }
 
 /*
- * Send compressed data to the output stream (via ahwrite).
- * Each data chunk is preceded by it's length.
- * In the case of Z0, or no zlib, just write the raw data.
- *
+ * Callback function for ReadDataFromArchive. To keep things simple, we
+ * always read one compressed block at a time.
  */
-static int
-_DoDeflate(ArchiveHandle *AH, lclContext *ctx, int flush)
+static size_t
+_CustomReadFunc(ArchiveHandle *AH, char **buf, size_t *buflen)
 {
-	z_streamp	zp = ctx->zp;
+	size_t		blkLen;
 
-#ifdef HAVE_LIBZ
-	char	   *out = ctx->zlibOut;
-	int			res = Z_OK;
+	/* Read length */
+	blkLen = ReadInt(AH);
+	if (blkLen == 0)
+		return 0;
 
-	if (AH->compression != 0)
+	/* If the caller's buffer is not large enough, allocate a bigger one */
+	if (blkLen > *buflen)
 	{
-		res = deflate(zp, flush);
-		if (res == Z_STREAM_ERROR)
-			die_horribly(AH, modulename, "could not compress data: %s\n", zp->msg);
-
-		if (((flush == Z_FINISH) && (zp->avail_out < zlibOutSize))
-			|| (zp->avail_out == 0)
-			|| (zp->avail_in != 0)
-			)
-		{
-			/*
-			 * Extra paranoia: avoid zero-length chunks since a zero length
-			 * chunk is the EOF marker. This should never happen but...
-			 */
-			if (zp->avail_out < zlibOutSize)
-			{
-				/*
-				 * printf("Wrote %lu byte deflated chunk\n", (unsigned long)
-				 * (zlibOutSize - zp->avail_out));
-				 */
-				WriteInt(AH, zlibOutSize - zp->avail_out);
-				if (fwrite(out, 1, zlibOutSize - zp->avail_out, AH->FH) != (zlibOutSize - zp->avail_out))
-					die_horribly(AH, modulename, "could not write to output file: %s\n", strerror(errno));
-				ctx->filePos += zlibOutSize - zp->avail_out;
-			}
-			zp->next_out = (void *) out;
-			zp->avail_out = zlibOutSize;
-		}
-	}
-	else
-#endif
-	{
-		if (zp->avail_in > 0)
-		{
-			WriteInt(AH, zp->avail_in);
-			if (fwrite(zp->next_in, 1, zp->avail_in, AH->FH) != zp->avail_in)
-				die_horribly(AH, modulename, "could not write to output file: %s\n", strerror(errno));
-			ctx->filePos += zp->avail_in;
-			zp->avail_in = 0;
-		}
-		else
-		{
-#ifdef HAVE_LIBZ
-			if (flush == Z_FINISH)
-				res = Z_STREAM_END;
-#endif
-		}
+		free(*buf);
+		*buf = (char *) pg_malloc(blkLen);
+		*buflen = blkLen;
 	}
 
-#ifdef HAVE_LIBZ
-	return res;
-#else
-	return 1;
-#endif
-}
+	/* exits app on read errors */
+	_ReadBuf(AH, *buf, blkLen);
 
-/*
- * Terminate zlib context and flush it's buffers. If no zlib
- * then just return.
- *
- */
-static void
-_EndDataCompressor(ArchiveHandle *AH, TocEntry *te)
-{
-
-#ifdef HAVE_LIBZ
-	lclContext *ctx = (lclContext *) AH->formatData;
-	z_streamp	zp = ctx->zp;
-	int			res;
-
-	if (AH->compression != 0)
-	{
-		zp->next_in = NULL;
-		zp->avail_in = 0;
-
-		do
-		{
-			/* printf("Ending data output\n"); */
-			res = _DoDeflate(AH, ctx, Z_FINISH);
-		} while (res != Z_STREAM_END);
-
-		if (deflateEnd(zp) != Z_OK)
-			die_horribly(AH, modulename, "could not close compression stream: %s\n", zp->msg);
-	}
-#endif
-
-	/* Send the end marker */
-	WriteInt(AH, 0);
+	return blkLen;
 }

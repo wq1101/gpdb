@@ -8,10 +8,10 @@
  *	  Structs that need to be client-visible are in pqcomm.h.
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/libpq/libpq-be.h,v 1.74 2010/01/15 09:19:08 heikki Exp $
+ * src/include/libpq/libpq-be.h
  *
  *-------------------------------------------------------------------------
  */
@@ -21,7 +21,7 @@
 #ifdef HAVE_SYS_TIME_H
 #include <sys/time.h>
 #endif
-#ifdef USE_SSL
+#ifdef USE_OPENSSL
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #endif
@@ -62,21 +62,21 @@ typedef struct
 {
 	void	   *value;
 	int			length;
-}	gss_buffer_desc;
+} gss_buffer_desc;
 #define GSS_BUFFER_DESC_DEFINED
 #endif
 #endif
 #endif   /* ENABLE_SSPI */
 
+#include "datatype/timestamp.h"
 #include "libpq/hba.h"
 #include "libpq/pqcomm.h"
-#include "utils/timestamp.h"
 
 
 typedef enum CAC_state
 {
-	CAC_OK, CAC_STARTUP, CAC_SHUTDOWN, CAC_RECOVERY, CAC_TOOMANY, CAC_MIRROR_OR_QUIESCENT
-	/* ,CAC_WAITBACKUP */
+	CAC_OK, CAC_STARTUP, CAC_SHUTDOWN, CAC_RECOVERY, CAC_TOOMANY,
+	CAC_WAITBACKUP, CAC_MIRROR_READY
 } CAC_state;
 
 
@@ -92,16 +92,30 @@ typedef struct
 	gss_ctx_id_t ctx;			/* GSSAPI connection context */
 	gss_name_t	name;			/* GSSAPI client name */
 #endif
-}	pg_gssinfo;
+} pg_gssinfo;
 #endif
 
 /*
- * This is used by the postmaster in its communication with frontends.	It
+ * This is used by the postmaster in its communication with frontends.  It
  * contains all state information needed during this communication before the
- * backend is run.	The Port structure is kept in malloc'd memory and is
- * still available when a backend is running (see MyProcPort).	The data
+ * backend is run.  The Port structure is kept in malloc'd memory and is
+ * still available when a backend is running (see MyProcPort).  The data
  * it points to must also be malloc'd, or else palloc'd in TopMemoryContext,
  * so that it survives into PostgresMain execution!
+ *
+ * remote_hostname is set if we did a successful reverse lookup of the
+ * client's IP address during connection setup.
+ * remote_hostname_resolv tracks the state of hostname verification:
+ *	+1 = remote_hostname is known to resolve to client's IP address
+ *	-1 = remote_hostname is known NOT to resolve to client's IP address
+ *	 0 = we have not done the forward DNS lookup yet
+ *	-2 = there was an error in name resolution
+ * If reverse lookup of the client IP address fails, remote_hostname will be
+ * left NULL while remote_hostname_resolv is set to -2.  If reverse lookup
+ * succeeds but forward lookup fails, remote_hostname_resolv is also set to -2
+ * (the case is distinguishable because remote_hostname isn't NULL).  In
+ * either of the -2 cases, remote_hostname_errcode saves the lookup return
+ * code for possible later use with gai_strerror.
  */
 
 typedef struct Port
@@ -112,12 +126,16 @@ typedef struct Port
 	SockAddr	laddr;			/* local addr (postmaster) */
 	SockAddr	raddr;			/* remote addr (client) */
 	char	   *remote_host;	/* name (or ip addr) of remote host */
+	char	   *remote_hostname;/* name (not ip addr) of remote host, if
+								 * available */
+	int			remote_hostname_resolv; /* see above */
+	int			remote_hostname_errcode;		/* see above */
 	char	   *remote_port;	/* text rep of remote port */
 	CAC_state	canAcceptConnections;	/* postmaster connection status */
 
 	/*
 	 * Information that needs to be saved from the startup packet and passed
-	 * into backend execution.	"char *" fields are NULL if not set.
+	 * into backend execution.  "char *" fields are NULL if not set.
 	 * guc_options points to a List of alternating option names and values.
 	 */
 	char	   *database_name;
@@ -155,7 +173,7 @@ typedef struct Port
 #if defined(ENABLE_GSS) || defined(ENABLE_SSPI)
 
 	/*
-	 * If GSSAPI is supported, store GSSAPI information. Oterwise, store a
+	 * If GSSAPI is supported, store GSSAPI information. Otherwise, store a
 	 * NULL pointer to make sure offsets in the struct remain the same.
 	 */
 	pg_gssinfo *gss;
@@ -164,17 +182,40 @@ typedef struct Port
 #endif
 
 	/*
-	 * SSL structures (keep these last so that USE_SSL doesn't affect
-	 * locations of other fields)
+	 * SSL structures.
 	 */
-#ifdef USE_SSL
-	SSL		*ssl;
-	X509	   	*peer;
-	char		*peer_cn;
+	bool		ssl_in_use;
+	char	   *peer_cn;
+	bool		peer_cert_valid;
+
+	/*
+	 * OpenSSL structures. (Keep these last so that the locations of other
+	 * fields are the same whether or not you build with OpenSSL.)
+	 */
+#ifdef USE_OPENSSL
+	SSL		   *ssl;
+	X509	   *peer;
 	unsigned long count;
 #endif
 } Port;
 
+#ifdef USE_SSL
+/*
+ * These functions are implemented by the glue code specific to each
+ * SSL implementation (e.g. be-secure-openssl.c)
+ */
+extern void be_tls_init(void);
+extern int	be_tls_open_server(Port *port);
+extern void be_tls_close(Port *port);
+extern ssize_t be_tls_read(Port *port, void *ptr, size_t len, int *waitfor);
+extern ssize_t be_tls_write(Port *port, void *ptr, size_t len, int *waitfor);
+
+extern int	be_tls_get_cipher_bits(Port *port);
+extern bool be_tls_get_compression(Port *port);
+extern void be_tls_get_version(Port *port, char *ptr, size_t len);
+extern void be_tls_get_cipher(Port *port, char *ptr, size_t len);
+extern void be_tls_get_peerdn_name(Port *port, char *ptr, size_t len);
+#endif
 
 extern ProtocolVersion FrontendProtocol;
 

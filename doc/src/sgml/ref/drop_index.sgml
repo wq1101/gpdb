@@ -1,11 +1,16 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/drop_index.sgml,v 1.23 2006/09/16 00:30:18 momjian Exp $
+doc/src/sgml/ref/drop_index.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-DROPINDEX">
+ <indexterm zone="sql-dropindex">
+  <primary>DROP INDEX</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="SQL-DROPINDEX-TITLE">DROP INDEX</refentrytitle>
+  <refentrytitle>DROP INDEX</refentrytitle>
+  <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
 
@@ -14,13 +19,9 @@ PostgreSQL documentation
   <refpurpose>remove an index</refpurpose>
  </refnamediv>
 
- <indexterm zone="sql-dropindex">
-  <primary>DROP INDEX</primary>
- </indexterm>
-
  <refsynopsisdiv>
 <synopsis>
-DROP INDEX [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> [, ...] [ CASCADE | RESTRICT ]
+DROP INDEX [ CONCURRENTLY ] [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> [, ...] [ CASCADE | RESTRICT ]
 </synopsis>
  </refsynopsisdiv>
 
@@ -39,10 +40,32 @@ DROP INDEX [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> [, ..
 
   <variablelist>
    <varlistentry>
+    <term><literal>CONCURRENTLY</literal></term>
+    <listitem>
+     <para>
+      Drop the index without locking out concurrent selects, inserts, updates,
+      and deletes on the index's table.  A normal <command>DROP INDEX</>
+      acquires exclusive lock on the table, blocking other accesses until the
+      index drop can be completed.  With this option, the command instead
+      waits until conflicting transactions have completed.
+     </para>
+     <para>
+      There are several caveats to be aware of when using this option.
+      Only one index name can be specified, and the <literal>CASCADE</> option
+      is not supported.  (Thus, an index that supports a <literal>UNIQUE</> or
+      <literal>PRIMARY KEY</> constraint cannot be dropped this way.)
+      Also, regular <command>DROP INDEX</> commands can be
+      performed within a transaction block, but
+      <command>DROP INDEX CONCURRENTLY</> cannot.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
     <term><literal>IF EXISTS</literal></term>
     <listitem>
      <para>
-      Do not throw an error if the index does not exist. A notice is issued 
+      Do not throw an error if the index does not exist. A notice is issued
       in this case.
      </para>
     </listitem>
@@ -61,7 +84,9 @@ DROP INDEX [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> [, ..
     <term><literal>CASCADE</literal></term>
     <listitem>
      <para>
-      Automatically drop objects that depend on the index.
+      Automatically drop objects that depend on the index,
+      and in turn all objects that depend on those objects
+      (see <xref linkend="ddl-depend">).
      </para>
     </listitem>
    </varlistentry>
@@ -86,8 +111,7 @@ DROP INDEX [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> [, ..
 
 <programlisting>
 DROP INDEX title_idx;
-</programlisting>
-  </para>
+</programlisting></para>
  </refsect1>
 
  <refsect1>
@@ -104,7 +128,7 @@ DROP INDEX title_idx;
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-createindex" endterm="sql-createindex-title"></member>
+   <member><xref linkend="sql-createindex"></member>
   </simplelist>
  </refsect1>
 

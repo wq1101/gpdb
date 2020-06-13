@@ -1,27 +1,27 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/drop_trigger.sgml,v 1.23 2008/11/14 10:22:46 petere Exp $
+doc/src/sgml/ref/drop_trigger.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-DROPTRIGGER">
+ <indexterm zone="sql-droptrigger">
+  <primary>DROP TRIGGER</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="SQL-DROPTRIGGER-TITLE">DROP TRIGGER</refentrytitle>
+  <refentrytitle>DROP TRIGGER</refentrytitle>
   <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
 
  <refnamediv>
   <refname>DROP TRIGGER</refname>
-  <refpurpose>remove a trigger</refpurpose> 
- </refnamediv>            
-
- <indexterm zone="sql-droptrigger">
-  <primary>DROP TRIGGER</primary>
- </indexterm>
+  <refpurpose>remove a trigger</refpurpose>
+ </refnamediv>
 
  <refsynopsisdiv>
 <synopsis>
-DROP TRIGGER [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> ON <replaceable class="PARAMETER">table</replaceable> [ CASCADE | RESTRICT ]
+DROP TRIGGER [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> ON <replaceable class="PARAMETER">table_name</replaceable> [ CASCADE | RESTRICT ]
 </synopsis>
  </refsynopsisdiv>
 
@@ -44,7 +44,7 @@ DROP TRIGGER [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> ON 
     <term><literal>IF EXISTS</literal></term>
     <listitem>
      <para>
-      Do not throw an error if the trigger does not exist. A notice is issued 
+      Do not throw an error if the trigger does not exist. A notice is issued
       in this case.
      </para>
     </listitem>
@@ -60,7 +60,7 @@ DROP TRIGGER [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> ON 
    </varlistentry>
 
    <varlistentry>
-    <term><replaceable class="PARAMETER">table</replaceable></term>
+    <term><replaceable class="PARAMETER">table_name</replaceable></term>
     <listitem>
      <para>
       The name (optionally schema-qualified) of the table for which
@@ -73,7 +73,9 @@ DROP TRIGGER [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> ON 
     <term><literal>CASCADE</literal></term>
     <listitem>
      <para>
-      Automatically drop objects that depend on the trigger.
+      Automatically drop objects that depend on the trigger,
+      and in turn all objects that depend on those objects
+      (see <xref linkend="ddl-depend">).
      </para>
     </listitem>
    </varlistentry>
@@ -99,13 +101,12 @@ DROP TRIGGER [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> ON 
 
 <programlisting>
 DROP TRIGGER if_dist_exists ON films;
-</programlisting>
-  </para>
+</programlisting></para>
  </refsect1>
- 
+
  <refsect1 id="SQL-DROPTRIGGER-compatibility">
   <title>Compatibility</title>
-  
+
   <para>
    The <command>DROP TRIGGER</command> statement in
    <productname>PostgreSQL</productname> is incompatible with the SQL
@@ -119,7 +120,7 @@ DROP TRIGGER if_dist_exists ON films;
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-createtrigger" endterm="sql-createtrigger-title"></member>
+   <member><xref linkend="sql-createtrigger"></member>
   </simplelist>
  </refsect1>
 

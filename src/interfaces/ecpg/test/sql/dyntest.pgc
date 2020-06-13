@@ -113,7 +113,7 @@ main ()
 	      break;
 	    case SQL3_DATE_TIME_TIMESTAMP:
 	    exec sql get descriptor MYDESC value :INDEX
-	    	:DATETIME_INTERVAL_CODE = datetime_interval_code;
+			:DATETIME_INTERVAL_CODE = datetime_interval_code;
 	      switch (DATETIME_INTERVAL_CODE)
 		{
 		case SQL3_DDT_DATE:
@@ -149,10 +149,7 @@ main ()
 		printf ("varchar()");
 	      break;
 	    default:
-	      if (TYPE < 0)
-		printf ("<OID %d>", -TYPE);
-	      else
-		printf ("<SQL3 %d>", TYPE);
+	      printf ("<SQL3 %d>", TYPE);
 	      break;
 	    }
 	  printf (")\n\toctet_length: %d returned_octet_length: %d)\n\t= ",
@@ -177,7 +174,7 @@ main ()
 		break;
 	      case SQL3_DATE_TIME_TIMESTAMP:
 	      exec sql get descriptor MYDESC value :INDEX
-	      	:DATETIME_INTERVAL_CODE = datetime_interval_code,
+			:DATETIME_INTERVAL_CODE = datetime_interval_code,
 		:STRINGVAR = data;
 		printf ("%d \"%s\"\n", DATETIME_INTERVAL_CODE, STRINGVAR);
 		break;

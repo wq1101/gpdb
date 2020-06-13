@@ -79,7 +79,6 @@ create table  bfv_subquery_t2(i int, j int);
 insert into  bfv_subquery_t1 select i, i%5 from generate_series(1,10)i;
 insert into  bfv_subquery_t2 values (1, 10);
 
-select count_operator('select bfv_subquery_t1.i, (select bfv_subquery_t1.i from bfv_subquery_t2) from bfv_subquery_t1;', 'Table Scan') > 0;
 select count_operator('select bfv_subquery_t1.i, (select bfv_subquery_t1.i from bfv_subquery_t2) from bfv_subquery_t1;', 'Seq Scan') > 0;
 
 select bfv_subquery_t1.i, (select bfv_subquery_t1.i from bfv_subquery_t2) from bfv_subquery_t1 order by 1, 2;
@@ -148,8 +147,6 @@ select 1 where 22 in (SELECT unnest(array[1,2]));
 select 1 where 22  in (SELECT unnest(array[1,2,22]));
 
 select 1 where 22 not in (SELECT unnest(array[1,2,22]));
-
--- Error when using subquery : no parameter found for initplan subquery
 
 -- start_ignore
 drop table if exists mpp_t1;
@@ -271,3 +268,36 @@ select * from foo where not exists (select * from bar where foo.b = foo.b || 'a'
 select * from foo where foo.a = (select min(bar.c) from bar where foo.b || bar.d = 'bb');
 
 drop table foo, bar;
+
+--
+-- Test subquery with rescan of RESULT node
+--
+create table foo_rescan_result(a, b) as (values (1, 2), (1, 1));
+create table bar_rescan_result(a, b) as (values (1, 1));
+
+select * from foo_rescan_result t1
+where (select count(*) from bar_rescan_result where t1.a=t1.b) > 0;
+--
+-- subqueries with unnest in projectlist
+--
+-- start_ignore
+DROP TABLE IF EXISTS A;
+CREATE TABLE A AS SELECT ARRAY[1,2,3] AS X;
+INSERT INTO A VALUES(NULL::int4[]);
+-- end_ignore
+
+SELECT (NOT EXISTS (SELECT UNNEST(X))) AS B FROM A;
+SELECT (EXISTS (SELECT UNNEST(X))) AS B FROM A;
+EXPLAIN SELECT (EXISTS (SELECT UNNEST(X))) AS B FROM A;
+
+DROP TABLE A;
+
+--
+-- Test the ctid in function scan
+--
+
+create table t1(a int) ;
+insert into t1 select i from generate_series(1, 100000) i;
+analyze t1;
+select count(*) from pg_backend_pid() b(a) where b.a % 100000 in (select a from t1);
+drop table t1;

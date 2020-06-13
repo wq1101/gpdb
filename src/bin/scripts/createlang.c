@@ -2,17 +2,17 @@
  *
  * createlang
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/bin/scripts/createlang.c,v 1.34 2009/02/26 16:02:39 petere Exp $
+ * src/bin/scripts/createlang.c
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres_fe.h"
 
 #include "common.h"
-#include "print.h"
+#include "fe_utils/print.h"
 
 static void help(const char *progname);
 
@@ -65,13 +65,13 @@ main(int argc, char *argv[])
 				listlangs = true;
 				break;
 			case 'h':
-				host = optarg;
+				host = pg_strdup(optarg);
 				break;
 			case 'p':
-				port = optarg;
+				port = pg_strdup(optarg);
 				break;
 			case 'U':
-				username = optarg;
+				username = pg_strdup(optarg);
 				break;
 			case 'w':
 				prompt_password = TRI_NO;
@@ -80,7 +80,7 @@ main(int argc, char *argv[])
 				prompt_password = TRI_YES;
 				break;
 			case 'd':
-				dbname = optarg;
+				dbname = pg_strdup(optarg);
 				break;
 			case 'e':
 				echo = true;
@@ -91,14 +91,23 @@ main(int argc, char *argv[])
 		}
 	}
 
+	/*
+	 * We set dbname from positional arguments if it is not already set by
+	 * option arguments -d. If not doing listlangs, positional dbname must
+	 * follow positional langname.
+	 */
+
 	if (argc - optind > 0)
 	{
 		if (listlangs)
-			dbname = argv[optind++];
+		{
+			if (dbname == NULL)
+				dbname = argv[optind++];
+		}
 		else
 		{
 			langname = argv[optind++];
-			if (argc - optind > 0)
+			if (argc - optind > 0 && dbname == NULL)
 				dbname = argv[optind++];
 		}
 	}
@@ -118,7 +127,7 @@ main(int argc, char *argv[])
 		else if (getenv("PGUSER"))
 			dbname = getenv("PGUSER");
 		else
-			dbname = get_user_name(progname);
+			dbname = get_user_name_or_exit(progname);
 	}
 
 	initPQExpBuffer(&sql);
@@ -132,7 +141,7 @@ main(int argc, char *argv[])
 		static const bool translate_columns[] = {false, true};
 
 		conn = connectDatabase(dbname, host, port, username, prompt_password,
-							   progname);
+							   progname, echo, false, false);
 
 		printfPQExpBuffer(&sql, "SELECT lanname as \"%s\", "
 				"(CASE WHEN lanpltrusted THEN '%s' ELSE '%s' END) as \"%s\" "
@@ -151,7 +160,9 @@ main(int argc, char *argv[])
 		popt.title = _("Procedural Languages");
 		popt.translate_header = true;
 		popt.translate_columns = translate_columns;
-		printQuery(result, &popt, stdout, NULL);
+		popt.n_translate_columns = lengthof(translate_columns);
+
+		printQuery(result, &popt, stdout, false, NULL);
 
 		PQfinish(conn);
 		exit(0);
@@ -164,11 +175,13 @@ main(int argc, char *argv[])
 		exit(1);
 	}
 
+	/* lower case language name */
 	for (p = langname; *p; p++)
 		if (*p >= 'A' && *p <= 'Z')
 			*p += ('a' - 'A');
 
-	conn = connectDatabase(dbname, host, port, username, prompt_password, progname);
+	conn = connectDatabase(dbname, host, port, username, prompt_password,
+						   progname, echo, false, false);
 
 	/*
 	 * Make sure the language isn't already installed
@@ -179,19 +192,27 @@ main(int argc, char *argv[])
 	result = executeQuery(conn, sql.data, progname, echo);
 	if (PQntuples(result) > 0)
 	{
-		PQfinish(conn);
 		fprintf(stderr,
 		  _("%s: language \"%s\" is already installed in database \"%s\"\n"),
-				progname, langname, dbname);
+				progname, langname, PQdb(conn));
+		PQfinish(conn);
 		/* separate exit status for "already installed" */
 		exit(2);
 	}
 	PQclear(result);
 
-	printfPQExpBuffer(&sql, "CREATE LANGUAGE \"%s\";\n", langname);
+	/*
+	 * In 9.1 and up, assume that languages should be installed using CREATE
+	 * EXTENSION.  However, it's possible this tool could be used against an
+	 * older server, and it's easy enough to continue supporting the old way.
+	 */
+	if (PQserverVersion(conn) >= 90100)
+		printfPQExpBuffer(&sql, "CREATE EXTENSION \"%s\";", langname);
+	else
+		printfPQExpBuffer(&sql, "CREATE LANGUAGE \"%s\";", langname);
 
 	if (echo)
-		printf("%s", sql.data);
+		printf("%s\n", sql.data);
 	result = PQexec(conn, sql.data);
 	if (PQresultStatus(result) != PGRES_COMMAND_OK)
 	{
@@ -218,8 +239,8 @@ help(const char *progname)
 	printf(_("  -d, --dbname=DBNAME       database to install language in\n"));
 	printf(_("  -e, --echo                show the commands being sent to the server\n"));
 	printf(_("  -l, --list                show a list of currently installed languages\n"));
-	printf(_("  --help                    show this help, then exit\n"));
-	printf(_("  --version                 output version information, then exit\n"));
+	printf(_("  -V, --version             output version information, then exit\n"));
+	printf(_("  -?, --help                show this help, then exit\n"));
 	printf(_("\nConnection options:\n"));
 	printf(_("  -h, --host=HOSTNAME       database server host or socket directory\n"));
 	printf(_("  -p, --port=PORT           database server port\n"));

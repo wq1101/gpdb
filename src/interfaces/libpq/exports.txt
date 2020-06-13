@@ -1,4 +1,4 @@
-# $PostgreSQL: pgsql/src/interfaces/libpq/exports.txt,v 1.25 2010/01/28 06:28:26 joe Exp $
+# src/interfaces/libpq/exports.txt
 # Functions to be exported by libpq DLLs
 PQconnectdb               1
 PQsetdbLogin              2
@@ -161,4 +161,13 @@ PQping                    158
 PQpingParams              159
 PQlibVersion              160
 PQsetSingleRowMode        161
-PQconninfo                162
+lo_lseek64                162
+lo_tell64                 163
+lo_truncate64             164
+PQconninfo                165
+PQsslInUse                166
+PQsslStruct               167
+PQsslAttributeNames       168
+PQsslAttribute            169
+PQsetErrorContextVisibility 170
+PQresultVerboseErrorMessage 171

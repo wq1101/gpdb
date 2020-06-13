@@ -1,46 +1,50 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/alter_tablespace.sgml,v 1.3 2006/09/16 00:30:16 momjian Exp $
+doc/src/sgml/ref/alter_tablespace.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-ALTERTABLESPACE">
+ <indexterm zone="sql-altertablespace">
+  <primary>ALTER TABLESPACE</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="SQL-ALTERTABLESPACE-TITLE">ALTER TABLESPACE</refentrytitle>
+  <refentrytitle>ALTER TABLESPACE</refentrytitle>
+  <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
 
  <refnamediv>
   <refname>ALTER TABLESPACE</refname>
   <refpurpose>change the definition of a tablespace</refpurpose>
- </refnamediv>  
-  
- <indexterm zone="sql-altertablespace">
-  <primary>ALTER TABLESPACE</primary>
- </indexterm>
+ </refnamediv>
 
  <refsynopsisdiv>
 <synopsis>
-ALTER TABLESPACE <replaceable>name</replaceable> RENAME TO <replaceable>newname</replaceable>
-ALTER TABLESPACE <replaceable>name</replaceable> OWNER TO <replaceable>newowner</replaceable>
+ALTER TABLESPACE <replaceable>name</replaceable> RENAME TO <replaceable>new_name</replaceable>
+ALTER TABLESPACE <replaceable>name</replaceable> OWNER TO { <replaceable>new_owner</replaceable> | CURRENT_USER | SESSION_USER }
+ALTER TABLESPACE <replaceable>name</replaceable> SET ( <replaceable class="PARAMETER">tablespace_option</replaceable> = <replaceable class="PARAMETER">value</replaceable> [, ... ] )
+ALTER TABLESPACE <replaceable>name</replaceable> RESET ( <replaceable class="PARAMETER">tablespace_option</replaceable> [, ... ] )
 </synopsis>
  </refsynopsisdiv>
-  
+
  <refsect1>
   <title>Description</title>
 
   <para>
-   <command>ALTER TABLESPACE</command> changes the definition of
+   <command>ALTER TABLESPACE</command> can be used to change the definition of
    a tablespace.
   </para>
 
   <para>
-   You must own the tablespace to use <command>ALTER TABLESPACE</>.
+   You must own the tablespace to change the definition of a tablespace.
    To alter the owner, you must also be a direct or indirect member of the new
    owning role.
    (Note that superusers have these privileges automatically.)
   </para>
+
  </refsect1>
-  
+
  <refsect1>
   <title>Parameters</title>
 
@@ -55,7 +59,7 @@ ALTER TABLESPACE <replaceable>name</replaceable> OWNER TO <replaceable>newowner<
    </varlistentry>
 
    <varlistentry>
-    <term><replaceable class="parameter">newname</replaceable></term>
+    <term><replaceable class="parameter">new_name</replaceable></term>
     <listitem>
      <para>
       The new name of the tablespace.  The new name cannot
@@ -66,13 +70,32 @@ ALTER TABLESPACE <replaceable>name</replaceable> OWNER TO <replaceable>newowner<
    </varlistentry>
 
    <varlistentry>
-    <term><replaceable class="parameter">newowner</replaceable></term>
+    <term><replaceable class="parameter">new_owner</replaceable></term>
     <listitem>
      <para>
       The new owner of the tablespace.
      </para>
     </listitem>
    </varlistentry>
+
+   <varlistentry>
+    <term><replaceable class="parameter">tablespace_option</replaceable></term>
+    <listitem>
+     <para>
+      A tablespace parameter to be set or reset.  Currently, the only
+      available parameters are <varname>seq_page_cost</> and
+      <varname>random_page_cost</>.  Setting either value for a particular
+      tablespace will override the planner's usual estimate of the cost of
+      reading pages from tables in that tablespace, as established by
+      the configuration parameters of the same name (see
+      <xref linkend="guc-seq-page-cost">,
+      <xref linkend="guc-random-page-cost">).  This may be useful if one
+      tablespace is located on a disk which is faster or slower than the
+      remainder of the I/O subsystem.
+     </para>
+    </listitem>
+   </varlistentry>
+
   </variablelist>
  </refsect1>
 
@@ -90,10 +113,9 @@ ALTER TABLESPACE index_space RENAME TO fast_raid;
    Change the owner of tablespace <literal>index_space</literal>:
 <programlisting>
 ALTER TABLESPACE index_space OWNER TO mary;
-</programlisting>
-  </para>
+</programlisting></para>
  </refsect1>
- 
+
  <refsect1>
   <title>Compatibility</title>
 
@@ -107,8 +129,8 @@ ALTER TABLESPACE index_space OWNER TO mary;
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-createtablespace" endterm="sql-createtablespace-title"></member>
-   <member><xref linkend="sql-droptablespace" endterm="sql-droptablespace-title"></member>
+   <member><xref linkend="sql-createtablespace"></member>
+   <member><xref linkend="sql-droptablespace"></member>
   </simplelist>
  </refsect1>
 </refentry>

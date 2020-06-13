@@ -4,12 +4,12 @@
  *	  Support routines for various kinds of object creation.
  *
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/commands/define.c,v 1.101 2008/01/01 19:45:48 momjian Exp $
+ *	  src/backend/commands/define.c
  *
  * DESCRIPTION
  *	  The "DefineFoo" routines take the parse tree and pick out the
@@ -42,19 +42,6 @@
 #include "parser/scansup.h"
 #include "utils/int8.h"
 
-
-/*
- * Translate the input language name to lower case, and truncate if needed.
- *
- * Returns a palloc'd string
- */
-char *
-case_translate_language_name(const char *input)
-{
-	return downcase_truncate_identifier(input, strlen(input), false);
-}
-
-
 /*
  * Extract a string value (otherwise uninterpreted) from a DefElem.
  */
@@ -69,12 +56,7 @@ defGetString(DefElem *def)
 	switch (nodeTag(def->arg))
 	{
 		case T_Integer:
-			{
-				char	   *str = palloc(32);
-
-				snprintf(str, 32, "%ld", (long) intVal(def->arg));
-				return str;
-			}
+			return psprintf("%ld", (long) intVal(def->arg));
 		case T_Float:
 
 			/*
@@ -88,6 +70,8 @@ defGetString(DefElem *def)
 			return TypeNameToString((TypeName *) def->arg);
 		case T_List:
 			return NameListToString((List *) def->arg);
+		case T_A_Star:
+			return pstrdup("*");
 		default:
 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(def->arg));
 	}
@@ -133,7 +117,7 @@ defGetBoolean(DefElem *def)
 		return true;
 
 	/*
-	 * Allow 0, 1, "true", "false"
+	 * Allow 0, 1, "true", "false", "on", "off"
 	 */
 	switch (nodeTag(def->arg))
 	{
@@ -153,11 +137,18 @@ defGetBoolean(DefElem *def)
 			{
 				char	   *sval = defGetString(def);
 
+				/*
+				 * The set of strings accepted here should match up with the
+				 * grammar's opt_boolean production.
+				 */
 				if (pg_strcasecmp(sval, "true") == 0)
 					return true;
 				if (pg_strcasecmp(sval, "false") == 0)
 					return false;
-
+				if (pg_strcasecmp(sval, "on") == 0)
+					return true;
+				if (pg_strcasecmp(sval, "off") == 0)
+					return false;
 			}
 			break;
 	}
@@ -166,6 +157,30 @@ defGetBoolean(DefElem *def)
 			 errmsg("%s requires a Boolean value",
 					def->defname)));
 	return false;				/* keep compiler quiet */
+}
+
+/*
+ * Extract an int32 value from a DefElem.
+ */
+int32
+defGetInt32(DefElem *def)
+{
+	if (def->arg == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("%s requires an integer value",
+						def->defname)));
+	switch (nodeTag(def->arg))
+	{
+		case T_Integer:
+			return (int32) intVal(def->arg);
+		default:
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("%s requires an integer value",
+							def->defname)));
+	}
+	return 0;					/* keep compiler quiet */
 }
 
 /*
@@ -187,7 +202,7 @@ defGetInt64(DefElem *def)
 
 			/*
 			 * Values too large for int4 will be represented as Float
-			 * constants by the lexer.	Accept these if they are valid int8
+			 * constants by the lexer.  Accept these if they are valid int8
 			 * strings.
 			 */
 			return DatumGetInt64(DirectFunctionCall1(int8in,
@@ -311,9 +326,5 @@ defGetTypeLength(DefElem *def)
 DefElem *
 defWithOids(bool value)
 {
-	DefElem    *f = makeNode(DefElem);
-
-	f->defname = "oids";
-	f->arg = (Node *) makeInteger(value);
-	return f;
+	return makeDefElem("oids", (Node *) makeInteger(value));
 }

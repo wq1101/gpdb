@@ -4,7 +4,7 @@
 #    Makefile for access/transam
 #
 # IDENTIFICATION
-#    $PostgreSQL: pgsql/src/backend/access/transam/Makefile,v 1.22 2008/02/19 10:30:07 petere Exp $
+#    src/backend/access/transam/Makefile
 #
 #-------------------------------------------------------------------------
 
@@ -12,11 +12,14 @@ subdir = src/backend/access/transam
 top_builddir = ../../../..
 include $(top_builddir)/src/Makefile.global
 
-OBJS = clog.o distributedlog.o filerepdefs.o gp_transaction_log.o gp_distributed_log.o \
-	   gp_changetracking_log.o transam.o varsup.o xact.o xlog.o xlogloc.o \
-	   xlogutils.o rmgr.o slru.o subtrans.o multixact.o twophase.o \
-	   twophase_rmgr.o persistentendxactrec.o persistentfilesysobjname.o \
-	   xlog_mm.o xlogfuncs.o
+OBJS = clog.o commit_ts.o generic_xlog.o multixact.o parallel.o rmgr.o slru.o \
+	subtrans.o timeline.o transam.o twophase.o twophase_rmgr.o varsup.o \
+	xact.o xlog.o xlogarchive.o xlogfuncs.o \
+	xloginsert.o xlogreader.o xlogutils.o
+
+OBJS +=  distributedlog.o gp_transaction_log.o gp_distributed_log.o xlogfuncs_gp.o
+
+override CPPFLAGS := -I$(libpq_srcdir) $(CPPFLAGS)
 
 include $(top_srcdir)/src/backend/common.mk
 

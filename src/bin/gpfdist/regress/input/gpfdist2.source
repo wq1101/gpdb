@@ -30,12 +30,12 @@ CREATE TABLE REG_REGION (R_REGIONKEY INT, R_NAME CHAR(25), R_COMMENT VARCHAR(152
 -- 'gpfdist' protocol
 -- --------------------------------------
 CREATE EXTERNAL WEB TABLE gpfdist2_start (x text)
-execute E'((@bindir@/gpfdist -p 7070 -d @abs_srcdir@/data  </dev/null >/dev/null 2>&1 &); sleep 1; echo "starting...") '
+execute E'((@bindir@/gpfdist -p 7070 -d @abs_srcdir@/data  </dev/null >/dev/null 2>&1 &); for i in `seq 1 30`; do curl 127.0.0.1:7070 >/dev/null 2>&1 && break; sleep 1; done; echo "starting...") '
 on SEGMENT 0
 FORMAT 'text' (delimiter '|');
 
 CREATE EXTERNAL WEB TABLE gpfdist2_stop (x text)
-execute E'(ps -A |grep [g]pfdist |awk \'{print $1;}\' |xargs kill) > /dev/null 2>&1; echo "stopping..."'
+execute E'(ps -A -o pid,comm |grep [g]pfdist |grep -v postgres: |awk \'{print $1;}\' |xargs kill) > /dev/null 2>&1; echo "stopping..."'
 on SEGMENT 0
 FORMAT 'text' (delimiter '|');
 
@@ -160,8 +160,8 @@ CREATE EXTERNAL TABLE ext_lineitem (
                 L_SHIPDATE date,
                 L_COMMITDATE date,
                 L_RECEIPTDATE date,
-                L_SHIPINSTRUCT CHAR(2),
-                L_SHIPMODE CHAR(1)
+                L_SHIPINSTRUCT CHAR(25),
+                L_SHIPMODE CHAR(10)
                 )
 LOCATION
 (
@@ -189,8 +189,8 @@ CREATE EXTERNAL TABLE ext_lineitem (
                 L_SHIPDATE date,
                 L_COMMITDATE date,
                 L_RECEIPTDATE date,
-                L_SHIPINSTRUCT CHAR(2),
-                L_SHIPMODE CHAR(1),
+                L_SHIPINSTRUCT CHAR(25),
+                L_SHIPMODE CHAR(10),
                 L_COMMENT VARCHAR(44),
                 L_BLAH CHAR(1)
                 )
@@ -569,7 +569,7 @@ CREATE INDEX index ON ext_lineitem (L_ORDERKEY);
 TRUNCATE ext_lineitem;
 DELETE FROM ext_lineitem where L_ORDERKEY > 10;
 UPDATE ext_lineitem SET L_ORDERKEY = 10 where L_ORDERKEY > 10;
-INSERT INTO ext_lineitem VALUES (1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1);
+INSERT INTO ext_lineitem VALUES (1,1,1,1,1,1,1,1,1,1,null,null,null,1,1,1);
 DROP EXTERNAL TABLE ext_lineitem;
 
 -- test 17 different delimiter
@@ -970,7 +970,7 @@ LOCATION
 FORMAT 'csv'
 (
         DELIMITER AS '|'
-		NEWLINE 'CR'
+        NEWLINE 'CR'
 )
 ;
 SELECT count(*) FROM ext_lineitem;

@@ -3,25 +3,28 @@
  * bufpage.c
  *	  POSTGRES standard buffer page code.
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/storage/page/bufpage.c,v 1.78 2008/02/10 20:39:08 tgl Exp $
+ *	  src/backend/storage/page/bufpage.c
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
-#include "access/htup.h"
-#include "storage/bufpage.h"
+#include "access/htup_details.h"
+#include "access/itup.h"
 #include "access/xlog.h"
 #include "storage/checksum.h"
+#include "utils/memdebug.h"
 #include "utils/memutils.h"
+
 
 /* GUC variable */
 bool		ignore_checksum_failure = false;
+
 
 /* ----------------------------------------------------------------
  *						Page support functions
@@ -60,7 +63,7 @@ PageInit(Page page, Size pageSize, Size specialSize)
  * PageIsVerified
  *		Check that the page header and checksum (if any) appear valid.
  *
- * This is called when a page has just been read in from disk.	The idea is
+ * This is called when a page has just been read in from disk.  The idea is
  * to cheaply detect trashed pages before we go nuts following bogus item
  * pointers, testing invalid transaction identifiers, etc.
  *
@@ -99,16 +102,16 @@ PageIsVerified(Page page, BlockNumber blkno)
 		}
 
 		/*
-		 * The following checks don't prove the header is correct,
-		 * only that it looks sane enough to allow into the buffer pool.
-		 * Later usage of the block can still reveal problems,
-		 * which is why we offer the checksum option.
+		 * The following checks don't prove the header is correct, only that
+		 * it looks sane enough to allow into the buffer pool. Later usage of
+		 * the block can still reveal problems, which is why we offer the
+		 * checksum option.
 		 */
 		if ((p->pd_flags & ~PD_VALID_FLAG_BITS) == 0 &&
-			 p->pd_lower <= p->pd_upper &&
-			 p->pd_upper <= p->pd_special &&
-			 p->pd_special <= BLCKSZ &&
-			 p->pd_special == MAXALIGN(p->pd_special))
+			p->pd_lower <= p->pd_upper &&
+			p->pd_upper <= p->pd_special &&
+			p->pd_special <= BLCKSZ &&
+			p->pd_special == MAXALIGN(p->pd_special))
 			header_sane = true;
 
 		if (header_sane && !checksum_failure)
@@ -150,12 +153,13 @@ PageIsVerified(Page page, BlockNumber blkno)
 
 
 /*
- *	PageAddItem
+ *	PageAddItemExtended
  *
- *	Add an item to a page.	Return value is offset at which it was
- *	inserted, or InvalidOffsetNumber if there's not room to insert.
+ *	Add an item to a page.  Return value is the offset at which it was
+ *	inserted, or InvalidOffsetNumber if the item is not inserted for any
+ *	reason.  A WARNING is issued indicating the reason for the refusal.
  *
- *	If overwrite is true, we just store the item at the specified
+ *	If flag PAI_OVERWRITE is set, we just store the item at the specified
  *	offsetNumber (which must be either a currently-unused item pointer,
  *	or one past the last existing item).  Otherwise,
  *	if offsetNumber is valid and <= current max offset in the page,
@@ -164,18 +168,20 @@ PageIsVerified(Page page, BlockNumber blkno)
  *	If offsetNumber is not valid, then assign one by finding the first
  *	one that is both unused and deallocated.
  *
- *	If is_heap is true, we enforce that there can't be more than
+ *	If flag PAI_IS_HEAP is set, we enforce that there can't be more than
  *	MaxHeapTuplesPerPage line pointers on the page.
+ *
+ *	If flag PAI_ALLOW_FAR_OFFSET is not set, we disallow placing items
+ *	beyond one past the last existing item.
  *
  *	!!! EREPORT(ERROR) IS DISALLOWED HERE !!!
  */
 OffsetNumber
-PageAddItem(Page page,
-			Item item,
-			Size size,
-			OffsetNumber offsetNumber,
-			bool overwrite,
-			bool is_heap)
+PageAddItemExtended(Page page,
+					Item item,
+					Size size,
+					OffsetNumber offsetNumber,
+					int flags)
 {
 	PageHeader	phdr = (PageHeader) page;
 	Size		alignedSize;
@@ -206,7 +212,7 @@ PageAddItem(Page page,
 	if (OffsetNumberIsValid(offsetNumber))
 	{
 		/* yes, check it */
-		if (overwrite)
+		if ((flags & PAI_OVERWRITE) != 0)
 		{
 			if (offsetNumber < limit)
 			{
@@ -254,13 +260,18 @@ PageAddItem(Page page,
 		}
 	}
 
-	if (offsetNumber > limit)
+	/*
+	 * Reject placing items beyond the first unused line pointer, unless
+	 * caller asked for that behavior specifically.
+	 */
+	if ((flags & PAI_ALLOW_FAR_OFFSET) == 0 && offsetNumber > limit)
 	{
 		elog(WARNING, "specified item offset is too large");
 		return InvalidOffsetNumber;
 	}
 
-	if (is_heap && offsetNumber > MaxHeapTuplesPerPage)
+	/* Reject placing items beyond heap boundary, if heap */
+	if ((flags & PAI_IS_HEAP) != 0 && offsetNumber > MaxHeapTuplesPerPage)
 	{
 		elog(WARNING, "can't put more than MaxHeapTuplesPerPage items in a heap page");
 		return InvalidOffsetNumber;
@@ -272,7 +283,10 @@ PageAddItem(Page page,
 	 * Note: do arithmetic as signed ints, to avoid mistakes if, say,
 	 * alignedSize > pd_upper.
 	 */
-	if (offsetNumber == limit || needshuffle)
+	if ((flags & PAI_ALLOW_FAR_OFFSET) != 0)
+		lower = Max(phdr->pd_lower,
+					SizeOfPageHeaderData + sizeof(ItemIdData) * offsetNumber);
+	else if (offsetNumber == limit || needshuffle)
 		lower = phdr->pd_lower + sizeof(ItemIdData);
 	else
 		lower = phdr->pd_lower;
@@ -296,6 +310,20 @@ PageAddItem(Page page,
 	/* set the item pointer */
 	ItemIdSetNormal(itemId, upper, size);
 
+	/*
+	 * Items normally contain no uninitialized bytes.  Core bufpage consumers
+	 * conform, but this is not a necessary coding rule; a new index AM could
+	 * opt to depart from it.  However, data type input functions and other
+	 * C-language functions that synthesize datums should initialize all
+	 * bytes; datumIsEqual() relies on this.  Testing here, along with the
+	 * similar check in printtup(), helps to catch such mistakes.
+	 *
+	 * Values of the "name" type retrieved via index-only scans may contain
+	 * uninitialized bytes; see comment in btrescan().  Valgrind will report
+	 * this as an error, but it is safe to ignore.
+	 */
+	VALGRIND_CHECK_MEM_IS_DEFINED(item, size);
+
 	/* copy the item's data onto the page */
 	memcpy((char *) page + upper, item, size);
 
@@ -307,32 +335,81 @@ PageAddItem(Page page,
 }
 
 /*
+ *	PageAddItem
+ *
+ *	Add an item to a page.  Return value is offset at which it was
+ *	inserted, or InvalidOffsetNumber if the item is not inserted for
+ *	any reason.
+ *
+ *	Passing the 'overwrite' and 'is_heap' parameters as true causes the
+ *	PAI_OVERWRITE and PAI_IS_HEAP flags to be set, respectively.
+ *
+ *	!!! EREPORT(ERROR) IS DISALLOWED HERE !!!
+ */
+OffsetNumber
+PageAddItem(Page page, Item item, Size size, OffsetNumber offsetNumber,
+			bool overwrite, bool is_heap)
+{
+	return PageAddItemExtended(page, item, size, offsetNumber,
+							   overwrite ? PAI_OVERWRITE : 0 |
+							   is_heap ? PAI_IS_HEAP : 0);
+}
+
+/*
  * PageGetTempPage
- *		Get a temporary page in local memory for special processing
+ *		Get a temporary page in local memory for special processing.
+ *		The returned page is not initialized at all; caller must do that.
  */
 Page
-PageGetTempPage(Page page, Size specialSize)
+PageGetTempPage(Page page)
 {
 	Size		pageSize;
-	Size		size;
 	Page		temp;
-	PageHeader	thdr;
 
 	pageSize = PageGetPageSize(page);
 	temp = (Page) palloc(pageSize);
-	thdr = (PageHeader) temp;
 
-	/* copy old page in */
+	return temp;
+}
+
+/*
+ * PageGetTempPageCopy
+ *		Get a temporary page in local memory for special processing.
+ *		The page is initialized by copying the contents of the given page.
+ */
+Page
+PageGetTempPageCopy(Page page)
+{
+	Size		pageSize;
+	Page		temp;
+
+	pageSize = PageGetPageSize(page);
+	temp = (Page) palloc(pageSize);
+
 	memcpy(temp, page, pageSize);
 
-	/* clear out the middle */
-	size = pageSize - SizeOfPageHeaderData;
-	size -= MAXALIGN(specialSize);
-	MemSet(PageGetContents(thdr), 0, size);
+	return temp;
+}
 
-	/* set high, low water marks */
-	thdr->pd_lower = SizeOfPageHeaderData;
-	thdr->pd_upper = pageSize - MAXALIGN(specialSize);
+/*
+ * PageGetTempPageCopySpecial
+ *		Get a temporary page in local memory for special processing.
+ *		The page is PageInit'd with the same special-space size as the
+ *		given page, and the special space is copied from the given page.
+ */
+Page
+PageGetTempPageCopySpecial(Page page)
+{
+	Size		pageSize;
+	Page		temp;
+
+	pageSize = PageGetPageSize(page);
+	temp = (Page) palloc(pageSize);
+
+	PageInit(temp, pageSize, PageGetSpecialSize(page));
+	memcpy(PageGetSpecialPointer(temp),
+		   PageGetSpecialPointer(page),
+		   PageGetSpecialSize(page));
 
 	return temp;
 }
@@ -354,14 +431,14 @@ PageRestoreTempPage(Page tempPage, Page oldPage)
 }
 
 /*
- * sorting support for PageRepairFragmentation and PageIndexMultiDelete
+ * sorting support for PageRepairFragmentation, PageIndexMultiDelete,
+ * PageIndexDeleteNoCompact
  */
 typedef struct itemIdSortData
 {
-	int			offsetindex;	/* linp array index */
-	int			itemoff;		/* page offset of item data */
-	Size		alignedlen;		/* MAXALIGN(item data len) */
-	ItemIdData	olditemid;		/* used only in PageIndexMultiDelete */
+	uint16		offsetindex;	/* linp array index */
+	int16		itemoff;		/* page offset of item data */
+	uint16		alignedlen;		/* MAXALIGN(item data len) */
 } itemIdSortData;
 typedef itemIdSortData *itemIdSort;
 
@@ -371,6 +448,38 @@ itemoffcompare(const void *itemidp1, const void *itemidp2)
 	/* Sort in decreasing itemoff order */
 	return ((itemIdSort) itemidp2)->itemoff -
 		((itemIdSort) itemidp1)->itemoff;
+}
+
+/*
+ * After removing or marking some line pointers unused, move the tuples to
+ * remove the gaps caused by the removed items.
+ */
+static void
+compactify_tuples(itemIdSort itemidbase, int nitems, Page page)
+{
+	PageHeader	phdr = (PageHeader) page;
+	Offset		upper;
+	int			i;
+
+	/* sort itemIdSortData array into decreasing itemoff order */
+	qsort((char *) itemidbase, nitems, sizeof(itemIdSortData),
+		  itemoffcompare);
+
+	upper = phdr->pd_special;
+	for (i = 0; i < nitems; i++)
+	{
+		itemIdSort	itemidptr = &itemidbase[i];
+		ItemId		lp;
+
+		lp = PageGetItemId(page, itemidptr->offsetindex + 1);
+		upper -= itemidptr->alignedlen;
+		memmove((char *) page + upper,
+				(char *) page + itemidptr->itemoff,
+				itemidptr->alignedlen);
+		lp->lp_off = upper;
+	}
+
+	phdr->pd_upper = upper;
 }
 
 /*
@@ -389,15 +498,12 @@ PageRepairFragmentation(Page page)
 	Offset		pd_lower = ((PageHeader) page)->pd_lower;
 	Offset		pd_upper = ((PageHeader) page)->pd_upper;
 	Offset		pd_special = ((PageHeader) page)->pd_special;
-	itemIdSort	itemidbase,
-				itemidptr;
 	ItemId		lp;
 	int			nline,
 				nstorage,
 				nunused;
 	int			i;
 	Size		totallen;
-	Offset		upper;
 
 	/*
 	 * It's worth the trouble to be more paranoid here than in most places,
@@ -414,8 +520,7 @@ PageRepairFragmentation(Page page)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("corrupted page pointers: lower = %u, upper = %u, special = %u",
-						pd_lower, pd_upper, pd_special),
-				 errSendAlert(true)));
+						pd_lower, pd_upper, pd_special)));
 
 	nline = PageGetMaxOffsetNumber(page);
 	nunused = nstorage = 0;
@@ -441,10 +546,11 @@ PageRepairFragmentation(Page page)
 		((PageHeader) page)->pd_upper = pd_special;
 	}
 	else
-	{							/* nstorage != 0 */
+	{
 		/* Need to compact the page the hard way */
-		itemidbase = (itemIdSort) palloc(sizeof(itemIdSortData) * nstorage);
-		itemidptr = itemidbase;
+		itemIdSortData itemidbase[MaxHeapTuplesPerPage];
+		itemIdSort	itemidptr = itemidbase;
+
 		totallen = 0;
 		for (i = 0; i < nline; i++)
 		{
@@ -458,8 +564,7 @@ PageRepairFragmentation(Page page)
 					ereport(ERROR,
 							(errcode(ERRCODE_DATA_CORRUPTED),
 							 errmsg("corrupted item pointer: %u",
-									itemidptr->itemoff),
-							 errSendAlert(true)));
+									itemidptr->itemoff)));
 				itemidptr->alignedlen = MAXALIGN(ItemIdGetLength(lp));
 				totallen += itemidptr->alignedlen;
 				itemidptr++;
@@ -470,29 +575,9 @@ PageRepairFragmentation(Page page)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 			   errmsg("corrupted item lengths: total %u, available space %u",
-					  (unsigned int) totallen, pd_special - pd_lower),
-			   errSendAlert(true)));
+					  (unsigned int) totallen, pd_special - pd_lower)));
 
-		/* sort itemIdSortData array into decreasing itemoff order */
-		qsort((char *) itemidbase, nstorage, sizeof(itemIdSortData),
-			  itemoffcompare);
-
-		/* compactify page */
-		upper = pd_special;
-
-		for (i = 0, itemidptr = itemidbase; i < nstorage; i++, itemidptr++)
-		{
-			lp = PageGetItemId(page, itemidptr->offsetindex + 1);
-			upper -= itemidptr->alignedlen;
-			memmove((char *) page + upper,
-					(char *) page + itemidptr->itemoff,
-					itemidptr->alignedlen);
-			lp->lp_off = upper;
-		}
-
-		((PageHeader) page)->pd_upper = upper;
-
-		pfree(itemidbase);
+		compactify_tuples(itemidbase, nstorage, page);
 	}
 
 	/* Set hint bit for PageAddItem */
@@ -590,7 +675,7 @@ PageGetHeapFreeSpace(Page page)
 				 * Since this is just a hint, we must confirm that there is
 				 * indeed a free line pointer
 				 */
-				for (offnum = FirstOffsetNumber; offnum <= nline; offnum++)
+				for (offnum = FirstOffsetNumber; offnum <= nline; offnum = OffsetNumberNext(offnum))
 				{
 					ItemId		lp = PageGetItemId(page, offnum);
 
@@ -650,8 +735,7 @@ PageIndexTupleDelete(Page page, OffsetNumber offnum)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("corrupted page pointers: lower = %u, upper = %u, special = %u",
-						phdr->pd_lower, phdr->pd_upper, phdr->pd_special),
-				 errSendAlert(true)));
+						phdr->pd_lower, phdr->pd_upper, phdr->pd_special)));
 
 	nline = PageGetMaxOffsetNumber(page);
 	if ((int) offnum <= 0 || (int) offnum > nline)
@@ -670,8 +754,7 @@ PageIndexTupleDelete(Page page, OffsetNumber offnum)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("corrupted item pointer: offset = %u, size = %u",
-						offset, (unsigned int) size),
-				 errSendAlert(true)));
+						offset, (unsigned int) size)));
 
 	/*
 	 * First, we want to get rid of the pd_linp entry for the index tuple. We
@@ -732,7 +815,7 @@ PageIndexTupleDelete(Page page, OffsetNumber offnum)
  * PageIndexMultiDelete
  *
  * This routine handles the case of deleting multiple tuples from an
- * index page at once.	It is considerably faster than a loop around
+ * index page at once.  It is considerably faster than a loop around
  * PageIndexTupleDelete ... however, the caller *must* supply the array
  * of item numbers to be deleted in item number order!
  */
@@ -743,18 +826,19 @@ PageIndexMultiDelete(Page page, OffsetNumber *itemnos, int nitems)
 	Offset		pd_lower = phdr->pd_lower;
 	Offset		pd_upper = phdr->pd_upper;
 	Offset		pd_special = phdr->pd_special;
-	itemIdSort	itemidbase,
-				itemidptr;
+	itemIdSortData itemidbase[MaxIndexTuplesPerPage];
+	ItemIdData	newitemids[MaxIndexTuplesPerPage];
+	itemIdSort	itemidptr;
 	ItemId		lp;
 	int			nline,
 				nused;
-	int			i;
 	Size		totallen;
-	Offset		upper;
 	Size		size;
 	unsigned	offset;
 	int			nextitm;
 	OffsetNumber offnum;
+
+	Assert(nitems <= MaxIndexTuplesPerPage);
 
 	/*
 	 * If there aren't very many items to delete, then retail
@@ -782,8 +866,7 @@ PageIndexMultiDelete(Page page, OffsetNumber *itemnos, int nitems)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("corrupted page pointers: lower = %u, upper = %u, special = %u",
-						pd_lower, pd_upper, pd_special),
-				 errSendAlert(true)));
+						pd_lower, pd_upper, pd_special)));
 
 	/*
 	 * Scan the item pointer array and build a list of just the ones we are
@@ -791,12 +874,11 @@ PageIndexMultiDelete(Page page, OffsetNumber *itemnos, int nitems)
 	 * still validity-checking.
 	 */
 	nline = PageGetMaxOffsetNumber(page);
-	itemidbase = (itemIdSort) palloc(sizeof(itemIdSortData) * nline);
 	itemidptr = itemidbase;
 	totallen = 0;
 	nused = 0;
 	nextitm = 0;
-	for (offnum = 1; offnum <= nline; offnum++)
+	for (offnum = FirstOffsetNumber; offnum <= nline; offnum = OffsetNumberNext(offnum))
 	{
 		lp = PageGetItemId(page, offnum);
 		Assert(ItemIdHasStorage(lp));
@@ -808,8 +890,7 @@ PageIndexMultiDelete(Page page, OffsetNumber *itemnos, int nitems)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("corrupted item pointer: offset = %u, size = %u",
-							offset, (unsigned int) size),
-					 errSendAlert(true)));
+							offset, (unsigned int) size)));
 
 		if (nextitm < nitems && offnum == itemnos[nextitm])
 		{
@@ -820,9 +901,9 @@ PageIndexMultiDelete(Page page, OffsetNumber *itemnos, int nitems)
 		{
 			itemidptr->offsetindex = nused;		/* where it will go */
 			itemidptr->itemoff = offset;
-			itemidptr->olditemid = *lp;
 			itemidptr->alignedlen = MAXALIGN(size);
 			totallen += itemidptr->alignedlen;
+			newitemids[nused] = *lp;
 			itemidptr++;
 			nused++;
 		}
@@ -836,33 +917,170 @@ PageIndexMultiDelete(Page page, OffsetNumber *itemnos, int nitems)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 			   errmsg("corrupted item lengths: total %u, available space %u",
-					  (unsigned int) totallen, pd_special - pd_lower),
-			   errSendAlert(true)));
+					  (unsigned int) totallen, pd_special - pd_lower)));
 
-	/* sort itemIdSortData array into decreasing itemoff order */
-	qsort((char *) itemidbase, nused, sizeof(itemIdSortData),
-		  itemoffcompare);
-
-	/* compactify page and install new itemids */
-	upper = pd_special;
-
-	for (i = 0, itemidptr = itemidbase; i < nused; i++, itemidptr++)
-	{
-		lp = PageGetItemId(page, itemidptr->offsetindex + 1);
-		upper -= itemidptr->alignedlen;
-		memmove((char *) page + upper,
-				(char *) page + itemidptr->itemoff,
-				itemidptr->alignedlen);
-		*lp = itemidptr->olditemid;
-		lp->lp_off = upper;
-	}
-
+	/*
+	 * Looks good. Overwrite the line pointers with the copy, from which we've
+	 * removed all the unused items.
+	 */
+	memcpy(phdr->pd_linp, newitemids, nused * sizeof(ItemIdData));
 	phdr->pd_lower = SizeOfPageHeaderData + nused * sizeof(ItemIdData);
-	phdr->pd_upper = upper;
 
-	pfree(itemidbase);
+	/* and compactify the tuple data */
+	compactify_tuples(itemidbase, nused, page);
 }
 
+/*
+ * PageIndexDeleteNoCompact
+ *		Delete the given items for an index page, and defragment the resulting
+ *		free space, but do not compact the item pointers array.
+ *
+ * itemnos is the array of tuples to delete; nitems is its size.  maxIdxTuples
+ * is the maximum number of tuples that can exist in a page.
+ *
+ * Unused items at the end of the array are removed.
+ *
+ * This is used for index AMs that require that existing TIDs of live tuples
+ * remain unchanged.
+ */
+void
+PageIndexDeleteNoCompact(Page page, OffsetNumber *itemnos, int nitems)
+{
+	PageHeader	phdr = (PageHeader) page;
+	LocationIndex pd_lower = phdr->pd_lower;
+	LocationIndex pd_upper = phdr->pd_upper;
+	LocationIndex pd_special = phdr->pd_special;
+	int			nline;
+	bool		empty;
+	OffsetNumber offnum;
+	int			nextitm;
+
+	/*
+	 * As with PageRepairFragmentation, paranoia seems justified.
+	 */
+	if (pd_lower < SizeOfPageHeaderData ||
+		pd_lower > pd_upper ||
+		pd_upper > pd_special ||
+		pd_special > BLCKSZ ||
+		pd_special != MAXALIGN(pd_special))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("corrupted page pointers: lower = %u, upper = %u, special = %u",
+						pd_lower, pd_upper, pd_special)));
+
+	/*
+	 * Scan the existing item pointer array and mark as unused those that are
+	 * in our kill-list; make sure any non-interesting ones are marked unused
+	 * as well.
+	 */
+	nline = PageGetMaxOffsetNumber(page);
+	empty = true;
+	nextitm = 0;
+	for (offnum = FirstOffsetNumber; offnum <= nline; offnum = OffsetNumberNext(offnum))
+	{
+		ItemId		lp;
+		ItemLength	itemlen;
+		ItemOffset	offset;
+
+		lp = PageGetItemId(page, offnum);
+
+		itemlen = ItemIdGetLength(lp);
+		offset = ItemIdGetOffset(lp);
+
+		if (ItemIdIsUsed(lp))
+		{
+			if (offset < pd_upper ||
+				(offset + itemlen) > pd_special ||
+				offset != MAXALIGN(offset))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+				   errmsg("corrupted item pointer: offset = %u, length = %u",
+						  offset, (unsigned int) itemlen)));
+
+			if (nextitm < nitems && offnum == itemnos[nextitm])
+			{
+				/* this one is on our list to delete, so mark it unused */
+				ItemIdSetUnused(lp);
+				nextitm++;
+			}
+			else if (ItemIdHasStorage(lp))
+			{
+				/* This one's live -- must do the compaction dance */
+				empty = false;
+			}
+			else
+			{
+				/* get rid of this one too */
+				ItemIdSetUnused(lp);
+			}
+		}
+	}
+
+	/* this will catch invalid or out-of-order itemnos[] */
+	if (nextitm != nitems)
+		elog(ERROR, "incorrect index offsets supplied");
+
+	if (empty)
+	{
+		/* Page is completely empty, so just reset it quickly */
+		phdr->pd_lower = SizeOfPageHeaderData;
+		phdr->pd_upper = pd_special;
+	}
+	else
+	{
+		/* There are live items: need to compact the page the hard way */
+		itemIdSortData itemidbase[MaxOffsetNumber];
+		itemIdSort	itemidptr;
+		int			i;
+		Size		totallen;
+
+		/*
+		 * Scan the page taking note of each item that we need to preserve.
+		 * This includes both live items (those that contain data) and
+		 * interspersed unused ones.  It's critical to preserve these unused
+		 * items, because otherwise the offset numbers for later live items
+		 * would change, which is not acceptable.  Unused items might get used
+		 * again later; that is fine.
+		 */
+		itemidptr = itemidbase;
+		totallen = 0;
+		PageClearHasFreeLinePointers(page);
+		for (i = 0; i < nline; i++)
+		{
+			ItemId		lp;
+
+			itemidptr->offsetindex = i;
+
+			lp = PageGetItemId(page, i + 1);
+			if (ItemIdHasStorage(lp))
+			{
+				itemidptr->itemoff = ItemIdGetOffset(lp);
+				itemidptr->alignedlen = MAXALIGN(ItemIdGetLength(lp));
+				totallen += itemidptr->alignedlen;
+				itemidptr++;
+			}
+			else
+			{
+				PageSetHasFreeLinePointers(page);
+				ItemIdSetUnused(lp);
+			}
+		}
+		nline = itemidptr - itemidbase;
+		/* By here, there are exactly nline elements in itemidbase array */
+
+		if (totallen > (Size) (pd_special - pd_lower))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+			   errmsg("corrupted item lengths: total %u, available space %u",
+					  (unsigned int) totallen, pd_special - pd_lower)));
+
+		/*
+		 * Defragment the data areas of each tuple, being careful to preserve
+		 * each item's position in the linp array.
+		 */
+		compactify_tuples(itemidbase, nline, page);
+	}
+}
 
 /*
  * Set checksum for a page in shared buffers.
@@ -870,7 +1088,7 @@ PageIndexMultiDelete(Page page, OffsetNumber *itemnos, int nitems)
  * If checksums are disabled, or if the page is not initialized, just return
  * the input.  Otherwise, we must make a copy of the page before calculating
  * the checksum, to prevent concurrent modifications (e.g. setting hint bits)
- * from making the final checksum invalid.	It doesn't matter if we include or
+ * from making the final checksum invalid.  It doesn't matter if we include or
  * exclude hints during the copy, as long as we write a valid page and
  * associated checksum.
  *

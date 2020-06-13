@@ -15,51 +15,45 @@
 #ifndef CDBMUTATE_H
 #define CDBMUTATE_H
 
+#include "nodes/execnodes.h"
 #include "nodes/plannodes.h"
-#include "nodes/params.h"
 #include "nodes/relation.h"
 #include "optimizer/walkers.h"
 
-extern Plan *apply_motion(struct PlannerInfo *root, Plan *plan, Query *query);
-
-extern Motion *make_union_motion(Plan *lefttree,
-		                                int destSegIndex, bool useExecutorVarFormat);
-extern Motion *make_sorted_union_motion(Plan *lefttree, int destSegIndex,
-						 int numSortCols, AttrNumber *sortColIdx,
-						 Oid *sortOperators, bool *nullsFirst,
-						 bool useExecutorVarFormat);
+extern Motion *make_union_motion(Plan *lefttree);
+extern Motion *make_sorted_union_motion(PlannerInfo *root, Plan *lefttree, int numSortCols, AttrNumber *sortColIdx, Oid *sortOperators,
+										Oid *collations, bool *nullsFirst);
 extern Motion *make_hashed_motion(Plan *lefttree,
-				    List *hashExpr, bool useExecutorVarFormat);
+								  List *hashExpr,
+								  List *hashOpfamilies,
+								  int numHashSegments);
 
-extern Motion *make_broadcast_motion(Plan *lefttree, bool useExecutorVarFormat);
+extern Motion *make_broadcast_motion(Plan *lefttree);
 
-extern Motion *make_explicit_motion(Plan *lefttree, AttrNumber segidColIdx, bool useExecutorVarFormat);
+extern Plan *make_explicit_motion(PlannerInfo *root,
+								  Plan *lefttree,
+								  AttrNumber segidColIdx);
 
 void 
 cdbmutate_warn_ctid_without_segid(struct PlannerInfo *root, struct RelOptInfo *rel);
 
-extern void add_slice_to_motion(Motion *m,
-		MotionType motionType, List *hashExpr, 
-		int numOutputSegs, int *outputSegIdx 
-		);
+extern Plan *apply_shareinput_dag_to_tree(PlannerInfo *root, Plan *plan);
+extern void collect_shareinput_producers(PlannerInfo *root, Plan *plan);
+extern Plan *replace_shareinput_targetlists(PlannerInfo *root, Plan *plan);
+extern Plan *apply_shareinput_xslice(Plan *plan, PlannerInfo *root);
 
-extern Plan *zap_trivial_result(PlannerInfo *root, Plan *plan); 
-extern Plan *apply_shareinput_dag_to_tree(PlannerGlobal *glob, Plan *plan, List *rtable);
-extern void collect_shareinput_producers(PlannerGlobal *glob, Plan *plan, List *rtable);
-extern Plan *replace_shareinput_targetlists(PlannerGlobal *glob, Plan *plan, List *rtable);
-extern Plan *apply_shareinput_xslice(Plan *plan, PlannerGlobal *glob);
-extern void assign_plannode_id(PlannedStmt *stmt);
-
-extern List *getExprListFromTargetList(List *tlist, int numCols, AttrNumber *colIdx,
-									   bool useExecutorVarFormat);
+extern List *getExprListFromTargetList(List *tlist, int numCols, AttrNumber *colIdx);
 extern void remove_unused_initplans(Plan *plan, PlannerInfo *root);
-extern void remove_unused_subplans(PlannerInfo *root, SubPlanWalkerContext *context);
 
-extern int32 cdbhash_const(Const *pconst, int iSegments);
-extern int32 cdbhash_const_list(List *plConsts, int iSegments);
+extern int32 cdbhash_const_list(List *plConsts, int iSegments, Oid *hashfuncs);
+extern Node *makeSegmentFilterExpr(int segid);
 
-extern Node *exec_make_plan_constant(struct PlannedStmt *stmt, bool is_SRI, List **cursorPositions);
-extern Node *planner_make_plan_constant(struct PlannerInfo *root, Node *n, bool is_SRI);
+extern Node *exec_make_plan_constant(struct PlannedStmt *stmt, EState *estate,
+						bool is_SRI, List **cursorPositions);
 extern void remove_subquery_in_RTEs(Node *node);
-extern void fixup_subplans(Plan *plan, PlannerInfo *root, SubPlanWalkerContext *context);
+
+extern Plan *cdbpathtoplan_create_sri_plan(RangeTblEntry *rte, PlannerInfo *subroot, Path *subpath, int createplan_flags);
+
+extern bool contains_outer_params(Node *node, void *context);
+
 #endif   /* CDBMUTATE_H */

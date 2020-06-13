@@ -2,13 +2,15 @@
 #include <stddef.h>
 #include <setjmp.h>
 #include "cmockery.h"
+
 #include "postgres.h"
+#include "utils/memutils.h"
 
 #include "../cdbdistributedsnapshot.c"
 
 #define SIZE_OF_IN_PROGRESS_ARRAY (10 * sizeof(DistributedTransactionId))
 
-void
+static void
 test__DistributedSnapshotWithLocalMapping_CommittedTest(void **state)
 {
 	DistributedSnapshotCommitted retval;
@@ -24,11 +26,9 @@ test__DistributedSnapshotWithLocalMapping_CommittedTest(void **state)
 
 		dslm.inProgressMappedLocalXids =
 			(TransactionId*)malloc(5 * sizeof(TransactionId));
-		dslm.maxLocalXidsCount = 5;
 
 		ds->inProgressXidArray =
 			(DistributedTransactionId*)malloc(SIZE_OF_IN_PROGRESS_ARRAY);
-		ds->maxCount = 10;
 		ds->distribSnapshotId = 12345;
 		ds->distribTransactionTimeStamp = timeStamp;
 	}

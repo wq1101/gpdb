@@ -19,11 +19,14 @@
 #include "catalog/heap.h"
 #include "catalog/index.h"
 #include "catalog/indexing.h"
+#include "catalog/namespace.h"
+#include "catalog/pg_am.h"
 #include "catalog/pg_appendonly_fn.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_type.h"
 #include "miscadmin.h"
+#include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "catalog/gp_fastsequence.h"
 
@@ -39,22 +42,25 @@ CreateAOAuxiliaryTable(
 		char relkind,
 		TupleDesc tupledesc,
 		IndexInfo  *indexInfo,
+		List *indexColNames,
 		Oid	*classObjectId,
-		int16 *coloptions)
+		int16 *coloptions,
+		bool is_part_parent)
 {
 	char aoauxiliary_relname[NAMEDATALEN];
 	char aoauxiliary_idxname[NAMEDATALEN];
 	bool shared_relation;
+	bool mapped_relation;
 	Oid relOid, aoauxiliary_relid = InvalidOid;
 	Oid aoauxiliary_idxid = InvalidOid;
 	ObjectAddress baseobject;
 	ObjectAddress aoauxiliaryobject;
+	Oid			namespaceid;
 
 	Assert(RelationIsValid(rel));
-	Assert(RelationIsAoRows(rel) || RelationIsAoCols(rel));
+	Assert(RelationIsAppendOptimized(rel));
 	Assert(auxiliaryNamePrefix);
 	Assert(tupledesc);
-	Assert(classObjectId);
 	if (relkind != RELKIND_AOSEGMENTS)
 		Assert(indexInfo);
 
@@ -69,20 +75,23 @@ CreateAOAuxiliaryTable(
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("shared tables cannot have append-only auxiliary relations after initdb")));
 
+	/* It's mapped if and only if its parent is, too */
+	mapped_relation = RelationIsMapped(rel);
+
 	relOid = RelationGetRelid(rel);
 
 	switch(relkind)
 	{
 		case RELKIND_AOVISIMAP:
-			GetAppendOnlyEntryAuxOids(relOid, SnapshotNow, NULL,
+			GetAppendOnlyEntryAuxOids(relOid, NULL, NULL,
 				NULL, NULL, &aoauxiliary_relid, &aoauxiliary_idxid);
 			break;
 		case RELKIND_AOBLOCKDIR:
-			GetAppendOnlyEntryAuxOids(relOid, SnapshotNow, NULL,
+			GetAppendOnlyEntryAuxOids(relOid, NULL, NULL,
 				&aoauxiliary_relid, &aoauxiliary_idxid, NULL, NULL);
 			break;
 		case RELKIND_AOSEGMENTS:
-			GetAppendOnlyEntryAuxOids(relOid, SnapshotNow,
+			GetAppendOnlyEntryAuxOids(relOid, NULL,
 				&aoauxiliary_relid,
 				NULL, NULL, NULL, NULL);
 			break;
@@ -104,6 +113,15 @@ CreateAOAuxiliaryTable(
 			 "%s_%u_index", auxiliaryNamePrefix, relOid);
 
 	/*
+	 * Aux tables for regular relations go in pg_aoseg; those for temp
+	 * relations go into the per-backend temp-toast-table namespace.
+	 */
+	if (RelationUsesTempNamespace(rel))
+		namespaceid = GetTempToastNamespace();
+	else
+		namespaceid = PG_AOSEGMENT_NAMESPACE;
+
+	/*
 	 * We place auxiliary relation in the pg_aoseg namespace
 	 * even if its master relation is a temp table. There cannot be
 	 * any naming collision, and the auxiliary relation will be
@@ -111,25 +129,31 @@ CreateAOAuxiliaryTable(
 	 * the aovisimap relation as temp.
 	 */
 	aoauxiliary_relid = heap_create_with_catalog(aoauxiliary_relname,
-											     PG_AOSEGMENT_NAMESPACE,
+											     namespaceid,
 											     rel->rd_rel->reltablespace,
 											     InvalidOid,
+												 InvalidOid,
+												 InvalidOid,
 											     rel->rd_rel->relowner,
 											     tupledesc,
-											     /* relam */ InvalidOid,
+												 NIL,
 											     relkind,
+												 rel->rd_rel->relpersistence,
 											     RELSTORAGE_HEAP,
 											     shared_relation,
+												 mapped_relation,
 											     true,
-											     /* bufferPoolBulkLoad */ false,
 											     0,
 											     ONCOMMIT_NOOP,
 											     NULL, /* GP Policy */
 											     (Datum) 0,
+												 /* use_user_acl */ false,
 											     true,
+												 true,
+												 NULL, /* typeaddress */
 												 /* valid_opts */ false,
-											     /* persistentTid */ NULL,
-											     /* persistentSerialNum */ NULL);
+												 /* is_part_child */ false,
+												 is_part_parent);
 
 	/* Make this table visible, else index creation will fail */
 	CommandCounterIncrement();
@@ -137,18 +161,30 @@ CreateAOAuxiliaryTable(
 	/* Create an index on AO auxiliary tables (like visimap) except for pg_aoseg table */
 	if (relkind != RELKIND_AOSEGMENTS)
 	{
-		aoauxiliary_idxid = index_create(aoauxiliary_relid,
+		Oid		   *collationObjectId;
+		Relation	aoauxiliary_rel;
+
+		/* ShareLock is not really needed here, but take it anyway */
+		aoauxiliary_rel = heap_open(aoauxiliary_relid, ShareLock);
+
+		collationObjectId = palloc0(list_length(indexColNames) * sizeof(Oid));
+
+		aoauxiliary_idxid = index_create(aoauxiliary_rel,
 										 aoauxiliary_idxname,
 										 InvalidOid,
+										 InvalidOid,
+										 InvalidOid,
+										 InvalidOid,
 										 indexInfo,
+										 indexColNames,
 										 BTREE_AM_OID,
 										 rel->rd_rel->reltablespace,
-										 classObjectId, coloptions, (Datum) 0,
-										 true, false, true, false,
-										 false, NULL);
+										 collationObjectId, classObjectId, coloptions, (Datum) 0,
+										 true, false, false, false,
+										 true, false, false, true, false, NULL);
 
 		/* Unlock target table -- no one can see it */
-		UnlockRelationOid(aoauxiliary_relid, ShareLock);
+		heap_close(aoauxiliary_rel, ShareLock);
 
 		/* Unlock the index -- no one can see it anyway */
 		UnlockRelationOid(aoauxiliary_idxid, AccessExclusiveLock);
@@ -202,4 +238,11 @@ CreateAOAuxiliaryTable(
 	CommandCounterIncrement();
 
 	return true;
+}
+
+bool
+IsAppendonlyMetadataRelkind(const char relkind) {
+	return (relkind == RELKIND_AOSEGMENTS ||
+			relkind == RELKIND_AOBLOCKDIR ||
+			relkind == RELKIND_AOVISIMAP);
 }

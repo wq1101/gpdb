@@ -4,21 +4,21 @@
  *	  Standard POSTGRES buffer page definitions.
  *
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/storage/bufpage.h,v 1.77 2008/01/01 19:45:58 momjian Exp $
+ * src/include/storage/bufpage.h
  *
  *-------------------------------------------------------------------------
  */
 #ifndef BUFPAGE_H
 #define BUFPAGE_H
 
-#include "storage/bufmgr.h"
+#include "access/xlogdefs.h"
 #include "storage/block.h"
 #include "storage/item.h"
 #include "storage/off.h"
-#include "access/xlog.h"
+#include "miscadmin.h"
 
 /*
  * A postgres disk page is an abstraction layered on top of a postgres
@@ -28,7 +28,7 @@
  * disk page is always a slotted page of the form:
  *
  * +----------------+---------------------------------+
- * | PageHeaderData | linp1 linp2 linp3 ...			  |
+ * | PageHeaderData | linp1 linp2 linp3 ...           |
  * +-----------+----+---------------------------------+
  * | ... linpN |									  |
  * +-----------+--------------------------------------+
@@ -36,7 +36,7 @@
  * |												  |
  * |			 v pd_upper							  |
  * +-------------+------------------------------------+
- * |			 | tupleN ...						  |
+ * |			 | tupleN ...                         |
  * +-------------+------------------+-----------------+
  * |	   ... tuple3 tuple2 tuple1 | "special space" |
  * +--------------------------------+-----------------+
@@ -67,7 +67,7 @@
  *
  * AM-specific per-page data (if any) is kept in the area marked "special
  * space"; each AM has an "opaque" structure defined somewhere that is
- * stored as the page trailer.	an access method should always
+ * stored as the page trailer.  an access method should always
  * initialize its pages with PageInit and then set its own opaque
  * fields.
  */
@@ -85,12 +85,27 @@ typedef uint16 LocationIndex;
 
 
 /*
+ * For historical reasons, the 64-bit LSN value is stored as two 32-bit
+ * values.
+ */
+typedef struct
+{
+	uint32		xlogid;			/* high bits */
+	uint32		xrecoff;		/* low bits */
+} PageXLogRecPtr;
+
+#define PageXLogRecPtrGet(val) \
+	((uint64) (val).xlogid << 32 | (val).xrecoff)
+#define PageXLogRecPtrSet(ptr, lsn) \
+	((ptr).xlogid = (uint32) ((lsn) >> 32), (ptr).xrecoff = (uint32) (lsn))
+
+/*
  * disk page organization
  *
  * space management information generic to any page
  *
  *		pd_lsn		- identifies xlog record for last change to this page.
- *		pd_checksum	- page checksum, if set.
+ *		pd_checksum - page checksum, if set.
  *		pd_flags	- flag bits.
  *		pd_lower	- offset to start of free space.
  *		pd_upper	- offset to end of free space.
@@ -114,7 +129,7 @@ typedef uint16 LocationIndex;
  * there are no flag bits relating to checksums.
  *
  * pd_prune_xid is a hint field that helps determine whether pruning will be
- * useful.	It is currently unused in index pages.
+ * useful.  It is currently unused in index pages.
  *
  * The page version number and page size are packed together into a single
  * uint16 field.  This is for historical reasons: before PostgreSQL 7.3,
@@ -129,10 +144,11 @@ typedef uint16 LocationIndex;
  * On the high end, we can only support pages up to 32KB because lp_off/lp_len
  * are 15 bits.
  */
+
 typedef struct PageHeaderData
 {
 	/* XXX LSN is member of *any* block, not only page-organized ones */
-	XLogRecPtr	pd_lsn;			/* LSN: next byte after last byte of xlog
+	PageXLogRecPtr pd_lsn;		/* LSN: next byte after last byte of xlog
 								 * record for last change to this page */
 	uint16		pd_checksum;	/* checksum */
 	uint16		pd_flags;		/* flag bits, see below */
@@ -141,7 +157,7 @@ typedef struct PageHeaderData
 	LocationIndex pd_special;	/* offset to start of special space */
 	uint16		pd_pagesize_version;
 	TransactionId pd_prune_xid; /* oldest prunable XID, or zero if none */
-	ItemIdData	pd_linp[1];		/* beginning of line pointer array */
+	ItemIdData	pd_linp[FLEXIBLE_ARRAY_MEMBER]; /* line pointer array */
 } PageHeaderData;
 
 typedef PageHeaderData *PageHeader;
@@ -161,8 +177,10 @@ typedef PageHeaderData *PageHeader;
 #define PD_HAS_FREE_LINES	0x0001		/* are there any unused line pointers? */
 #define PD_PAGE_FULL		0x0002		/* not enough free space for new
 										 * tuple? */
+#define PD_ALL_VISIBLE		0x0004		/* all tuples on page are visible to
+										 * everyone */
 
-#define PD_VALID_FLAG_BITS	0x0003		/* OR of all valid pd_flags bits */
+#define PD_VALID_FLAG_BITS	0x0007		/* OR of all valid pd_flags bits */
 
 /*
  * Page layout version number 0 is for pre-7.3 Postgres releases.
@@ -182,6 +200,7 @@ typedef PageHeaderData *PageHeader;
  *		used 4 for the previous format.
  */
 #define PG_PAGE_LAYOUT_VERSION		14
+
 #define PG_DATA_CHECKSUM_VERSION	1
 
 /* ----------------------------------------------------------------
@@ -196,9 +215,9 @@ typedef PageHeaderData *PageHeader;
 #define PageIsValid(page) PointerIsValid(page)
 
 /*
- * line pointer does not count as part of header
+ * line pointer(s) do not count as part of header
  */
-#define SizeOfPageHeaderData (offsetof(PageHeaderData, pd_linp[0]))
+#define SizeOfPageHeaderData (offsetof(PageHeaderData, pd_linp))
 
 /*
  * PageIsEmpty
@@ -223,9 +242,13 @@ typedef PageHeaderData *PageHeader;
 /*
  * PageGetContents
  *		To be used in case the page does not contain item pointers.
+ *
+ * Note: prior to 8.3 this was not guaranteed to yield a MAXALIGN'd result.
+ * Now it is.  Beware of old code that might think the offset to the contents
+ * is just SizeOfPageHeaderData rather than MAXALIGN(SizeOfPageHeaderData).
  */
 #define PageGetContents(page) \
-	((char *) (&((PageHeader) (page))->pd_linp[0]))
+	((char *) (page) + MAXALIGN(SizeOfPageHeaderData))
 
 /*
  * PageGetContentsMaxAligned
@@ -289,12 +312,31 @@ typedef PageHeaderData *PageHeader;
 	((uint16) (PageGetPageSize(page) - ((PageHeader)(page))->pd_special))
 
 /*
+ * Using assertions, validate that the page special pointer is OK.
+ *
+ * This is intended to catch use of the pointer before page initialization.
+ * It is implemented as a function due to the limitations of the MSVC
+ * compiler, which choked on doing all these tests within another macro.  We
+ * return true so that MacroAssert() can be used while still getting the
+ * specifics from the macro failure within this function.
+ */
+static inline bool
+PageValidateSpecialPointer(Page page)
+{
+	Assert(PageIsValid(page));
+	Assert(((PageHeader) (page))->pd_special <= BLCKSZ);
+	Assert(((PageHeader) (page))->pd_special >= SizeOfPageHeaderData);
+
+	return true;
+}
+
+/*
  * PageGetSpecialPointer
  *		Returns pointer to special space on a page.
  */
 #define PageGetSpecialPointer(page) \
 ( \
-	AssertMacro(PageIsValid(page)), \
+	AssertMacro(PageValidateSpecialPointer(page)), \
 	(char *) ((char *) (page) + ((PageHeader) (page))->pd_special) \
 )
 
@@ -312,29 +354,6 @@ typedef PageHeaderData *PageHeader;
 	AssertMacro(ItemIdHasStorage(itemId)), \
 	(Item)(((char *)(page)) + ItemIdGetOffset(itemId)) \
 )
-
-/*
- * BufferGetPageSize
- *		Returns the page size within a buffer.
- *
- * Notes:
- *		Assumes buffer is valid.
- *
- *		The buffer can be a raw disk block and need not contain a valid
- *		(formatted) disk page.
- */
-/* XXX should dig out of buffer descriptor */
-#define BufferGetPageSize(buffer) \
-( \
-	AssertMacro(BufferIsValid(buffer)), \
-	(Size)BLCKSZ \
-)
-
-/*
- * BufferGetPage
- *		Returns the page associated with a buffer.
- */
-#define BufferGetPage(buffer) ((Page)BufferGetBlock(buffer))
 
 /*
  * PageGetMaxOffsetNumber
@@ -361,35 +380,22 @@ typedef PageHeaderData *PageHeader;
  * local buffers do not need to worry about concurrency.
  *
  */
+extern bool BufferLockHeldByMe(Page page);
 static inline XLogRecPtr
 PageGetLSN(Page page)
 {
-#ifdef USE_ASSERT_CHECKING
-	extern PGDLLIMPORT char *BufferBlocks; /* duplicates bufmgr.h */
-	char *pagePtr = page;
-
-	/*
-	 * We only want to assert that we hold a lock on the page contents if the
-	 * page is shared (i.e. it is one of the BufferBlocks).
-	 */
-	if (BufferBlocks <= pagePtr &&
-		pagePtr < (BufferBlocks + NBuffers * BLCKSZ))
-	{
-		BufferDesc *hdr = &BufferDescriptors[(pagePtr - BufferBlocks) / BLCKSZ];
-		Assert(LWLockHeldByMe(hdr->content_lock));
-	}
+#if defined (USE_ASSERT_CHECKING) && !defined(FRONTEND)
+	Assert(BufferLockHeldByMe(page));
 #endif
-
-	return ((PageHeader) page)->pd_lsn;
+	return PageXLogRecPtrGet(((PageHeader) (page))->pd_lsn);
 }
 
 /*
- * Additional macros for access to page headers
+ * Additional macros for access to page headers. (Beware multiple evaluation
+ * of the arguments!)
  */
 #define PageSetLSN(page, lsn) \
-	(((PageHeader) (page))->pd_lsn = (lsn))
-#define PageXLogRecPtrSet(ptr, lsn) \
-	((ptr).xlogid = (uint32) ((lsn) >> 32), (ptr).xrecoff = (uint32) (lsn))
+	PageXLogRecPtrSet(((PageHeader) (page))->pd_lsn, lsn)
 
 #define PageHasFreeLinePointers(page) \
 	(((PageHeader) (page))->pd_flags & PD_HAS_FREE_LINES)
@@ -404,6 +410,13 @@ PageGetLSN(Page page)
 	(((PageHeader) (page))->pd_flags |= PD_PAGE_FULL)
 #define PageClearFull(page) \
 	(((PageHeader) (page))->pd_flags &= ~PD_PAGE_FULL)
+
+#define PageIsAllVisible(page) \
+	(((PageHeader) (page))->pd_flags & PD_ALL_VISIBLE)
+#define PageSetAllVisible(page) \
+	(((PageHeader) (page))->pd_flags |= PD_ALL_VISIBLE)
+#define PageClearAllVisible(page) \
+	(((PageHeader) (page))->pd_flags &= ~PD_ALL_VISIBLE)
 
 #define PageIsPrunable(page, oldestxmin) \
 ( \
@@ -433,12 +446,19 @@ do { \
  *		extern declarations
  * ----------------------------------------------------------------
  */
+#define PAI_OVERWRITE			(1 << 0)
+#define PAI_IS_HEAP				(1 << 1)
+#define PAI_ALLOW_FAR_OFFSET	(1 << 2)
 
 extern void PageInit(Page page, Size pageSize, Size specialSize);
 extern bool PageIsVerified(Page page, BlockNumber blkno);
 extern OffsetNumber PageAddItem(Page page, Item item, Size size,
 			OffsetNumber offsetNumber, bool overwrite, bool is_heap);
-extern Page PageGetTempPage(Page page, Size specialSize);
+extern OffsetNumber PageAddItemExtended(Page page, Item item, Size size,
+					OffsetNumber offsetNumber, int flags);
+extern Page PageGetTempPage(Page page);
+extern Page PageGetTempPageCopy(Page page);
+extern Page PageGetTempPageCopySpecial(Page page);
 extern void PageRestoreTempPage(Page tempPage, Page oldPage);
 extern void PageRepairFragmentation(Page page);
 extern Size PageGetFreeSpace(Page page);
@@ -446,6 +466,8 @@ extern Size PageGetExactFreeSpace(Page page);
 extern Size PageGetHeapFreeSpace(Page page);
 extern void PageIndexTupleDelete(Page page, OffsetNumber offset);
 extern void PageIndexMultiDelete(Page page, OffsetNumber *itemnos, int nitems);
+extern void PageIndexDeleteNoCompact(Page page, OffsetNumber *itemnos,
+						 int nitems);
 extern char *PageSetChecksumCopy(Page page, BlockNumber blkno);
 extern void PageSetChecksumInplace(Page page, BlockNumber blkno);
 

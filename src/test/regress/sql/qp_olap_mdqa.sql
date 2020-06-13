@@ -64,14 +64,6 @@ create table sale_ord
 	
 ) distributed by (cn,vn,pn);
 
-create table util
-(
-	xn int not null,
-	
-	primary key (xn)
-	
-) distributed by (xn);
-
 -- Customers
 insert into customer values 
   ( 1, 'Macbeth', 'Inverness'),
@@ -128,14 +120,6 @@ insert into sale_ord values
   ( 10,3, 30, 600, '1401-6-1', 12, 5),
   ( 11,4, 40, 700, '1401-6-1', 1, 1),
   ( 12,4, 40, 800, '1401-6-1', 1, 1);
-
--- Util
-
-insert into util values 
-  (1),
-  (20),
-  (300);
-
 -- end_ignore
 
 SELECT CASE WHEN sale.vn < 10 THEN 1 ELSE 2 END as newalias1,
@@ -215,6 +199,8 @@ SELECT CASE WHEN sale.cn < 10 THEN 1 ELSE 2 END as newalias1,CASE WHEN sale.pn <
 FROM sale
 GROUP BY CUBE((sale.dt,newalias2,sale.prc),(sale.vn)),sale.cn,sale.pn;
 
+-- NOTE: this query suffers from the issue discussed at:
+-- https://www.postgresql.org/message-id/flat/7dbdcf5c-b5a6-ef89-4958-da212fe10176%40iki.fi
 SELECT CASE WHEN sale.qty < 10 THEN 1 ELSE 2 END as newalias1,
                CASE WHEN sale.qty < 10 THEN 1 ELSE 2 END as newalias4,
                GROUPING(sale.qty,sale.cn,sale.qty)

@@ -18,7 +18,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include "access/fileam.h"
+#include "access/url.h"
 #include "cdb/cdbtimer.h"
 #include "cdb/cdbvars.h"
 #include "libpq/pqsignal.h"
@@ -62,8 +62,6 @@ typedef struct URL_EXECUTE_FILE
 	execute_handle_t *handle;	/* ResourceOwner-tracked stuff */
 } URL_EXECUTE_FILE;
 
-static int popen_with_stderr(int *rwepipe, const char *exe, bool forwrite);
-static int pclose_with_stderr(int pid, int *rwepipe, StringInfo sinfo);
 static void pclose_without_stderr(int *rwepipe);
 static char *interpretError(int exitCode, char *buf, size_t buflen, char *err, size_t errlen);
 static const char *getSignalNameFromCode(int signo);
@@ -179,12 +177,25 @@ make_export(char *name, const char *value, StringInfo buf)
 {
 	char		ch;
 
+	/*
+	 * Shell-quote the value so that we don't need to escape other special char
+	 * except single quote and backslash. (We assume the variable name doesn't contain
+	 * funny characters.
+	 *
+	 * Every single-quote is replaced with '\''. For example, value
+	 * foo'bar becomes 'foo'\''bar'.
+	 *
+	 * Don't need to escape backslash, although using echo will behave differently on
+	 * different platforms. It's better to write as: /usr/bin/env bash -c 'echo -E "$VAR"'.
+	 */
 	appendStringInfo(buf, "%s='", name);
 
 	for ( ; 0 != (ch = *value); value++)
 	{
-		if (ch == '\'' || ch == '\\')
-			appendStringInfoChar(buf, '\\');
+		if(ch == '\'')
+		{
+			appendStringInfo(buf, "\'\\\'");
+		}
 
 		appendStringInfoChar(buf, ch);
 	}
@@ -193,7 +204,7 @@ make_export(char *name, const char *value, StringInfo buf)
 }
 
 
-static char *
+char *
 make_command(const char *cmd, extvar_t *ev)
 {
 	StringInfoData buf;
@@ -215,12 +226,7 @@ make_command(const char *cmd, extvar_t *ev)
 	make_export("GP_SEG_PORT", ev->GP_SEG_PORT, &buf);
 	make_export("GP_SESSION_ID", ev->GP_SESSION_ID, &buf);
 	make_export("GP_SEGMENT_COUNT", ev->GP_SEGMENT_COUNT, &buf);
-
-	/* hadoop env var */
-	make_export("GP_HADOOP_CONN_JARDIR", ev->GP_HADOOP_CONN_JARDIR, &buf);
-	make_export("GP_HADOOP_CONN_VERSION", ev->GP_HADOOP_CONN_VERSION, &buf);
-	if (strlen(ev->GP_HADOOP_HOME) > 0)
-		make_export("HADOOP_HOME",    ev->GP_HADOOP_HOME,    &buf);
+	make_export("GP_QUERY_STRING", ev->GP_QUERY_STRING, &buf);
 
 	appendStringInfoString(&buf, cmd);
 
@@ -280,11 +286,10 @@ url_execute_fopen(char *url, bool forwrite, extvar_t *ev, CopyState pstate)
 	/* Restore process interval timers */
 	restoreTimers(&savetimers);
 
+	elog(DEBUG5, "EXTERNAL TABLE EXECUTE Command: %s", file->shexec);
 	if (file->handle->pid == -1)
 	{
 		errno = save_errno;
-		pfree(file->common.url);
-		pfree(file);
 		ereport(ERROR,
 				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
 						errmsg("cannot start external table command: %m"),
@@ -313,8 +318,8 @@ url_execute_fclose(URL_FILE *file, bool failOnError, const char *relname)
 
 	cleanup_execute_handle(efile->handle);
 	efile->handle = NULL;
-	
-	url = pstrdup(file->url);	
+
+	url = pstrdup(file->url);
 	if (ret == 0)
 	{
 		/* pclose() ended successfully; no errors to reflect */
@@ -374,7 +379,13 @@ url_execute_ferror(URL_FILE *file, int bytesread, char *ebuf, int ebuflen)
 		 * Read one byte less than the maximum size to ensure zero
 		 * termination of the buffer.
 		 */
-		nread = piperead(efile->handle->pipes[EXEC_ERR_P], ebuf, ebuflen -1);
+reread:
+		nread = read(efile->handle->pipes[EXEC_ERR_P], ebuf, ebuflen -1);
+		if(nread == -1 && errno == EINTR)
+		{
+			CHECK_FOR_INTERRUPTS();
+			goto reread;
+		}
 
 		if(nread != -1)
 			ebuf[nread] = 0;
@@ -389,16 +400,57 @@ size_t
 url_execute_fread(void *ptr, size_t size, URL_FILE *file, CopyState pstate)
 {
 	URL_EXECUTE_FILE *efile = (URL_EXECUTE_FILE *) file;
+	ssize_t		n;
+	bool        rerun;
 
-	return piperead(efile->handle->pipes[EXEC_DATA_P], ptr, size);
+	do {
+		n = read(efile->handle->pipes[EXEC_DATA_P], ptr, size);
+
+		if (n == -1 && errno == EINTR)
+		{
+			CHECK_FOR_INTERRUPTS();
+			rerun = true;
+		}
+		else
+			rerun = false;
+	} while (rerun);
+
+	return n;
 }
 
 size_t
 url_execute_fwrite(void *ptr, size_t size, URL_FILE *file, CopyState pstate)
 {
-	URL_EXECUTE_FILE *efile = (URL_EXECUTE_FILE *) file;
+    URL_EXECUTE_FILE *efile = (URL_EXECUTE_FILE *) file;
+    int fd = efile->handle->pipes[EXEC_DATA_P];
+    size_t offset = 0;
+    const char* p = (const char* ) ptr;
 
-	return pipewrite(efile->handle->pipes[EXEC_DATA_P], ptr, size);
+    size_t n;
+    /* ensure all data in buffer is send out to pipe*/
+    while(size > offset)
+    {
+        n = write(fd,p,size - offset);
+
+		if (n == -1)
+		{
+			if (errno == EINTR)
+			{
+				CHECK_FOR_INTERRUPTS();
+				continue;
+			}
+			return -1;
+		}
+
+        if(n == 0) break;
+
+        offset += n;
+        p = (const char*)ptr + offset;
+    }
+
+    if(offset < size) elog(WARNING,"partial write, expected %lu, written %lu", size, offset);
+
+    return offset;
 }
 
 /*
@@ -586,20 +638,20 @@ getSignalNameFromCode(int signo)
  * if 'forwrite' is set then we set the data pipe write side on the
  * parent. otherwise, we set the read side on the parent.
  */
-static int
+int
 popen_with_stderr(int *pipes, const char *exe, bool forwrite)
 {
 	int data[2];	/* pipe to send data child <--> parent */
 	int err[2];		/* pipe to send errors child --> parent */
 	int pid = -1;
-	
+
 	const int READ = 0;
 	const int WRITE = 1;
 
-	if (pgpipe(data) < 0)
+	if (pipe(data) < 0)
 		return -1;
 
-	if (pgpipe(err) < 0)
+	if (pipe(err) < 0)
 	{
 		close(data[READ]);
 		close(data[WRITE]);
@@ -608,7 +660,7 @@ popen_with_stderr(int *pipes, const char *exe, bool forwrite)
 #ifndef WIN32
 
 	pid = fork();
-	
+
 	if (pid > 0) /* parent */
 	{
 
@@ -622,16 +674,16 @@ popen_with_stderr(int *pipes, const char *exe, bool forwrite)
 		{
 			/* parent reads from child */
 			close(data[WRITE]);
-			pipes[EXEC_DATA_P] = data[READ]; 			
+			pipes[EXEC_DATA_P] = data[READ];
 		}
-		
+
 		close(err[WRITE]);
 		pipes[EXEC_ERR_P] = err[READ];
-		
+
 		return pid;
 	}
 	else if (pid == 0) /* child */
-	{		
+	{
 
 		/*
 		 * set up the data pipe
@@ -640,7 +692,7 @@ popen_with_stderr(int *pipes, const char *exe, bool forwrite)
 		{
 			close(data[WRITE]);
 			close(fileno(stdin));
-			
+
 			/* assign pipes to parent to stdin */
 			if (dup2(data[READ], fileno(stdin)) < 0)
 			{
@@ -649,13 +701,13 @@ popen_with_stderr(int *pipes, const char *exe, bool forwrite)
 			}
 
 			/* no longer needed after the duplication */
-			close(data[READ]);			
+			close(data[READ]);
 		}
 		else
 		{
 			close(data[READ]);
 			close(fileno(stdout));
-			
+
 			/* assign pipes to parent to stdout */
 			if (dup2(data[WRITE], fileno(stdout)) < 0)
 			{
@@ -666,26 +718,26 @@ popen_with_stderr(int *pipes, const char *exe, bool forwrite)
 			/* no longer needed after the duplication */
 			close(data[WRITE]);
 		}
-		
+
 		/*
 		 * now set up the error pipe
 		 */
 		close(err[READ]);
 		close(fileno(stderr));
-		
+
 		if (dup2(err[WRITE], fileno(stderr)) < 0)
 		{
 			if(forwrite)
 				close(data[WRITE]);
 			else
 				close(data[READ]);
-			
+
 			perror("dup2 error");
-			exit(EXIT_FAILURE);			
+			exit(EXIT_FAILURE);
 		}
 
 		close(err[WRITE]);
-				
+
 		/* go ahead and execute the user command */
 		execl("/bin/sh", "sh", "-c", exe, NULL);
 
@@ -706,8 +758,8 @@ popen_with_stderr(int *pipes, const char *exe, bool forwrite)
 		}
 		close(err[READ]);
 		close(err[WRITE]);
-		
-		return -1;		
+
+		return -1;
 	}
 #endif
 
@@ -725,7 +777,7 @@ read_err_msg(int fid, StringInfo sinfo)
 
 	while (true)
 	{
-		int nread = piperead(fid, ebuf, ebuflen);
+		int nread = read(fid, ebuf, ebuflen);
 
 		if(nread == 0)
 		{
@@ -754,23 +806,26 @@ read_err_msg(int fid, StringInfo sinfo)
  * termination status. if child terminated with error, 'buf' will
  * point to the error string retrieved from child's stderr.
  */
-static int
+int
 pclose_with_stderr(int pid, int *pipes, StringInfo sinfo)
 {
-	int status;
-	
+	int status = 0;
+
 	/* close the data pipe. we can now read from error pipe without being blocked */
 	close(pipes[EXEC_DATA_P]);
-	
+
 	read_err_msg(pipes[EXEC_ERR_P], sinfo);
 
 	close(pipes[EXEC_ERR_P]);
 
-#ifndef WIN32
-	waitpid(pid, &status, 0);
-#else
-    status = -1;
-#endif
+	if (kill(pid, 0) == 0) /* process exists */
+	{
+	#ifndef WIN32
+		waitpid(pid, &status, 0);
+	#else
+		status = -1;
+	#endif
+	}
 
 	return status;
 }

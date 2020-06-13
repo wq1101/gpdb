@@ -1,8 +1,8 @@
 #! /usr/bin/perl
 #
-# Copyright (c) 2001-2009, PostgreSQL Global Development Group
+# Copyright (c) 2001-2016, PostgreSQL Global Development Group
 #
-# $PostgreSQL: pgsql/src/backend/utils/mb/Unicode/UCS_to_BIG5.pl,v 1.9 2009/03/18 16:26:18 heikki Exp $
+# src/backend/utils/mb/Unicode/UCS_to_BIG5.pl
 #
 # Generate UTF-8 <--> BIG5 conversion tables from
 # map files provided by Unicode organization.
@@ -33,68 +33,84 @@ require "ucs2utf.pl";
 #
 $in_file = "BIG5.TXT";
 
-open( FILE, $in_file ) || die( "cannot open $in_file" );
+open(FILE, $in_file) || die("cannot open $in_file");
 
 reset 'array';
 
-while( <FILE> ){
+while (<FILE>)
+{
 	chop;
-	if( /^#/ ){
+	if (/^#/)
+	{
 		next;
 	}
-	( $c, $u, $rest ) = split;
-	$ucs = hex($u);
+	($c, $u, $rest) = split;
+	$ucs  = hex($u);
 	$code = hex($c);
-	if( $code >= 0x80 && $ucs >= 0x0080){
+	if ($code >= 0x80 && $ucs >= 0x0080)
+	{
 		$utf = &ucs2utf($ucs);
-		if( $array{ $utf } ne "" ){
-			printf STDERR "Warning: duplicate UTF8: %04x\n",$ucs;
+		if ($array{$utf} ne "")
+		{
+			printf STDERR "Warning: duplicate UTF8: %04x\n", $ucs;
 			next;
 		}
 		$count++;
-		$array{ $utf } = $code;
+		$array{$utf} = $code;
 	}
 }
-close( FILE );
+close(FILE);
 
 $in_file = "CP950.TXT";
 
-open( FILE, $in_file ) || die( "cannot open $in_file" );
+open(FILE, $in_file) || die("cannot open $in_file");
 
-while( <FILE> ){
+while (<FILE>)
+{
 	chop;
-	if( /^#/ ){
+	if (/^#/)
+	{
 		next;
 	}
-	( $c, $u, $rest ) = split;
-	$ucs = hex($u);
+	($c, $u, $rest) = split;
+	$ucs  = hex($u);
 	$code = hex($c);
 
 	# Pick only the ETEN extended characters in the range 0xf9d6 - 0xf9dc
 	# from CP950.TXT
-	if( $code >= 0x80 && $ucs >= 0x0080 &&
-	    $code >= 0xf9d6 && $code <= 0xf9dc ){
+	if (   $code >= 0x80
+		&& $ucs >= 0x0080
+		&& $code >= 0xf9d6
+		&& $code <= 0xf9dc)
+	{
 		$utf = &ucs2utf($ucs);
-		if( $array{ $utf } ne "" ){
-			printf STDERR "Warning: duplicate UTF8: %04x\n",$ucs;
+		if ($array{$utf} ne "")
+		{
+			printf STDERR "Warning: duplicate UTF8: %04x\n", $ucs;
 			next;
 		}
 		$count++;
-		$array{ $utf } = $code;
+		$array{$utf} = $code;
 	}
 }
-close( FILE );
+close(FILE);
 
 $file = lc("utf8_to_big5.map");
-open( FILE, "> $file" ) || die( "cannot open $file" );
-print FILE "static pg_utf_to_local ULmapBIG5[ $count ] = {\n";
+open(FILE, "> $file") || die("cannot open $file");
 
-for $index ( sort {$a <=> $b} keys( %array ) ){
-	$code = $array{ $index };
+print FILE "/* src/backend/utils/mb/Unicode/$file */\n\n";
+print FILE "static const pg_utf_to_local ULmapBIG5[ $count ] = {\n";
+
+for $index (sort { $a <=> $b } keys(%array))
+{
+	$code = $array{$index};
 	$count--;
-	if( $count == 0 ){
+	if ($count == 0)
+	{
 		printf FILE "  {0x%04x, 0x%04x}\n", $index, $code;
-	} else {
+	}
+	else
+	{
 		printf FILE "  {0x%04x, 0x%04x},\n", $index, $code;
 	}
 }
@@ -107,71 +123,86 @@ close(FILE);
 #
 $in_file = "BIG5.TXT";
 
-open( FILE, $in_file ) || die( "cannot open $in_file" );
+open(FILE, $in_file) || die("cannot open $in_file");
 
 reset 'array';
 
-while( <FILE> ){
+while (<FILE>)
+{
 	chop;
-	if( /^#/ ){
+	if (/^#/)
+	{
 		next;
 	}
-	( $c, $u, $rest ) = split;
-	$ucs = hex($u);
+	($c, $u, $rest) = split;
+	$ucs  = hex($u);
 	$code = hex($c);
-	if( $code >= 0x80 && $ucs >= 0x0080){
+	if ($code >= 0x80 && $ucs >= 0x0080)
+	{
 		$utf = &ucs2utf($ucs);
-		if( $array{ $utf } ne "" ){
-			printf STDERR "Warning: duplicate UTF8: %04x\n",$ucs;
+		if ($array{$utf} ne "")
+		{
+			printf STDERR "Warning: duplicate UTF8: %04x\n", $ucs;
 			next;
 		}
 		$count++;
-		$array{ $code } = $utf;
+		$array{$code} = $utf;
 	}
 }
-close( FILE );
+close(FILE);
 
 $in_file = "CP950.TXT";
 
-open( FILE, $in_file ) || die( "cannot open $in_file" );
+open(FILE, $in_file) || die("cannot open $in_file");
 
-while( <FILE> ){
+while (<FILE>)
+{
 	chop;
-	if( /^#/ ){
+	if (/^#/)
+	{
 		next;
 	}
-	( $c, $u, $rest ) = split;
-	$ucs = hex($u);
+	($c, $u, $rest) = split;
+	$ucs  = hex($u);
 	$code = hex($c);
 
 	# Pick only the ETEN extended characters in the range 0xf9d6 - 0xf9dc
 	# from CP950.TXT
-	if( $code >= 0x80 && $ucs >= 0x0080 &&
-	    $code >= 0xf9d6 && $code <= 0xf9dc ){
+	if (   $code >= 0x80
+		&& $ucs >= 0x0080
+		&& $code >= 0xf9d6
+		&& $code <= 0xf9dc)
+	{
 		$utf = &ucs2utf($ucs);
-		if( $array{ $utf } ne "" ){
-			printf STDERR "Warning: duplicate UTF8: %04x\n",$ucs;
+		if ($array{$utf} ne "")
+		{
+			printf STDERR "Warning: duplicate UTF8: %04x\n", $ucs;
 			next;
 		}
 		$count++;
-		$array{ $code } = $utf;
+		$array{$code} = $utf;
 	}
 }
-close( FILE );
+close(FILE);
 
 $file = lc("big5_to_utf8.map");
-open( FILE, "> $file" ) || die( "cannot open $file" );
-print FILE "static pg_local_to_utf LUmapBIG5[ $count ] = {\n";
-for $index ( sort {$a <=> $b} keys( %array ) ){
-	$utf = $array{ $index };
+open(FILE, "> $file") || die("cannot open $file");
+
+print FILE "/* src/backend/utils/mb/Unicode/$file */\n\n";
+print FILE "static const pg_local_to_utf LUmapBIG5[ $count ] = {\n";
+for $index (sort { $a <=> $b } keys(%array))
+{
+	$utf = $array{$index};
 	$count--;
-	if( $count == 0 ){
+	if ($count == 0)
+	{
 		printf FILE "  {0x%04x, 0x%04x}\n", $index, $utf;
-	} else {
+	}
+	else
+	{
 		printf FILE "  {0x%04x, 0x%04x},\n", $index, $utf;
 	}
 }
 
 print FILE "};\n";
 close(FILE);
-

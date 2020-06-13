@@ -3,12 +3,73 @@
  * analyze.c
  *	  the Postgres statistics generator
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ *
+ * There are a few things in Greenplum that make this more complicated
+ * than in upstream:
+ *
+ * AO tables
+ * ---------
+ *
+ * To work with AO tables, there is a new function, acquire_sample_rows_ao(),
+ * which return a set of sample rows, just like the upstream
+ * acquire_sample_rows() function. The upstream acquire_sample_rows()
+ * function has been renamed to acquire_sample_rows_heap(), and
+ * acquire_sample_rows() is now a wrapper that calls either
+ * acquire_sample_rows_heap() or acquire_sample_rows_ao(), depending on
+ * the table type.
+ *
+ * Dispatching
+ * -----------
+ *
+ * Greenplum is an MPP system, so we need to collect the statistics from
+ * all the segments. The segment servers don't keep statistics (unless you
+ * connect to a segment in utility node and run ANALYZE directly), and
+ * the orchestration of ANALYZE happens in the dispatcher. The high
+ * level logic is the same as in upstream, but a few functions have been
+ * modified to gather data from the segments, instead of reading directly
+ * from local disk:
+ *
+ * acquire_sample_rows(), when called in the dispatcher, calls into the
+ * segments to acquire the sample across all segments.
+ * RelationGetNumberOfBlocks() calls have been replaced with a wrapper
+ * function, AcquireNumberOfBlocks(), which likewise calls into the
+ * segments, to get total relation size across all segments.
+ *
+ * AcquireNumberOfBlocks() calls pg_relation_size(), which already
+ * contains the logic to gather the size from all segments.
+ *
+ * Acquiring the sample rows is more tricky. When called in dispatcher,
+ * acquire_sample_rows() calls a helper function called gp_acquire_sample_rows()
+ * in the segments, to collect a sample on each segment. It then merges
+ * the sample rows from each segment to produce a sample of the whole
+ * cluster. gp_acquire_sample_rows() in turn calls acquire_sample_rows(), to
+ * collect the sample on the segment.
+ *
+ * One complication with collecting the sample is the way that very
+ * large datums are handled. We don't want to transfer multi-gigabyte
+ * tuples from each segment. That would slow things down, and risk
+ * running out of memory, if the sample contains a lot of them. They
+ * are not very useful for statistics, anyway; hardly anyone builds an
+ * index or does lookups where the histogram or MCV is meaningful for
+ * very large keys. PostgreSQL also ignores any datums larger than
+ * WIDTH_THRESHOLD (1kB) in the statistics computation, and we use the
+ * same limit to restrict what gets transferred from the segments.
+ * We substitute the very large datums with NULLs in the sample, but
+ * keep track separately, which datums came out as NULLs because they
+ * were too large, as opposed to "real" NULLs.
+ *
+ *
+ * Merging leaf statistics with hyperloglog
+ * ----------------------------------------
+ *
+ * TODO: explain how this works.
+ *
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/commands/analyze.c,v 1.115 2008/02/20 14:31:35 alvherre Exp $
+ *	  src/backend/commands/analyze.c
  *
  *-------------------------------------------------------------------------
  */
@@ -16,129 +77,130 @@
 
 #include <math.h>
 
-#include "access/heapam.h"
+#include "access/multixact.h"
 #include "access/transam.h"
+#include "access/tupconvert.h"
 #include "access/tuptoaster.h"
+#include "access/visibilitymap.h"
 #include "access/xact.h"
-#include "catalog/heap.h"
+#include "catalog/catalog.h"
 #include "catalog/index.h"
 #include "catalog/indexing.h"
-#include "catalog/namespace.h"
+#include "catalog/pg_collation.h"
+#include "catalog/pg_inherits_fn.h"
 #include "catalog/pg_namespace.h"
-#include "cdb/cdbpartition.h"
-#include "cdb/cdbtm.h"
-#include "cdb/cdbvars.h"
 #include "commands/dbcommands.h"
+#include "commands/tablecmds.h"
 #include "commands/vacuum.h"
 #include "executor/executor.h"
-#include "executor/spi.h"
+#include "foreign/fdwapi.h"
 #include "miscadmin.h"
-#include "parser/parse_expr.h"
+#include "nodes/nodeFuncs.h"
 #include "parser/parse_oper.h"
 #include "parser/parse_relation.h"
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
+#include "storage/bufmgr.h"
+#include "storage/lmgr.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "utils/acl.h"
-#include "utils/builtins.h"
+#include "utils/attoptcache.h"
 #include "utils/datum.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/pg_rusage.h"
+#include "utils/sampling.h"
+#include "utils/sortsupport.h"
 #include "utils/syscache.h"
-#include "utils/tuplesort.h"
-#include "utils/tuplesort_mk.h"
+#include "utils/timestamp.h"
+#include "utils/tqual.h"
+#include "utils/typcache.h"
+
+#include "catalog/heap.h"
+#include "cdb/cdbappendonlyam.h"
+#include "cdb/cdbaocsam.h"
+#include "cdb/cdbdisp_query.h"
+#include "cdb/cdbdispatchresult.h"
+#include "cdb/cdbpartition.h"
+#include "cdb/cdbtm.h"
+#include "cdb/cdbutil.h"
+#include "cdb/cdbvars.h"
+#include "commands/analyzeutils.h"
+#include "executor/spi.h"
+#include "funcapi.h"
+#include "libpq-fe.h"
+#include "utils/builtins.h"
+#include "utils/hyperloglog/gp_hyperloglog.h"
+#include "utils/snapmgr.h"
+
 
 /*
- * To avoid consuming too much memory during analysis and/or too much space
- * in the resulting pg_statistic rows, we ignore varlena datums that are wider
- * than WIDTH_THRESHOLD (after detoasting!).  This is legitimate for MCV
- * and distinct-value calculations since a wide value is unlikely to be
- * duplicated at all, much less be a most-common value.  For the same reason,
- * ignoring wide values will not affect our estimates of histogram bin
- * boundaries very much.
+ * For Hyperloglog, we define an error margin of 0.3%. If the number of
+ * distinct values estimated by hyperloglog is within an error of 0.3%,
+ * we consider everything as distinct.
  */
-#define WIDTH_THRESHOLD  1024
+#define GP_HLL_ERROR_MARGIN  0.003
 
-/* Data structure for Algorithm S from Knuth 3.4.2 */
-typedef struct
-{
-	BlockNumber N;				/* number of blocks, known in advance */
-	int			n;				/* desired sample size */
-	BlockNumber t;				/* current block number */
-	int			m;				/* blocks selected so far */
-} BlockSamplerData;
-typedef BlockSamplerData *BlockSampler;
+/* Fix attr number of return record of function gp_acquire_sample_rows */
+#define FIX_ATTR_NUM  3
 
 /* Per-index data for ANALYZE */
 typedef struct AnlIndexData
 {
 	IndexInfo  *indexInfo;		/* BuildIndexInfo result */
-	BlockNumber nblocks;
 	double		tupleFract;		/* fraction of rows for partial index */
 	VacAttrStats **vacattrstats;	/* index attrs to analyze */
 	int			attr_cnt;
 } AnlIndexData;
 
-/*
- * Maintain the row index for large datums which must not be considered for
- * samples while calculating statistcs. The sample value at the row index for 
- * a column are masked as NULL.
- */
-typedef struct RowIndexes
-{
-	bool* rows;
-	int toowide_cnt;
-} RowIndexes;
 
 /* Default statistics target (GUC parameter) */
 int			default_statistics_target = 100;
 
 /* A few variables that don't seem worth passing around as parameters */
-static int	elevel = -1;
-
 static MemoryContext anl_context = NULL;
-
 static BufferAccessStrategy vac_strategy;
 
+Bitmapset	**acquire_func_colLargeRowIndexes;
 
-static void BlockSampler_Init(BlockSampler bs, BlockNumber nblocks,
-				  int samplesize);
-static bool BlockSampler_HasMore(BlockSampler bs);
-static BlockNumber BlockSampler_Next(BlockSampler bs);
+
+static void do_analyze_rel(Relation onerel, int options,
+			   VacuumParams *params, List *va_cols,
+			   AcquireSampleRowsFunc acquirefunc, BlockNumber relpages,
+			   bool inh, bool in_outer_xact, int elevel,
+			   gp_acquire_sample_rows_context *ctx);
 static void compute_index_stats(Relation onerel, double totalrows,
 					AnlIndexData *indexdata, int nindexes,
 					HeapTuple *rows, int numrows,
 					MemoryContext col_context);
-static VacAttrStats *examine_attribute(Relation onerel, int attnum);
-static int acquire_sample_rows(Relation onerel, HeapTuple *rows,
-					int targrows, double *totalrows, double *totaldeadrows);
-static int acquire_sample_rows_by_query(Relation onerel, int nattrs, VacAttrStats **attrstats, HeapTuple **rows,
-										int targrows, double *totalrows, double *totaldeadrows, BlockNumber *totalpages, bool rootonly,  RowIndexes **colLargeRowIndexes /* Maintain information if the row of a column exceeds WIDTH_THRESHOLD */);
-static double random_fract(void);
-static double init_selection_state(int n);
-static double get_next_S(double t, int n, double *stateptr);
+static VacAttrStats *examine_attribute(Relation onerel, int attnum,
+				  Node *index_expr, int elevel);
+static int acquire_sample_rows_dispatcher(Relation onerel, bool inh, int elevel,
+										  HeapTuple *rows, int targrows,
+										  double *totalrows, double *totaldeadrows);
+static BlockNumber acquire_index_number_of_blocks(Relation indexrel, Relation tablerel);
+
 static int	compare_rows(const void *a, const void *b);
-static void update_attstats(Oid relid, int natts, VacAttrStats **vacattrstats);
+static void update_attstats(Oid relid, bool inh,
+				int natts, VacAttrStats **vacattrstats);
 static Datum std_fetch_func(VacAttrStatsP stats, int rownum, bool *isNull);
 static Datum ind_fetch_func(VacAttrStatsP stats, int rownum, bool *isNull);
 
-static bool std_typanalyze(VacAttrStats *stats);
-
-static void analyzeEstimateReltuplesRelpages(Oid relationOid, float4 *relTuples, float4 *relPages, bool rootonly);
-static void analyzeEstimateIndexpages(Relation onerel, Relation indrel, BlockNumber *indexPages);
-
-static void analyze_rel_internal(Oid relid, VacuumStmt *vacstmt,
-			BufferAccessStrategy bstrategy);
+static void analyze_rel_internal(Oid relid, RangeVar *relation, int options,
+								 VacuumParams *params, List *va_cols,
+								 bool in_outer_xact, BufferAccessStrategy bstrategy,
+								 gp_acquire_sample_rows_context *ctx);
+static void acquire_hll_by_query(Relation onerel, int nattrs, VacAttrStats **attrstats, int elevel);
 
 /*
  *	analyze_rel() -- analyze one relation
  */
 void
-analyze_rel(Oid relid, VacuumStmt *vacstmt,
-			BufferAccessStrategy bstrategy)
+analyze_rel(Oid relid, RangeVar *relation, int options,
+			VacuumParams *params, List *va_cols, bool in_outer_xact,
+			BufferAccessStrategy bstrategy, gp_acquire_sample_rows_context *ctx)
 {
 	bool		optimizerBackup;
 
@@ -152,7 +214,8 @@ analyze_rel(Oid relid, VacuumStmt *vacstmt,
 
 	PG_TRY();
 	{
-		analyze_rel_internal(relid, vacstmt, bstrategy);
+		analyze_rel_internal(relid, relation, options, params, va_cols,
+				in_outer_xact, bstrategy, ctx);
 	}
 	/* Clean up in case of error. */
 	PG_CATCH();
@@ -168,50 +231,26 @@ analyze_rel(Oid relid, VacuumStmt *vacstmt,
 }
 
 static void
-analyze_rel_internal(Oid relid, VacuumStmt *vacstmt,
-			BufferAccessStrategy bstrategy)
+analyze_rel_internal(Oid relid, RangeVar *relation, int options,
+			VacuumParams *params, List *va_cols, bool in_outer_xact,
+			BufferAccessStrategy bstrategy, gp_acquire_sample_rows_context *ctx)
 {
 	Relation	onerel;
-	int			attr_cnt,
-				tcnt,
-				i,
-				ind;
-	Relation   *Irel;
-	int			nindexes;
-	bool		hasindex;
-	bool		analyzableindex;
-	VacAttrStats **vacattrstats;
-	AnlIndexData *indexdata;
-	int			targrows,
-				numrows;
-	double		totalrows,
-				totaldeadrows;
-	BlockNumber	totalpages;
-	HeapTuple  *rows;
-	PGRUsage	ru0;
-	TimestampTz starttime = 0;
-	Oid			save_userid;
-	int			save_sec_context;
-	int			save_nestlevel;
-	RowIndexes	**colLargeRowIndexes;
+	int			elevel;
+	AcquireSampleRowsFunc acquirefunc = NULL;
+	BlockNumber relpages = 0;
 
-	if (vacstmt->verbose)
+	/* Select logging level */
+	if (options & VACOPT_VERBOSE)
 		elevel = INFO;
 	else
 		elevel = DEBUG2;
 
+	/* Set up static variables */
 	vac_strategy = bstrategy;
 
 	/*
-	 * Use the current context for storing analysis info.  vacuum.c ensures
-	 * that this context will be cleared when I return, thus releasing the
-	 * memory allocated here.
-	 */
-	anl_context = CurrentMemoryContext;
-
-	/*
-	 * Check for user-requested abort.	Note we want this to be inside a
-	 * transaction, so xact.c doesn't issue useless WARNING.
+	 * Check for user-requested abort.
 	 */
 	CHECK_FOR_INTERRUPTS();
 
@@ -222,7 +261,19 @@ analyze_rel_internal(Oid relid, VacuumStmt *vacstmt,
 	 * matter if we ever try to accumulate stats on dead tuples.) If the rel
 	 * has been dropped since we last saw it, we don't need to process it.
 	 */
-	onerel = try_relation_open(relid, ShareUpdateExclusiveLock, false);
+	if (!(options & VACOPT_NOWAIT))
+		onerel = try_relation_open(relid, ShareUpdateExclusiveLock, false);
+	else if (ConditionalLockRelationOid(relid, ShareUpdateExclusiveLock))
+		onerel = try_relation_open(relid, NoLock, false);
+	else
+	{
+		onerel = NULL;
+		if (IsAutoVacuumWorkerProcess() && params->log_min_duration >= 0)
+			ereport(LOG,
+					(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+				  errmsg("skipping analyze of \"%s\" --- lock not available",
+						 relation->relname)));
+	}
 	if (!onerel)
 		return;
 
@@ -233,12 +284,12 @@ analyze_rel_internal(Oid relid, VacuumStmt *vacstmt,
 		  (pg_database_ownercheck(MyDatabaseId, GetUserId()) && !onerel->rd_rel->relisshared)))
 	{
 		/* No need for a WARNING if we already complained during VACUUM */
-		if (!vacstmt->vacuum)
+		if (!(options & VACOPT_VACUUM))
 		{
 			if (onerel->rd_rel->relisshared)
 				ereport(WARNING,
-						(errmsg("skipping \"%s\" --- only superuser can analyze it",
-								RelationGetRelationName(onerel))));
+				 (errmsg("skipping \"%s\" --- only superuser can analyze it",
+						 RelationGetRelationName(onerel))));
 			else if (onerel->rd_rel->relnamespace == PG_CATALOG_NAMESPACE)
 				ereport(WARNING,
 						(errmsg("skipping \"%s\" --- only superuser or database owner can analyze it",
@@ -253,27 +304,12 @@ analyze_rel_internal(Oid relid, VacuumStmt *vacstmt,
 	}
 
 	/*
-	 * Check that it's a plain table; we used to do this in get_rel_oids() but
-	 * seems safer to check after we've locked the relation.
-	 */
-	if (onerel->rd_rel->relkind != RELKIND_RELATION || RelationIsExternal(onerel))
-	{
-		/* No need for a WARNING if we already complained during VACUUM */
-		if (!vacstmt->vacuum)
-			ereport(WARNING,
-					(errmsg("skipping \"%s\" --- cannot analyze indexes, views, external tables, or special system tables",
-							RelationGetRelationName(onerel))));
-		relation_close(onerel, ShareUpdateExclusiveLock);
-		return;
-	}
-
-	/*
 	 * Silently ignore tables that are temp tables of other backends ---
 	 * trying to analyze these is rather pointless, since their contents are
 	 * probably not up-to-date on disk.  (We don't throw a warning here; it
 	 * would just lead to chatter during a database-wide ANALYZE.)
 	 */
-	if (isOtherTempNamespace(RelationGetNamespace(onerel)))
+	if (RELATION_IS_OTHER_TEMP(onerel))
 	{
 		relation_close(onerel, ShareUpdateExclusiveLock);
 		return;
@@ -288,10 +324,171 @@ analyze_rel_internal(Oid relid, VacuumStmt *vacstmt,
 		return;
 	}
 
-	ereport(elevel,
-			(errmsg("analyzing \"%s.%s\"",
-					get_namespace_name(RelationGetNamespace(onerel)),
-					RelationGetRelationName(onerel))));
+	/*
+	 * Check that it's a plain table, materialized view, or foreign table; we
+	 * used to do this in get_rel_oids() but seems safer to check after we've
+	 * locked the relation.
+	 */
+	if (onerel->rd_rel->relkind == RELKIND_RELATION ||
+		onerel->rd_rel->relkind == RELKIND_MATVIEW)
+	{
+		/* Regular table, so we'll use the regular row acquisition function */
+		acquirefunc = acquire_sample_rows;
+
+		/* Also get regular table's size */
+		relpages = AcquireNumberOfBlocks(onerel);
+	}
+	else if (onerel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
+	{
+		/*
+		 * For a foreign table, call the FDW's hook function to see whether it
+		 * supports analysis.
+		 */
+		FdwRoutine *fdwroutine;
+		bool		ok = false;
+
+		fdwroutine = GetFdwRoutineForRelation(onerel, false);
+
+		if (fdwroutine->AnalyzeForeignTable != NULL)
+			ok = fdwroutine->AnalyzeForeignTable(onerel,
+												 &acquirefunc,
+												 &relpages);
+
+		if (!ok)
+		{
+			ereport(WARNING,
+			 (errmsg("skipping \"%s\" --- cannot analyze this foreign table",
+					 RelationGetRelationName(onerel))));
+			relation_close(onerel, ShareUpdateExclusiveLock);
+			return;
+		}
+	}
+	else
+	{
+		/* No need for a WARNING if we already complained during VACUUM */
+		if (!(options & VACOPT_VACUUM))
+			ereport(WARNING,
+					(errmsg("skipping \"%s\" --- cannot analyze non-tables or special system tables",
+							RelationGetRelationName(onerel))));
+		relation_close(onerel, ShareUpdateExclusiveLock);
+		return;
+	}
+
+	/*
+	 * OK, let's do it.  First let other backends know I'm in ANALYZE.
+	 */
+	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+	MyPgXact->vacuumFlags |= PROC_IN_ANALYZE;
+	LWLockRelease(ProcArrayLock);
+
+	/*
+	 * Do the normal non-recursive ANALYZE.
+	 *
+	 * Skip this for partitioned tables. A partitioned table, i.e. the
+	 * "root partition", doesn't contain any rows.
+	 */
+	PartStatus ps = rel_part_status(relid);
+	if (!(ps == PART_STATUS_ROOT || ps == PART_STATUS_INTERIOR))
+		do_analyze_rel(onerel, options, params, va_cols, acquirefunc, relpages,
+					   false, in_outer_xact, elevel, ctx);
+
+	/*
+	 * If there are child tables, do recursive ANALYZE.
+	 */
+	if (onerel->rd_rel->relhassubclass)
+		do_analyze_rel(onerel, options, params, va_cols, acquirefunc, relpages,
+					   true, in_outer_xact, elevel, ctx);
+
+	/* MPP-6929: metadata tracking */
+	if (!vacuumStatement_IsTemporary(onerel) && (Gp_role == GP_ROLE_DISPATCH))
+	{
+		char *asubtype = "";
+
+		if (IsAutoVacuumWorkerProcess())
+			asubtype = "AUTO";
+
+		MetaTrackUpdObject(RelationRelationId,
+						   RelationGetRelid(onerel),
+						   GetUserId(),
+						   "ANALYZE",
+						   asubtype
+			);
+	}
+
+	/*
+	 * Close source relation now, but keep lock so that no one deletes it
+	 * before we commit.  (If someone did, they'd fail to clean up the entries
+	 * we made in pg_statistic.  Also, releasing the lock before commit would
+	 * expose us to concurrent-update failures in update_attstats.)
+	 */
+	relation_close(onerel, NoLock);
+
+	/*
+	 * Reset my PGXACT flag.  Note: we need this here, and not in vacuum_rel,
+	 * because the vacuum flag is cleared by the end-of-xact code.
+	 */
+	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+	MyPgXact->vacuumFlags &= ~PROC_IN_ANALYZE;
+	LWLockRelease(ProcArrayLock);
+}
+
+/*
+ *	do_analyze_rel() -- analyze one relation, recursively or not
+ *
+ * Note that "acquirefunc" is only relevant for the non-inherited case.
+ * For the inherited case, acquire_inherited_sample_rows() determines the
+ * appropriate acquirefunc for each child table.
+ */
+static void
+do_analyze_rel(Relation onerel, int options, VacuumParams *params,
+			   List *va_cols, AcquireSampleRowsFunc acquirefunc,
+			   BlockNumber relpages, bool inh, bool in_outer_xact,
+			   int elevel, gp_acquire_sample_rows_context *ctx)
+{
+	int			attr_cnt,
+				tcnt,
+				i,
+				ind;
+	Relation   *Irel;
+	int			nindexes;
+	bool		hasindex;
+	VacAttrStats **vacattrstats;
+	AnlIndexData *indexdata;
+	int			targrows,
+				numrows;
+	double		totalrows,
+				totaldeadrows;
+	HeapTuple  *rows;
+	PGRUsage	ru0;
+	TimestampTz starttime = 0;
+	MemoryContext caller_context;
+	Oid			save_userid;
+	int			save_sec_context;
+	int			save_nestlevel;
+	Bitmapset **colLargeRowIndexes;
+	bool		sample_needed;
+
+	if (inh)
+		ereport(elevel,
+				(errmsg("analyzing \"%s.%s\" inheritance tree",
+						get_namespace_name(RelationGetNamespace(onerel)),
+						RelationGetRelationName(onerel))));
+	else
+		ereport(elevel,
+				(errmsg("analyzing \"%s.%s\"",
+						get_namespace_name(RelationGetNamespace(onerel)),
+						RelationGetRelationName(onerel))));
+
+	/*
+	 * Set up a working context so that we can easily free whatever junk gets
+	 * created.
+	 */
+	anl_context = AllocSetContextCreate(CurrentMemoryContext,
+										"Analyze",
+										ALLOCSET_DEFAULT_MINSIZE,
+										ALLOCSET_DEFAULT_INITSIZE,
+										ALLOCSET_DEFAULT_MAXSIZE);
+	caller_context = MemoryContextSwitchTo(anl_context);
 
 	/*
 	 * Switch to the table owner's userid, so that any index functions are run
@@ -303,32 +500,31 @@ analyze_rel_internal(Oid relid, VacuumStmt *vacstmt,
 						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
 	save_nestlevel = NewGUCNestLevel();
 
-	/* let others know what I'm doing */
-	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
-	MyProc->vacuumFlags |= PROC_IN_ANALYZE;
-	LWLockRelease(ProcArrayLock);
-
 	/* measure elapsed time iff autovacuum logging requires it */
-	if (IsAutoVacuumWorkerProcess() && Log_autovacuum_min_duration >= 0)
+	if (IsAutoVacuumWorkerProcess() && params->log_min_duration >= 0)
 	{
 		pg_rusage_init(&ru0);
-		if (Log_autovacuum_min_duration > 0)
+		if (params->log_min_duration > 0)
 			starttime = GetCurrentTimestamp();
 	}
 
 	/*
 	 * Determine which columns to analyze
 	 *
-	 * Note that system attributes are never analyzed.
+	 * Note that system attributes are never analyzed, so we just reject them
+	 * at the lookup stage.  We also reject duplicate column mentions.  (We
+	 * could alternatively ignore duplicates, but analyzing a column twice
+	 * won't work; we'd end up making a conflicting update in pg_statistic.)
 	 */
-	if (vacstmt->va_cols != NIL)
+	if (va_cols != NIL)
 	{
+		Bitmapset  *unique_cols = NULL;
 		ListCell   *le;
 
-		vacattrstats = (VacAttrStats **) palloc(list_length(vacstmt->va_cols) *
+		vacattrstats = (VacAttrStats **) palloc(list_length(va_cols) *
 												sizeof(VacAttrStats *));
 		tcnt = 0;
-		foreach(le, vacstmt->va_cols)
+		foreach(le, va_cols)
 		{
 			char	   *col = strVal(lfirst(le));
 
@@ -338,7 +534,14 @@ analyze_rel_internal(Oid relid, VacuumStmt *vacstmt,
 						(errcode(ERRCODE_UNDEFINED_COLUMN),
 					errmsg("column \"%s\" of relation \"%s\" does not exist",
 						   col, RelationGetRelationName(onerel))));
-			vacattrstats[tcnt] = examine_attribute(onerel, i);
+			if (bms_is_member(i, unique_cols))
+				ereport(ERROR,
+						(errcode(ERRCODE_DUPLICATE_COLUMN),
+						 errmsg("column \"%s\" of relation \"%s\" appears more than once",
+								col, RelationGetRelationName(onerel))));
+			unique_cols = bms_add_member(unique_cols, i);
+
+			vacattrstats[tcnt] = examine_attribute(onerel, i, NULL, elevel);
 			if (vacattrstats[tcnt] != NULL)
 				tcnt++;
 		}
@@ -352,7 +555,7 @@ analyze_rel_internal(Oid relid, VacuumStmt *vacstmt,
 		tcnt = 0;
 		for (i = 1; i <= attr_cnt; i++)
 		{
-			vacattrstats[tcnt] = examine_attribute(onerel, i);
+			vacattrstats[tcnt] = examine_attribute(onerel, i, NULL, elevel);
 			if (vacattrstats[tcnt] != NULL)
 				tcnt++;
 		}
@@ -361,13 +564,20 @@ analyze_rel_internal(Oid relid, VacuumStmt *vacstmt,
 
 	/*
 	 * Open all indexes of the relation, and see if there are any analyzable
-	 * columns in the indexes.	We do not analyze index columns if there was
-	 * an explicit column list in the ANALYZE command, however.
+	 * columns in the indexes.  We do not analyze index columns if there was
+	 * an explicit column list in the ANALYZE command, however.  If we are
+	 * doing a recursive scan, we don't want to touch the parent's indexes at
+	 * all.
 	 */
-	vac_open_indexes(onerel, AccessShareLock, &nindexes, &Irel);
+	if (!inh)
+		vac_open_indexes(onerel, AccessShareLock, &nindexes, &Irel);
+	else
+	{
+		Irel = NULL;
+		nindexes = 0;
+	}
 	hasindex = (nindexes > 0);
 	indexdata = NULL;
-	analyzableindex = false;
 	if (hasindex)
 	{
 		indexdata = (AnlIndexData *) palloc0(nindexes * sizeof(AnlIndexData));
@@ -378,7 +588,7 @@ analyze_rel_internal(Oid relid, VacuumStmt *vacstmt,
 
 			thisdata->indexInfo = indexInfo = BuildIndexInfo(Irel[ind]);
 			thisdata->tupleFract = 1.0; /* fix later if partial */
-			if (indexInfo->ii_Expressions != NIL && vacstmt->va_cols == NIL)
+			if (indexInfo->ii_Expressions != NIL && va_cols == NIL)
 			{
 				ListCell   *indexpr_item = list_head(indexInfo->ii_Expressions);
 
@@ -398,26 +608,10 @@ analyze_rel_internal(Oid relid, VacuumStmt *vacstmt,
 							elog(ERROR, "too few entries in indexprs list");
 						indexkey = (Node *) lfirst(indexpr_item);
 						indexpr_item = lnext(indexpr_item);
-
-						/*
-						 * Can't analyze if the opclass uses a storage type
-						 * different from the expression result type. We'd get
-						 * confused because the type shown in pg_attribute for
-						 * the index column doesn't match what we are getting
-						 * from the expression. Perhaps this can be fixed
-						 * someday, but for now, punt.
-						 */
-						if (exprType(indexkey) !=
-							Irel[ind]->rd_att->attrs[i]->atttypid)
-							continue;
-
 						thisdata->vacattrstats[tcnt] =
-							examine_attribute(Irel[ind], i + 1);
+							examine_attribute(Irel[ind], i + 1, indexkey, elevel);
 						if (thisdata->vacattrstats[tcnt] != NULL)
-						{
 							tcnt++;
-							analyzableindex = true;
-						}
 					}
 				}
 				thisdata->attr_cnt = tcnt;
@@ -426,15 +620,10 @@ analyze_rel_internal(Oid relid, VacuumStmt *vacstmt,
 	}
 
 	/*
-	 * Quit if no analyzable columns and no pg_class update needed.
-	 */
-	if (attr_cnt <= 0 && !analyzableindex && vacstmt->vacuum)
-		goto cleanup;
-
-	/*
 	 * Determine how many rows we need to sample, using the worst case from
-	 * all analyzable columns.	We use a lower bound of 100 rows to avoid
-	 * possible overflow in Vitter's algorithm.
+	 * all analyzable columns.  We use a lower bound of 100 rows to avoid
+	 * possible overflow in Vitter's algorithm.  (Note: that will also be the
+	 * target in the corner case where there are no analyzable columns.)
 	 */
 	targrows = 100;
 	for (i = 0; i < attr_cnt; i++)
@@ -456,21 +645,75 @@ analyze_rel_internal(Oid relid, VacuumStmt *vacstmt,
 	/*
 	 * Maintain information if the row of a column exceeds WIDTH_THRESHOLD
 	 */
-	colLargeRowIndexes = (RowIndexes **) palloc(sizeof(RowIndexes *) * attr_cnt);
+	colLargeRowIndexes = (Bitmapset **) palloc0(sizeof(Bitmapset *) * onerel->rd_att->natts);
+
+	if ((options & VACOPT_FULLSCAN) != 0)
+	{
+		if(rel_part_status(RelationGetRelid(onerel)) != PART_STATUS_ROOT)
+		{
+			acquire_hll_by_query(onerel, attr_cnt, vacattrstats, elevel);
+
+			ereport(elevel, (errmsg("HLL FULL SCAN")));
+		}
+	}
+
+	sample_needed = needs_sample(vacattrstats, attr_cnt);
+	if (sample_needed)
+	{
+		if (ctx)
+			MemoryContextSwitchTo(caller_context);
+		rows = (HeapTuple *) palloc(targrows * sizeof(HeapTuple));
+
+		/*
+		 * Acquire the sample rows
+		 *
+		 * colLargeRowindexes is passed out-of-band, in a global variable,
+		 * to avoid changing the function signature from upstream's.
+		 */
+		acquire_func_colLargeRowIndexes = colLargeRowIndexes;
+		if (inh)
+			numrows = acquire_inherited_sample_rows(onerel, elevel,
+													rows, targrows,
+													&totalrows, &totaldeadrows);
+		else
+			numrows = (*acquirefunc) (onerel, elevel,
+									  rows, targrows,
+									  &totalrows, &totaldeadrows);
+		acquire_func_colLargeRowIndexes = NULL;
+		if (ctx)
+			MemoryContextSwitchTo(anl_context);
+	}
+	else
+	{
+		/* If we're just merging stats from leafs, these are not needed either */
+		totalrows = 0;
+		totaldeadrows = 0;
+		numrows = 0;
+		rows = NULL;
+	}
+
+	if (ctx)
+	{
+		ctx->sample_rows = rows;
+		ctx->num_sample_rows = numrows;
+		ctx->totalrows = totalrows;
+		ctx->totaldeadrows = totaldeadrows;
+	}
 
 	/*
-	 * Acquire the sample rows
-	 */
-	numrows = acquire_sample_rows_by_query(onerel, attr_cnt, vacattrstats, &rows, targrows,
-										   &totalrows, &totaldeadrows, &totalpages, vacstmt->rootonly, colLargeRowIndexes);
-
-	/*
-	 * Compute the statistics.	Temporary results during the calculations for
+	 * Compute the statistics.  Temporary results during the calculations for
 	 * each column are stored in a child context.  The calc routines are
 	 * responsible to make sure that whatever they store into the VacAttrStats
 	 * structure is allocated in anl_context.
+	 *
+	 * When we have a root partition, we use the leaf partition statistics to
+	 * derive root table statistics. In that case, we do not need to collect a
+	 * sample. Therefore, the statistics calculation depends on root level have
+	 * any tuples. In addition, we continue for statistics calculation if
+	 * optimizer_analyze_root_partition or ROOTPARTITION is specified in the
+	 * ANALYZE statement.
 	 */
-	if (numrows > 0)
+	if (numrows > 0 || !sample_needed)
 	{
 		HeapTuple *validRows = (HeapTuple *) palloc(numrows * sizeof(HeapTuple));
 		MemoryContext col_context,
@@ -486,30 +729,46 @@ analyze_rel_internal(Oid relid, VacuumStmt *vacstmt,
 		for (i = 0; i < attr_cnt; i++)
 		{
 			VacAttrStats *stats = vacattrstats[i];
-			RowIndexes *rowIndexes = colLargeRowIndexes[i];
-			int validRowsLength = numrows - rowIndexes->toowide_cnt;
+			/*
+			 * utilize hyperloglog and merge utilities to derive
+			 * root table statistics by directly calling merge_leaf_stats()
+			 * if all leaf partition attributes are analyzed
+			 */
+			if(stats->merge_stats)
+			{
+				(*stats->compute_stats) (stats, std_fetch_func, 0, 0);
+				MemoryContextResetAndDeleteChildren(col_context);
+				continue;
+			}
+			Assert(sample_needed);
+
+			Bitmapset  *rowIndexes = colLargeRowIndexes[stats->attr->attnum - 1];
+			int			validRowsLength;
 
 			/* If there are too wide rows in the sample, remove them
 			 * from the sample being sent for stats collection
 			 */
-			if (rowIndexes->toowide_cnt > 0)
+			if (rowIndexes)
 			{
-				int validRowsIdx = 0;
-				for (int rownum=0; rownum < numrows; rownum++)
+				validRowsLength = 0;
+				for (int rownum = 0; rownum < numrows; rownum++)
 				{
-					if (rowIndexes->rows[rownum]) // if row is too wide, ignore it from the sample
+					/* if row is too wide, leave it out of the sample */
+					if (bms_is_member(rownum, rowIndexes))
 						continue;
-					validRows[validRowsIdx] = rows[rownum];
-					validRowsIdx++;
+
+					validRows[validRowsLength] = rows[rownum];
+					validRowsLength++;
 				}
 				stats->rows = validRows;
-				validRowsLength = validRowsIdx;
 			}
 			else
 			{
 				stats->rows = rows;
 				validRowsLength = numrows;
 			}
+			AttributeOpts *aopt =
+			get_attribute_options(onerel->rd_id, stats->attr->attnum);
 
 			stats->tupDesc = onerel->rd_att;
 
@@ -519,6 +778,43 @@ analyze_rel_internal(Oid relid, VacuumStmt *vacstmt,
 										 std_fetch_func,
 										 validRowsLength, // numbers of rows in sample excluding toowide if any.
 										 totalrows);
+				/*
+				 * Store HLL/HLL fullscan information for leaf partitions in
+				 * the stats object
+				 */
+				if (rel_part_status(stats->attr->attrelid) == PART_STATUS_LEAF)
+				{
+					MemoryContext old_context;
+					Datum *hll_values;
+
+					old_context = MemoryContextSwitchTo(stats->anl_context);
+					hll_values = (Datum *) palloc(sizeof(Datum));
+					int16 hll_length = 0;
+					int16 stakind = 0;
+					if(stats->stahll_full != NULL)
+					{
+						hll_length = datumGetSize(PointerGetDatum(stats->stahll_full), false, -1);
+						hll_values[0] = datumCopy(PointerGetDatum(stats->stahll_full), false, hll_length);
+						stakind = STATISTIC_KIND_FULLHLL;
+					}
+					else if(stats->stahll != NULL)
+					{
+						((GpHLLCounter) (stats->stahll))->relPages = relpages;
+						((GpHLLCounter) (stats->stahll))->relTuples = totalrows;
+
+						hll_length = gp_hyperloglog_len((GpHLLCounter)stats->stahll);
+						hll_values[0] = datumCopy(PointerGetDatum(stats->stahll), false, hll_length);
+						stakind = STATISTIC_KIND_HLL;
+					}
+					MemoryContextSwitchTo(old_context);
+					if (stakind > 0)
+					{
+						stats->stakind[STATISTIC_NUM_SLOTS-1] = stakind;
+						stats->stavalues[STATISTIC_NUM_SLOTS-1] = hll_values;
+						stats->numvalues[STATISTIC_NUM_SLOTS-1] =  1;
+						stats->statyplen[STATISTIC_NUM_SLOTS-1] = hll_length;
+					}
+				}
 			}
 			else
 			{
@@ -531,6 +827,21 @@ analyze_rel_internal(Oid relid, VacuumStmt *vacstmt,
 				stats->stadistinct = 0.0;		/* "unknown" */
 			}
 			stats->rows = rows; // Reset to original rows
+
+			/*
+			 * If the appropriate flavor of the n_distinct option is
+			 * specified, override with the corresponding value.
+			 */
+			aopt = get_attribute_options(onerel->rd_id, stats->attr->attnum);
+			if (aopt != NULL)
+			{
+				float8		n_distinct;
+
+				n_distinct = inh ? aopt->n_distinct_inherited : aopt->n_distinct;
+				if (n_distinct != 0.0)
+					stats->stadistinct = n_distinct;
+			}
+
 			MemoryContextResetAndDeleteChildren(col_context);
 		}
 
@@ -550,34 +861,58 @@ analyze_rel_internal(Oid relid, VacuumStmt *vacstmt,
 
 		/*
 		 * Emit the completed stats rows into pg_statistic, replacing any
-		 * previous statistics for the target columns.	(If there are stats in
+		 * previous statistics for the target columns.  (If there are stats in
 		 * pg_statistic for columns we didn't process, we leave them alone.)
 		 */
-		update_attstats(relid, attr_cnt, vacattrstats);
+		update_attstats(RelationGetRelid(onerel), inh,
+						attr_cnt, vacattrstats);
 
 		for (ind = 0; ind < nindexes; ind++)
 		{
 			AnlIndexData *thisdata = &indexdata[ind];
 
-			update_attstats(RelationGetRelid(Irel[ind]),
+			update_attstats(RelationGetRelid(Irel[ind]), false,
 							thisdata->attr_cnt, thisdata->vacattrstats);
 		}
 	}
 
 	/*
-	 * If we are running a standalone ANALYZE, update pages/tuples stats in
-	 * pg_class.  We know the accurate page count from the smgr, but only an
-	 * approximate number of tuples; therefore, if we are part of VACUUM
-	 * ANALYZE do *not* overwrite the accurate count already inserted by
-	 * VACUUM.	The same consideration applies to indexes.
+	 * Update pages/tuples stats in pg_class ... but not if we're doing
+	 * inherited stats.
+	 *
+	 * GPDB_92_MERGE_FIXME: In postgres it is sufficient to check the number of
+	 * pages that are visible with visibilitymap_count(), but in GPDB this
+	 * needs to be the count of all pages marked all visible across the all the
+	 * QEs. We need to gather this information from the segments and then update
+	 * it here.
 	 */
-	if (!vacstmt->vacuum)
+	if (!inh)
 	{
-		vac_update_relstats(RelationGetRelid(onerel),
-							totalpages,
-							totalrows, hasindex,
-							InvalidTransactionId);
+		BlockNumber relallvisible;
 
+		if (RelationIsAppendOptimized(onerel))
+			relallvisible = 0;
+		else
+			visibilitymap_count(onerel, &relallvisible, NULL);
+
+		vac_update_relstats(onerel,
+							relpages,
+							totalrows,
+							relallvisible,
+							hasindex,
+							InvalidTransactionId,
+							InvalidMultiXactId,
+							in_outer_xact,
+							false /* isvacuum */);
+	}
+
+	/*
+	 * Same for indexes. Vacuum always scans all indexes, so if we're part of
+	 * VACUUM ANALYZE, don't overwrite the accurate count already inserted by
+	 * VACUUM.
+	 */
+	if (!inh && !(options & VACOPT_VACUUM))
+	{
 		for (ind = 0; ind < nindexes; ind++)
 		{
 			AnlIndexData *thisdata = &indexdata[ind];
@@ -592,9 +927,9 @@ analyze_rel_internal(Oid relid, VacuumStmt *vacstmt,
 				 */
 				elog(elevel, "ANALYZE skipping index %s since relation %s has no rows.",
 					 RelationGetRelationName(Irel[ind]), RelationGetRelationName(onerel));
-				estimatedIndexPages = 1.0;
+				estimatedIndexPages = 1;
 			}
-			else 
+			else
 			{
 				/**
 				 * NOTE: we don't attempt to estimate the number of tuples in an index.
@@ -602,50 +937,66 @@ analyze_rel_internal(Oid relid, VacuumStmt *vacstmt,
 				 * This does not hold for partial indexes. The number of tuples matching will be
 				 * derived in selfuncs.c using the base table statistics.
 				 */
-				analyzeEstimateIndexpages(onerel, Irel[ind], &estimatedIndexPages);
+				estimatedIndexPages = acquire_index_number_of_blocks(Irel[ind], onerel);
 				elog(elevel, "ANALYZE estimated relpages=%u for index %s",
 					 estimatedIndexPages, RelationGetRelationName(Irel[ind]));
 			}
 
 			totalindexrows = ceil(thisdata->tupleFract * totalrows);
-			vac_update_relstats(RelationGetRelid(Irel[ind]),
+			vac_update_relstats(Irel[ind],
 								estimatedIndexPages,
-								totalindexrows, false,
-								InvalidTransactionId);
+								totalindexrows,
+								0,
+								false,
+								InvalidTransactionId,
+								InvalidMultiXactId,
+								in_outer_xact,
+								false /* isvacuum */);
 		}
-
-		/* report results to the stats collector, too */
-		pgstat_report_analyze(onerel, totalrows, totaldeadrows);
 	}
 
-	/* MPP-6929: metadata tracking */
-	if (!vacuumStatement_IsTemporary(onerel) && (Gp_role == GP_ROLE_DISPATCH))
+	/*
+	 * Report ANALYZE to the stats collector, too.  However, if doing
+	 * inherited stats we shouldn't report, because the stats collector only
+	 * tracks per-table stats.  Reset the changes_since_analyze counter only
+	 * if we analyzed all columns; otherwise, there is still work for
+	 * auto-analyze to do.
+	 */
+	if (!inh)
+		pgstat_report_analyze(onerel, totalrows, totaldeadrows,
+							  (va_cols == NIL));
+
+	/* If this isn't part of VACUUM ANALYZE, let index AMs do cleanup */
+	if (!(options & VACOPT_VACUUM))
 	{
-		char *asubtype = "";
+		for (ind = 0; ind < nindexes; ind++)
+		{
+			IndexBulkDeleteResult *stats;
+			IndexVacuumInfo ivinfo;
 
-		if (IsAutoVacuumWorkerProcess())
-			asubtype = "AUTO";
+			ivinfo.index = Irel[ind];
+			ivinfo.analyze_only = true;
+			ivinfo.estimated_count = true;
+			ivinfo.message_level = elevel;
+			ivinfo.num_heap_tuples = onerel->rd_rel->reltuples;
+			ivinfo.strategy = vac_strategy;
 
-		MetaTrackUpdObject(RelationRelationId,
-						   relid,
-						   GetUserId(),
-						   "ANALYZE",
-						   asubtype
-			);
+			stats = index_vacuum_cleanup(&ivinfo, NULL);
+
+			if (stats)
+				pfree(stats);
+		}
 	}
-
-	/* We skip to here if there were no analyzable columns */
-cleanup:
 
 	/* Done with indexes */
 	vac_close_indexes(nindexes, Irel, NoLock);
 
 	/* Log the action if appropriate */
-	if (IsAutoVacuumWorkerProcess() && Log_autovacuum_min_duration >= 0)
+	if (IsAutoVacuumWorkerProcess() && params->log_min_duration >= 0)
 	{
-		if (Log_autovacuum_min_duration == 0 ||
+		if (params->log_min_duration == 0 ||
 			TimestampDifferenceExceeds(starttime, GetCurrentTimestamp(),
-									   Log_autovacuum_min_duration))
+									   params->log_min_duration))
 			ereport(LOG,
 					(errmsg("automatic analyze of table \"%s.%s.%s\" system usage: %s",
 							get_database_name(MyDatabaseId),
@@ -654,27 +1005,16 @@ cleanup:
 							pg_rusage_show(&ru0))));
 	}
 
-	/*
-	 * Close source relation now, but keep lock so that no one deletes it
-	 * before we commit.  (If someone did, they'd fail to clean up the entries
-	 * we made in pg_statistic.  Also, releasing the lock before commit would
-	 * expose us to concurrent-update failures in update_attstats.)
-	 */
-	relation_close(onerel, NoLock);
-
-	/*
-	 * Reset my PGPROC flag.  Note: we need this here, and not in vacuum_rel,
-	 * because the vacuum flag is cleared by the end-of-xact code.
-	 */
-	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
-	MyProc->vacuumFlags &= ~PROC_IN_ANALYZE;
-	LWLockRelease(ProcArrayLock);
-
 	/* Roll back any GUC changes executed by index functions */
 	AtEOXact_GUC(false, save_nestlevel);
 
 	/* Restore userid and security context */
 	SetUserIdAndSecContext(save_userid, save_sec_context);
+
+	/* Restore current context and release memory */
+	MemoryContextSwitchTo(caller_context);
+	MemoryContextDelete(anl_context);
+	anl_context = NULL;
 }
 
 /*
@@ -747,6 +1087,8 @@ compute_index_stats(Relation onerel, double totalrows,
 		{
 			HeapTuple	heapTuple = rows[rowno];
 
+			vacuum_delay_point();
+
 			/*
 			 * Reset the per-tuple context each time, to reclaim any cruft
 			 * left behind by evaluating the predicate or index expressions.
@@ -754,7 +1096,7 @@ compute_index_stats(Relation onerel, double totalrows,
 			ResetExprContext(econtext);
 
 			/* Set up for predicate or expression evaluation */
-			ExecStoreGenericTuple(heapTuple, slot, false);
+			ExecStoreHeapTuple(heapTuple, slot, InvalidBuffer, false);
 
 			/* If index is partial, check predicate */
 			if (predicate != NIL)
@@ -818,6 +1160,9 @@ compute_index_stats(Relation onerel, double totalrows,
 			for (i = 0; i < attr_cnt; i++)
 			{
 				VacAttrStats *stats = thisdata->vacattrstats[i];
+				AttributeOpts *aopt =
+				get_attribute_options(stats->attr->attrelid,
+									  stats->attr->attnum);
 
 				stats->exprvals = exprvals + i;
 				stats->exprnulls = exprnulls + i;
@@ -826,6 +1171,15 @@ compute_index_stats(Relation onerel, double totalrows,
 										 ind_fetch_func,
 										 numindexrows,
 										 totalindexrows);
+
+				/*
+				 * If the n_distinct option is specified, it overrides the
+				 * above computation.  For indices, we always use just
+				 * n_distinct, not n_distinct_inherited.
+				 */
+				if (aopt != NULL && aopt->n_distinct != 0.0)
+					stats->stadistinct = aopt->n_distinct;
+
 				MemoryContextResetAndDeleteChildren(col_context);
 			}
 		}
@@ -847,13 +1201,17 @@ compute_index_stats(Relation onerel, double totalrows,
  *
  * Determine whether the column is analyzable; if so, create and initialize
  * a VacAttrStats struct for it.  If not, return NULL.
+ *
+ * If index_expr isn't NULL, then we're trying to analyze an expression index,
+ * and index_expr is the expression tree representing the column's data.
  */
 static VacAttrStats *
-examine_attribute(Relation onerel, int attnum)
+examine_attribute(Relation onerel, int attnum, Node *index_expr, int elevel)
 {
 	Form_pg_attribute attr = onerel->rd_att->attrs[attnum - 1];
 	HeapTuple	typtuple;
 	VacAttrStats *stats;
+	int			i;
 	bool		ok;
 
 	/* Never analyze dropped columns */
@@ -865,23 +1223,68 @@ examine_attribute(Relation onerel, int attnum)
 		return NULL;
 
 	/*
-	 * Create the VacAttrStats struct.
+	 * Create the VacAttrStats struct.  Note that we only have a copy of the
+	 * fixed fields of the pg_attribute tuple.
 	 */
 	stats = (VacAttrStats *) palloc0(sizeof(VacAttrStats));
-	stats->attr = (Form_pg_attribute) palloc(ATTRIBUTE_TUPLE_SIZE);
-	memcpy(stats->attr, attr, ATTRIBUTE_TUPLE_SIZE);
-	typtuple = SearchSysCacheCopy(TYPEOID,
-								  ObjectIdGetDatum(attr->atttypid),
-								  0, 0, 0);
+	stats->elevel = elevel;
+	stats->attr = (Form_pg_attribute) palloc(ATTRIBUTE_FIXED_PART_SIZE);
+	memcpy(stats->attr, attr, ATTRIBUTE_FIXED_PART_SIZE);
+
+	/*
+	 * When analyzing an expression index, believe the expression tree's type
+	 * not the column datatype --- the latter might be the opckeytype storage
+	 * type of the opclass, which is not interesting for our purposes.  (Note:
+	 * if we did anything with non-expression index columns, we'd need to
+	 * figure out where to get the correct type info from, but for now that's
+	 * not a problem.)	It's not clear whether anyone will care about the
+	 * typmod, but we store that too just in case.
+	 */
+	if (index_expr)
+	{
+		stats->attrtypid = exprType(index_expr);
+		stats->attrtypmod = exprTypmod(index_expr);
+	}
+	else
+	{
+		stats->attrtypid = attr->atttypid;
+		stats->attrtypmod = attr->atttypmod;
+	}
+
+	typtuple = SearchSysCacheCopy1(TYPEOID,
+								   ObjectIdGetDatum(stats->attrtypid));
 	if (!HeapTupleIsValid(typtuple))
-		elog(ERROR, "cache lookup failed for type %u", attr->atttypid);
+		elog(ERROR, "cache lookup failed for type %u", stats->attrtypid);
 	stats->attrtype = (Form_pg_type) GETSTRUCT(typtuple);
 	stats->relstorage = RelationGetForm(onerel)->relstorage;
 	stats->anl_context = anl_context;
 	stats->tupattnum = attnum;
 
 	/*
-	 * Call the type-specific typanalyze function.	If none is specified, use
+	 * The fields describing the stats->stavalues[n] element types default to
+	 * the type of the data being analyzed, but the type-specific typanalyze
+	 * function can change them if it wants to store something else.
+	 */
+	for (i = 0; i < STATISTIC_NUM_SLOTS-1; i++)
+	{
+		stats->statypid[i] = stats->attrtypid;
+		stats->statyplen[i] = stats->attrtype->typlen;
+		stats->statypbyval[i] = stats->attrtype->typbyval;
+		stats->statypalign[i] = stats->attrtype->typalign;
+	}
+
+	/*
+	 * The last slots of statistics is reserved for hyperloglog counter which
+	 * is saved as a bytea. Therefore the type information is hardcoded for the
+	 * bytea.
+	 */
+	stats->statypid[i] = BYTEAOID; // oid for bytea
+	stats->statyplen[i] = -1; // variable length type
+	stats->statypbyval[i] = false; // bytea is pass by reference
+	stats->statypalign[i] = 'i'; // INT alignment (4-byte)
+
+	/*
+	 * Call the type-specific typanalyze function.  If none is specified, use
 	 * std_typanalyze().
 	 */
 	if (OidIsValid(stats->attrtype->typanalyze))
@@ -902,95 +1305,16 @@ examine_attribute(Relation onerel, int attnum)
 }
 
 /*
- * BlockSampler_Init -- prepare for random sampling of blocknumbers
- *
- * BlockSampler is used for stage one of our new two-stage tuple
- * sampling mechanism as discussed on pgsql-hackers 2004-04-02 (subject
- * "Large DB").  It selects a random sample of samplesize blocks out of
- * the nblocks blocks in the table.  If the table has less than
- * samplesize blocks, all blocks are selected.
- *
- * Since we know the total number of blocks in advance, we can use the
- * straightforward Algorithm S from Knuth 3.4.2, rather than Vitter's
- * algorithm.
- */
-static void
-BlockSampler_Init(BlockSampler bs, BlockNumber nblocks, int samplesize)
-{
-	bs->N = nblocks;			/* measured table size */
-
-	/*
-	 * If we decide to reduce samplesize for tables that have less or not much
-	 * more than samplesize blocks, here is the place to do it.
-	 */
-	bs->n = samplesize;
-	bs->t = 0;					/* blocks scanned so far */
-	bs->m = 0;					/* blocks selected so far */
-}
-
-static bool
-BlockSampler_HasMore(BlockSampler bs)
-{
-	return (bs->t < bs->N) && (bs->m < bs->n);
-}
-
-static BlockNumber
-BlockSampler_Next(BlockSampler bs)
-{
-	BlockNumber K = bs->N - bs->t;		/* remaining blocks */
-	int			k = bs->n - bs->m;		/* blocks still to sample */
-	double		p;				/* probability to skip block */
-	double		V;				/* random */
-
-	Assert(BlockSampler_HasMore(bs));	/* hence K > 0 and k > 0 */
-
-	if ((BlockNumber) k >= K)
-	{
-		/* need all the rest */
-		bs->m++;
-		return bs->t++;
-	}
-
-	/*----------
-	 * It is not obvious that this code matches Knuth's Algorithm S.
-	 * Knuth says to skip the current block with probability 1 - k/K.
-	 * If we are to skip, we should advance t (hence decrease K), and
-	 * repeat the same probabilistic test for the next block.  The naive
-	 * implementation thus requires a random_fract() call for each block
-	 * number.	But we can reduce this to one random_fract() call per
-	 * selected block, by noting that each time the while-test succeeds,
-	 * we can reinterpret V as a uniform random number in the range 0 to p.
-	 * Therefore, instead of choosing a new V, we just adjust p to be
-	 * the appropriate fraction of its former value, and our next loop
-	 * makes the appropriate probabilistic test.
-	 *
-	 * We have initially K > k > 0.  If the loop reduces K to equal k,
-	 * the next while-test must fail since p will become exactly zero
-	 * (we assume there will not be roundoff error in the division).
-	 * (Note: Knuth suggests a "<=" loop condition, but we use "<" just
-	 * to be doubly sure about roundoff error.)  Therefore K cannot become
-	 * less than k, which means that we cannot fail to select enough blocks.
-	 *----------
-	 */
-	V = random_fract();
-	p = 1.0 - (double) k / (double) K;
-	while (V < p)
-	{
-		/* skip */
-		bs->t++;
-		K--;					/* keep K == N - t */
-
-		/* adjust p to be new cutoff point in reduced range */
-		p *= 1.0 - (double) k / (double) K;
-	}
-
-	/* select */
-	bs->m++;
-	return bs->t++;
-}
-
-/*
  * acquire_sample_rows -- acquire a random sample of rows from the table
+ *
+ * Selected rows are returned in the caller-allocated array rows[], which
+ * must have at least targrows entries.
+ * The actual number of rows selected is returned as the function result.
+ * We also estimate the total numbers of live and dead rows in the table,
+ * and return them into *totalrows and *totaldeadrows, respectively.
+ *
+ * The returned list of tuples is in order by physical position in the table.
+ * (We will rely on this later to derive correlation estimates.)
  *
  * As of May 2004 we use a new two-stage method:  Stage one selects up
  * to targrows random blocks (or all blocks, if there aren't so many).
@@ -1007,9 +1331,6 @@ BlockSampler_Next(BlockSampler bs)
  * the number of different blocks represented by the sample tends to be
  * too small.  We can live with that for now.  Improvements are welcome.
  *
- * We also estimate the total numbers of live and dead rows in the table,
- * and return them into *totalrows and *totaldeadrows, respectively.
- *
  * An important property of this sampling method is that because we do
  * look at a statistically unbiased set of blocks, we should get
  * unbiased estimates of the average numbers of live and dead rows per
@@ -1018,35 +1339,33 @@ BlockSampler_Next(BlockSampler bs)
  *
  * The returned list of tuples is in order by physical position in the table.
  * (We will rely on this later to derive correlation estimates.)
- *
- * GPDB: Not used in Greenplum currently. Instead, we acquire the sample
- * rows by issuing an SPI query, see acquire_sample_rows_by_query
  */
-static int pg_attribute_unused()
-acquire_sample_rows(Relation onerel, HeapTuple *rows, int targrows,
-					double *totalrows, double *totaldeadrows)
+static int
+acquire_sample_rows_heap(Relation onerel, int elevel,
+						 HeapTuple *rows, int targrows,
+						 double *totalrows, double *totaldeadrows)
 {
 	int			numrows = 0;	/* # rows now in reservoir */
-	double		samplerows = 0;	/* total # rows collected */
+	double		samplerows = 0; /* total # rows collected */
 	double		liverows = 0;	/* # live rows seen */
 	double		deadrows = 0;	/* # dead rows seen */
 	double		rowstoskip = -1;	/* -1 means not set yet */
 	BlockNumber totalblocks;
 	TransactionId OldestXmin;
 	BlockSamplerData bs;
-	double		rstate;
+	ReservoirStateData rstate;
 
-	Assert(targrows > 1);
+	Assert(targrows > 0);
 
 	totalblocks = RelationGetNumberOfBlocks(onerel);
 
 	/* Need a cutoff xmin for HeapTupleSatisfiesVacuum */
-	OldestXmin = GetOldestXmin(onerel->rd_rel->relisshared, true);
+	OldestXmin = GetOldestXmin(onerel, true);
 
 	/* Prepare for sampling block numbers */
-	BlockSampler_Init(&bs, totalblocks, targrows);
+	BlockSampler_Init(&bs, totalblocks, targrows, random());
 	/* Prepare for sampling rows */
-	rstate = init_selection_state(targrows);
+	reservoir_init_selection_state(&rstate, targrows);
 
 	/* Outer loop over blocks to sample */
 	while (BlockSampler_HasMore(&bs))
@@ -1064,11 +1383,12 @@ acquire_sample_rows(Relation onerel, HeapTuple *rows, int targrows,
 		 * the maxoffset value stays good (else concurrent VACUUM might delete
 		 * tuples out from under us).  Hence, pin the page until we are done
 		 * looking at it.  We also choose to hold sharelock on the buffer
-		 * throughout --- we could release and re-acquire sharelock for
-		 * each tuple, but since we aren't doing much work per tuple, the
-		 * extra lock traffic is probably better avoided.
+		 * throughout --- we could release and re-acquire sharelock for each
+		 * tuple, but since we aren't doing much work per tuple, the extra
+		 * lock traffic is probably better avoided.
 		 */
-		targbuffer = ReadBufferWithStrategy(onerel, targblock, vac_strategy);
+		targbuffer = ReadBufferExtended(onerel, MAIN_FORKNUM, targblock,
+										RBM_NORMAL, vac_strategy);
 		LockBuffer(targbuffer, BUFFER_LOCK_SHARE);
 		targpage = BufferGetPage(targbuffer);
 		maxoffset = PageGetMaxOffsetNumber(targpage);
@@ -1084,24 +1404,9 @@ acquire_sample_rows(Relation onerel, HeapTuple *rows, int targrows,
 
 			/*
 			 * We ignore unused and redirect line pointers.  DEAD line
-			 * pointers should be counted as dead, because we need vacuum
-			 * to run to get rid of them.  Note that this rule agrees with
-			 * the way that heap_page_prune() counts things.
-			 */
-			if (!ItemIdIsNormal(itemid))
-			{
-				if (ItemIdIsDead(itemid))
-					deadrows += 1;
-				continue;
-			}
-
-			itemid = PageGetItemId(targpage, targoffset);
-
-			/*
-			 * We ignore unused and redirect line pointers.  DEAD line
-			 * pointers should be counted as dead, because we need vacuum
-			 * to run to get rid of them.  Note that this rule agrees with
-			 * the way that heap_page_prune() counts things.
+			 * pointers should be counted as dead, because we need vacuum to
+			 * run to get rid of them.  Note that this rule agrees with the
+			 * way that heap_page_prune() counts things.
 			 */
 			if (!ItemIdIsNormal(itemid))
 			{
@@ -1112,11 +1417,13 @@ acquire_sample_rows(Relation onerel, HeapTuple *rows, int targrows,
 
 			ItemPointerSet(&targtuple.t_self, targblock, targoffset);
 
+#if 0
+			targtuple.t_tableOid = RelationGetRelid(onerel);
+#endif
 			targtuple.t_data = (HeapTupleHeader) PageGetItem(targpage, itemid);
 			targtuple.t_len = ItemIdGetLength(itemid);
 
-			switch (HeapTupleSatisfiesVacuum(onerel,
-											 targtuple.t_data,
+			switch (HeapTupleSatisfiesVacuum(onerel, &targtuple,
 											 OldestXmin,
 											 targbuffer))
 			{
@@ -1132,6 +1439,7 @@ acquire_sample_rows(Relation onerel, HeapTuple *rows, int targrows,
 					break;
 
 				case HEAPTUPLE_INSERT_IN_PROGRESS:
+
 					/*
 					 * Insert-in-progress rows are not counted.  We assume
 					 * that when the inserting transaction commits or aborts,
@@ -1139,17 +1447,17 @@ acquire_sample_rows(Relation onerel, HeapTuple *rows, int targrows,
 					 * count.  This works right only if that transaction ends
 					 * after we finish analyzing the table; if things happen
 					 * in the other order, its stats update will be
-					 * overwritten by ours.  However, the error will be
-					 * large only if the other transaction runs long enough
-					 * to insert many tuples, so assuming it will finish
-					 * after us is the safer option.
+					 * overwritten by ours.  However, the error will be large
+					 * only if the other transaction runs long enough to
+					 * insert many tuples, so assuming it will finish after us
+					 * is the safer option.
 					 *
 					 * A special case is that the inserting transaction might
 					 * be our own.  In this case we should count and sample
 					 * the row, to accommodate users who load a table and
 					 * analyze it in one transaction.  (pgstat_report_analyze
-					 * has to adjust the numbers we send to the stats collector
-					 * to make this come out right.)
+					 * has to adjust the numbers we send to the stats
+					 * collector to make this come out right.)
 					 */
 					if (TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetXmin(targtuple.t_data)))
 					{
@@ -1159,6 +1467,7 @@ acquire_sample_rows(Relation onerel, HeapTuple *rows, int targrows,
 					break;
 
 				case HEAPTUPLE_DELETE_IN_PROGRESS:
+
 					/*
 					 * We count delete-in-progress rows as still live, using
 					 * the same reasoning given above; but we don't bother to
@@ -1167,10 +1476,10 @@ acquire_sample_rows(Relation onerel, HeapTuple *rows, int targrows,
 					 * If the delete was done by our own transaction, however,
 					 * we must count the row as dead to make
 					 * pgstat_report_analyze's stats adjustments come out
-					 * right.  (Note: this works out properly when the row
-					 * was both inserted and deleted in our xact.)
+					 * right.  (Note: this works out properly when the row was
+					 * both inserted and deleted in our xact.)
 					 */
-					if (TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetXmax(targtuple.t_data)))
+					if (TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetUpdateXid(targtuple.t_data)))
 						deadrows += 1;
 					else
 						liverows += 1;
@@ -1186,7 +1495,7 @@ acquire_sample_rows(Relation onerel, HeapTuple *rows, int targrows,
 				/*
 				 * The first targrows sample rows are simply copied into the
 				 * reservoir. Then we start replacing tuples in the sample
-				 * until we reach the end of the relation.	This algorithm is
+				 * until we reach the end of the relation.  This algorithm is
 				 * from Jeff Vitter's paper (see full citation below). It
 				 * works by repeatedly computing the number of tuples to skip
 				 * before selecting a tuple, which replaces a randomly chosen
@@ -1202,11 +1511,11 @@ acquire_sample_rows(Relation onerel, HeapTuple *rows, int targrows,
 					/*
 					 * t in Vitter's paper is the number of records already
 					 * processed.  If we need to compute a new S value, we
-					 * must use the not-yet-incremented value of samplerows
-					 * as t.
+					 * must use the not-yet-incremented value of samplerows as
+					 * t.
 					 */
 					if (rowstoskip < 0)
-						rowstoskip = get_next_S(samplerows, targrows, &rstate);
+						rowstoskip = reservoir_get_next_S(&rstate, samplerows, targrows);
 
 					if (rowstoskip <= 0)
 					{
@@ -1214,7 +1523,7 @@ acquire_sample_rows(Relation onerel, HeapTuple *rows, int targrows,
 						 * Found a suitable tuple, so save it, replacing one
 						 * old tuple at random
 						 */
-						int			k = (int) (targrows * random_fract());
+						int			k = (int) (targrows * sampler_random_fract(rstate.randstate));
 
 						Assert(k >= 0 && k < targrows);
 						heap_freetuple(rows[k]);
@@ -1244,12 +1553,16 @@ acquire_sample_rows(Relation onerel, HeapTuple *rows, int targrows,
 		qsort((void *) rows, numrows, sizeof(HeapTuple), compare_rows);
 
 	/*
-	 * Estimate total numbers of rows in relation.
+	 * Estimate total numbers of live and dead rows in relation, extrapolating
+	 * on the assumption that the average tuple density in pages we didn't
+	 * scan is the same as in the pages we did scan.  Since what we scanned is
+	 * a random sample of the pages in the relation, this should be a good
+	 * assumption.
 	 */
 	if (bs.m > 0)
 	{
-		*totalrows = floor((liverows * totalblocks) / bs.m + 0.5);
-		*totaldeadrows = floor((deadrows * totalblocks) / bs.m + 0.5);
+		*totalrows = floor((liverows / bs.m) * totalblocks + 0.5);
+		*totaldeadrows = floor((deadrows / bs.m) * totalblocks + 0.5);
 	}
 	else
 	{
@@ -1272,114 +1585,179 @@ acquire_sample_rows(Relation onerel, HeapTuple *rows, int targrows,
 	return numrows;
 }
 
-/* Select a random value R uniformly distributed in (0 - 1) */
-static double
-random_fract(void)
-{
-	return ((double) random() + 1) / ((double) MAX_RANDOM_VALUE + 2);
-}
-
 /*
- * These two routines embody Algorithm Z from "Random sampling with a
- * reservoir" by Jeffrey S. Vitter, in ACM Trans. Math. Softw. 11, 1
- * (Mar. 1985), Pages 37-57.  Vitter describes his algorithm in terms
- * of the count S of records to skip before processing another record.
- * It is computed primarily based on t, the number of records already read.
- * The only extra state needed between calls is W, a random state variable.
+ * Collect a sample of rows from an AO or AOCS table.
  *
- * init_selection_state computes the initial W value.
- *
- * Given that we've already read t records (t >= n), get_next_S
- * determines the number of records to skip before the next record is
- * processed.
+ * The block-sampling method used for heap tables doesn't work with
+ * append-only tables. We could build a reasonably efficient block-sampling
+ * method for AO tables, too, using the block directory, if it's available.
+ * But for now, this scans the whole table.
  */
-static double
-init_selection_state(int n)
+static int
+acquire_sample_rows_ao(Relation onerel, int elevel,
+					   HeapTuple *rows, int targrows,
+					   double *totalrows, double *totaldeadrows)
 {
-	/* Initial value of W (for use when Algorithm Z is first applied) */
-	return exp(-log(random_fract()) / n);
-}
+	AppendOnlyScanDesc aoScanDesc = NULL;
+	AOCSScanDesc aocsScanDesc = NULL;
+	Snapshot	appendOnlyMetaDataSnapshot;
+	double		rstate;
+	TupleTableSlot *slot;
+	int			numrows = 0;	/* # rows now in reservoir */
+	double		samplerows = 0; /* total # rows collected */
+	double		rowstoskip = -1;	/* -1 means not set yet */
 
-static double
-get_next_S(double t, int n, double *stateptr)
-{
-	double		S;
+	/*
+	 * the append-only meta data should never be fetched with
+	 * SnapshotAny as bogus results are returned.
+	 */
+	appendOnlyMetaDataSnapshot = GetTransactionSnapshot();
 
-	/* The magic constant here is T from Vitter's paper */
-	if (t <= (22.0 * n))
+	if (RelationIsAoRows(onerel))
+		aoScanDesc = appendonly_beginscan(onerel,
+										  SnapshotSelf,
+										  appendOnlyMetaDataSnapshot,
+										  0, NULL);
+	else
 	{
-		/* Process records using Algorithm X until t is large enough */
-		double		V,
-					quot;
+		int			natts = RelationGetNumberOfAttributes(onerel);
+		bool	   *proj = (bool *) palloc(natts * sizeof(bool));
+		int			i;
 
-		V = random_fract();		/* Generate V */
-		S = 0;
-		t += 1;
-		/* Note: "num" in Vitter's code is always equal to t - n */
-		quot = (t - (double) n) / t;
-		/* Find min S satisfying (4.1) */
-		while (quot > V)
+		for(i = 0; i < natts; i++)
+			proj[i] = true;
+
+		Assert(RelationIsAoCols(onerel));
+		aocsScanDesc = aocs_beginscan(onerel,
+									  SnapshotSelf,
+									  appendOnlyMetaDataSnapshot,
+									  RelationGetDescr(onerel), proj);
+	}
+	slot = MakeSingleTupleTableSlot(RelationGetDescr(onerel));
+
+	/* Prepare for sampling rows */
+	rstate = anl_init_selection_state(targrows);
+
+	for (;;)
+	{
+		if (aoScanDesc)
+			appendonly_getnext(aoScanDesc, ForwardScanDirection, slot);
+		else
+			aocs_getnext(aocsScanDesc, ForwardScanDirection, slot);
+
+		if (TupIsNull(slot))
+			break;
+
+		if (rowstoskip < 0)
+			rowstoskip = anl_get_next_S(samplerows, targrows,
+										&rstate);
+
+		/* XXX: this is copied from acquire_sample_rows_heap */
+
+		/*
+		 * The first targrows sample rows are simply copied into the
+		 * reservoir. Then we start replacing tuples in the sample
+		 * until we reach the end of the relation.	This algorithm is
+		 * from Jeff Vitter's paper (see full citation below). It
+		 * works by repeatedly computing the number of tuples to skip
+		 * before selecting a tuple, which replaces a randomly chosen
+		 * element of the reservoir (current set of tuples).  At all
+		 * times the reservoir is a true random sample of the tuples
+		 * we've passed over so far, so when we fall off the end of
+		 * the relation we're done.
+		 */
+		if (numrows < targrows)
+			rows[numrows++] = ExecCopySlotHeapTuple(slot);
+		else
 		{
-			S += 1;
-			t += 1;
-			quot *= (t - (double) n) / t;
+			/*
+			 * t in Vitter's paper is the number of records already
+			 * processed.  If we need to compute a new S value, we
+			 * must use the not-yet-incremented value of samplerows as
+			 * t.
+			 */
+			if (rowstoskip < 0)
+				rowstoskip = anl_get_next_S(samplerows, targrows,
+											&rstate);
+
+			if (rowstoskip <= 0)
+			{
+				/*
+				 * Found a suitable tuple, so save it, replacing one
+				 * old tuple at random
+				 */
+				int			k = (int) (targrows * anl_random_fract());
+
+				Assert(k >= 0 && k < targrows);
+				heap_freetuple(rows[k]);
+				rows[k] = ExecCopySlotHeapTuple(slot);
+			}
+
+			rowstoskip -= 1;
 		}
+
+		samplerows += 1;
+	}
+
+	/* Get the total tuple count in the table */
+	FileSegTotals *fstotal;
+	int64		hidden_tupcount = 0;
+
+	if (aoScanDesc)
+	{
+		fstotal = GetSegFilesTotals(onerel, SnapshotSelf);
+		hidden_tupcount = AppendOnlyVisimap_GetRelationHiddenTupleCount(&aoScanDesc->visibilityMap);
 	}
 	else
 	{
-		/* Now apply Algorithm Z */
-		double		W = *stateptr;
-		double		term = t - (double) n + 1;
-
-		for (;;)
-		{
-			double		numer,
-						numer_lim,
-						denom;
-			double		U,
-						X,
-						lhs,
-						rhs,
-						y,
-						tmp;
-
-			/* Generate U and X */
-			U = random_fract();
-			X = t * (W - 1.0);
-			S = floor(X);		/* S is tentatively set to floor(X) */
-			/* Test if U <= h(S)/cg(X) in the manner of (6.3) */
-			tmp = (t + 1) / term;
-			lhs = exp(log(((U * tmp * tmp) * (term + S)) / (t + X)) / n);
-			rhs = (((t + X) / (term + S)) * term) / t;
-			if (lhs <= rhs)
-			{
-				W = rhs / lhs;
-				break;
-			}
-			/* Test if U <= f(S)/cg(X) */
-			y = (((U * (t + 1)) / term) * (t + S + 1)) / (t + X);
-			if ((double) n < S)
-			{
-				denom = t;
-				numer_lim = term + S;
-			}
-			else
-			{
-				denom = t - (double) n + S;
-				numer_lim = t + 1;
-			}
-			for (numer = t + S; numer >= numer_lim; numer -= 1)
-			{
-				y *= numer / denom;
-				denom -= 1;
-			}
-			W = exp(-log(random_fract()) / n);	/* Generate W in advance */
-			if (exp(log(y) / n) <= (t + X) / t)
-				break;
-		}
-		*stateptr = W;
+		fstotal = GetAOCSSSegFilesTotals(onerel, SnapshotSelf);
+		hidden_tupcount = AppendOnlyVisimap_GetRelationHiddenTupleCount(&aocsScanDesc->visibilityMap);
 	}
-	return S;
+	*totalrows = (double) fstotal->totaltuples - hidden_tupcount;
+	/*
+	 * Currently, we always report 0 dead rows on an AO table. We could
+	 * perhaps get a better estimate using the AO visibility map. But this
+	 * will do for now.
+	 */
+	*totaldeadrows = 0;
+
+	ExecDropSingleTupleTableSlot(slot);
+	if (aoScanDesc)
+		appendonly_endscan(aoScanDesc);
+	if (aocsScanDesc)
+		aocs_endscan(aocsScanDesc);
+
+	return numrows;
+}
+
+/*
+ * Acquire a sample of rows.
+ *
+ * In GPDB, this is just a thin wrapper to route to the appropriate
+ * subroutine, depending on the table type.
+ */
+int
+acquire_sample_rows(Relation onerel, int elevel,
+					HeapTuple *rows, int targrows,
+					double *totalrows, double *totaldeadrows)
+{
+	if (Gp_role == GP_ROLE_DISPATCH &&
+		onerel->rd_cdbpolicy && !GpPolicyIsEntry(onerel->rd_cdbpolicy))
+	{
+		/* Fetch sample from the segments. */
+		return acquire_sample_rows_dispatcher(onerel, false, elevel,
+											  rows, targrows,
+											  totalrows, totaldeadrows);
+	}
+	/* Gather sample on this server. */
+	else if (RelationIsHeap(onerel))
+		return acquire_sample_rows_heap(onerel, elevel, rows, targrows,
+										totalrows, totaldeadrows);
+	else if (RelationIsAppendOptimized(onerel))
+		return acquire_sample_rows_ao(onerel, elevel, rows, targrows,
+									  totalrows, totaldeadrows);
+	else
+		elog(ERROR, "unsupported table type");
 }
 
 /*
@@ -1388,8 +1766,8 @@ get_next_S(double t, int n, double *stateptr)
 static int
 compare_rows(const void *a, const void *b)
 {
-	HeapTuple	ha = *(HeapTuple *) a;
-	HeapTuple	hb = *(HeapTuple *) b;
+	HeapTuple	ha = *(const HeapTuple *) a;
+	HeapTuple	hb = *(const HeapTuple *) b;
 	BlockNumber ba = ItemPointerGetBlockNumber(&ha->t_self);
 	OffsetNumber oa = ItemPointerGetOffsetNumber(&ha->t_self);
 	BlockNumber bb = ItemPointerGetBlockNumber(&hb->t_self);
@@ -1407,165 +1785,275 @@ compare_rows(const void *a, const void *b)
 }
 
 
-
 /*
- * This performs the same job as acquire_sample_rows() in PostgreSQL, but
- * uses an SQL query to get the rows instead of a low-level block sampler.
+ * acquire_inherited_sample_rows -- acquire sample rows from inheritance tree
  *
- * Unlike acquire_sample_rows(), this allocates the rows array for you,
- * and returns it in *rows. The reason is that this might return a few rows
- * more than requested, so the caller cannot know in advance how big the
- * array needs to be. Also, this takes the array of attributes as arguments,
- * and only fetches those rows that are needed in the sample; the rest are
- * filled in as NULLs. (That makes a difference for column-oriented tables,
- * where fetching extra columns is expensive.)
+ * This has the same API as acquire_sample_rows, except that rows are
+ * collected from all inheritance children as well as the specified table.
+ * We fail and return zero if there are no inheritance children, or if all
+ * children are foreign tables that don't support ANALYZE.
  */
-static int
-acquire_sample_rows_by_query(Relation onerel, int nattrs, VacAttrStats **attrstats,
-							 HeapTuple **rows, int targrows,
-							 double *totalrows, double *totaldeadrows, BlockNumber *totalblocks, bool rootonly, RowIndexes **colLargeRowIndexes)
+int
+acquire_inherited_sample_rows(Relation onerel, int elevel,
+							  HeapTuple *rows, int targrows,
+							  double *totalrows, double *totaldeadrows)
 {
-	StringInfoData str;
-	StringInfoData columnStr;
-	StringInfoData thresholdStr;
-	int			i;
-	const char *schemaName = NULL;
-	const char *tableName = NULL;
-	float4		randomThreshold = 0.0;
-	float4		relTuples;
-	float4		relPages;
-	int			ret;
-	int			sampleTuples;
-	Datum	   *vals;
-	bool	   *nulls;
-	MemoryContext oldcxt;
-	bool	   *isVarlenaCol = (bool *) palloc(sizeof(bool)*nattrs);
+	List	   *tableOIDs;
+	Relation   *rels;
+	AcquireSampleRowsFunc *acquirefuncs;
+	double	   *relblocks;
+	double		totalblocks;
+	int			numrows,
+				nrels,
+				i;
+	ListCell   *lc;
 
-	Assert(targrows > 0.0);
+	/*
+	 * Like in acquire_sample_rows(), if we're in the QD, fetch the sample
+	 * from segments.
+	 */
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		return acquire_sample_rows_dispatcher(onerel,
+											  true, /* inherited stats */
+											  elevel, rows, targrows,
+											  totalrows, totaldeadrows);
+	}
 
-	analyzeEstimateReltuplesRelpages(RelationGetRelid(onerel), &relTuples, &relPages,
-									 rootonly);
-	*totalrows = relTuples;
-	*totaldeadrows = 0;
-	*totalblocks = relPages;
-	if (relTuples == 0.0)
+	/*
+	 * Find all members of inheritance set.  We only need AccessShareLock on
+	 * the children.
+	 */
+	tableOIDs =
+		find_all_inheritors(RelationGetRelid(onerel), AccessShareLock, NULL);
+
+	/*
+	 * Check that there's at least one descendant, else fail.  This could
+	 * happen despite analyze_rel's relhassubclass check, if table once had a
+	 * child but no longer does.  In that case, we can clear the
+	 * relhassubclass field so as not to make the same mistake again later.
+	 * (This is safe because we hold ShareUpdateExclusiveLock.)
+	 */
+	if (list_length(tableOIDs) < 2)
+	{
+		/* CCI because we already updated the pg_class row in this command */
+		CommandCounterIncrement();
+		SetRelationHasSubclass(RelationGetRelid(onerel), false);
+		*totalrows = 0;
+		*totaldeadrows = 0;
+		ereport(elevel,
+				(errmsg("skipping analyze of \"%s.%s\" inheritance tree --- this inheritance tree contains no child tables",
+						get_namespace_name(RelationGetNamespace(onerel)),
+						RelationGetRelationName(onerel))));
 		return 0;
+	}
 
 	/*
-	 * Calculate probability for a row to be selected in the sample, and
-	 * construct a clause like "WHERE random() < [threshold]" for that.
-	 * If the threshold is >= 1.0, we want to select all rows, and
-	 * thresholdStr is left empty.
+	 * Identify acquirefuncs to use, and count blocks in all the relations.
+	 * The result could overflow BlockNumber, so we use double arithmetic.
 	 */
-	randomThreshold = targrows / relTuples;
-	initStringInfo(&thresholdStr);
-	if (randomThreshold < 1.0)
-		appendStringInfo(&thresholdStr, "where random() < %.38f", randomThreshold);
-
-	schemaName = get_namespace_name(RelationGetNamespace(onerel));
-	tableName = RelationGetRelationName(onerel);
-
-	initStringInfo(&columnStr);
-
-	if (nattrs > 0)
+	rels = (Relation *) palloc(list_length(tableOIDs) * sizeof(Relation));
+	acquirefuncs = (AcquireSampleRowsFunc *)
+		palloc(list_length(tableOIDs) * sizeof(AcquireSampleRowsFunc));
+	relblocks = (double *) palloc(list_length(tableOIDs) * sizeof(double));
+	totalblocks = 0;
+	nrels = 0;
+	foreach(lc, tableOIDs)
 	{
-		for (i = 0; i < nattrs; i++)
+		Oid			childOID = lfirst_oid(lc);
+		Relation	childrel;
+		AcquireSampleRowsFunc acquirefunc = NULL;
+		BlockNumber relpages = 0;
+
+		/* We already got the needed lock */
+		childrel = heap_open(childOID, NoLock);
+
+		/* Ignore if temp table of another backend */
+		if (RELATION_IS_OTHER_TEMP(childrel))
 		{
-			isVarlenaCol[i] = false;
-			const char *attname = quote_identifier(NameStr(attrstats[i]->attr->attname));
-			bool is_varlena = (!attrstats[i]->attr->attbyval &&
-									  attrstats[i]->attr->attlen == -1);
-			bool is_varwidth = (!attrstats[i]->attr->attbyval &&
-									   attrstats[i]->attr->attlen < 0);
-
-			if (is_varlena || is_varwidth)
-			{
-				appendStringInfo(&columnStr,
-								 "(case when pg_column_size(Ta.%s) > %d then NULL else Ta.%s  end) as %s, ",
-								 attname,
-								 WIDTH_THRESHOLD,
-								 attname,
-								 attname);
-				appendStringInfo(&columnStr,
-								 "(case when Ta.%s is NULL then %s else %s end)",
-								 attname,
-								 "false", // Less than WIDTH_THRESHOLD
-								 "true"); // Greater than WIDTH_THRESHOLD
-				isVarlenaCol[i] = true;
-			}
-
-			else
-			{
-				appendStringInfo(&columnStr, "Ta.%s ", attname);
-			}
-
-			if (i != nattrs - 1 )
-			{
-				appendStringInfo(&columnStr, ", ");
-			}
+			/* ... but release the lock on it */
+			Assert(childrel != onerel);
+			heap_close(childrel, AccessShareLock);
+			continue;
 		}
-	}
-	else
-	{
-		appendStringInfo(&columnStr, "NULL");
-	}
 
-	/*
-	 * If table is partitioned, we create a sample over all parts.
-	 * The external partitions are skipped.
-	 */
-	initStringInfo(&str);
-	if (rel_has_external_partition(RelationGetRelid(onerel)))
-	{
-		PartitionNode *pn = get_parts(RelationGetRelid(onerel), 0 /*level*/ ,
-								0 /*parent*/, false /* inctemplate */, false /*includesubparts*/);
-
-		ListCell *lc = NULL;
-		bool isFirst = true;
-		foreach(lc, pn->rules)
+		/* Check table type (MATVIEW can't happen, but might as well allow) */
+		if (childrel->rd_rel->relkind == RELKIND_RELATION ||
+			childrel->rd_rel->relkind == RELKIND_MATVIEW)
 		{
-			PartitionRule *rule = lfirst(lc);
-			Relation rel = heap_open(rule->parchildrelid, NoLock);
+			/* Regular table, so use the regular row acquisition function */
+			acquirefunc = acquire_sample_rows;
+			relpages = AcquireNumberOfBlocks(childrel);
+		}
+		else if (childrel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
+		{
+			/*
+			 * For a foreign table, call the FDW's hook function to see
+			 * whether it supports analysis.
+			 */
+			FdwRoutine *fdwroutine;
+			bool		ok = false;
 
-			if (RelationIsExternal(rel))
+			fdwroutine = GetFdwRoutineForRelation(childrel, false);
+
+			if (fdwroutine->AnalyzeForeignTable != NULL)
+				ok = fdwroutine->AnalyzeForeignTable(childrel,
+													 &acquirefunc,
+													 &relpages);
+
+			if (!ok)
 			{
-				heap_close(rel, NoLock);
+				/* ignore, but release the lock on it */
+				Assert(childrel != onerel);
+				heap_close(childrel, AccessShareLock);
 				continue;
 			}
-
-			if (isFirst)
-			{
-				isFirst = false;
-			}
-			else
-			{
-				appendStringInfo(&str, " UNION ALL ");
-			}
-
-			appendStringInfo(&str, "select %s from %s.%s as Ta ",
-							 columnStr.data,
-							 quote_identifier(schemaName),
-							 quote_identifier(RelationGetRelationName(rel)));
-
-			heap_close(rel, NoLock);
+		}
+		else
+		{
+			/* ignore, but release the lock on it */
+			Assert(childrel != onerel);
+			heap_close(childrel, AccessShareLock);
+			continue;
 		}
 
-		appendStringInfo(&str, " %s limit %lu ",
-						 thresholdStr.data, (unsigned long) targrows);
+		/* OK, we'll process this child */
+		rels[nrels] = childrel;
+		acquirefuncs[nrels] = acquirefunc;
+		relblocks[nrels] = (double) relpages;
+		totalblocks += (double) relpages;
+		nrels++;
 	}
-	else
+
+	/*
+	 * If we don't have at least two tables to consider, fail.
+	 */
+	if (nrels < 2)
 	{
-		appendStringInfo(&str, "select %s from %s.%s as Ta %s limit %lu ",
-						 columnStr.data,
-						 quote_identifier(schemaName),
-						 quote_identifier(tableName), thresholdStr.data, (unsigned long) targrows);
+		ereport(elevel,
+				(errmsg("skipping analyze of \"%s.%s\" inheritance tree --- this inheritance tree contains no analyzable child tables",
+						get_namespace_name(RelationGetNamespace(onerel)),
+						RelationGetRelationName(onerel))));
+		return 0;
 	}
+
+	/*
+	 * Now sample rows from each relation, proportionally to its fraction of
+	 * the total block count.  (This might be less than desirable if the child
+	 * rels have radically different free-space percentages, but it's not
+	 * clear that it's worth working harder.)
+	 */
+	numrows = 0;
+	*totalrows = 0;
+	*totaldeadrows = 0;
+	for (i = 0; i < nrels; i++)
+	{
+		Relation	childrel = rels[i];
+		AcquireSampleRowsFunc acquirefunc = acquirefuncs[i];
+		double		childblocks = relblocks[i];
+
+		if (childblocks > 0)
+		{
+			int			childtargrows;
+
+			childtargrows = (int) rint(targrows * childblocks / totalblocks);
+			/* Make sure we don't overrun due to roundoff error */
+			childtargrows = Min(childtargrows, targrows - numrows);
+			if (childtargrows > 0)
+			{
+				int			childrows;
+				double		trows,
+							tdrows;
+
+				/* Fetch a random sample of the child's rows */
+				childrows = (*acquirefunc) (childrel, elevel,
+											rows + numrows, childtargrows,
+											&trows, &tdrows);
+
+				/* We may need to convert from child's rowtype to parent's */
+				if (childrows > 0 &&
+					!equalTupleDescs(RelationGetDescr(childrel),
+									 RelationGetDescr(onerel),
+									 false))
+				{
+					TupleConversionMap *map;
+
+					map = convert_tuples_by_name(RelationGetDescr(childrel),
+												 RelationGetDescr(onerel));
+					if (map != NULL)
+					{
+						int			j;
+
+						for (j = 0; j < childrows; j++)
+						{
+							HeapTuple	newtup;
+
+							newtup = execute_attr_map_tuple(rows[numrows + j], map);
+							heap_freetuple(rows[numrows + j]);
+							rows[numrows + j] = newtup;
+						}
+						free_conversion_map(map);
+					}
+				}
+
+				/* And add to counts */
+				numrows += childrows;
+				*totalrows += trows;
+				*totaldeadrows += tdrows;
+			}
+		}
+
+		/*
+		 * Note: we cannot release the child-table locks, since we may have
+		 * pointers to their TOAST tables in the sampled rows.
+		 */
+		heap_close(childrel, NoLock);
+	}
+
+	return numrows;
+}
+
+/*
+ * This function acquires the HLL counter for the entire table by
+ * using the hyperloglog extension gp_hyperloglog_accum().
+ *
+ * Unlike acquire_sample_rows(), this returns the HLL counter for
+ * the entire table, and not jsut a sample, and it stores the HLL
+ * counter into a separate attribute in the stats stahll_full to
+ * distinguish it from the HLL for sampled data. This functions scans
+ * the full table only once.
+ */
+static void
+acquire_hll_by_query(Relation onerel, int nattrs, VacAttrStats **attrstats, int elevel)
+{
+	StringInfoData str, columnStr;
+	int			i;
+	int			ret;
+	Datum	   *vals;
+	MemoryContext oldcxt;
+	const char *schemaName = get_namespace_name(RelationGetNamespace(onerel));
+
+	initStringInfo(&str);
+	initStringInfo(&columnStr);
+	for (i = 0; i < nattrs; i++)
+	{
+		const char *attname = quote_identifier(NameStr(attrstats[i]->attr->attname));
+		appendStringInfo(&columnStr, "pg_catalog.gp_hyperloglog_accum(%s)", attname);
+		if(i != nattrs-1)
+			appendStringInfo(&columnStr, ", ");
+	}
+
+	appendStringInfo(&str, "select %s from %s.%s as Ta ",
+					 columnStr.data,
+					 quote_identifier(schemaName),
+					 quote_identifier(RelationGetRelationName(onerel)));
 
 	oldcxt = CurrentMemoryContext;
 
 	if (SPI_OK_CONNECT != SPI_connect())
-		ereport(ERROR, (errcode(ERRCODE_CDB_INTERNAL_ERROR),
-						errmsg("Unable to connect to execute internal query.")));
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("unable to connect to execute internal query")));
 
 	elog(elevel, "Executing SQL: %s", str.data);
 
@@ -1575,240 +2063,569 @@ acquire_sample_rows_by_query(Relation onerel, int nattrs, VacAttrStats **attrsta
 	 */
 	ret = SPI_execute(str.data, false, 0);
 	Assert(ret > 0);
-	sampleTuples = SPI_processed;
+
+	/*
+	 * targrows in analyze_rel_internal() is an int,
+	 * it's unlikely that this query will return more rows
+	 */
+	Assert(SPI_processed < 2);
+	int sampleTuples = (int) SPI_processed;
 
 	/* Ok, read in the tuples to *rows */
 	MemoryContextSwitchTo(oldcxt);
-	vals = (Datum *) palloc(RelationGetNumberOfAttributes(onerel) * sizeof(Datum));
-	nulls = (bool *) palloc(RelationGetNumberOfAttributes(onerel) * sizeof(bool));
-	for (i = 0; i < RelationGetNumberOfAttributes(onerel); i++)
-	{
-		vals[i] = (Datum) 0;
-		nulls[i] = true;
-	}
+	vals = (Datum *) palloc0(nattrs * sizeof(Datum));
+	bool isNull = false;
 
-	/* Initialize the arrays to hold information about column width */
-	for (i = 0; i < nattrs; i++)
-	{
-		colLargeRowIndexes[i] = (RowIndexes *) palloc0(sizeof(RowIndexes));
-		colLargeRowIndexes[i]->rows = (bool *) palloc(sizeof(bool) * sampleTuples);
-		colLargeRowIndexes[i]->toowide_cnt = 0;
-	}
-
-	*rows = (HeapTuple *) palloc(sampleTuples * sizeof(HeapTuple));
 	for (i = 0; i < sampleTuples; i++)
 	{
 		HeapTuple	sampletup = SPI_tuptable->vals[i];
 		int			j;
-		int			index = 0;
 
 		for (j = 0; j < nattrs; j++)
 		{
-			colLargeRowIndexes[j]->rows[i] = false;
 			int	tupattnum = attrstats[j]->tupattnum;
-			Assert(tupattnum >= 1 && tupattnum <= RelationGetNumberOfAttributes(onerel));
+			Assert(tupattnum >= 1 && tupattnum <= nattrs);
 
-			vals[tupattnum - 1] = heap_getattr(sampletup, index + 1,
+			vals[tupattnum - 1] = heap_getattr(sampletup, j + 1,
 											   SPI_tuptable->tupdesc,
-											   &nulls[tupattnum - 1]);
-			if (isVarlenaCol[j])
+											   &isNull);
+			if (isNull)
 			{
-				index++; /* Move the index to the supplementary column*/
-				if (nulls[tupattnum - 1])
-				{
-					bool dummyNull = false;
-					Datum dummyVal = heap_getattr(sampletup, index + 1,
-												  SPI_tuptable->tupdesc,
-												  &dummyNull);
-
-					/* 
-					 * If Datum is too large, mark the index position as true
-					 * and increase the too wide count
-					 */
-					if (DatumGetInt32(dummyVal))
-					{
-						colLargeRowIndexes[j]->rows[i] = true;
-						colLargeRowIndexes[j]->toowide_cnt++;
-					}
-				}
+				attrstats[j]->stahll_full = (bytea *)gp_hyperloglog_init_def();
+				continue;
 			}
-			index++; /* Move index to the next table attribute */
-		}
-		(*rows)[i] = heap_form_tuple(onerel->rd_att, vals, nulls);
-	}
 
-	/**
-	 * MPP-10723: Very rarely, we may be unlucky and get an empty sample. We
-	 * error out in this case rather than generate bad statistics.
-	 */
-	if (relTuples > gp_statistics_sampling_threshold &&
-		sampleTuples == 0)
-	{
-		elog(ERROR, "ANALYZE unable to generate accurate statistics on table %s.%s. Try lowering gp_analyze_relative_error",
-			 quote_identifier(schemaName),
-			 quote_identifier(tableName));
+			int16 typlen;
+			bool typbyval;
+			get_typlenbyval(SPI_tuptable->tupdesc->tdtypeid, &typlen, &typbyval);
+			int hll_length = datumGetSize(vals[tupattnum-1], typbyval, typlen);
+			attrstats[j]->stahll_full = (bytea *)datumCopy(PointerGetDatum(vals[tupattnum - 1]), false, hll_length);
+		}
 	}
 
 	SPI_finish();
-
-	return sampleTuples;
 }
 
-
-/**
- * This method estimates reltuples/relpages for a relation. To do this, it employs
- * the built-in function 'gp_statistics_estimate_reltuples_relpages'. If the table to be
- * analyzed is a system table, then it calculates statistics only using the master.
- * Input:
- * 	relationOid - relation's Oid
- * Output:
- * 	relTuples - estimated number of tuples
- * 	relPages  - estimated number of pages
+/*
+ * Compute relation size.
+ *
+ * In upstream, this is a simple RelationGetNumberOfBlocks() call. But in
+ * GPDB, we need to deal with AO and AOCS tables, and if we're in the
+ * dispatcher, need to get the size from the segments.
  */
-static void
-analyzeEstimateReltuplesRelpages(Oid relationOid, float4 *relTuples, float4 *relPages, bool rootonly)
+BlockNumber
+AcquireNumberOfBlocks(Relation onerel)
 {
-	*relPages = 0.0;		
-	*relTuples = 0.0;			
-	
-	List *allRelOids = NIL;
+	int64		totalbytes;
 
-	/* if GUC optimizer_analyze_root_partition is off, we do not analyze root partitions, unless
-	 * using the 'ANALYZE ROOTPARTITION tablename' command.
-	 * This is done by estimating the reltuples to be 0 and thus bypass the actual analyze.
-	 * See MPP-21427.
-	 * For mid-level partitions, we aggregate the reltuples and relpages from all leaf children beneath.
-	 */
-	if (rel_part_status(relationOid) == PART_STATUS_INTERIOR ||
-			(rel_is_partitioned(relationOid) && (optimizer_analyze_root_partition || rootonly)))
+	if (Gp_role == GP_ROLE_DISPATCH &&
+		onerel->rd_cdbpolicy && !GpPolicyIsEntry(onerel->rd_cdbpolicy))
 	{
-		allRelOids = rel_get_leaf_children_relids(relationOid);
+		/* Query the segments using pg_relation_size(<rel>). */
+		char		relsize_sql[100];
+
+		snprintf(relsize_sql, sizeof(relsize_sql),
+				 "select pg_catalog.pg_relation_size(%u, 'main')", RelationGetRelid(onerel));
+		totalbytes = get_size_from_segDBs(relsize_sql);
+		if (GpPolicyIsReplicated(onerel->rd_cdbpolicy))
+		{
+			/*
+			 * pg_relation_size sums up the table size on each segment. That's
+			 * correct for hash and randomly distributed tables. But for a
+			 * replicated table, we want pg_class.relpages to count the data
+			 * only once.
+			 */
+			totalbytes = totalbytes / onerel->rd_cdbpolicy->numsegments;
+		}
+
+		return RelationGuessNumberOfBlocks(totalbytes);
+	}
+	/* Check size on this server. */
+	else if (RelationIsHeap(onerel))
+	{
+		/* NOTE: This covers indexes, too */
+		return RelationGetNumberOfBlocks(onerel);
+	}
+	else if (RelationIsAoRows(onerel))
+	{
+		totalbytes = GetAOTotalBytes(onerel, GetActiveSnapshot());
+		return RelationGuessNumberOfBlocks(totalbytes);
+	}
+	else if (RelationIsAoCols(onerel))
+	{
+		totalbytes = GetAOCSTotalBytes(onerel, GetActiveSnapshot(), true);
+		return RelationGuessNumberOfBlocks(totalbytes);
 	}
 	else
+		elog(ERROR, "unsupported table type");
+}
+
+/*
+ * Compute index relation's size.
+ *
+ * Like AcquireNumberOfBlocks(), but for indexes. Indexes don't
+ * have a distribution policy, so we use the parent table's policy
+ * to determine whether we need to get the size on segments or
+ * locally.
+ */
+static BlockNumber
+acquire_index_number_of_blocks(Relation indexrel, Relation tablerel)
+{
+	int64		totalbytes;
+
+	if (Gp_role == GP_ROLE_DISPATCH &&
+		tablerel->rd_cdbpolicy && !GpPolicyIsEntry(tablerel->rd_cdbpolicy))
 	{
-		allRelOids = list_make1_oid(relationOid);
+		/* Query the segments using pg_relation_size(<rel>). */
+		char		relsize_sql[100];
+
+		snprintf(relsize_sql, sizeof(relsize_sql),
+				 "select pg_catalog.pg_relation_size(%u, 'main')", RelationGetRelid(indexrel));
+		totalbytes = get_size_from_segDBs(relsize_sql);
+		if (GpPolicyIsReplicated(tablerel->rd_cdbpolicy))
+		{
+			/*
+			 * pg_relation_size sums up the table size on each segment. That's
+			 * correct for hash and randomly distributed tables. But for a
+			 * replicated table, we want pg_class.relpages to count the data
+			 * only once.
+			 */
+			totalbytes = totalbytes / tablerel->rd_cdbpolicy->numsegments;
+		}
+
+		return RelationGuessNumberOfBlocks(totalbytes);
+	}
+	/* Check size on this server. */
+	else
+	{
+		Assert(RelationIsHeap(indexrel));
+		return RelationGetNumberOfBlocks(indexrel);
+	}
+}
+
+/*
+ * parse_record_to_string
+ *
+ * CDB: a copy of record_in, but only parse the record string
+ * into separate strs for each column.
+ */
+static void
+parse_record_to_string(char *string, TupleDesc tupdesc, char** values, bool *nulls)
+{
+	char	*ptr;
+	int	ncolumns;
+	int	i;
+	bool	needComma;
+	StringInfoData	buf;
+
+	Assert(string != NULL);
+	Assert(values != NULL);
+	Assert(nulls != NULL);
+	
+	ncolumns = tupdesc->natts;
+	needComma = false;
+
+	/*
+	 * Scan the string.  We use "buf" to accumulate the de-quoted data for
+	 * each column, which is then fed to the appropriate input converter.
+	 */
+	ptr = string;
+
+	/* Allow leading whitespace */
+	while (*ptr && isspace((unsigned char) *ptr))
+		ptr++;
+	if (*ptr++ != '(')
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("malformed record literal: \"%s\"", string),
+				 errdetail("Missing left parenthesis.")));
 	}
 
-	/* iterate over all parts and add up estimates */
-	ListCell *lc = NULL;
-	foreach (lc, allRelOids)
+	initStringInfo(&buf);
+
+	for (i = 0; i < ncolumns; i++)
 	{
-		Oid			singleOid = lfirst_oid(lc);
-		StringInfoData	sqlstmt;
-		int			ret;
-		Datum		arrayDatum;
-		bool		isNull;
-		Datum	   *values = NULL;
-		int			valuesLength;
-
-		initStringInfo(&sqlstmt);
-
-		if (GpPolicyFetch(CurrentMemoryContext, singleOid)->ptype == POLICYTYPE_ENTRY)
+		/* Ignore dropped columns in datatype, but fill with nulls */
+		if (tupdesc->attrs[i]->attisdropped)
 		{
-			appendStringInfo(&sqlstmt, "select sum(gp_statistics_estimate_reltuples_relpages_oid(c.oid))::float4[] "
-					"from pg_class c where c.oid=%d", singleOid);
+			values[i] = NULL;
+			nulls[i] = true;
+			continue;
+		}
+
+		if (needComma)
+		{
+			/* Skip comma that separates prior field from this one */
+			if (*ptr == ',')
+				ptr++;
+			else
+			{
+				/* *ptr must be ')' */
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+						 errmsg("malformed record literal: \"%s\"", string),
+						 errdetail("Too few columns.")));
+			}
+		}
+
+		/* Check for null: completely empty input means null */
+		if (*ptr == ',' || *ptr == ')')
+		{
+			values[i] = NULL;
+			nulls[i] = true;
 		}
 		else
 		{
-			appendStringInfo(&sqlstmt, "select sum(gp_statistics_estimate_reltuples_relpages_oid(c.oid))::float4[] "
-					"from gp_dist_random('pg_class') c where c.oid=%d", singleOid);
+			/* Extract string for this column */
+			bool		inquote = false;
+
+			resetStringInfo(&buf);
+			while (inquote || !(*ptr == ',' || *ptr == ')'))
+			{
+				char		ch = *ptr++;
+
+				if (ch == '\0')
+				{
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+							 errmsg("malformed record literal: \"%s\"",
+									string),
+							 errdetail("Unexpected end of input.")));
+				}
+				if (ch == '\\')
+				{
+					if (*ptr == '\0')
+					{
+						ereport(ERROR,
+								(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+								 errmsg("malformed record literal: \"%s\"",
+										string),
+								 errdetail("Unexpected end of input.")));
+					}
+					appendStringInfoChar(&buf, *ptr++);
+				}
+				else if (ch == '"')
+				{
+					if (!inquote)
+						inquote = true;
+					else if (*ptr == '"')
+					{
+						/* doubled quote within quote sequence */
+						appendStringInfoChar(&buf, *ptr++);
+					}
+					else
+						inquote = false;
+				}
+				else
+					appendStringInfoChar(&buf, ch);
+			}
+
+			values[i] = palloc(strlen(buf.data) + 1);
+			memcpy(values[i], buf.data, strlen(buf.data) + 1);
+			nulls[i] = false;
 		}
 
-		if (SPI_OK_CONNECT != SPI_connect())
-			ereport(ERROR, (errcode(ERRCODE_CDB_INTERNAL_ERROR),
-							errmsg("Unable to connect to execute internal query.")));
-
-		elog(elevel, "Executing SQL: %s", sqlstmt.data);
-
-		/* Do the query. */
-		ret = SPI_execute(sqlstmt.data, true, 0);
-		Assert(ret > 0);
-		Assert(SPI_tuptable != NULL);
-		Assert(SPI_processed == 1);
-
-		arrayDatum = heap_getattr(SPI_tuptable->vals[0], 1, SPI_tuptable->tupdesc, &isNull);
-		if (isNull)
-			elog(ERROR, "could not get estimated number of tuples and pages for relation %u", singleOid);
-
-		deconstruct_array(DatumGetArrayTypeP(arrayDatum),
-						  FLOAT4OID,
-						  sizeof(float4),
-						  true,
-						  'i',
-						  &values, NULL, &valuesLength);
-		Assert(valuesLength == 2);
-
-		*relTuples += DatumGetFloat4(values[0]);
-		*relPages += DatumGetFloat4(values[1]);
-
-		SPI_finish();
+		/*
+		 * Prep for next column
+		 */
+		needComma = true;
 	}
 
-	return;
+	if (*ptr++ != ')')
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("malformed record literal: \"%s\"", string),
+				 errdetail("Too many columns.")));
+	}
+	/* Allow trailing whitespace */
+	while (*ptr && isspace((unsigned char) *ptr))
+		ptr++;
+	if (*ptr)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("malformed record literal: \"%s\"", string),
+				 errdetail("Junk after right parenthesis.")));
+	}
 }
 
-/**
- * This method determines the number of pages corresponding to an index.
- * Input:
- * 	relationOid - relation being analyzed
- * 	indexOid - index whose size is to be determined
- * Output:
- * 	indexPages - number of pages in the index
+/*
+ * Collect a sample from segments.
+ *
+ * Calls the gp_acquire_sample_rows() helper function on each segment,
+ * and merges the results.
  */
-static void
-analyzeEstimateIndexpages(Relation onerel, Relation indrel, BlockNumber *indexPages)
+static int
+acquire_sample_rows_dispatcher(Relation onerel, bool inh, int elevel,
+							   HeapTuple *rows, int targrows,
+							   double *totalrows, double *totaldeadrows)
 {
-	StringInfoData 	sqlstmt;
-	int			ret;
-	Datum		arrayDatum;
-	bool		isNull;
-	Datum	   *values = NULL;
-	int			valuesLength;
+	/*
+	 * 'colLargeRowIndexes' is essentially an argument, but it's passed via a
+	 * global variable to avoid changing the AcquireSampleRowsFunc prototype.
+	 */
+	Bitmapset **colLargeRowIndexes = acquire_func_colLargeRowIndexes;
+	TupleDesc	relDesc = RelationGetDescr(onerel);
+	TupleDesc	funcTupleDesc;
+	TupleDesc	sampleTupleDesc;
+	AttInMetadata *attinmeta;
+	StringInfoData str;
+	int			sampleTuples;	/* 32 bit - assume that number of tuples will not > 2B */
+	char 	  **funcRetValues;
+	bool 	   *funcRetNulls;
+	char 	  **values;
+	int			numLiveColumns;
+	int			perseg_targrows;
+	int			ncolumns;
+	CdbPgResults cdb_pgresults = {NULL, 0};
+	int			i;
+	int			index = 0;
 
-	initStringInfo(&sqlstmt);
+	Assert(targrows > 0.0);
 
-	if (GpPolicyFetch(CurrentMemoryContext, RelationGetRelid(onerel))->ptype == POLICYTYPE_ENTRY)
-	{
-		appendStringInfo(&sqlstmt, "select sum(gp_statistics_estimate_reltuples_relpages_oid(c.oid))::float4[] "
-						 "from pg_class c where c.oid=%d", RelationGetRelid(indrel));
-	}
+	/*
+	 * Acquire an evenly-sized sample from each segment.
+	 *
+	 * XXX: If there's a significant bias between the segments, i.e. some
+	 * segments have a lot more rows than others, the sample will biased, too.
+	 * Would be nice to improve that, but it's not clear how. We could issue
+	 * another query to get the table size from each segment first, and use
+	 * those to weigh the sample size to get from each segment. But that'd
+	 * require an extra round-trip, which is also not good. The caller
+	 * actually already did that, to get the total relation size, but it
+	 * doesn't pass that down to us, let alone the per-segment sizes.
+	 */
+	if (GpPolicyIsReplicated(onerel->rd_cdbpolicy))
+		perseg_targrows = targrows;
+	else if (GpPolicyIsPartitioned(onerel->rd_cdbpolicy))
+		perseg_targrows = targrows / onerel->rd_cdbpolicy->numsegments;
 	else
+		elog(ERROR, "acquire_sample_rows_dispatcher() cannot be used on a non-distributed table");
+
+	/*
+	 * Count the number of columns, excluding dropped columns. We'll need that
+	 * later.
+	 */
+	numLiveColumns = 0;
+	for (i = 0; i < relDesc->natts; i++)
 	{
-		appendStringInfo(&sqlstmt, "select sum(gp_statistics_estimate_reltuples_relpages_oid(c.oid))::float4[] "
-						 "from gp_dist_random('pg_class') c where c.oid=%d", RelationGetRelid(indrel));
+		Form_pg_attribute attr = relDesc->attrs[i];
+
+		if (attr->attisdropped)
+			continue;
+
+		numLiveColumns++;
 	}
 
-	if (SPI_OK_CONNECT != SPI_connect())
-		ereport(ERROR, (errcode(ERRCODE_CDB_INTERNAL_ERROR),
-						errmsg("Unable to connect to execute internal query.")));
-	elog(elevel, "Executing SQL: %s", sqlstmt.data);
+	/*
+	 * Construct SQL command to dispatch to segments.
+	 *
+	 * Did not use 'select * from pg_catalog.gp_acquire_sample_rows(...) as (..);'
+	 * here. Because it requires to specify columns explicitly which leads to
+	 * permission check on each columns. This is not consistent with GPDB5 and
+	 * may result in different behaviour under different acl configuration.
+	 */
+	initStringInfo(&str);
+	appendStringInfo(&str, "select pg_catalog.gp_acquire_sample_rows(%u, %d, '%s');",
+					 RelationGetRelid(onerel),
+					 perseg_targrows,
+					 inh ? "t" : "f");
 
-	/* Do the query. */
-	ret = SPI_execute(sqlstmt.data, true, 0);
-	Assert(ret > 0);
+	/*
+	 * Execute it.
+	 */
+	elog(elevel, "Executing SQL: %s", str.data);
+	CdbDispatchCommand(str.data, DF_WITH_SNAPSHOT, &cdb_pgresults);
 
-	if (SPI_processed != 1)
-		elog(ERROR, "unexpected number of rows returned for internal analyze query");
+	/*
+	 * Build a modified tuple descriptor for the table.
+	 *
+	 * Some datatypes need special treatment, so we cannot use the relation's
+	 * original tupledesc.
+	 *
+	 * Also create tupledesc of return record of function gp_acquire_sample_rows.
+	 */
+	sampleTupleDesc = CreateTupleDescCopy(relDesc);
+	ncolumns = numLiveColumns + FIX_ATTR_NUM;
+	
+	funcTupleDesc = CreateTemplateTupleDesc(ncolumns, false);
+	TupleDescInitEntry(funcTupleDesc, (AttrNumber) 1, "", FLOAT8OID, -1, 0);
+	TupleDescInitEntry(funcTupleDesc, (AttrNumber) 2, "", FLOAT8OID, -1, 0);
+	TupleDescInitEntry(funcTupleDesc, (AttrNumber) 3, "", TEXTOID, -1, 0);
+	
+	for (i = 0; i < relDesc->natts; i++)
+	{
+		Form_pg_attribute attr = relDesc->attrs[i];
+		
+		Oid			typid = gp_acquire_sample_rows_col_type(attr->atttypid);
 
-    arrayDatum = heap_getattr(SPI_tuptable->vals[0], 1, SPI_tuptable->tupdesc, &isNull);
-	if (isNull)
-		elog(ERROR, "could not get estimated number of tuples and pages for index \"%s\"",
-			 RelationGetRelationName(indrel));
+		sampleTupleDesc->attrs[i]->atttypid = typid;
 
-    deconstruct_array(DatumGetArrayTypeP(arrayDatum),
-            FLOAT4OID,
-            sizeof(float4),
-            true,
-            'i',
-            &values, NULL, &valuesLength);
-    Assert(valuesLength == 2);
+		if (!attr->attisdropped)
+		{
+			TupleDescInitEntry(funcTupleDesc, (AttrNumber) 4 + index, "",
+							   typid, attr->atttypmod, attr->attndims);
+		
+			index++;
+		}
+	}
 
-	*indexPages = DatumGetFloat4(values[1]);
+	/* For RECORD results, make sure a typmod has been assigned */
+	Assert(funcTupleDesc->tdtypeid == RECORDOID && funcTupleDesc->tdtypmod < 0);
+	assign_record_type_typmod(funcTupleDesc);
 
-	SPI_finish();
+	attinmeta = TupleDescGetAttInMetadata(sampleTupleDesc);
 
-	pfree(sqlstmt.data);
-	return;
+	/*
+	 * Read the result set from each segment. Gather the sample rows *rows,
+	 * and sum up the summary rows for grand 'totalrows' and 'totaldeadrows'.
+	 */
+	funcRetValues = (char **) palloc0(funcTupleDesc->natts * sizeof(char *));
+	funcRetNulls = (bool *) palloc(funcTupleDesc->natts * sizeof(bool));
+	values = (char **) palloc0(relDesc->natts * sizeof(char *));
+	sampleTuples = 0;
+	*totalrows = 0;
+	*totaldeadrows = 0;
+	for (int resultno = 0; resultno < cdb_pgresults.numResults; resultno++)
+	{
+		struct pg_result *pgresult = cdb_pgresults.pg_results[resultno];
+		bool		got_summary = false;
+		double		this_totalrows = 0;
+		double		this_totaldeadrows = 0;
+
+		if (PQresultStatus(pgresult) != PGRES_TUPLES_OK)
+		{
+			cdbdisp_clearCdbPgResults(&cdb_pgresults);
+			ereport(ERROR,
+					(errmsg("unexpected result from segment: %d",
+							PQresultStatus(pgresult))));
+		}
+
+		if (GpPolicyIsReplicated(onerel->rd_cdbpolicy))
+		{
+			/*
+			 * A replicated table has the same data in all segments. Arbitrarily,
+			 * use the sample from the first segment, and discard the rest.
+			 * (This is rather inefficient, of course. It would be better to
+			 * dispatch to only one segment, but there is no easy API for that
+			 * in the dispatcher.)
+			 */
+			if (resultno > 0)
+				continue;
+		}
+
+		for (int rowno = 0; rowno < PQntuples(pgresult); rowno++)
+		{
+			/*
+			 * We cannot use record_in function to get row record here.
+			 * Since the result row may contain just the totalrows info where the data columns
+			 * are NULLs. Consider domain: 'create domain dnotnull varchar(15) NOT NULL;'
+			 * NULLs are not allowed in data columns.
+			 */
+			char * rowStr = PQgetvalue(pgresult, rowno, 0);
+
+			if (rowStr == NULL)
+				elog(ERROR, "got NULL pointer from return value of gp_acquire_sample_rows");
+
+			parse_record_to_string(rowStr, funcTupleDesc, funcRetValues, funcRetNulls);
+
+			if (!funcRetNulls[0])
+			{
+				/* This is a summary row. */
+				if (got_summary)
+					elog(ERROR, "got duplicate summary row from gp_acquire_sample_rows");
+
+				this_totalrows = DatumGetFloat8(DirectFunctionCall1(float8in,
+																	CStringGetDatum(funcRetValues[0])));
+				this_totaldeadrows = DatumGetFloat8(DirectFunctionCall1(float8in,
+																		CStringGetDatum(funcRetValues[1])));
+				got_summary = true;
+			}
+			else
+			{
+				/* This is a sample row. */
+				if (sampleTuples >= targrows)
+					elog(ERROR, "too many sample rows received from gp_acquire_sample_rows");
+
+				/* Read the 'toolarge' bitmap, if any */
+				if (colLargeRowIndexes && !funcRetNulls[2])
+				{
+					char	   *toolarge;
+					toolarge = funcRetValues[2];
+					if (strlen(toolarge) != numLiveColumns)
+						elog(ERROR, "'toolarge' bitmap has incorrect length");
+
+					index = 0;
+					for (i = 0; i < relDesc->natts; i++)
+					{
+						Form_pg_attribute attr = relDesc->attrs[i];
+
+						if (attr->attisdropped)
+							continue;
+
+						if (toolarge[index] == '1')
+							colLargeRowIndexes[i] = bms_add_member(colLargeRowIndexes[i], sampleTuples);
+						index++;
+					}
+				}
+
+				/* Process the columns */
+				index = 0;
+				for (i = 0; i < relDesc->natts; i++)
+				{
+					Form_pg_attribute attr = relDesc->attrs[i];
+
+					if (attr->attisdropped)
+						continue;
+
+					if (funcRetNulls[3 + index])
+						values[i] = NULL;
+					else
+						values[i] = funcRetValues[3 + index];
+					index++; /* Move index to the next result set attribute */
+				}
+
+				rows[sampleTuples] = BuildTupleFromCStrings(attinmeta, values);
+				sampleTuples++;
+
+				/*
+				 * note: we don't set the OIDs in the sample. ANALYZE doesn't
+				 * collect stats for them
+				 */
+			}
+		}
+
+		if (!got_summary)
+			elog(ERROR, "did not get summary row from gp_acquire_sample_rows");
+
+		if (resultno >= onerel->rd_cdbpolicy->numsegments)
+		{
+			/*
+			 * This result is for a segment that's not holding any data for this
+			 * table. Should get 0 rows.
+			 */
+			if (this_totalrows != 0 || this_totalrows != 0)
+				elog(WARNING, "table \"%s\" contains rows in segment %d, which is outside the # of segments for the table's policy (%d segments)",
+					 RelationGetRelationName(onerel), resultno, onerel->rd_cdbpolicy->numsegments);
+		}
+
+		(*totalrows) += this_totalrows;
+		(*totaldeadrows) += this_totaldeadrows;
+	}
+	for (i = 0; i < funcTupleDesc->natts; i++)
+	{
+		if (funcRetValues[i])
+			pfree(funcRetValues[i]);
+	}
+	pfree(funcRetValues);
+	pfree(funcRetNulls);
+	pfree(values);
+
+	cdbdisp_clearCdbPgResults(&cdb_pgresults);
+
+	return sampleTuples;
 }
 
 /*
@@ -1817,7 +2634,7 @@ analyzeEstimateIndexpages(Relation onerel, Relation indrel, BlockNumber *indexPa
  *		Statistics are stored in several places: the pg_class row for the
  *		relation has stats about the whole relation, and there is a
  *		pg_statistic row for each (non-system) attribute that has ever
- *		been analyzed.	The pg_class values are updated by VACUUM, not here.
+ *		been analyzed.  The pg_class values are updated by VACUUM, not here.
  *
  *		pg_statistic rows are just added or updated normally.  This means
  *		that pg_statistic will probably contain some deleted rows at the
@@ -1834,7 +2651,7 @@ analyzeEstimateIndexpages(Relation onerel, Relation indrel, BlockNumber *indexPa
  *		by taking a self-exclusive lock on the relation in analyze_rel().
  */
 static void
-update_attstats(Oid relid, int natts, VacAttrStats **vacattrstats)
+update_attstats(Oid relid, bool inh, int natts, VacAttrStats **vacattrstats)
 {
 	Relation	sd;
 	int			attno;
@@ -1854,7 +2671,7 @@ update_attstats(Oid relid, int natts, VacAttrStats **vacattrstats)
 					n;
 		Datum		values[Natts_pg_statistic];
 		bool		nulls[Natts_pg_statistic];
-		char		replaces[Natts_pg_statistic];
+		bool		replaces[Natts_pg_statistic];
 
 		/* Ignore attr if we weren't able to collect stats */
 		if (!stats->stats_valid)
@@ -1866,23 +2683,26 @@ update_attstats(Oid relid, int natts, VacAttrStats **vacattrstats)
 		for (i = 0; i < Natts_pg_statistic; ++i)
 		{
 			nulls[i] = false;
-			replaces[i] = 'r';
+			replaces[i] = true;
 		}
 
-		i = 0;
-		values[i++] = ObjectIdGetDatum(relid);	/* starelid */
-		values[i++] = Int16GetDatum(stats->attr->attnum);		/* staattnum */
-		values[i++] = Float4GetDatum(stats->stanullfrac);		/* stanullfrac */
-		values[i++] = Int32GetDatum(stats->stawidth);	/* stawidth */
-		values[i++] = Float4GetDatum(stats->stadistinct);		/* stadistinct */
+		values[Anum_pg_statistic_starelid - 1] = ObjectIdGetDatum(relid);
+		values[Anum_pg_statistic_staattnum - 1] = Int16GetDatum(stats->attr->attnum);
+		values[Anum_pg_statistic_stainherit - 1] = BoolGetDatum(inh);
+		values[Anum_pg_statistic_stanullfrac - 1] = Float4GetDatum(stats->stanullfrac);
+		values[Anum_pg_statistic_stawidth - 1] = Int32GetDatum(stats->stawidth);
+		values[Anum_pg_statistic_stadistinct - 1] = Float4GetDatum(stats->stadistinct);
+		i = Anum_pg_statistic_stakind1 - 1;
 		for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
 		{
 			values[i++] = Int16GetDatum(stats->stakind[k]);		/* stakindN */
 		}
+		i = Anum_pg_statistic_staop1 - 1;
 		for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
 		{
 			values[i++] = ObjectIdGetDatum(stats->staop[k]);	/* staopN */
 		}
+		i = Anum_pg_statistic_stanumbers1 - 1;
 		for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
 		{
 			int			nnum = stats->numnumbers[k];
@@ -1897,7 +2717,7 @@ update_attstats(Oid relid, int natts, VacAttrStats **vacattrstats)
 				/* XXX knows more than it should about type float4: */
 				arry = construct_array(numdatums, nnum,
 									   FLOAT4OID,
-									   sizeof(float4), true, 'i');
+									   sizeof(float4), FLOAT4PASSBYVAL, 'i');
 				values[i++] = PointerGetDatum(arry);	/* stanumbersN */
 			}
 			else
@@ -1906,6 +2726,7 @@ update_attstats(Oid relid, int natts, VacAttrStats **vacattrstats)
 				values[i++] = (Datum) 0;
 			}
 		}
+		i = Anum_pg_statistic_stavalues1 - 1;
 		for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
 		{
 			if (stats->numvalues[k] > 0)
@@ -1914,10 +2735,10 @@ update_attstats(Oid relid, int natts, VacAttrStats **vacattrstats)
 
 				arry = construct_array(stats->stavalues[k],
 									   stats->numvalues[k],
-									   stats->attr->atttypid,
-									   stats->attrtype->typlen,
-									   stats->attrtype->typbyval,
-									   stats->attrtype->typalign);
+									   stats->statypid[k],
+									   stats->statyplen[k],
+									   stats->statypbyval[k],
+									   stats->statypalign[k]);
 				values[i++] = PointerGetDatum(arry);	/* stavaluesN */
 			}
 			else
@@ -1928,10 +2749,10 @@ update_attstats(Oid relid, int natts, VacAttrStats **vacattrstats)
 		}
 
 		/* Is there already a pg_statistic tuple for this attribute? */
-		oldtup = SearchSysCache(STATRELATT,
-								ObjectIdGetDatum(relid),
-								Int16GetDatum(stats->attr->attnum),
-								0, 0);
+		oldtup = SearchSysCache3(STATRELATTINH,
+								 ObjectIdGetDatum(relid),
+								 Int16GetDatum(stats->attr->attnum),
+								 BoolGetDatum(inh));
 
 		if (HeapTupleIsValid(oldtup))
 		{
@@ -2003,6 +2824,12 @@ ind_fetch_func(VacAttrStatsP stats, int rownum, bool *isNull)
  *==========================================================================
  */
 
+
+/*
+ * In PostgreSQL, WIDTH_THRESHOLD is here, but we've moved it to vacuum.h in
+ * GPDB.
+ */
+
 #define swapInt(a,b)	do {int _tmp; _tmp=a; a=b; b=_tmp;} while(0)
 #define swapDatum(a,b)	do {Datum _tmp; _tmp=a; a=b; b=_tmp;} while(0)
 
@@ -2030,24 +2857,27 @@ typedef struct
 
 typedef struct
 {
-	FmgrInfo   *cmpFn;
-	int			cmpFlags;
+	SortSupport ssup;
 	int		   *tupnoLink;
 } CompareScalarsContext;
 
 
-static void compute_minimal_stats(VacAttrStatsP stats,
+static void compute_trivial_stats(VacAttrStatsP stats,
 					  AnalyzeAttrFetchFunc fetchfunc,
 					  int samplerows,
 					  double totalrows);
-static void compute_very_minimal_stats(VacAttrStatsP stats,
-					  AnalyzeAttrFetchFunc fetchfunc,
-					  int samplerows,
-					  double totalrows);
+static void compute_distinct_stats(VacAttrStatsP stats,
+					   AnalyzeAttrFetchFunc fetchfunc,
+					   int samplerows,
+					   double totalrows);
 static void compute_scalar_stats(VacAttrStatsP stats,
 					 AnalyzeAttrFetchFunc fetchfunc,
 					 int samplerows,
 					 double totalrows);
+static void merge_leaf_stats(VacAttrStatsP stats,
+								 AnalyzeAttrFetchFunc fetchfunc,
+								 int samplerows,
+								 double totalrows);
 static int	compare_scalars(const void *a, const void *b, void *arg);
 static int	compare_mcvs(const void *a, const void *b);
 
@@ -2055,14 +2885,12 @@ static int	compare_mcvs(const void *a, const void *b);
 /*
  * std_typanalyze -- the default type-specific typanalyze function
  */
-static bool
+bool
 std_typanalyze(VacAttrStats *stats)
 {
 	Form_pg_attribute attr = stats->attr;
-	Operator	func_operator;
-	Oid			eqopr = InvalidOid;
-	Oid			eqfunc = InvalidOid;
-	Oid			ltopr = InvalidOid;
+	Oid			ltopr;
+	Oid			eqopr;
 	StdAnalyzeData *mystats;
 
 	/* If the attstattarget column is negative, use the default value */
@@ -2070,42 +2898,33 @@ std_typanalyze(VacAttrStats *stats)
 	if (attr->attstattarget < 0)
 		attr->attstattarget = default_statistics_target;
 
-	/* If column has no "=" operator, we can't do much of anything */
-	func_operator = equality_oper(attr->atttypid, true);
-	if (func_operator != NULL)
-	{
-		eqopr = oprid(func_operator);
-		eqfunc = oprfuncid(func_operator);
-		ReleaseSysCache(func_operator);
-	}
-	if (!OidIsValid(eqfunc))
-	{
-		/* Can't do much but the minimal stuff */
-		stats->compute_stats = compute_very_minimal_stats;
-		/* Might as well use the same minrows as below */
-		stats->minrows = 300 * attr->attstattarget;
-		return true;
-	}
-
-	/* Is there a "<" operator with suitable semantics? */
-	func_operator = ordering_oper(attr->atttypid, true);
-	if (func_operator != NULL)
-	{
-		ltopr = oprid(func_operator);
-		ReleaseSysCache(func_operator);
-	}
+	/* Look for default "<" and "=" operators for column's type */
+	get_sort_group_operators(stats->attrtypid,
+							 false, false, false,
+							 &ltopr, &eqopr, NULL,
+							 NULL);
 
 	/* Save the operator info for compute_stats routines */
 	mystats = (StdAnalyzeData *) palloc(sizeof(StdAnalyzeData));
 	mystats->eqopr = eqopr;
-	mystats->eqfunc = eqfunc;
+	mystats->eqfunc = OidIsValid(eqopr) ? get_opcode(eqopr) : InvalidOid;
 	mystats->ltopr = ltopr;
 	stats->extra_data = mystats;
+	stats->merge_stats = false;
 
 	/*
 	 * Determine which standard statistics algorithm to use
 	 */
-	if (OidIsValid(ltopr))
+	List *va_cols = list_make1_int(stats->attr->attnum);
+	if (rel_part_status(attr->attrelid) == PART_STATUS_ROOT &&
+		leaf_parts_analyzed(stats->attr->attrelid, InvalidOid, va_cols, stats->elevel) &&
+		op_hashjoinable(eqopr, stats->attrtypid))
+	{
+		stats->merge_stats = true;
+		stats->compute_stats = merge_leaf_stats;
+		stats->minrows = 300 * attr->attstattarget;
+	}
+	else if (OidIsValid(eqopr) && OidIsValid(ltopr))
 	{
 		/* Seems to be a scalar datatype */
 		stats->compute_stats = compute_scalar_stats;
@@ -2130,19 +2949,109 @@ std_typanalyze(VacAttrStats *stats)
 		 */
 		stats->minrows = 300 * attr->attstattarget;
 	}
-	else
+	else if (OidIsValid(eqopr))
 	{
-		/* Can't do much but the minimal stuff */
-		stats->compute_stats = compute_minimal_stats;
+		/* We can still recognize distinct values */
+		stats->compute_stats = compute_distinct_stats;
 		/* Might as well use the same minrows as above */
 		stats->minrows = 300 * attr->attstattarget;
 	}
-
+	else
+	{
+		/* Can't do much but the trivial stuff */
+		stats->compute_stats = compute_trivial_stats;
+		/* Might as well use the same minrows as above */
+		stats->minrows = 300 * attr->attstattarget;
+	}
+	list_free(va_cols);
 	return true;
 }
 
+
 /*
- *	compute_minimal_stats() -- compute minimal column statistics
+ *	compute_trivial_stats() -- compute very basic column statistics
+ *
+ *	We use this when we cannot find a hash "=" operator for the datatype.
+ *
+ *	We determine the fraction of non-null rows and the average datum width.
+ */
+static void
+compute_trivial_stats(VacAttrStatsP stats,
+					  AnalyzeAttrFetchFunc fetchfunc,
+					  int samplerows,
+					  double totalrows)
+{
+	int			i;
+	int			null_cnt = 0;
+	int			nonnull_cnt = 0;
+	double		total_width = 0;
+	bool		is_varlena = (!stats->attrtype->typbyval &&
+							  stats->attrtype->typlen == -1);
+	bool		is_varwidth = (!stats->attrtype->typbyval &&
+							   stats->attrtype->typlen < 0);
+
+	for (i = 0; i < samplerows; i++)
+	{
+		Datum		value;
+		bool		isnull;
+
+		vacuum_delay_point();
+
+		value = fetchfunc(stats, i, &isnull);
+
+		/* Check for null/nonnull */
+		if (isnull)
+		{
+			null_cnt++;
+			continue;
+		}
+		nonnull_cnt++;
+
+		/*
+		 * If it's a variable-width field, add up widths for average width
+		 * calculation.  Note that if the value is toasted, we use the toasted
+		 * width.  We don't bother with this calculation if it's a fixed-width
+		 * type.
+		 */
+		if (is_varlena)
+		{
+			total_width += VARSIZE_ANY(DatumGetPointer(value));
+		}
+		else if (is_varwidth)
+		{
+			/* must be cstring */
+			total_width += strlen(DatumGetCString(value)) + 1;
+		}
+	}
+
+	/* We can only compute average width if we found some non-null values. */
+	if (nonnull_cnt > 0)
+	{
+		stats->stats_valid = true;
+		/* Do the simple null-frac and width stats */
+		stats->stanullfrac = (double) null_cnt / (double) samplerows;
+		if (is_varwidth)
+			stats->stawidth = total_width / (double) nonnull_cnt;
+		else
+			stats->stawidth = stats->attrtype->typlen;
+		stats->stadistinct = 0.0;		/* "unknown" */
+	}
+	else if (null_cnt > 0)
+	{
+		/* We found only nulls; assume the column is entirely null */
+		stats->stats_valid = true;
+		stats->stanullfrac = 1.0;
+		if (is_varwidth)
+			stats->stawidth = 0;	/* "unknown" */
+		else
+			stats->stawidth = stats->attrtype->typlen;
+		stats->stadistinct = 0.0;		/* "unknown" */
+	}
+}
+
+
+/*
+ *	compute_distinct_stats() -- compute column statistics including ndistinct
  *
  *	We use this when we can find only an "=" operator for the datatype.
  *
@@ -2157,20 +3066,20 @@ std_typanalyze(VacAttrStats *stats)
  *	depend mainly on the length of the list we are willing to keep.
  */
 static void
-compute_minimal_stats(VacAttrStatsP stats,
-					  AnalyzeAttrFetchFunc fetchfunc,
-					  int samplerows,
-					  double totalrows)
+compute_distinct_stats(VacAttrStatsP stats,
+					   AnalyzeAttrFetchFunc fetchfunc,
+					   int samplerows,
+					   double totalrows)
 {
 	int			i;
 	int			null_cnt = 0;
 	int			nonnull_cnt = 0;
 	int			toowide_cnt = 0;
 	double		total_width = 0;
-	bool		is_varlena = (!stats->attr->attbyval &&
-							  stats->attr->attlen == -1);
-	bool		is_varwidth = (!stats->attr->attbyval &&
-							   stats->attr->attlen < 0);
+	bool		is_varlena = (!stats->attrtype->typbyval &&
+							  stats->attrtype->typlen == -1);
+	bool		is_varwidth = (!stats->attrtype->typbyval &&
+							   stats->attrtype->typlen < 0);
 	FmgrInfo	f_cmpeq;
 	typedef struct
 	{
@@ -2194,6 +3103,12 @@ compute_minimal_stats(VacAttrStatsP stats,
 
 	fmgr_info(mystats->eqfunc, &f_cmpeq);
 
+	stats->stahll = (bytea *)gp_hyperloglog_init_def();
+
+	ereport(DEBUG2,
+			(errmsg("Computing Minimal Stats for column %s",
+					get_attname(stats->attr->attrelid, stats->attr->attnum))));
+
 	for (i = 0; i < samplerows; i++)
 	{
 		Datum		value;
@@ -2214,6 +3129,8 @@ compute_minimal_stats(VacAttrStatsP stats,
 		}
 		nonnull_cnt++;
 
+		stats->stahll = (bytea *)gp_hyperloglog_add_item((GpHLLCounter) stats->stahll, value, stats->attr->attlen, stats->attr->attbyval, stats->attr->attalign);
+
 		/*
 		 * If it's a variable-width field, add up widths for average width
 		 * calculation.  Note that if the value is toasted, we use the toasted
@@ -2227,7 +3144,7 @@ compute_minimal_stats(VacAttrStatsP stats,
 			/*
 			 * If the value is toasted, we want to detoast it just once to
 			 * avoid repeated detoastings and resultant excess memory usage
-			 * during the comparisons.	Also, check to see if the value is
+			 * during the comparisons.  Also, check to see if the value is
 			 * excessively wide, and if so don't detoast at all --- just
 			 * ignore the value.
 			 */
@@ -2251,7 +3168,10 @@ compute_minimal_stats(VacAttrStatsP stats,
 		firstcount1 = track_cnt;
 		for (j = 0; j < track_cnt; j++)
 		{
-			if (DatumGetBool(FunctionCall2(&f_cmpeq, value, track[j].value)))
+			/* We always use the default collation for statistics */
+			if (DatumGetBool(FunctionCall2Coll(&f_cmpeq,
+											   DEFAULT_COLLATION_OID,
+											   value, track[j].value)))
 			{
 				match = true;
 				break;
@@ -2313,10 +3233,17 @@ compute_minimal_stats(VacAttrStatsP stats,
 			summultiple += track[nmultiple].count;
 		}
 
+		((GpHLLCounter) (stats->stahll))->nmultiples = nmultiple;
+		((GpHLLCounter) (stats->stahll))->ndistinct = track_cnt;
+		((GpHLLCounter) (stats->stahll))->samplerows = samplerows;
+
 		if (nmultiple == 0)
 		{
-			/* If we found no repeated values, assume it's a unique column */
-			stats->stadistinct = -1.0;
+			/*
+			 * If we found no repeated non-null values, assume it's a unique
+			 * column; but be sure to discount for any nulls we found.
+			 */
+			stats->stadistinct = -1.0 * (1.0 - stats->stanullfrac);
 		}
 		else if (track_cnt < track_max && toowide_cnt == 0 &&
 				 nmultiple == track_cnt)
@@ -2324,7 +3251,11 @@ compute_minimal_stats(VacAttrStatsP stats,
 			/*
 			 * Our track list includes every value in the sample, and every
 			 * value appeared more than once.  Assume the column has just
-			 * these values.
+			 * these values.  (This case is meant to address columns with
+			 * small, fixed sets of possible values, such as boolean or enum
+			 * columns.  If there are any values that appear just once in the
+			 * sample, including too-wide values, we should assume that that's
+			 * not what we're dealing with.)
 			 */
 			stats->stadistinct = track_cnt;
 		}
@@ -2341,30 +3272,37 @@ compute_minimal_stats(VacAttrStatsP stats,
 			 * recommend are considerably more complex, and are numerically
 			 * very unstable when n is much smaller than N.
 			 *
+			 * In this calculation, we consider only non-nulls.  We used to
+			 * include rows with null values in the n and N counts, but that
+			 * leads to inaccurate answers in columns with many nulls, and
+			 * it's intuitively bogus anyway considering the desired result is
+			 * the number of distinct non-null values.
+			 *
 			 * We assume (not very reliably!) that all the multiply-occurring
 			 * values are reflected in the final track[] list, and the other
 			 * nonnull values all appeared but once.  (XXX this usually
-			 * results in a drastic overestimate of ndistinct.	Can we do
+			 * results in a drastic overestimate of ndistinct.  Can we do
 			 * any better?)
 			 *----------
 			 */
 			int			f1 = nonnull_cnt - summultiple;
 			int			d = f1 + nmultiple;
-			double		numer,
-						denom,
-						stadistinct;
+			double		n = samplerows - null_cnt;
+			double		N = totalrows * (1.0 - stats->stanullfrac);
+			double		stadistinct;
 
-			numer = (double) samplerows *(double) d;
+			/* N == 0 shouldn't happen, but just in case ... */
+			if (N > 0)
+				stadistinct = (n * d) / ((n - f1) + f1 * n / N);
+			else
+				stadistinct = 0;
 
-			denom = (double) (samplerows - f1) +
-				(double) f1 *(double) samplerows / totalrows;
-
-			stadistinct = numer / denom;
 			/* Clamp to sane range in case of roundoff error */
-			if (stadistinct < (double) d)
-				stadistinct = (double) d;
-			if (stadistinct > totalrows)
-				stadistinct = totalrows;
+			if (stadistinct < d)
+				stadistinct = d;
+			if (stadistinct > N)
+				stadistinct = N;
+			/* And round to integer */
 			stats->stadistinct = floor(stadistinct + 0.5);
 		}
 
@@ -2381,10 +3319,20 @@ compute_minimal_stats(VacAttrStatsP stats,
 		 * Decide how many values are worth storing as most-common values. If
 		 * we are able to generate a complete MCV list (all the values in the
 		 * sample will fit, and we think these are all the ones in the table),
-		 * then do so.	Otherwise, store only those values that are
+		 * then do so.  Otherwise, store only those values that are
 		 * significantly more common than the (estimated) average. We set the
 		 * threshold rather arbitrarily at 25% more than average, with at
 		 * least 2 instances in the sample.
+		 *
+		 * Note: the first of these cases is meant to address columns with
+		 * small, fixed sets of possible values, such as boolean or enum
+		 * columns.  If we can *completely* represent the column population by
+		 * an MCV list that will fit into the stats target, then we should do
+		 * so and thus provide the planner with complete information.  But if
+		 * the MCV list is not complete, it's generally worth being more
+		 * selective, and not just filling it all the way up to the stats
+		 * target.  So for an incomplete list, we try to take only MCVs that
+		 * are significantly more common than average.
 		 */
 		if (track_cnt < track_max && toowide_cnt == 0 &&
 			stats->stadistinct > 0 &&
@@ -2395,14 +3343,15 @@ compute_minimal_stats(VacAttrStatsP stats,
 		}
 		else
 		{
-			double		ndistinct = stats->stadistinct;
+			double		ndistinct_table = stats->stadistinct;
 			double		avgcount,
 						mincount;
 
-			if (ndistinct < 0)
-				ndistinct = -ndistinct * totalrows;
-			/* estimate # of occurrences in sample of a typical value */
-			avgcount = (double) samplerows / ndistinct;
+			/* Re-extract estimate of # distinct nonnull values in table */
+			if (ndistinct_table < 0)
+				ndistinct_table = -ndistinct_table * totalrows;
+			/* estimate # occurrences in sample of a typical nonnull value */
+			avgcount = (double) nonnull_cnt / ndistinct_table;
 			/* set minimum threshold count to store a value */
 			mincount = avgcount * 1.25;
 			if (mincount < 2)
@@ -2433,8 +3382,8 @@ compute_minimal_stats(VacAttrStatsP stats,
 			for (i = 0; i < num_mcv; i++)
 			{
 				mcv_values[i] = datumCopy(track[i].value,
-										  stats->attr->attbyval,
-										  stats->attr->attlen);
+										  stats->attrtype->typbyval,
+										  stats->attrtype->typlen);
 				mcv_freqs[i] = (double) track[i].count / (double) samplerows;
 			}
 			MemoryContextSwitchTo(old_context);
@@ -2445,95 +3394,12 @@ compute_minimal_stats(VacAttrStatsP stats,
 			stats->numnumbers[0] = num_mcv;
 			stats->stavalues[0] = mcv_values;
 			stats->numvalues[0] = num_mcv;
+
+			/*
+			 * Accept the defaults for stats->statypid and others. They have
+			 * been set before we were called (see vacuum.h)
+			 */
 		}
-	}
-	else if (null_cnt > 0)
-	{
-		/* We found only nulls; assume the column is entirely null */
-		stats->stats_valid = true;
-		stats->stanullfrac = 1.0;
-		if (is_varwidth)
-			stats->stawidth = 0;	/* "unknown" */
-		else
-			stats->stawidth = stats->attrtype->typlen;
-		stats->stadistinct = 0.0;		/* "unknown" */
-	}
-
-	/* We don't need to bother cleaning up any of our temporary palloc's */
-}
-
-
-/*
- *	compute_very_minimal_stats() -- compute minimal column statistics
- *
- *	We use this when we cannot even find an "=" operator for the datatype.
- *	We determine the fraction of non-null rows and the average width. There
- *	isn't much else we can do. These stats are not too useful, but ORCA
- *	gives warnings if a column doesn't have a pg_statistics row, so any
- *	statistics at all is better than none.
- */
-static void
-compute_very_minimal_stats(VacAttrStatsP stats,
-						   AnalyzeAttrFetchFunc fetchfunc,
-						   int samplerows,
-						   double totalrows)
-{
-	int			i;
-	int			null_cnt = 0;
-	int			nonnull_cnt = 0;
-	double		total_width = 0;
-	bool		is_varlena = (!stats->attr->attbyval &&
-							  stats->attr->attlen == -1);
-	bool		is_varwidth = (!stats->attr->attbyval &&
-							   stats->attr->attlen < 0);
-
-	for (i = 0; i < samplerows; i++)
-	{
-		Datum		value;
-		bool		isnull;
-
-		vacuum_delay_point();
-
-		value = fetchfunc(stats, i, &isnull);
-
-		/* Check for null/nonnull */
-		if (isnull)
-		{
-			null_cnt++;
-			continue;
-		}
-		nonnull_cnt++;
-
-		/*
-		 * If it's a variable-width field, add up widths for average width
-		 * calculation.  Note that if the value is toasted, we use the toasted
-		 * width.  We don't bother with this calculation if it's a fixed-width
-		 * type.
-		 */
-		if (is_varlena)
-		{
-			total_width += VARSIZE_ANY(DatumGetPointer(value));
-		}
-		else if (is_varwidth)
-		{
-			/* must be cstring */
-			total_width += strlen(DatumGetCString(value)) + 1;
-		}
-	}
-
-	/* We can only compute real stats if we found some non-null values. */
-	if (nonnull_cnt > 0)
-	{
-		stats->stats_valid = true;
-		/* Do the simple null-frac and width stats */
-		stats->stanullfrac = (double) null_cnt / (double) samplerows;
-		if (is_varwidth)
-			stats->stawidth = total_width / (double) nonnull_cnt;
-		else
-			stats->stawidth = stats->attrtype->typlen;
-
-		/* Assume it's a unique column */
-		stats->stadistinct = -1.0;
 	}
 	else if (null_cnt > 0)
 	{
@@ -2574,14 +3440,12 @@ compute_scalar_stats(VacAttrStatsP stats,
 	int			nonnull_cnt = 0;
 	int			toowide_cnt = 0;
 	double		total_width = 0;
-	bool		is_varlena = (!stats->attr->attbyval &&
-							  stats->attr->attlen == -1);
-	bool		is_varwidth = (!stats->attr->attbyval &&
-							   stats->attr->attlen < 0);
+	bool		is_varlena = (!stats->attrtype->typbyval &&
+							  stats->attrtype->typlen == -1);
+	bool		is_varwidth = (!stats->attrtype->typbyval &&
+							   stats->attrtype->typlen < 0);
 	double		corr_xysum;
-	Oid			cmpFn;
-	int			cmpFlags;
-	FmgrInfo	f_cmpfn;
+	SortSupportData ssup;
 	ScalarItem *values;
 	int			values_cnt = 0;
 	int		   *tupnoLink;
@@ -2595,8 +3459,27 @@ compute_scalar_stats(VacAttrStatsP stats,
 	tupnoLink = (int *) palloc(samplerows * sizeof(int));
 	track = (ScalarMCVItem *) palloc(num_mcv * sizeof(ScalarMCVItem));
 
-	SelectSortFunction(mystats->ltopr, false, &cmpFn, &cmpFlags);
-	fmgr_info(cmpFn, &f_cmpfn);
+	memset(&ssup, 0, sizeof(ssup));
+	ssup.ssup_cxt = CurrentMemoryContext;
+	/* We always use the default collation for statistics */
+	ssup.ssup_collation = DEFAULT_COLLATION_OID;
+	ssup.ssup_nulls_first = false;
+
+	/*
+	 * For now, don't perform abbreviated key conversion, because full values
+	 * are required for MCV slot generation.  Supporting that optimization
+	 * would necessitate teaching compare_scalars() to call a tie-breaker.
+	 */
+	ssup.abbreviate = false;
+
+	PrepareSortSupportFromOrderingOp(mystats->ltopr, &ssup);
+
+	/* Initialize HLL counter to be stored in stats */
+	stats->stahll = (bytea *)gp_hyperloglog_init_def();
+
+	ereport(DEBUG2,
+			(errmsg("Computing Scalar Stats for column %s",
+					get_attname(stats->attr->attrelid, stats->attr->attnum))));
 
 	/* Initial scan to find sortable values */
 	for (i = 0; i < samplerows; i++)
@@ -2616,6 +3499,8 @@ compute_scalar_stats(VacAttrStatsP stats,
 		}
 		nonnull_cnt++;
 
+		stats->stahll = (bytea *)gp_hyperloglog_add_item((GpHLLCounter) stats->stahll, value, stats->attr->attlen, stats->attr->attbyval, stats->attr->attalign);
+
 		/*
 		 * If it's a variable-width field, add up widths for average width
 		 * calculation.  Note that if the value is toasted, we use the toasted
@@ -2629,7 +3514,7 @@ compute_scalar_stats(VacAttrStatsP stats,
 			/*
 			 * If the value is toasted, we want to detoast it just once to
 			 * avoid repeated detoastings and resultant excess memory usage
-			 * during the comparisons.	Also, check to see if the value is
+			 * during the comparisons.  Also, check to see if the value is
 			 * excessively wide, and if so don't detoast at all --- just
 			 * ignore the value.
 			 */
@@ -2664,8 +3549,7 @@ compute_scalar_stats(VacAttrStatsP stats,
 		CompareScalarsContext cxt;
 
 		/* Sort the collected values */
-		cxt.cmpFn = &f_cmpfn;
-		cxt.cmpFlags = cmpFlags;
+		cxt.ssup = &ssup;
 		cxt.tupnoLink = tupnoLink;
 		qsort_arg((void *) values, values_cnt, sizeof(ScalarItem),
 				  compare_scalars, (void *) &cxt);
@@ -2675,7 +3559,7 @@ compute_scalar_stats(VacAttrStatsP stats,
 		 * accumulate ordering-correlation statistics.
 		 *
 		 * To determine which are most common, we first have to count the
-		 * number of duplicates of each value.	The duplicates are adjacent in
+		 * number of duplicates of each value.  The duplicates are adjacent in
 		 * the sorted list, so a brute-force approach is to compare successive
 		 * datum values until we find two that are not equal. However, that
 		 * requires N-1 invocations of the datum comparison routine, which are
@@ -2684,7 +3568,7 @@ compute_scalar_stats(VacAttrStatsP stats,
 		 * that are adjacent in the sorted order; otherwise it could not know
 		 * that it's ordered the pair correctly.) We exploit this by having
 		 * compare_scalars remember the highest tupno index that each
-		 * ScalarItem has been found equal to.	At the end of the sort, a
+		 * ScalarItem has been found equal to.  At the end of the sort, a
 		 * ScalarItem's tupnoLink will still point to itself if and only if it
 		 * is the last item of its group of duplicates (since the group will
 		 * be ordered by tupno).
@@ -2742,16 +3626,30 @@ compute_scalar_stats(VacAttrStatsP stats,
 		else
 			stats->stawidth = stats->attrtype->typlen;
 
+		// interpolate NDV calculation based on the hll distinct count
+		// for each column in leaf partitions which will be used later
+		// to merge root stats
+		((GpHLLCounter) (stats->stahll))->nmultiples = nmultiple;
+		((GpHLLCounter) (stats->stahll))->ndistinct = ndistinct;
+		((GpHLLCounter) (stats->stahll))->samplerows = samplerows;
+
 		if (nmultiple == 0)
 		{
-			/* If we found no repeated values, assume it's a unique column */
-			stats->stadistinct = -1.0;
+			/*
+			 * If we found no repeated non-null values, assume it's a unique
+			 * column; but be sure to discount for any nulls we found.
+			 */
+			stats->stadistinct = -1.0 * (1.0 - stats->stanullfrac);
 		}
 		else if (toowide_cnt == 0 && nmultiple == ndistinct)
 		{
 			/*
 			 * Every value in the sample appeared more than once.  Assume the
-			 * column has just these values.
+			 * column has just these values.  (This case is meant to address
+			 * columns with small, fixed sets of possible values, such as
+			 * boolean or enum columns.  If there are any values that appear
+			 * just once in the sample, including too-wide values, we should
+			 * assume that that's not what we're dealing with.)
 			 */
 			stats->stadistinct = ndistinct;
 		}
@@ -2768,29 +3666,52 @@ compute_scalar_stats(VacAttrStatsP stats,
 			 * recommend are considerably more complex, and are numerically
 			 * very unstable when n is much smaller than N.
 			 *
+			 * In this calculation, we consider only non-nulls.  We used to
+			 * include rows with null values in the n and N counts, but that
+			 * leads to inaccurate answers in columns with many nulls, and
+			 * it's intuitively bogus anyway considering the desired result is
+			 * the number of distinct non-null values.
+			 *
 			 * Overwidth values are assumed to have been distinct.
 			 *----------
 			 */
 			int			f1 = ndistinct - nmultiple + toowide_cnt;
 			int			d = f1 + nmultiple;
-			double		numer,
-						denom,
-						stadistinct;
+			double		n = samplerows - null_cnt;
+			double		N = totalrows * (1.0 - stats->stanullfrac);
+			double		stadistinct;
 
-			numer = (double) samplerows *(double) d;
+			/* N == 0 shouldn't happen, but just in case ... */
+			if (N > 0)
+				stadistinct = (n * d) / ((n - f1) + f1 * n / N);
+			else
+				stadistinct = 0;
 
-			denom = (double) (samplerows - f1) +
-				(double) f1 *(double) samplerows / totalrows;
-
-			stadistinct = numer / denom;
 			/* Clamp to sane range in case of roundoff error */
-			if (stadistinct < (double) d)
-				stadistinct = (double) d;
-			if (stadistinct > totalrows)
-				stadistinct = totalrows;
+			if (stadistinct < d)
+				stadistinct = d;
+			if (stadistinct > N)
+				stadistinct = N;
+			/* And round to integer */
 			stats->stadistinct = floor(stadistinct + 0.5);
 		}
 
+		/*
+		 * For FULLSCAN HLL, get ndistinct from the GpHLLCounter
+		 * instead of computing it
+		 */
+		if (stats->stahll_full != NULL)
+		{
+			GpHLLCounter hLLFull = (GpHLLCounter) DatumGetByteaP(stats->stahll_full);
+			GpHLLCounter hllFull_copy = gp_hll_copy(hLLFull);
+			stats->stadistinct = round(gp_hyperloglog_estimate(hllFull_copy));
+			pfree(hllFull_copy);
+			if ((fabs(totalrows - stats->stadistinct) / (float) totalrows) < 0.05)
+			{
+				stats->stadistinct = -1;
+			}
+
+		}
 		/*
 		 * If we estimated the number of distinct values at more than 10% of
 		 * the total row count (a very arbitrary limit), then assume that
@@ -2804,13 +3725,25 @@ compute_scalar_stats(VacAttrStatsP stats,
 		 * Decide how many values are worth storing as most-common values. If
 		 * we are able to generate a complete MCV list (all the values in the
 		 * sample will fit, and we think these are all the ones in the table),
-		 * then do so.	Otherwise, store only those values that are
+		 * then do so.  Otherwise, store only those values that are
 		 * significantly more common than the (estimated) average. We set the
 		 * threshold rather arbitrarily at 25% more than average, with at
 		 * least 2 instances in the sample.  Also, we won't suppress values
 		 * that have a frequency of at least 1/K where K is the intended
 		 * number of histogram bins; such values might otherwise cause us to
-		 * emit duplicate histogram bin boundaries.
+		 * emit duplicate histogram bin boundaries.  (We might end up with
+		 * duplicate histogram entries anyway, if the distribution is skewed;
+		 * but we prefer to treat such values as MCVs if at all possible.)
+		 *
+		 * Note: the first of these cases is meant to address columns with
+		 * small, fixed sets of possible values, such as boolean or enum
+		 * columns.  If we can *completely* represent the column population by
+		 * an MCV list that will fit into the stats target, then we should do
+		 * so and thus provide the planner with complete information.  But if
+		 * the MCV list is not complete, it's generally worth being more
+		 * selective, and not just filling it all the way up to the stats
+		 * target.  So for an incomplete list, we try to take only MCVs that
+		 * are significantly more common than average.
 		 */
 		if (track_cnt == ndistinct && toowide_cnt == 0 &&
 			stats->stadistinct > 0 &&
@@ -2821,21 +3754,22 @@ compute_scalar_stats(VacAttrStatsP stats,
 		}
 		else
 		{
-			double		ndistinct = stats->stadistinct;
+			double		ndistinct_table = stats->stadistinct;
 			double		avgcount,
 						mincount,
 						maxmincount;
 
-			if (ndistinct < 0)
-				ndistinct = -ndistinct * totalrows;
-			/* estimate # of occurrences in sample of a typical value */
-			avgcount = (double) samplerows / ndistinct;
+			/* Re-extract estimate of # distinct nonnull values in table */
+			if (ndistinct_table < 0)
+				ndistinct_table = -ndistinct_table * totalrows;
+			/* estimate # occurrences in sample of a typical nonnull value */
+			avgcount = (double) nonnull_cnt / ndistinct_table;
 			/* set minimum threshold count to store a value */
 			mincount = avgcount * 1.25;
 			if (mincount < 2)
 				mincount = 2;
 			/* don't let threshold exceed 1/K, however */
-			maxmincount = (double) samplerows / (double) num_bins;
+			maxmincount = (double) values_cnt / (double) num_bins;
 			if (mincount > maxmincount)
 				mincount = maxmincount;
 			if (num_mcv > track_cnt)
@@ -2864,8 +3798,8 @@ compute_scalar_stats(VacAttrStatsP stats,
 			for (i = 0; i < num_mcv; i++)
 			{
 				mcv_values[i] = datumCopy(values[track[i].first].value,
-										  stats->attr->attbyval,
-										  stats->attr->attlen);
+										  stats->attrtype->typbyval,
+										  stats->attrtype->typlen);
 				mcv_freqs[i] = (double) track[i].count / (double) samplerows;
 			}
 			MemoryContextSwitchTo(old_context);
@@ -2876,6 +3810,11 @@ compute_scalar_stats(VacAttrStatsP stats,
 			stats->numnumbers[slot_idx] = num_mcv;
 			stats->stavalues[slot_idx] = mcv_values;
 			stats->numvalues[slot_idx] = num_mcv;
+
+			/*
+			 * Accept the defaults for stats->statypid and others. They have
+			 * been set before we were called (see vacuum.h)
+			 */
 			slot_idx++;
 		}
 
@@ -2892,6 +3831,10 @@ compute_scalar_stats(VacAttrStatsP stats,
 			MemoryContext old_context;
 			Datum	   *hist_values;
 			int			nvals;
+			int			pos,
+						posfrac,
+						delta,
+						deltafrac;
 
 			/* Sort the MCV items into position order to speed next loop */
 			qsort((void *) track, num_mcv,
@@ -2945,31 +3888,51 @@ compute_scalar_stats(VacAttrStatsP stats,
 			/* Must copy the target values into anl_context */
 			old_context = MemoryContextSwitchTo(stats->anl_context);
 			hist_values = (Datum *) palloc(num_hist * sizeof(Datum));
+
+			/*
+			 * The object of this loop is to copy the first and last values[]
+			 * entries along with evenly-spaced values in between.  So the
+			 * i'th value is values[(i * (nvals - 1)) / (num_hist - 1)].  But
+			 * computing that subscript directly risks integer overflow when
+			 * the stats target is more than a couple thousand.  Instead we
+			 * add (nvals - 1) / (num_hist - 1) to pos at each step, tracking
+			 * the integral and fractional parts of the sum separately.
+			 */
+			delta = (nvals - 1) / (num_hist - 1);
+			deltafrac = (nvals - 1) % (num_hist - 1);
+			pos = posfrac = 0;
+
 			for (i = 0; i < num_hist; i++)
 			{
-				int			pos;
-
-				pos = (i * (nvals - 1)) / (num_hist - 1);
 				hist_values[i] = datumCopy(values[pos].value,
-										   stats->attr->attbyval,
-										   stats->attr->attlen);
+										   stats->attrtype->typbyval,
+										   stats->attrtype->typlen);
+				pos += delta;
+				posfrac += deltafrac;
+				if (posfrac >= (num_hist - 1))
+				{
+					/* fractional part exceeds 1, carry to integer part */
+					pos++;
+					posfrac -= (num_hist - 1);
+				}
 			}
+
 			MemoryContextSwitchTo(old_context);
 
 			stats->stakind[slot_idx] = STATISTIC_KIND_HISTOGRAM;
 			stats->staop[slot_idx] = mystats->ltopr;
 			stats->stavalues[slot_idx] = hist_values;
 			stats->numvalues[slot_idx] = num_hist;
+
+			/*
+			 * Accept the defaults for stats->statypid and others. They have
+			 * been set before we were called (see vacuum.h)
+			 */
 			slot_idx++;
 		}
 
 		/* Generate a correlation entry if there are multiple values */
-		/*
-		 * GPDB: Don't calculate correlation for AO-tables, however.
-		 * The rows are not necessarily in the order that our sampling
-		 * query returned them, for an append-only table.
-		 */
-		if (values_cnt > 1 && stats->relstorage == RELSTORAGE_HEAP)
+		if (values_cnt > 1)
 		{
 			MemoryContext old_context;
 			float4	   *corrs;
@@ -3006,7 +3969,21 @@ compute_scalar_stats(VacAttrStatsP stats,
 			slot_idx++;
 		}
 	}
-	else if (nonnull_cnt == 0 && null_cnt > 0)
+	else if (nonnull_cnt > 0)
+	{
+		/* We found some non-null values, but they were all too wide */
+		Assert(nonnull_cnt == toowide_cnt);
+		stats->stats_valid = true;
+		/* Do the simple null-frac and width stats */
+		stats->stanullfrac = (double) null_cnt / (double) samplerows;
+		if (is_varwidth)
+			stats->stawidth = total_width / (double) nonnull_cnt;
+		else
+			stats->stawidth = stats->attrtype->typlen;
+		/* Assume all too-wide values are distinct, so it's a unique column */
+		stats->stadistinct = -1.0 * (1.0 - stats->stanullfrac);
+	}
+	else if (null_cnt > 0)
 	{
 		/* We found only nulls; assume the column is entirely null */
 		stats->stats_valid = true;
@@ -3019,10 +3996,16 @@ compute_scalar_stats(VacAttrStatsP stats,
 	}
 	else
 	{
-		/* ORCA complains if a column has no statistics whatsoever,
-		 * so store something */
+		/*
+		 * ORCA complains if a column has no statistics whatsoever, so store
+		 * either the best we can figure out given what we have, or zero in
+		 * case we don't have enough.
+		 */
 		stats->stats_valid = true;
-		stats->stanullfrac = (double) null_cnt / (double) samplerows;
+		if (samplerows)
+			stats->stanullfrac = (double) null_cnt / (double) samplerows;
+		else
+			stats->stanullfrac = 0.0;
 		if (is_varwidth)
 			stats->stawidth = 0;	/* "unknown" */
 		else
@@ -3034,10 +4017,464 @@ compute_scalar_stats(VacAttrStatsP stats,
 }
 
 /*
+ *	merge_leaf_stats() -- merge leaf stats for the root
+ *
+ *	We use this when we can find "=" and "<" operators for the datatype.
+ *
+ *	This is only used when the relation is the root partition and merges
+ *	the statistics available in pg_statistic for the leaf partitions.
+ *
+ *	We determine the fraction of non-null rows, the average width, the
+ *	most common values, the (estimated) number of distinct values, the
+ *	distribution histogram.
+ */
+static void
+merge_leaf_stats(VacAttrStatsP stats,
+				 AnalyzeAttrFetchFunc fetchfunc,
+				 int samplerows,
+				 double totalrows)
+{
+	PartitionNode *pn =
+		get_parts(stats->attr->attrelid, 0 /*level*/, 0 /*parent*/,
+				  false /* inctemplate */, true /*includesubparts*/);
+	Assert(pn);
+	ereport(DEBUG2,
+			(errmsg("Merging leaf partition stats to calculate root partition stats : column %s",
+					get_attname(stats->attr->attrelid, stats->attr->attnum))));
+
+	List *oid_list = all_leaf_partition_relids(pn); /* all leaves */
+	StdAnalyzeData *mystats = (StdAnalyzeData *) stats->extra_data;
+	int numPartitions = list_length(oid_list);
+
+	ListCell *lc;
+	float *relTuples = (float *) palloc0(sizeof(float) * numPartitions);
+	float *nDistincts = (float *) palloc0(sizeof(float) * numPartitions);
+	float *nMultiples = (float *) palloc0(sizeof(float) * numPartitions);
+	int relNum = 0;
+	float totalTuples = 0;
+	float nmultiple = 0; // number of values that appeared more than once
+	bool allDistinct = false;
+	int slot_idx = 0;
+	int sampleCount = 0;
+	Oid ltopr = mystats->ltopr;
+	Oid eqopr = mystats->eqopr;
+
+	foreach (lc, oid_list)
+	{
+		Oid pkrelid = lfirst_oid(lc);
+
+		relTuples[relNum] = get_rel_reltuples(pkrelid);
+		totalTuples = totalTuples + relTuples[relNum];
+		relNum++;
+	}
+
+	if (totalTuples == 0.0)
+		return;
+
+	MemoryContext old_context;
+
+	HeapTuple *heaptupleStats =
+		(HeapTuple *) palloc(numPartitions * sizeof(HeapTuple *));
+
+	// NDV calculations
+	float4 colAvgWidth = 0;
+	float4 nullCount = 0;
+	GpHLLCounter *hllcounters = (GpHLLCounter *) palloc0(numPartitions * sizeof(GpHLLCounter));
+	GpHLLCounter *hllcounters_fullscan = (GpHLLCounter *) palloc0(numPartitions * sizeof(GpHLLCounter));
+	GpHLLCounter *hllcounters_copy = (GpHLLCounter *) palloc0(numPartitions * sizeof(GpHLLCounter));
+
+	GpHLLCounter finalHLL = NULL;
+	GpHLLCounter finalHLLFull = NULL;
+	int i = 0;
+	double ndistinct = 0.0;
+	int fullhll_count = 0;
+	int samplehll_count = 0;
+	int totalhll_count = 0;
+	foreach (lc, oid_list)
+	{
+		Oid relid = lfirst_oid(lc);
+		colAvgWidth =
+			colAvgWidth +
+			get_attavgwidth(relid, stats->attr->attnum) * relTuples[i];
+		nullCount = nullCount +
+					get_attnullfrac(relid, stats->attr->attnum) * relTuples[i];
+
+		const char *attname = get_relid_attribute_name(stats->attr->attrelid, stats->attr->attnum);
+		AttrNumber child_attno = get_attnum(relid, attname);
+
+		heaptupleStats[i] = get_att_stats(relid, child_attno);
+
+		// if there is no colstats, we can skip this partition's stats
+		if (!HeapTupleIsValid(heaptupleStats[i]))
+		{
+			i++;
+			continue;
+		}
+
+		AttStatsSlot hllSlot;
+
+		get_attstatsslot(&hllSlot, heaptupleStats[i], STATISTIC_KIND_FULLHLL,
+						 InvalidOid, ATTSTATSSLOT_VALUES);
+
+		if (hllSlot.nvalues > 0)
+		{
+			hllcounters_fullscan[i] = (GpHLLCounter) DatumGetByteaP(hllSlot.values[0]);
+			GpHLLCounter finalHLLFull_intermediate = finalHLLFull;
+			finalHLLFull = gp_hyperloglog_merge_counters(finalHLLFull_intermediate, hllcounters_fullscan[i]);
+			if (NULL != finalHLLFull_intermediate)
+			{
+				pfree(finalHLLFull_intermediate);
+			}
+			free_attstatsslot(&hllSlot);
+			fullhll_count++;
+			totalhll_count++;
+		}
+
+		get_attstatsslot(&hllSlot, heaptupleStats[i], STATISTIC_KIND_HLL,
+						 InvalidOid, ATTSTATSSLOT_VALUES);
+
+		if (hllSlot.nvalues > 0)
+		{
+			hllcounters[i] = (GpHLLCounter) DatumGetByteaP(hllSlot.values[0]);
+			nDistincts[i] = (float) hllcounters[i]->ndistinct;
+			nMultiples[i] = (float) hllcounters[i]->nmultiples;
+			sampleCount += hllcounters[i]->samplerows;
+			hllcounters_copy[i] = gp_hll_copy(hllcounters[i]);
+			GpHLLCounter finalHLL_intermediate = finalHLL;
+			finalHLL = gp_hyperloglog_merge_counters(finalHLL_intermediate, hllcounters[i]);
+			if (NULL != finalHLL_intermediate)
+			{
+				pfree(finalHLL_intermediate);
+			}
+			free_attstatsslot(&hllSlot);
+			samplehll_count++;
+			totalhll_count++;
+		}
+		i++;
+	}
+
+	if (totalhll_count == 0)
+	{
+		/*
+		 * If neither HLL nor HLL Full scan stats are available,
+		 * continue merging stats based on the defaults, instead
+		 * of reading them from HLL counter.
+		 */
+	}
+	else
+	{
+		/*
+		 * If all partitions have HLL full scan counters,
+		 * merge root NDV's based on leaf partition HLL full scan
+		 * counter
+		 */
+		if (fullhll_count == totalhll_count)
+		{
+			ndistinct = gp_hyperloglog_estimate(finalHLLFull);
+			pfree(finalHLLFull);
+			/*
+			 * For fullscan the ndistinct is calculated based on the entire table scan
+			 * so if it's within the marginal error, we consider everything as distinct,
+			 * else the ndistinct value will provide the actual value and we do not ,
+			 * need to do any additional calculation for the nmultiple
+			 */
+			if ((fabs(totalTuples - ndistinct) / (float) totalTuples) < GP_HLL_ERROR_MARGIN)
+			{
+				allDistinct = true;
+			}
+			nmultiple = ndistinct;
+		}
+		/*
+		 * Else if all partitions have HLL counter based on sampled data,
+		 * merge root NDV's based on leaf partition HLL counter on
+		 * sampled data
+		 */
+		else if (finalHLL != NULL && samplehll_count == totalhll_count)
+		{
+			ndistinct = gp_hyperloglog_estimate(finalHLL);
+			pfree(finalHLL);
+			/*
+			 * For sampled HLL counter, the ndistinct calculated is based on the
+			 * sampled data. We consider everything distinct if the ndistinct
+			 * calculated is within marginal error, else we need to calculate
+			 * the number of distinct values for the table based on the estimator
+			 * proposed by Haas and Stokes, used later in the code.
+			 */
+			if ((fabs(sampleCount - ndistinct) / (float) sampleCount) < GP_HLL_ERROR_MARGIN)
+			{
+				allDistinct = true;
+			}
+			else
+			{
+				/*
+				 * The gp_hyperloglog_estimate() utility merges the number of
+				 * distnct values accurately, but for the NDV estimator used later
+				 * in the code, we also need additional information for nmultiples,
+				 * i.e., the number of values that appeared more than once.
+				 * At this point we have the information for nmultiples for each
+				 * partition, but the nmultiples in one partition can be accounted as
+				 * a distinct value in some other partition. In order to merge the
+				 * approximate nmultiples better, we extract unique values in each
+				 * partition as follows,
+				 * P1 -> ndistinct1 , nmultiple1
+				 * P2 -> ndistinct2 , nmultiple2
+				 * P3 -> ndistinct3 , nmultiple3
+				 * Root -> ndistinct(Root) (using gp_hyperloglog_estimate)
+				 * nunique1 = ndistinct(Root) - gp_hyperloglog_estimate(P2 & P3)
+				 * nunique2 = ndistinct(Root) - gp_hyperloglog_estimate(P1 & P3)
+				 * nunique3 = ndistinct(Root) - gp_hyperloglog_estimate(P2 & P1)
+				 * And finally once we have unique values in individual partitions,
+				 * we can get the nmultiples on the ROOT as seen below,
+				 * nmultiple(Root) = ndistinct(Root) - (sum of uniques in each partition)
+				 */
+				/*
+				 * hllcounters_left array stores the merged hll result of all the
+				 * hll counters towards the left of index i and excluding the hll
+				 * counter at index i
+				 */
+				GpHLLCounter *hllcounters_left = (GpHLLCounter *) palloc0(numPartitions * sizeof(GpHLLCounter));
+
+				/*
+				 * hllcounters_right array stores the merged hll result of all the
+				 * hll counters towards the right of index i and excluding the hll
+				 * counter at index i
+				 */
+				GpHLLCounter *hllcounters_right = (GpHLLCounter *) palloc0(numPartitions * sizeof(GpHLLCounter));
+
+				hllcounters_left[0] = gp_hyperloglog_init_def();
+				hllcounters_right[numPartitions - 1] = gp_hyperloglog_init_def();
+
+				/*
+				 * The following loop populates the left and right array by accumulating the merged
+				 * result of all the hll counters towards the left/right of the given index i excluding
+				 * the counter at index i.
+				 * Note that there might be empty values for some partitions, in which case the
+				 * corresponding element in the left/right arrays will simply be the value
+				 * of its neighbor.
+				 * For E.g If the hllcounters_copy array is 1, null, 2, 3, null, 4
+				 * the left and right arrays will be as follows:
+				 * hllcounters_left:  default, 1, 1, (1,2), (1,2,3), (1,2,3)
+				 * hllcounters_right: (2,3,4), (2,3,4), (3,4), 4, 4, default
+				 */
+				/*
+				 * The first and the last element in the left and right arrays
+				 * are default values since there is no element towards
+				 * the left or right of them
+				 */
+				for (i = 1; i < numPartitions; i++)
+				{
+					/* populate left array */
+					if (nDistincts[i - 1] == 0)
+					{
+						hllcounters_left[i] = gp_hll_copy(hllcounters_left[i - 1]);
+					}
+					else
+					{
+						GpHLLCounter hllcounter_temp1 = gp_hll_copy(hllcounters_copy[i - 1]);
+						GpHLLCounter hllcounter_temp2 = gp_hll_copy(hllcounters_left[i - 1]);
+						hllcounters_left[i] = gp_hyperloglog_merge_counters(hllcounter_temp1, hllcounter_temp2);
+						pfree(hllcounter_temp1);
+						pfree(hllcounter_temp2);
+					}
+
+					/* populate right array */
+					if (nDistincts[numPartitions - i] == 0)
+					{
+						hllcounters_right[numPartitions - i - 1] = gp_hll_copy(hllcounters_right[numPartitions - i]);
+					}
+					else
+					{
+						GpHLLCounter hllcounter_temp1 = gp_hll_copy(hllcounters_copy[numPartitions - i]);
+						GpHLLCounter hllcounter_temp2 = gp_hll_copy(hllcounters_right[numPartitions - i]);
+						hllcounters_right[numPartitions - i - 1] = gp_hyperloglog_merge_counters(hllcounter_temp1, hllcounter_temp2);
+						pfree(hllcounter_temp1);
+						pfree(hllcounter_temp2);
+					}
+				}
+
+				int nUnique = 0;
+				for (i = 0; i < numPartitions; i++)
+				{
+					/* Skip if statistics are missing for the partition */
+					if (nDistincts[i] == 0)
+						continue;
+
+					GpHLLCounter hllcounter_temp1 = gp_hll_copy(hllcounters_left[i]);
+					GpHLLCounter hllcounter_temp2 = gp_hll_copy(hllcounters_right[i]);
+					GpHLLCounter final = NULL;
+					final = gp_hyperloglog_merge_counters(hllcounter_temp1, hllcounter_temp2);
+
+					pfree(hllcounter_temp1);
+					pfree(hllcounter_temp2);
+
+					if (final != NULL)
+					{
+						float nUniques = ndistinct - gp_hyperloglog_estimate(final);
+						nUnique += nUniques;
+						nmultiple += nMultiples[i] * (nUniques / nDistincts[i]);
+						pfree(final);
+					}
+					else
+					{
+						nUnique = ndistinct;
+						break;
+					}
+				}
+
+				// nmultiples for the ROOT
+				nmultiple += ndistinct - nUnique;
+
+				if (nmultiple < 0)
+					nmultiple = 0;
+
+				pfree(hllcounters_left);
+				pfree(hllcounters_right);
+			}
+		}
+		else
+		{
+			/* Else error out due to incompatible leaf HLL counter merge */
+			pfree(hllcounters);
+			pfree(hllcounters_fullscan);
+			pfree(hllcounters_copy);
+			pfree(nDistincts);
+			pfree(nMultiples);
+
+			ereport(ERROR,
+					(errmsg("ANALYZE cannot merge since not all non-empty leaf partitions have consistent hyperloglog statistics for merge"),
+					 errhint("Re-run ANALYZE or ANALYZE FULLSCAN")));
+		}
+	}
+	pfree(hllcounters);
+	pfree(hllcounters_fullscan);
+	pfree(hllcounters_copy);
+	pfree(nDistincts);
+	pfree(nMultiples);
+
+	if (allDistinct || (!OidIsValid(eqopr) && !OidIsValid(ltopr)))
+	{
+		/* If we found no repeated values, assume it's a unique column */
+		ndistinct = -1.0;
+	}
+	else if ((int) nmultiple >= (int) ndistinct)
+	{
+		/*
+		 * Every value in the sample appeared more than once.  Assume the
+		 * column has just these values.
+		 */
+	}
+	else
+	{
+		/*----------
+		 * Estimate the number of distinct values using the estimator
+		 * proposed by Haas and Stokes in IBM Research Report RJ 10025:
+		 *		n*d / (n - f1 + f1*n/N)
+		 * where f1 is the number of distinct values that occurred
+		 * exactly once in our sample of n rows (from a total of N),
+		 * and d is the total number of distinct values in the sample.
+		 * This is their Duj1 estimator; the other estimators they
+		 * recommend are considerably more complex, and are numerically
+		 * very unstable when n is much smaller than N.
+		 *
+		 * Overwidth values are assumed to have been distinct.
+		 *----------
+		 */
+		int f1 = ndistinct - nmultiple;
+		int d = f1 + nmultiple;
+		double numer, denom, stadistinct;
+
+		numer = (double) sampleCount * (double) d;
+
+		denom = (double) (sampleCount - f1) +
+				(double) f1 * (double) sampleCount / totalTuples;
+
+		stadistinct = numer / denom;
+		/* Clamp to sane range in case of roundoff error */
+		if (stadistinct < (double) d)
+			stadistinct = (double) d;
+		if (stadistinct > totalTuples)
+			stadistinct = totalTuples;
+		ndistinct = floor(stadistinct + 0.5);
+	}
+
+	ndistinct = round(ndistinct);
+	if (ndistinct > 0.1 * totalTuples)
+		ndistinct = -(ndistinct / totalTuples);
+
+	// finalize NDV calculation
+	stats->stadistinct = ndistinct;
+	stats->stats_valid = true;
+	stats->stawidth = colAvgWidth / totalTuples;
+	stats->stanullfrac = (float4) nullCount / (float4) totalTuples;
+
+	// MCV calculations
+	MCVFreqPair **mcvpairArray = NULL;
+	int rem_mcv = 0;
+	int num_mcv = 0;
+	if (ndistinct > -1 && OidIsValid(eqopr))
+	{
+		if (ndistinct < 0)
+		{
+			ndistinct = -ndistinct * totalTuples;
+		}
+
+		old_context = MemoryContextSwitchTo(stats->anl_context);
+
+		void *resultMCV[2];
+
+		mcvpairArray = aggregate_leaf_partition_MCVs(
+			stats->attr->attrelid, stats->attr->attnum, heaptupleStats,
+			relTuples, default_statistics_target, ndistinct, &num_mcv, &rem_mcv,
+			resultMCV);
+		MemoryContextSwitchTo(old_context);
+
+		if (num_mcv > 0)
+		{
+			stats->stakind[slot_idx] = STATISTIC_KIND_MCV;
+			stats->staop[slot_idx] = mystats->eqopr;
+			stats->stavalues[slot_idx] = (Datum *) resultMCV[0];
+			stats->numvalues[slot_idx] = num_mcv;
+			stats->stanumbers[slot_idx] = (float4 *) resultMCV[1];
+			stats->numnumbers[slot_idx] = num_mcv;
+			slot_idx++;
+		}
+	}
+
+	// Histogram calculation
+	if (OidIsValid(eqopr) && OidIsValid(ltopr))
+	{
+		old_context = MemoryContextSwitchTo(stats->anl_context);
+
+		void *resultHistogram[1];
+		int num_hist = aggregate_leaf_partition_histograms(
+			stats->attr->attrelid, stats->attr->attnum, heaptupleStats,
+			relTuples, default_statistics_target, mcvpairArray + num_mcv,
+			rem_mcv, resultHistogram);
+		MemoryContextSwitchTo(old_context);
+		if (num_hist > 0)
+		{
+			stats->stakind[slot_idx] = STATISTIC_KIND_HISTOGRAM;
+			stats->staop[slot_idx] = mystats->ltopr;
+			stats->stavalues[slot_idx] = (Datum *) resultHistogram[0];
+			stats->numvalues[slot_idx] = num_hist;
+			slot_idx++;
+		}
+	}
+	for (i = 0; i < numPartitions; i++)
+	{
+		if (HeapTupleIsValid(heaptupleStats[i]))
+			heap_freetuple(heaptupleStats[i]);
+	}
+	if (num_mcv > 0)
+		pfree(mcvpairArray);
+	pfree(heaptupleStats);
+	pfree(relTuples);
+}
+/*
  * qsort_arg comparator for sorting ScalarItems
  *
  * Aside from sorting the items, we update the tupnoLink[] array
- * whenever two ScalarItems are found to contain equal datums.	The array
+ * whenever two ScalarItems are found to contain equal datums.  The array
  * is indexed by tupno; for each ScalarItem, it contains the highest
  * tupno that that item's datum has been found to be equal to.  This allows
  * us to avoid additional comparisons in compute_scalar_stats().
@@ -3045,15 +4482,14 @@ compute_scalar_stats(VacAttrStatsP stats,
 static int
 compare_scalars(const void *a, const void *b, void *arg)
 {
-	Datum		da = ((ScalarItem *) a)->value;
-	int			ta = ((ScalarItem *) a)->tupno;
-	Datum		db = ((ScalarItem *) b)->value;
-	int			tb = ((ScalarItem *) b)->tupno;
+	Datum		da = ((const ScalarItem *) a)->value;
+	int			ta = ((const ScalarItem *) a)->tupno;
+	Datum		db = ((const ScalarItem *) b)->value;
+	int			tb = ((const ScalarItem *) b)->tupno;
 	CompareScalarsContext *cxt = (CompareScalarsContext *) arg;
-	int32		compare;
+	int			compare;
 
-	compare = ApplySortFunction(cxt->cmpFn, cxt->cmpFlags,
-								da, false, db, false);
+	compare = ApplySortComparator(da, false, db, false, cxt->ssup);
 	if (compare != 0)
 		return compare;
 
@@ -3077,8 +4513,8 @@ compare_scalars(const void *a, const void *b, void *arg)
 static int
 compare_mcvs(const void *a, const void *b)
 {
-	int			da = ((ScalarMCVItem *) a)->first;
-	int			db = ((ScalarMCVItem *) b)->first;
+	int			da = ((const ScalarMCVItem *) a)->first;
+	int			db = ((const ScalarMCVItem *) b)->first;
 
 	return da - db;
 }

@@ -1,7 +1,8 @@
-/* $PostgreSQL: pgsql/src/interfaces/ecpg/pgtypeslib/numeric.c,v 1.33 2006/10/04 00:30:12 momjian Exp $ */
+/* src/interfaces/ecpg/pgtypeslib/numeric.c */
 
 #include "postgres_fe.h"
 #include <ctype.h>
+#include <float.h>
 #include <limits.h>
 
 #include "extern.h"
@@ -173,6 +174,25 @@ set_var_from_str(char *str, char **ptr, numeric *dest)
 		(*ptr)++;
 	}
 
+	if (pg_strncasecmp(*ptr, "NaN", 3) == 0)
+	{
+		*ptr += 3;
+		dest->sign = NUMERIC_NAN;
+
+		/* Should be nothing left but spaces */
+		while (*(*ptr))
+		{
+			if (!isspace((unsigned char) *(*ptr)))
+			{
+				errno = PGTYPES_NUM_BAD_NUMERIC;
+				return -1;
+			}
+			(*ptr)++;
+		}
+
+		return 0;
+	}
+
 	if (alloc_var(dest, strlen((*ptr))) < 0)
 		return -1;
 	dest->weight = -1;
@@ -243,8 +263,7 @@ set_var_from_str(char *str, char **ptr, numeric *dest)
 			return -1;
 		}
 		(*ptr) = endptr;
-		if (exponent > NUMERIC_MAX_PRECISION ||
-			exponent < -NUMERIC_MAX_PRECISION)
+		if (exponent >= INT_MAX / 2 || exponent <= -(INT_MAX / 2))
 		{
 			errno = PGTYPES_NUM_BAD_NUMERIC;
 			return -1;
@@ -295,6 +314,15 @@ get_str_from_var(numeric *var, int dscale)
 	char	   *cp;
 	int			i;
 	int			d;
+
+	if (var->sign == NUMERIC_NAN)
+	{
+		str = (char *) pgtypes_alloc(4);
+		if (str == NULL)
+			return NULL;
+		sprintf(str, "NaN");
+		return str;
+	}
 
 	/*
 	 * Check if we must round up before printing the value and do so.
@@ -389,7 +417,7 @@ PGTYPESnumeric_from_asc(char *str, char **endptr)
 	ret = set_var_from_str(str, ptr, value);
 	if (ret)
 	{
-		free(value);
+		PGTYPESnumeric_free(value);
 		return (NULL);
 	}
 
@@ -946,7 +974,7 @@ PGTYPESnumeric_sub(numeric *var1, numeric *var2, numeric *result)
  * mul_var() -
  *
  *	Multiplication on variable level. Product of var1 * var2 is stored
- *	in result.	Accuracy of result is determined by global_rscale.
+ *	in result.  Accuracy of result is determined by global_rscale.
  * ----------
  */
 int
@@ -1050,7 +1078,6 @@ select_div_scale(numeric *var1, numeric *var2, int *rscale)
 	NumericDigit firstdigit1,
 				firstdigit2;
 	int			res_dscale;
-	int			res_rscale;
 
 	/*
 	 * The result scale of a division isn't specified in any SQL standard. For
@@ -1102,7 +1129,7 @@ select_div_scale(numeric *var1, numeric *var2, int *rscale)
 	res_dscale = Min(res_dscale, NUMERIC_MAX_DISPLAY_SCALE);
 
 	/* Select result scale */
-	*rscale = res_rscale = res_dscale + 4;
+	*rscale = res_dscale + 4;
 
 	return res_dscale;
 }
@@ -1339,18 +1366,17 @@ done:
 int
 PGTYPESnumeric_cmp(numeric *var1, numeric *var2)
 {
-
 	/* use cmp_abs function to calculate the result */
 
-	/* both are positive: normal comparation with cmp_abs */
+	/* both are positive: normal comparison with cmp_abs */
 	if (var1->sign == NUMERIC_POS && var2->sign == NUMERIC_POS)
 		return cmp_abs(var1, var2);
 
-	/* both are negative: return the inverse of the normal comparation */
+	/* both are negative: return the inverse of the normal comparison */
 	if (var1->sign == NUMERIC_NEG && var2->sign == NUMERIC_NEG)
 	{
 		/*
-		 * instead of inverting the result, we invert the paramter ordering
+		 * instead of inverting the result, we invert the parameter ordering
 		 */
 		return cmp_abs(var2, var1);
 	}
@@ -1471,11 +1497,11 @@ PGTYPESnumeric_copy(numeric *src, numeric *dst)
 int
 PGTYPESnumeric_from_double(double d, numeric *dst)
 {
-	char		buffer[100];
+	char		buffer[DBL_DIG + 100];
 	numeric    *tmp;
 	int			i;
 
-	if (sprintf(buffer, "%f", d) == 0)
+	if (sprintf(buffer, "%.*g", DBL_DIG, d) <= 0)
 		return -1;
 
 	if ((tmp = PGTYPESnumeric_from_asc(buffer, NULL)) == NULL)
@@ -1544,9 +1570,8 @@ int
 PGTYPESnumeric_to_double(numeric *nv, double *dp)
 {
 	double		tmp;
-	int			i;
 
-	if ((i = numericvar_to_double(nv, &tmp)) != 0)
+	if (numericvar_to_double(nv, &tmp) != 0)
 		return -1;
 	*dp = tmp;
 	return 0;
@@ -1583,8 +1608,12 @@ PGTYPESnumeric_to_long(numeric *nv, long *lp)
 	errno = 0;
 	*lp = strtol(s, &endptr, 10);
 	if (endptr == s)
+	{
 		/* this should not happen actually */
+		free(s);
 		return -1;
+	}
+	free(s);
 	if (errno == ERANGE)
 	{
 		if (*lp == LONG_MIN)
@@ -1593,7 +1622,6 @@ PGTYPESnumeric_to_long(numeric *nv, long *lp)
 			errno = PGTYPES_NUM_OVERFLOW;
 		return -1;
 	}
-	free(s);
 	return 0;
 }
 

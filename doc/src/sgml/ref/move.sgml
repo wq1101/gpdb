@@ -1,19 +1,9 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/move.sgml,v 1.30 2006/09/16 00:30:19 momjian Exp $
+doc/src/sgml/ref/move.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-MOVE">
- <refmeta>
-  <refentrytitle id="SQL-MOVE-TITLE">MOVE</refentrytitle>
-  <refmiscinfo>SQL - Language Statements</refmiscinfo>
- </refmeta>
-
- <refnamediv>
-  <refname>MOVE</refname>
-  <refpurpose>position a cursor</refpurpose>
- </refnamediv>
-
  <indexterm zone="sql-move">
   <primary>MOVE</primary>
  </indexterm>
@@ -23,9 +13,38 @@ PostgreSQL documentation
   <secondary>MOVE</secondary>
  </indexterm>
 
+ <refmeta>
+  <refentrytitle>MOVE</refentrytitle>
+  <manvolnum>7</manvolnum>
+  <refmiscinfo>SQL - Language Statements</refmiscinfo>
+ </refmeta>
+
+ <refnamediv>
+  <refname>MOVE</refname>
+  <refpurpose>position a cursor</refpurpose>
+ </refnamediv>
+
  <refsynopsisdiv>
+<!-- Note the "direction" bit is also in ref/fetch.sgml -->
 <synopsis>
-MOVE [ <replaceable class="PARAMETER">direction</replaceable> { FROM | IN } ] <replaceable class="PARAMETER">cursorname</replaceable>
+MOVE [ <replaceable class="PARAMETER">direction</replaceable> [ FROM | IN ] ] <replaceable class="PARAMETER">cursor_name</replaceable>
+
+<phrase>where <replaceable class="PARAMETER">direction</replaceable> can be empty or one of:</phrase>
+
+    NEXT
+    PRIOR
+    FIRST
+    LAST
+    ABSOLUTE <replaceable class="PARAMETER">count</replaceable>
+    RELATIVE <replaceable class="PARAMETER">count</replaceable>
+    <replaceable class="PARAMETER">count</replaceable>
+    ALL
+    FORWARD
+    FORWARD <replaceable class="PARAMETER">count</replaceable>
+    FORWARD ALL
+    BACKWARD
+    BACKWARD <replaceable class="PARAMETER">count</replaceable>
+    BACKWARD ALL
 </synopsis>
  </refsynopsisdiv>
 
@@ -39,8 +58,9 @@ MOVE [ <replaceable class="PARAMETER">direction</replaceable> { FROM | IN } ] <r
   </para>
 
   <para>
-   Refer to 
-   <xref linkend="sql-fetch" endterm="sql-fetch-title">
+   The parameters for the <command>MOVE</command> command are identical to
+   those of the <command>FETCH</command> command; refer to
+   <xref linkend="sql-fetch">
    for details on syntax and usage.
   </para>
  </refsect1>
@@ -96,9 +116,9 @@ COMMIT WORK;
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-close" endterm="sql-close-title"></member>
-   <member><xref linkend="sql-declare" endterm="sql-declare-title"></member>
-   <member><xref linkend="sql-fetch" endterm="sql-fetch-title"></member>
+   <member><xref linkend="sql-close"></member>
+   <member><xref linkend="sql-declare"></member>
+   <member><xref linkend="sql-fetch"></member>
   </simplelist>
  </refsect1>
 </refentry>

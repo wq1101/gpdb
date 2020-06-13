@@ -1,11 +1,16 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/create_operator.sgml,v 1.49 2007/11/28 15:42:31 petere Exp $
+doc/src/sgml/ref/create_operator.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-CREATEOPERATOR">
+ <indexterm zone="sql-createoperator">
+  <primary>CREATE OPERATOR</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="sql-createoperator-title">CREATE OPERATOR</refentrytitle>
+  <refentrytitle>CREATE OPERATOR</refentrytitle>
+  <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
 
@@ -14,15 +19,11 @@ PostgreSQL documentation
   <refpurpose>define a new operator</refpurpose>
  </refnamediv>
 
- <indexterm zone="sql-createoperator">
-  <primary>CREATE OPERATOR</primary>
- </indexterm>
-
  <refsynopsisdiv>
 <synopsis>
 CREATE OPERATOR <replaceable>name</replaceable> (
-    PROCEDURE = <replaceable class="parameter">funcname</replaceable>
-    [, LEFTARG = <replaceable class="parameter">lefttype</replaceable> ] [, RIGHTARG = <replaceable class="parameter">righttype</replaceable> ]
+    PROCEDURE = <replaceable class="parameter">function_name</replaceable>
+    [, LEFTARG = <replaceable class="parameter">left_type</replaceable> ] [, RIGHTARG = <replaceable class="parameter">right_type</replaceable> ]
     [, COMMUTATOR = <replaceable class="parameter">com_op</replaceable> ] [, NEGATOR = <replaceable class="parameter">neg_op</replaceable> ]
     [, RESTRICT = <replaceable class="parameter">res_proc</replaceable> ] [, JOIN = <replaceable class="parameter">join_proc</replaceable> ]
     [, HASHES ] [, MERGES ]
@@ -51,8 +52,7 @@ CREATE OPERATOR <replaceable>name</replaceable> (
    There are a few restrictions on your choice of name:
    <itemizedlist>
     <listitem>
-     <para>
-     <literal>--</literal> and <literal>/*</literal> cannot appear anywhere in an operator name,
+     <para><literal>--</literal> and <literal>/*</literal> cannot appear anywhere in an operator name,
      since they will be taken as the start of a comment.
      </para>
     </listitem>
@@ -68,6 +68,12 @@ CREATE OPERATOR <replaceable>name</replaceable> (
      but <literal>*-</literal> is not.
      This restriction allows <productname>PostgreSQL</productname> to
      parse SQL-compliant commands without requiring spaces between tokens.
+     </para>
+    </listitem>
+    <listitem>
+     <para>
+     The use of <literal>=&gt;</> as an operator name is deprecated.  It may
+     be disallowed altogether in a future release.
      </para>
     </listitem>
    </itemizedlist>
@@ -87,7 +93,7 @@ CREATE OPERATOR <replaceable>name</replaceable> (
   </para>
 
   <para>
-   The <replaceable class="parameter">funcname</replaceable>
+   The <replaceable class="parameter">function_name</replaceable>
    procedure must have been previously defined using <command>CREATE
    FUNCTION</command> and must be defined to accept the correct number
    of arguments (either one or two) of the indicated types.
@@ -96,6 +102,13 @@ CREATE OPERATOR <replaceable>name</replaceable> (
   <para>
    The other clauses specify optional operator optimization clauses.
    Their meaning is detailed in <xref linkend="xoper-optimization">.
+  </para>
+
+  <para>
+   To be able to create an operator, you must have <literal>USAGE</literal>
+   privilege on the argument types and the return type, as well
+   as <literal>EXECUTE</literal> privilege on the underlying function.  If a
+   commutator or negator operator is specified, you must own these operators.
   </para>
  </refsect1>
 
@@ -119,7 +132,7 @@ CREATE OPERATOR <replaceable>name</replaceable> (
      </varlistentry>
 
      <varlistentry>
-      <term><replaceable class="parameter">funcname</replaceable></term>
+      <term><replaceable class="parameter">function_name</replaceable></term>
       <listitem>
        <para>
         The function used to implement this operator.
@@ -128,7 +141,7 @@ CREATE OPERATOR <replaceable>name</replaceable> (
      </varlistentry>
 
      <varlistentry>
-      <term><replaceable class="parameter">lefttype</replaceable></term>
+      <term><replaceable class="parameter">left_type</replaceable></term>
       <listitem>
        <para>
         The data type of the operator's left operand, if any.
@@ -138,7 +151,7 @@ CREATE OPERATOR <replaceable>name</replaceable> (
      </varlistentry>
 
      <varlistentry>
-      <term><replaceable class="parameter">righttype</replaceable></term>
+      <term><replaceable class="parameter">right_type</replaceable></term>
       <listitem>
        <para>
         The data type of the operator's right operand, if any.
@@ -208,15 +221,20 @@ CREATE OPERATOR <replaceable>name</replaceable> (
    arguments, use the <literal>OPERATOR()</> syntax, for example:
 <programlisting>
 COMMUTATOR = OPERATOR(myschema.===) ,
-</programlisting>  
-  </para>
+</programlisting></para>
  </refsect1>
-  
+
  <refsect1>
   <title>Notes</title>
 
   <para>
    Refer to <xref linkend="xoper"> for further information.
+  </para>
+
+  <para>
+   It is not possible to specify an operator's lexical precedence in
+   <command>CREATE OPERATOR</>, because the parser's precedence behavior
+   is hard-wired.  See <xref linkend="sql-precedence"> for precedence details.
   </para>
 
   <para>
@@ -230,14 +248,12 @@ COMMUTATOR = OPERATOR(myschema.===) ,
   </para>
 
   <para>
-   Use <xref linkend="sql-dropoperator"
-   endterm="sql-dropoperator-title"> to delete user-defined operators
-   from a database.  Use <xref linkend="sql-alteroperator"
-   endterm="sql-alteroperator-title"> to modify operators in a
+   Use <xref linkend="sql-dropoperator"> to delete user-defined operators
+   from a database.  Use <xref linkend="sql-alteroperator"> to modify operators in a
    database.
   </para>
  </refsect1>
-  
+
  <refsect1>
   <title>Examples</title>
 
@@ -255,10 +271,9 @@ CREATE OPERATOR === (
     JOIN = area_join_procedure,
     HASHES, MERGES
 );
-</programlisting>  
-  </para>
+</programlisting></para>
  </refsect1>
- 
+
  <refsect1>
   <title>Compatibility</title>
 
@@ -273,9 +288,9 @@ CREATE OPERATOR === (
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-alteroperator" endterm="sql-alteroperator-title"></member>
-   <member><xref linkend="sql-createopclass" endterm="sql-createopclass-title"></member>
-   <member><xref linkend="sql-dropoperator" endterm="sql-dropoperator-title"></member>
+   <member><xref linkend="sql-alteroperator"></member>
+   <member><xref linkend="sql-createopclass"></member>
+   <member><xref linkend="sql-dropoperator"></member>
   </simplelist>
  </refsect1>
 </refentry>

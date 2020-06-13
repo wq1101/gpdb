@@ -4,11 +4,11 @@
  *	  routines for signaling the postmaster from its child processes
  *
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/storage/ipc/pmsignal.c,v 1.28 2009/06/11 14:49:01 momjian Exp $
+ *	  src/backend/storage/ipc/pmsignal.c
  *
  *-------------------------------------------------------------------------
  */
@@ -26,9 +26,9 @@
 
 /*
  * The postmaster is signaled by its children by sending SIGUSR1.  The
- * specific reason is communicated via flags in shared memory.	We keep
+ * specific reason is communicated via flags in shared memory.  We keep
  * a boolean flag for each possible "reason", so that different reasons
- * can be signaled by different backends at the same time.	(However,
+ * can be signaled by different backends at the same time.  (However,
  * if the same reason is signaled more than once simultaneously, the
  * postmaster will observe it only once.)
  *
@@ -42,7 +42,7 @@
  * have three possible states: UNUSED, ASSIGNED, ACTIVE.  An UNUSED slot is
  * available for assignment.  An ASSIGNED slot is associated with a postmaster
  * child process, but either the process has not touched shared memory yet,
- * or it has successfully cleaned up after itself.	A ACTIVE slot means the
+ * or it has successfully cleaned up after itself.  A ACTIVE slot means the
  * process is actively using shared memory.  The slots are assigned to
  * child processes at random, and postmaster.c is responsible for tracking
  * which one goes with which PID.
@@ -66,7 +66,7 @@ struct PMSignalData
 	/* per-child-process flags */
 	int			num_child_flags;	/* # of entries in PMChildFlags[] */
 	int			next_child_flag;	/* next slot to try to assign */
-	sig_atomic_t PMChildFlags[1];		/* VARIABLE LENGTH ARRAY */
+	sig_atomic_t PMChildFlags[FLEXIBLE_ARRAY_MEMBER];
 };
 
 NON_EXEC_STATIC volatile PMSignalData *PMSignalState = NULL;
@@ -267,59 +267,27 @@ MarkPostmasterChildInactive(void)
 
 /*
  * PostmasterIsAlive - check whether postmaster process is still alive
- *
- * amDirectChild should be passed as "true" by code that knows it is
- * executing in a direct child process of the postmaster; pass "false"
- * if an indirect child or not sure.  The "true" case uses a faster and
- * more reliable test, so use it when possible.
  */
 bool
-PostmasterIsAlive(bool amDirectChild)
+PostmasterIsAlive(void)
 {
 #ifndef WIN32
-	if (amDirectChild)
+	char		c;
+	ssize_t		rc;
+
+	rc = read(postmaster_alive_fds[POSTMASTER_FD_WATCH], &c, 1);
+	if (rc < 0)
 	{
-		/*
-		 * If the postmaster is alive, we'll still be its child.  If it's
-		 * died, we'll be reassigned as a child of the init process.
-		 */
-#ifdef __darwin__
-		/*
-		 * When attached w/gdb on OSX, gdb becomes parent of debugged process!
-		 * If we are direct child of postmaster and end up as child of
-		 * init, the postmaster musta died. This, of course, fails to detect
-		 * death of postmaster while this process is attached to gdb - but
-		 * that's easier to deal w/than being difficult to use gdb in the
-		 * normal case.
-		 */
-		return(getppid() != 1 /* init's pid */);
-#else  /* __darwin__ */
-		return (getppid() == PostmasterPid);
-#endif /* __darwin__ */
+		if (errno == EAGAIN || errno == EWOULDBLOCK)
+			return true;
+		else
+			elog(FATAL, "read on postmaster death monitoring pipe failed: %m");
 	}
-	else
-	{
-		/*
-		 * Use kill() to see if the postmaster is still alive.	This can
-		 * sometimes give a false positive result, since the postmaster's PID
-		 * may get recycled, but it is good enough for existing uses by
-		 * indirect children.
-		 */
-		return (kill(PostmasterPid, 0) == 0);
-	}
+	else if (rc > 0)
+		elog(FATAL, "unexpected data in postmaster death monitoring pipe");
+
+	return false;
 #else							/* WIN32 */
 	return (WaitForSingleObject(PostmasterHandle, 0) == WAIT_TIMEOUT);
 #endif   /* WIN32 */
 }
-
-
-/*
- * ParentIsAlive - check whether parent process is still alive;
- */
-bool
-ParentProcIsAlive()
-{
-	/* if parent exits, init process (PID 1) is reported as parent */
-	return (getppid() != 1);
-}
-

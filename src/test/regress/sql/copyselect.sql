@@ -53,11 +53,11 @@ copy (select * from copyselect_test1 join copyselect_test2 using (id)) to stdout
 --
 -- Test UNION SELECT
 --
-copy (select t from copyselect_test1 where id = 1 UNION select * from v_copyselect_test1) to stdout;
+copy (select t from copyselect_test1 where id = 1 UNION select * from v_copyselect_test1 ORDER BY 1) to stdout;
 --
 -- Test subselect
 --
-copy (select * from (select t from copyselect_test1 where id = 1 UNION select * from v_copyselect_test1) t1) to stdout;
+copy (select * from (select t from copyselect_test1 where id = 1 UNION select * from v_copyselect_test1) t1 ORDER BY 1) to stdout;
 --
 -- Test headers, CSV and quotes
 --
@@ -70,7 +70,7 @@ copy (select t from copyselect_test1 where id = 1) to stdout csv header force qu
 -- This should fail
 --
 \copy v_copyselect_test1 to stdout
--- 
+--
 -- Test \copy (select ...)
 --
 \copy (select "id",'id','id""'||t,(id + 1)*id,t,"copyselect_test1"."t" from copyselect_test1 where id=3) to stdout
@@ -80,3 +80,17 @@ copy (select t from copyselect_test1 where id = 1) to stdout csv header force qu
 drop table copyselect_test2;
 drop view v_copyselect_test1;
 drop table copyselect_test1;
+
+-- psql handling of COPY in multi-command strings
+copy (select 1) to stdout\; select 1/0;	-- row, then error
+select 1/0\; copy (select 1) to stdout; -- error only
+copy (select 1) to stdout\; copy (select 2) to stdout\; select 0\; select 3; -- 1 2 3
+
+create table test3 (c int);
+select 0\; copy test3 from stdin\; copy test3 from stdin\; select 1; -- 1
+1
+\.
+2
+\.
+select * from test3;
+drop table test3;

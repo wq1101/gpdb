@@ -2,11 +2,11 @@
  *
  *	  EUC_CN and MULE_INTERNAL
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/mb/conversion_procs/euc_cn_and_mic/euc_cn_and_mic.c,v 1.19 2009/01/29 19:23:39 tgl Exp $
+ *	  src/backend/utils/mb/conversion_procs/euc_cn_and_mic/euc_cn_and_mic.c
  *
  *-------------------------------------------------------------------------
  */
@@ -19,9 +19,6 @@ PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(euc_cn_to_mic);
 PG_FUNCTION_INFO_V1(mic_to_euc_cn);
-
-extern Datum euc_cn_to_mic(PG_FUNCTION_ARGS);
-extern Datum mic_to_euc_cn(PG_FUNCTION_ARGS);
 
 /* ----------
  * conv_proc(

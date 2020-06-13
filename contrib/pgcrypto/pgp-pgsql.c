@@ -26,15 +26,17 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $PostgreSQL: pgsql/contrib/pgcrypto/pgp-pgsql.c,v 1.11 2009/06/11 14:48:52 momjian Exp $
+ * contrib/pgcrypto/pgp-pgsql.c
  */
 
 #include "postgres.h"
 
-#include "fmgr.h"
-#include "parser/scansup.h"
+#include "lib/stringinfo.h"
+#include "catalog/pg_type.h"
 #include "mb/pg_wchar.h"
 #include "utils/builtins.h"
+#include "utils/array.h"
+#include "funcapi.h"
 
 #include "mbuf.h"
 #include "px.h"
@@ -43,23 +45,6 @@
 /*
  * public functions
  */
-Datum		pgp_sym_encrypt_text(PG_FUNCTION_ARGS);
-Datum		pgp_sym_encrypt_bytea(PG_FUNCTION_ARGS);
-Datum		pgp_sym_decrypt_text(PG_FUNCTION_ARGS);
-Datum		pgp_sym_decrypt_bytea(PG_FUNCTION_ARGS);
-
-Datum		pgp_pub_encrypt_text(PG_FUNCTION_ARGS);
-Datum		pgp_pub_encrypt_bytea(PG_FUNCTION_ARGS);
-Datum		pgp_pub_decrypt_text(PG_FUNCTION_ARGS);
-Datum		pgp_pub_decrypt_bytea(PG_FUNCTION_ARGS);
-
-Datum		pgp_key_id_w(PG_FUNCTION_ARGS);
-
-Datum		pg_armor(PG_FUNCTION_ARGS);
-Datum		pg_dearmor(PG_FUNCTION_ARGS);
-
-/* function headers */
-
 PG_FUNCTION_INFO_V1(pgp_sym_encrypt_bytea);
 PG_FUNCTION_INFO_V1(pgp_sym_encrypt_text);
 PG_FUNCTION_INFO_V1(pgp_sym_decrypt_bytea);
@@ -74,6 +59,7 @@ PG_FUNCTION_INFO_V1(pgp_key_id_w);
 
 PG_FUNCTION_INFO_V1(pg_armor);
 PG_FUNCTION_INFO_V1(pg_dearmor);
+PG_FUNCTION_INFO_V1(pgp_armor_headers);
 
 /*
  * Mix a block of data into RNG.
@@ -166,6 +152,19 @@ convert_to_utf8(text *src)
 	return convert_charset(src, GetDatabaseEncoding(), PG_UTF8);
 }
 
+static bool
+string_is_ascii(const char *str)
+{
+	const char *p;
+
+	for (p = str; *p; p++)
+	{
+		if (IS_HIGHBIT_SET(*p))
+			return false;
+	}
+	return true;
+}
+
 static void
 clear_and_pfree(text *p)
 {
@@ -182,6 +181,7 @@ struct debug_expect
 	int			expect;
 	int			cipher_algo;
 	int			s2k_mode;
+	int			s2k_count;
 	int			s2k_cipher_algo;
 	int			s2k_digest_algo;
 	int			compress_algo;
@@ -197,6 +197,7 @@ fill_expect(struct debug_expect * ex, int text_mode)
 	ex->expect = 0;
 	ex->cipher_algo = -1;
 	ex->s2k_mode = -1;
+	ex->s2k_count = -1;
 	ex->s2k_cipher_algo = -1;
 	ex->s2k_digest_algo = -1;
 	ex->compress_algo = -1;
@@ -219,6 +220,7 @@ check_expect(PGP_Context *ctx, struct debug_expect * ex)
 {
 	EX_CHECK(cipher_algo);
 	EX_CHECK(s2k_mode);
+	EX_CHECK(s2k_count);
 	EX_CHECK(s2k_digest_algo);
 	EX_CHECK(use_sess_key);
 	if (ctx->use_sess_key)
@@ -248,6 +250,8 @@ set_arg(PGP_Context *ctx, char *key, char *val,
 		res = pgp_set_sess_key(ctx, atoi(val));
 	else if (strcmp(key, "s2k-mode") == 0)
 		res = pgp_set_s2k_mode(ctx, atoi(val));
+	else if (strcmp(key, "s2k-count") == 0)
+		res = pgp_set_s2k_count(ctx, atoi(val));
 	else if (strcmp(key, "s2k-digest-algo") == 0)
 		res = pgp_set_s2k_digest_algo(ctx, val);
 	else if (strcmp(key, "s2k-cipher-algo") == 0)
@@ -260,7 +264,11 @@ set_arg(PGP_Context *ctx, char *key, char *val,
 		res = pgp_set_convert_crlf(ctx, atoi(val));
 	else if (strcmp(key, "unicode-mode") == 0)
 		res = pgp_set_unicode_mode(ctx, atoi(val));
-	/* decrypt debug */
+
+	/*
+	 * The remaining options are for debugging/testing and are therefore not
+	 * documented in the user-facing docs.
+	 */
 	else if (ex != NULL && strcmp(key, "debug") == 0)
 		ex->debug = atoi(val);
 	else if (ex != NULL && strcmp(key, "expect-cipher-algo") == 0)
@@ -282,6 +290,11 @@ set_arg(PGP_Context *ctx, char *key, char *val,
 	{
 		ex->expect = 1;
 		ex->s2k_mode = atoi(val);
+	}
+	else if (ex != NULL && strcmp(key, "expect-s2k-count") == 0)
+	{
+		ex->expect = 1;
+		ex->s2k_count = atoi(val);
 	}
 	else if (ex != NULL && strcmp(key, "expect-s2k-digest-algo") == 0)
 	{
@@ -617,7 +630,7 @@ decrypt_internal(int is_pubenc, int need_text, text *data,
 	px_set_debug_handler(NULL);
 
 	/*
-	 * add successfull decryptions also into RNG
+	 * add successful decryptions also into RNG
 	 */
 	add_entropy(res, key, keypsw);
 
@@ -824,28 +837,133 @@ pgp_pub_decrypt_text(PG_FUNCTION_ARGS)
  * Wrappers for PGP ascii armor
  */
 
+/*
+ * Helper function for pgp_armor. Converts arrays of keys and values into
+ * plain C arrays, and checks that they don't contain invalid characters.
+ */
+static int
+parse_key_value_arrays(ArrayType *key_array, ArrayType *val_array,
+					   char ***p_keys, char ***p_values)
+{
+	int			nkdims = ARR_NDIM(key_array);
+	int			nvdims = ARR_NDIM(val_array);
+	char	  **keys,
+			  **values;
+	Datum	   *key_datums,
+			   *val_datums;
+	bool	   *key_nulls,
+			   *val_nulls;
+	int			key_count,
+				val_count;
+	int			i;
+
+	if (nkdims > 1 || nkdims != nvdims)
+		ereport(ERROR,
+				(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+				 errmsg("wrong number of array subscripts")));
+	if (nkdims == 0)
+		return 0;
+
+	deconstruct_array(key_array,
+					  TEXTOID, -1, false, 'i',
+					  &key_datums, &key_nulls, &key_count);
+
+	deconstruct_array(val_array,
+					  TEXTOID, -1, false, 'i',
+					  &val_datums, &val_nulls, &val_count);
+
+	if (key_count != val_count)
+		ereport(ERROR,
+				(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+				 errmsg("mismatched array dimensions")));
+
+	keys = (char **) palloc(sizeof(char *) * key_count);
+	values = (char **) palloc(sizeof(char *) * val_count);
+
+	for (i = 0; i < key_count; i++)
+	{
+		char	   *v;
+
+		/* Check that the key doesn't contain anything funny */
+		if (key_nulls[i])
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("null value not allowed for header key")));
+
+		v = TextDatumGetCString(key_datums[i]);
+
+		if (!string_is_ascii(v))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				errmsg("header key must not contain non-ASCII characters")));
+		if (strstr(v, ": "))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("header key must not contain \": \"")));
+		if (strchr(v, '\n'))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("header key must not contain newlines")));
+		keys[i] = v;
+
+		/* And the same for the value */
+		if (val_nulls[i])
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("null value not allowed for header value")));
+
+		v = TextDatumGetCString(val_datums[i]);
+
+		if (!string_is_ascii(v))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			  errmsg("header value must not contain non-ASCII characters")));
+		if (strchr(v, '\n'))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("header value must not contain newlines")));
+
+		values[i] = v;
+	}
+
+	*p_keys = keys;
+	*p_values = values;
+	return key_count;
+}
+
 Datum
 pg_armor(PG_FUNCTION_ARGS)
 {
 	bytea	   *data;
 	text	   *res;
-	int			data_len,
-				res_len,
-				guess_len;
+	int			data_len;
+	StringInfoData buf;
+	int			num_headers;
+	char	  **keys = NULL,
+			  **values = NULL;
 
 	data = PG_GETARG_BYTEA_P(0);
 	data_len = VARSIZE(data) - VARHDRSZ;
+	if (PG_NARGS() == 3)
+	{
+		num_headers = parse_key_value_arrays(PG_GETARG_ARRAYTYPE_P(1),
+											 PG_GETARG_ARRAYTYPE_P(2),
+											 &keys, &values);
+	}
+	else if (PG_NARGS() == 1)
+		num_headers = 0;
+	else
+		elog(ERROR, "unexpected number of arguments %d", PG_NARGS());
 
-	guess_len = pgp_armor_enc_len(data_len);
-	res = palloc(VARHDRSZ + guess_len);
+	initStringInfo(&buf);
 
-	res_len = pgp_armor_encode((uint8 *) VARDATA(data), data_len,
-							   (uint8 *) VARDATA(res));
-	if (res_len > guess_len)
-		ereport(ERROR,
-				(errcode(ERRCODE_EXTERNAL_ROUTINE_INVOCATION_EXCEPTION),
-				 errmsg("Overflow - encode estimate too small")));
-	SET_VARSIZE(res, VARHDRSZ + res_len);
+	pgp_armor_encode((uint8 *) VARDATA(data), data_len, &buf,
+					 num_headers, keys, values);
+
+	res = palloc(VARHDRSZ + buf.len);
+	SET_VARSIZE(res, VARHDRSZ + buf.len);
+	memcpy(VARDATA(res), buf.data, buf.len);
+	pfree(buf.data);
 
 	PG_FREE_IF_COPY(data, 0);
 	PG_RETURN_TEXT_P(res);
@@ -856,31 +974,104 @@ pg_dearmor(PG_FUNCTION_ARGS)
 {
 	text	   *data;
 	bytea	   *res;
-	int			data_len,
-				res_len,
-				guess_len;
+	int			data_len;
+	int			ret;
+	StringInfoData buf;
 
 	data = PG_GETARG_TEXT_P(0);
 	data_len = VARSIZE(data) - VARHDRSZ;
 
-	guess_len = pgp_armor_dec_len(data_len);
-	res = palloc(VARHDRSZ + guess_len);
+	initStringInfo(&buf);
 
-	res_len = pgp_armor_decode((uint8 *) VARDATA(data), data_len,
-							   (uint8 *) VARDATA(res));
-	if (res_len < 0)
+	ret = pgp_armor_decode((uint8 *) VARDATA(data), data_len, &buf);
+	if (ret < 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_EXTERNAL_ROUTINE_INVOCATION_EXCEPTION),
-				 errmsg("%s", px_strerror(res_len))));
-	if (res_len > guess_len)
-		ereport(ERROR,
-				(errcode(ERRCODE_EXTERNAL_ROUTINE_INVOCATION_EXCEPTION),
-				 errmsg("Overflow - decode estimate too small")));
-	SET_VARSIZE(res, VARHDRSZ + res_len);
+				 errmsg("%s", px_strerror(ret))));
+	res = palloc(VARHDRSZ + buf.len);
+	SET_VARSIZE(res, VARHDRSZ + buf.len);
+	memcpy(VARDATA(res), buf.data, buf.len);
+	pfree(buf.data);
 
 	PG_FREE_IF_COPY(data, 0);
 	PG_RETURN_TEXT_P(res);
 }
+
+/* cross-call state for pgp_armor_headers */
+typedef struct
+{
+	int			nheaders;
+	char	  **keys;
+	char	  **values;
+} pgp_armor_headers_state;
+
+Datum
+pgp_armor_headers(PG_FUNCTION_ARGS)
+{
+	FuncCallContext *funcctx;
+	pgp_armor_headers_state *state;
+	char	   *utf8key;
+	char	   *utf8val;
+	HeapTuple	tuple;
+	TupleDesc	tupdesc;
+	AttInMetadata *attinmeta;
+
+	if (SRF_IS_FIRSTCALL())
+	{
+		text	   *data = PG_GETARG_TEXT_PP(0);
+		int			res;
+		MemoryContext oldcontext;
+
+		funcctx = SRF_FIRSTCALL_INIT();
+
+		/* we need the state allocated in the multi call context */
+		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+		/* Build a tuple descriptor for our result type */
+		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+			elog(ERROR, "return type must be a row type");
+
+		attinmeta = TupleDescGetAttInMetadata(tupdesc);
+		funcctx->attinmeta = attinmeta;
+
+		state = (pgp_armor_headers_state *) palloc(sizeof(pgp_armor_headers_state));
+
+		res = pgp_extract_armor_headers((uint8 *) VARDATA_ANY(data),
+										VARSIZE_ANY_EXHDR(data),
+										&state->nheaders, &state->keys,
+										&state->values);
+		if (res < 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_EXTERNAL_ROUTINE_INVOCATION_EXCEPTION),
+					 errmsg("%s", px_strerror(res))));
+
+		MemoryContextSwitchTo(oldcontext);
+		funcctx->user_fctx = state;
+	}
+
+	funcctx = SRF_PERCALL_SETUP();
+	state = (pgp_armor_headers_state *) funcctx->user_fctx;
+
+	if (funcctx->call_cntr >= state->nheaders)
+		SRF_RETURN_DONE(funcctx);
+	else
+	{
+		char	   *values[2];
+
+		/* we assume that the keys (and values) are in UTF-8. */
+		utf8key = state->keys[funcctx->call_cntr];
+		utf8val = state->values[funcctx->call_cntr];
+
+		values[0] = pg_any_to_server(utf8key, strlen(utf8key), PG_UTF8);
+		values[1] = pg_any_to_server(utf8val, strlen(utf8val), PG_UTF8);
+
+		/* build a tuple */
+		tuple = BuildTupleFromCStrings(funcctx->attinmeta, values);
+		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
+	}
+}
+
+
 
 /*
  * Wrappers for PGP key id

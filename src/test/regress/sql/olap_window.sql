@@ -10,8 +10,6 @@ set Debug_print_plan=on;
 --
 -- Changes here should also be made to olap_window_seq.sql
 
-set gp_enable_sequential_window_plans to false;
-
 ---- 1 -- Null window specification -- OVER () ----
 
 select row_number() over (), cn,pn,vn 
@@ -1631,3 +1629,10 @@ FROM
   GROUP BY name,device_model
   HAVING COUNT(DISTINCT CASE WHEN ppp > 0 THEN device_id ELSE NULL END)>0
 ) b;
+
+-- check SRF in WindowAgg's targetlist can be handled correctly
+
+explain (costs off)
+select unnest(array[a,a]), rank() over (order by a) from generate_series(2,3) a;
+
+select unnest(array[a,a]), rank() over (order by a) from generate_series(2,3) a;

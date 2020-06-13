@@ -5,12 +5,13 @@
 #include "cmockery.h"
 
 #include "postgres.h"
+#include "utils/memutils.h"
 #include "utils/string_wrapper.h"
 
 #define STRXFRM_INPUT_LENGTH_LIMIT (50)
 
 /* Test conversion of a long string (larger than STRXFRM_INPUT_LENGTH_LIMIT)*/
-void
+static void
 test__gp_strxfrm__LongQuery(void **state)
 {
 

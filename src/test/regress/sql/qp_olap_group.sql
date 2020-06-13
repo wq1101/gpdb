@@ -24,7 +24,7 @@ GROUP BY CUBE((sale.cn,sale.prc),(sale.vn),(sale.prc),(sale.cn)),CUBE((sale.cn,s
 SELECT DISTINCT sale.vn,sale.dt,sale.prc, TO_CHAR(COALESCE(STDDEV_SAMP(floor(sale.pn+sale.vn)),0),'99999999.9999999') 
 FROM sale,vendor
 WHERE sale.vn=vendor.vn
-GROUP BY GROUPING SETS(CUBE((sale.pn),(sale.dt,sale.qty),(sale.vn,sale.vn,sale.cn),(sale.cn),(sale.pn,sale.vn))),ROLLUP((sale.cn,sale.dt,sale.prc),(sale.pn,sale.pn,sale.cn),(sale.dt,sale.vn,sale.pn),(sale.dt,sale.cn),(sale.dt,sale.prc,sale.pn),(sale.vn,sale.qty)),CUBE((sale.vn,sale.cn),(sale.qty,sale.prc),(sale.qty),(sale.cn,sale.vn),(sale.vn,sale.cn),(sale.qty,sale.cn));
+GROUP BY GROUPING SETS(CUBE((sale.pn),(sale.dt,sale.qty),(sale.vn,sale.vn,sale.cn),(sale.cn),(sale.pn,sale.vn))),ROLLUP((sale.cn,sale.dt,sale.prc),(sale.pn,sale.pn,sale.cn),(sale.dt,sale.vn,sale.pn),(sale.dt,sale.cn),(sale.dt,sale.prc,sale.pn),(sale.vn,sale.qty)),CUBE((sale.vn,sale.cn),(sale.qty,sale.prc),(sale.qty),(sale.cn,sale.vn));
 
 -- ###### Queries involving SUM() function ###### --
 
@@ -61,7 +61,6 @@ WHERE sale.pn=product.pn
 GROUP BY ROLLUP((sale.vn),(sale.vn),(sale.qty)),sale.pn,sale.cn;
 
 -- ###### Queries involving COVAR_POP() function ###### --
-
 SELECT DISTINCT sale.qty,sale.pn,GROUPING(sale.pn,sale.pn), TO_CHAR(COALESCE(COVAR_POP(floor(sale.prc-sale.prc),floor(sale.vn-sale.prc)),0),'99999999.9999999'),TO_CHAR(COALESCE(VAR_POP(floor(sale.qty+sale.vn)),0),'99999999.9999999'),TO_CHAR(COALESCE(STDDEV_SAMP(floor(sale.pn)),0),'99999999.9999999'),TO_CHAR(COALESCE(AVG(DISTINCT floor(sale.pn)),0),'99999999.9999999') 
 FROM sale,product
 WHERE sale.pn=product.pn
@@ -162,3 +161,8 @@ SELECT COUNT(DISTINCT cn) as cn_r, f, g FROM (SELECT cn, CASE WHEN (vn = 0) THEN
 SELECT COUNT(DISTINCT cn) as cn_r, f, g FROM (SELECT cn, vn + 1 AS f, 1 AS g FROM sale) sale_view GROUP BY ROLLUP(f,g) HAVING (f > 1);
 PREPARE p AS SELECT COUNT(DISTINCT cn) as cn_r, f, g FROM (SELECT cn, vn + $1 AS f, $1 AS g FROM sale) sale_view GROUP BY ROLLUP(f,g) HAVING (g > 1);
 EXECUTE p(2);
+
+-- ###### Queries involving CUBE with HAVING CLAUSE ###### --
+
+WITH src AS (SELECT 1 AS a, 1 AS b)
+SELECT 1 FROM src GROUP BY CUBE(a, b) HAVING a IS NOT NULL;

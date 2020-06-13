@@ -2,11 +2,11 @@
  *
  *	  EUC_JP, SJIS and MULE_INTERNAL
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/mb/conversion_procs/euc_jp_and_sjis/euc_jp_and_sjis.c,v 1.22 2009/02/28 18:49:42 tgl Exp $
+ *	  src/backend/utils/mb/conversion_procs/euc_jp_and_sjis/euc_jp_and_sjis.c
  *
  *-------------------------------------------------------------------------
  */
@@ -35,13 +35,6 @@ PG_FUNCTION_INFO_V1(euc_jp_to_mic);
 PG_FUNCTION_INFO_V1(mic_to_euc_jp);
 PG_FUNCTION_INFO_V1(sjis_to_mic);
 PG_FUNCTION_INFO_V1(mic_to_sjis);
-
-extern Datum euc_jp_to_sjis(PG_FUNCTION_ARGS);
-extern Datum sjis_to_euc_jp(PG_FUNCTION_ARGS);
-extern Datum euc_jp_to_mic(PG_FUNCTION_ARGS);
-extern Datum mic_to_euc_jp(PG_FUNCTION_ARGS);
-extern Datum sjis_to_mic(PG_FUNCTION_ARGS);
-extern Datum mic_to_sjis(PG_FUNCTION_ARGS);
 
 /* ----------
  * conv_proc(

@@ -1,4 +1,4 @@
-/* $PostgreSQL: pgsql/src/port/inet_aton.c,v 1.10 2007/03/26 21:44:11 momjian Exp $
+/* src/port/inet_aton.c
  *
  *	This inet_aton() function was taken from the GNU C library and
  *	incorporated into Postgres for those systems which do not have this
@@ -6,7 +6,7 @@
  *
  *	The function was been extracted whole from the file inet_aton.c in
  *	Release 5.3.12 of the Linux C library, which is derived from the
- *	GNU C library, by Bryan Henderson in October 1996.	The copyright
+ *	GNU C library, by Bryan Henderson in October 1996.  The copyright
  *	notice from that file is below.
  */
 
@@ -29,7 +29,7 @@
  * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
  * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED.	IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
  * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
  * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
  * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)

@@ -2,7 +2,7 @@
 -- TRANSACTIONS
 --
 BEGIN;
-SELECT * 
+SELECT *
    INTO TABLE xacttest
    FROM aggtest;
 INSERT INTO xacttest (a, b) VALUES (777, 777.777);
@@ -24,13 +24,13 @@ SELECT * FROM aggtest;
 (0 rows)
 
 ABORT;
--- should not exist 
+-- should not exist
 SELECT oid FROM pg_class WHERE relname = 'disappear';
  oid 
 -----
 (0 rows)
 
--- should have members again 
+-- should have members again
 SELECT * FROM aggtest;
   a  |    b    
 -----+---------
@@ -43,11 +43,86 @@ SELECT * FROM aggtest;
 -- Read-only tests
 CREATE TABLE writetest (a int);
 CREATE TEMPORARY TABLE temptest (a int);
+BEGIN;
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ ONLY, DEFERRABLE; -- ok
+SELECT * FROM writetest; -- ok
+ a 
+---
+(0 rows)
+
+SET TRANSACTION READ WRITE; --fail
+ERROR:  transaction read-write mode must be set before any query
+COMMIT;
+BEGIN;
+SET TRANSACTION READ ONLY; -- ok
+SET TRANSACTION READ WRITE; -- ok
+SET TRANSACTION READ ONLY; -- ok
+SELECT * FROM writetest; -- ok
+ a 
+---
+(0 rows)
+
+SAVEPOINT x;
+SET TRANSACTION READ ONLY; -- ok
+SELECT * FROM writetest; -- ok
+ a 
+---
+(0 rows)
+
+SET TRANSACTION READ ONLY; -- ok
+SET TRANSACTION READ WRITE; --fail
+ERROR:  cannot set transaction read-write mode inside a read-only transaction
+COMMIT;
+BEGIN;
+SET TRANSACTION READ WRITE; -- ok
+SAVEPOINT x;
+SET TRANSACTION READ WRITE; -- ok
+SET TRANSACTION READ ONLY; -- ok
+SELECT * FROM writetest; -- ok
+ a 
+---
+(0 rows)
+
+SET TRANSACTION READ ONLY; -- ok
+SET TRANSACTION READ WRITE; --fail
+ERROR:  cannot set transaction read-write mode inside a read-only transaction
+COMMIT;
+BEGIN;
+SET TRANSACTION READ WRITE; -- ok
+SAVEPOINT x;
+SET TRANSACTION READ ONLY; -- ok
+SELECT * FROM writetest; -- ok
+ a 
+---
+(0 rows)
+
+ROLLBACK TO SAVEPOINT x;
+SHOW transaction_read_only;  -- off
+ transaction_read_only 
+-----------------------
+ off
+(1 row)
+
+SAVEPOINT y;
+SET TRANSACTION READ ONLY; -- ok
+SELECT * FROM writetest; -- ok
+ a 
+---
+(0 rows)
+
+RELEASE SAVEPOINT y;
+SHOW transaction_read_only;  -- off
+ transaction_read_only 
+-----------------------
+ off
+(1 row)
+
+COMMIT;
 SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY;
 DROP TABLE writetest; -- fail
-ERROR:  transaction is read-only
+ERROR:  cannot execute DROP TABLE in a read-only transaction
 INSERT INTO writetest VALUES (1); -- fail
-ERROR:  transaction is read-only
+ERROR:  cannot execute INSERT in a read-only transaction
 SELECT * FROM writetest; -- ok
  a 
 ---
@@ -57,14 +132,14 @@ DELETE FROM temptest; -- ok
 UPDATE temptest SET a = 0 FROM writetest WHERE temptest.a = 1 AND writetest.a = temptest.a; -- ok
 PREPARE test AS UPDATE writetest SET a = 0; -- ok
 EXECUTE test; -- fail
-ERROR:  transaction is read-only
+ERROR:  cannot execute UPDATE in a read-only transaction
 SELECT * FROM writetest, temptest; -- ok
  a | a 
 ---+---
 (0 rows)
 
 CREATE TABLE test AS SELECT * FROM writetest; -- fail
-ERROR:  transaction is read-only
+ERROR:  cannot execute CREATE TABLE AS in a read-only transaction
 START TRANSACTION READ WRITE;
 DROP TABLE writetest; -- ok
 COMMIT;
@@ -93,6 +168,8 @@ SELECT * FROM foo;		-- should be empty
 
 SELECT * FROM bar;		-- shouldn't exist
 ERROR:  relation "bar" does not exist
+LINE 1: SELECT * FROM bar;
+                      ^
 SELECT * FROM barbaz;	-- should be empty
  a 
 ---
@@ -109,6 +186,8 @@ BEGIN;
 	SAVEPOINT one;
 		INSERT into bar VALUES (1);
 ERROR:  relation "bar" does not exist
+LINE 1: INSERT into bar VALUES (1);
+                    ^
 	ROLLBACK TO one;
 	RELEASE SAVEPOINT one;
 	SAVEPOINT two;
@@ -175,8 +254,7 @@ BEGIN;
 ROLLBACK;
 COMMIT;		-- should not be in a transaction block
 WARNING:  there is no transaction in progress
-		
-SELECT * FROM savepoints ORDER BY 1;
+SELECT * FROM savepoints;
  a 
 ---
  1
@@ -193,7 +271,7 @@ ERROR:  column "foo" does not exist
 LINE 1: SELECT foo;
                ^
 COMMIT;
-SELECT * FROM savepoints ORDER BY 1;
+SELECT * FROM savepoints;
  a 
 ---
  1
@@ -228,7 +306,7 @@ BEGIN;
 	ROLLBACK TO SAVEPOINT one;
 		INSERT INTO savepoints VALUES (11);
 COMMIT;
-SELECT a FROM savepoints WHERE a in (9, 10, 11) ORDER BY 1;
+SELECT a FROM savepoints WHERE a in (9, 10, 11);
  a  
 ----
   9
@@ -255,7 +333,7 @@ BEGIN;
 			SAVEPOINT three;
 				INSERT INTO savepoints VALUES (17);
 COMMIT;
-SELECT a FROM savepoints WHERE a BETWEEN 12 AND 17 ORDER BY 1;
+SELECT a FROM savepoints WHERE a BETWEEN 12 AND 17;
  a  
 ----
  12
@@ -275,7 +353,7 @@ BEGIN;
 	ROLLBACK TO SAVEPOINT one;
 		INSERT INTO savepoints VALUES (22);
 COMMIT;
-SELECT a FROM savepoints WHERE a BETWEEN 18 AND 22 ORDER BY 1;
+SELECT a FROM savepoints WHERE a BETWEEN 18 AND 22;
  a  
 ----
  18
@@ -460,14 +538,12 @@ rollback;
 BEGIN;
 	savepoint x;
 		CREATE TABLE koju (a INT UNIQUE);
-NOTICE:  CREATE TABLE / UNIQUE will create implicit index "koju_a_key" for table "koju"
 		INSERT INTO koju VALUES (1);
 		INSERT INTO koju VALUES (1);
 ERROR:  duplicate key value violates unique constraint "koju_a_key"
 DETAIL:  Key (a)=(1) already exists.
 	rollback to x;
 	CREATE TABLE koju (a INT UNIQUE);
-NOTICE:  CREATE TABLE / UNIQUE will create implicit index "koju_a_key" for table "koju"
 	INSERT INTO koju VALUES (1);
 	INSERT INTO koju VALUES (1);
 ERROR:  duplicate key value violates unique constraint "koju_a_key"
@@ -476,6 +552,20 @@ ROLLBACK;
 DROP TABLE foo;
 DROP TABLE baz;
 DROP TABLE barbaz;
+-- test case for problems with revalidating an open relation during abort
+create function inverse(int) returns float8 as
+$$
+begin
+  analyze revalidate_bug;
+  return 1::float8/$1;
+exception
+  when division_by_zero then return 0;
+end$$ language plpgsql volatile;
+create table revalidate_bug (c float8 unique);
+insert into revalidate_bug values (1);
+insert into revalidate_bug values (inverse(0));
+drop table revalidate_bug;
+drop function inverse(int);
 -- verify that cursors created during an aborted subtransaction are
 -- closed, but that we do not rollback the effect of any FETCHs
 -- performed in the aborted subtransaction
@@ -523,28 +613,57 @@ fetch from foo;
 (1 row)
 
 abort;
--- tests for the "tid" type
-SELECT '(3, 3)'::tid = '(3, 4)'::tid;
- ?column? 
-----------
- f
+-- Test for proper cleanup after a failure in a cursor portal
+-- that was created in an outer subtransaction
+CREATE FUNCTION invert(x float8) RETURNS float8 LANGUAGE plpgsql AS
+$$ begin return 1/x; end $$;
+CREATE FUNCTION create_temp_tab() RETURNS text
+LANGUAGE plpgsql AS $$
+BEGIN
+  CREATE TEMP TABLE new_table (f1 float8);
+  -- case of interest is that we fail while holding an open
+  -- relcache reference to new_table
+  INSERT INTO new_table SELECT invert(0.0);
+  RETURN 'foo';
+END $$;
+BEGIN;
+DECLARE ok CURSOR FOR SELECT * FROM int8_tbl;
+DECLARE ctt CURSOR FOR SELECT create_temp_tab();
+FETCH ok;
+ q1  | q2  
+-----+-----
+ 123 | 456
 (1 row)
 
-SELECT '(3, 3)'::tid = '(3, 3)'::tid;
- ?column? 
-----------
- t
+SAVEPOINT s1;
+FETCH ok;  -- should work
+ q1  |        q2        
+-----+------------------
+ 123 | 4567890123456789
 (1 row)
 
-SELECT '(3, 3)'::tid <> '(3, 3)'::tid;
- ?column? 
-----------
- f
+FETCH ctt; -- error occurs here
+ERROR:  division by zero
+CONTEXT:  PL/pgSQL function invert(double precision) line 1 at RETURN
+SQL statement "INSERT INTO new_table SELECT invert(0.0)"
+PL/pgSQL function create_temp_tab() line 6 at SQL statement
+ROLLBACK TO s1;
+FETCH ok;  -- should work
+        q1        | q2  
+------------------+-----
+ 4567890123456789 | 123
 (1 row)
 
-SELECT '(3, 3)'::tid <> '(3, 4)'::tid;
- ?column? 
-----------
- t
-(1 row)
-
+FETCH ctt; -- must be rejected
+ERROR:  portal "ctt" cannot be run
+COMMIT;
+DROP FUNCTION create_temp_tab();
+DROP FUNCTION invert(x float8);
+-- Test for successful cleanup of an aborted transaction at session exit.
+-- THIS MUST BE THE LAST TEST IN THIS FILE.
+begin;
+select 1/0;
+ERROR:  division by zero
+rollback to X;
+ERROR:  no such savepoint
+-- DO NOT ADD ANYTHING HERE.

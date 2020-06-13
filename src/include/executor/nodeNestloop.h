@@ -4,10 +4,10 @@
  *
  *
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/executor/nodeNestloop.h,v 1.27 2008/01/01 19:45:57 momjian Exp $
+ * src/include/executor/nodeNestloop.h
  *
  *-------------------------------------------------------------------------
  */
@@ -16,15 +16,9 @@
 
 #include "nodes/execnodes.h"
 
-extern int	ExecCountSlotsNestLoop(NestLoop *node);
 extern NestLoopState *ExecInitNestLoop(NestLoop *node, EState *estate, int eflags);
 extern TupleTableSlot *ExecNestLoop(NestLoopState *node);
 extern void ExecEndNestLoop(NestLoopState *node);
-extern void ExecReScanNestLoop(NestLoopState *node, ExprContext *exprCtxt);
-
-static inline gpmon_packet_t * GpmonPktFromNLJState(NestLoopState *node)
-{
-	return &node->js.ps.gpmon_pkt;
-}
+extern void ExecReScanNestLoop(NestLoopState *node);
 
 #endif   /* NODENESTLOOP_H */

@@ -2,7 +2,7 @@
 /*
   Name:		imath.c
   Purpose:	Arbitrary precision integer arithmetic routines.
-  Author:	M. J. Fromberger <http://www.dartmouth.edu/~sting/>
+  Author:	M. J. Fromberger <http://spinning-yarns.org/michael/sw/>
   Info:		Id: imath.c 21 2006-04-02 18:58:36Z sting
 
   Copyright (C) 2002 Michael J. Fromberger, All Rights Reserved.
@@ -27,7 +27,7 @@
   CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
   SOFTWARE.
  */
-/* $PostgreSQL: pgsql/contrib/pgcrypto/imath.c,v 1.8 2009/06/11 14:48:52 momjian Exp $ */
+/* contrib/pgcrypto/imath.c */
 
 #include "postgres.h"
 #include "px.h"
@@ -647,7 +647,7 @@ mp_int_add(mp_int a, mp_int b, mp_int c)
 		/* Different signs -- subtract magnitudes, preserve sign of greater */
 		mp_int		x,
 					y;
-		int			cmp = s_ucmp(a, b); /* magnitude comparision, sign ignored */
+		int			cmp = s_ucmp(a, b); /* magnitude comparison, sign ignored */
 
 		/* Set x to max(a, b), y to min(a, b) to simplify later code */
 		if (cmp >= 0)
@@ -1254,11 +1254,9 @@ mp_int_compare(mp_int a, mp_int b)
 		 * If they're both zero or positive, the normal comparison applies; if
 		 * both negative, the sense is reversed.
 		 */
-		if (sa == MP_ZPOS)
-			return cmp;
-		else
-			return -cmp;
-
+		if (sa != MP_ZPOS)
+			INVERT_COMPARE_RESULT(cmp);
+		return cmp;
 	}
 	else
 	{
@@ -1314,10 +1312,9 @@ mp_int_compare_value(mp_int z, int value)
 	{
 		cmp = s_vcmp(z, value);
 
-		if (vsign == MP_ZPOS)
-			return cmp;
-		else
-			return -cmp;
+		if (vsign != MP_ZPOS)
+			INVERT_COMPARE_RESULT(cmp);
+		return cmp;
 	}
 	else
 	{

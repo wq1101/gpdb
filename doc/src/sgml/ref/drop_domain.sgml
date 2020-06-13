@@ -1,11 +1,16 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/drop_domain.sgml,v 1.18 2007/05/15 19:13:55 neilc Exp $
+doc/src/sgml/ref/drop_domain.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-DROPDOMAIN">
+ <indexterm zone="sql-dropdomain">
+  <primary>DROP DOMAIN</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="SQL-DROPDOMAIN-TITLE">DROP DOMAIN</refentrytitle>
+  <refentrytitle>DROP DOMAIN</refentrytitle>
+  <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
 
@@ -13,10 +18,6 @@ PostgreSQL documentation
   <refname>DROP DOMAIN</refname>
   <refpurpose>remove a domain</refpurpose>
  </refnamediv>
-
- <indexterm zone="sql-dropdomain">
-  <primary>DROP DOMAIN</primary>
- </indexterm>
 
  <refsynopsisdiv>
 <synopsis>
@@ -41,7 +42,7 @@ DROP DOMAIN [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> [, .
     <term><literal>IF EXISTS</literal></term>
     <listitem>
      <para>
-      Do not throw an error if the domain does not exist. A notice is issued 
+      Do not throw an error if the domain does not exist. A notice is issued
       in this case.
      </para>
     </listitem>
@@ -61,7 +62,9 @@ DROP DOMAIN [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> [, .
     <listitem>
      <para>
       Automatically drop objects that depend on the domain (such as
-      table columns).
+      table columns),
+      and in turn all objects that depend on those objects
+      (see <xref linkend="ddl-depend">).
      </para>
     </listitem>
    </varlistentry>
@@ -86,16 +89,15 @@ DROP DOMAIN [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> [, .
 
 <programlisting>
 DROP DOMAIN box;
-</programlisting>
-  </para>
+</programlisting></para>
  </refsect1>
 
  <refsect1 id="SQL-DROPDOMAIN-compatibility">
   <title>Compatibility</title>
-  
+
   <para>
    This command conforms to the SQL standard, except for the
-   <literal>IF EXISTS</> option, which is a <productname>PostgreSQL</> 
+   <literal>IF EXISTS</> option, which is a <productname>PostgreSQL</>
    extension.
   </para>
  </refsect1>
@@ -104,8 +106,8 @@ DROP DOMAIN box;
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-createdomain" endterm="sql-createdomain-title"></member>
-   <member><xref linkend="sql-alterdomain" endterm="sql-alterdomain-title"></member>
+   <member><xref linkend="sql-createdomain"></member>
+   <member><xref linkend="sql-alterdomain"></member>
   </simplelist>
  </refsect1>
 

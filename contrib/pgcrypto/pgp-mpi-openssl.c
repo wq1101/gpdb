@@ -26,14 +26,13 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $PostgreSQL: pgsql/contrib/pgcrypto/pgp-mpi-openssl.c,v 1.5 2009/06/11 14:48:52 momjian Exp $
+ * contrib/pgcrypto/pgp-mpi-openssl.c
  */
 #include "postgres.h"
 
 #include <openssl/bn.h>
 
 #include "px.h"
-#include "mbuf.h"
 #include "pgp.h"
 
 static BIGNUM *
@@ -75,7 +74,7 @@ bn_to_mpi(BIGNUM *bn)
 }
 
 /*
- * Decide the number of bits in the random componont k
+ * Decide the number of bits in the random component k
  *
  * It should be in the same range as p for signing (which
  * is deprecated), but can be much smaller for encrypting.
@@ -83,8 +82,8 @@ bn_to_mpi(BIGNUM *bn)
  * Until I research it further, I just mimic gpg behaviour.
  * It has a special mapping table, for values <= 5120,
  * above that it uses 'arbitrary high number'.  Following
- * algorihm hovers 10-70 bits above gpg values.  And for
- * larger p, it uses gpg's algorihm.
+ * algorithm hovers 10-70 bits above gpg values.  And for
+ * larger p, it uses gpg's algorithm.
  *
  * The point is - if k gets large, encryption will be
  * really slow.  It does not matter for decryption.

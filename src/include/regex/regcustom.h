@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1998, 1999 Henry Spencer.	All rights reserved.
+ * Copyright (c) 1998, 1999 Henry Spencer.  All rights reserved.
  *
  * Development of this software was funded, in part, by Cray Research Inc.,
  * UUNET Communications Services Inc., Sun Microsystems Inc., and Scriptics
@@ -25,7 +25,7 @@
  * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
  * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
- * $PostgreSQL: pgsql/src/include/regex/regcustom.h,v 1.7 2008/02/14 17:33:37 tgl Exp $
+ * src/include/regex/regcustom.h
  */
 
 /* headers if any */
@@ -65,7 +65,19 @@ typedef int celt;				/* type to hold chr, or NOCELT */
 #define DIGITVAL(c) ((c)-'0')	/* turn chr digit into its value */
 #define CHRBITS 32				/* bits in a chr; must not use sizeof */
 #define CHR_MIN 0x00000000		/* smallest and largest chr; the value */
-#define CHR_MAX 0xfffffffe		/* CHR_MAX-CHR_MIN+1 should fit in uchr */
+#define CHR_MAX 0x7ffffffe		/* CHR_MAX-CHR_MIN+1 must fit in an int, and
+								 * CHR_MAX+1 must fit in both chr and celt */
+
+/*
+ * Check if a chr value is in range.  Ideally we'd just write this as
+ *		((c) >= CHR_MIN && (c) <= CHR_MAX)
+ * However, if chr is unsigned and CHR_MIN is zero, the first part of that
+ * is a no-op, and certain overly-nannyish compilers give warnings about it.
+ * So we leave that out here.  If you want to make chr signed and/or CHR_MIN
+ * not zero, redefine this macro as above.  Callers should assume that the
+ * macro may multiply evaluate its argument, even though it does not today.
+ */
+#define CHR_IS_IN_RANGE(c)	((c) <= CHR_MAX)
 
 /* functions operating on chr */
 #define iscalnum(x) pg_wc_isalnum(x)

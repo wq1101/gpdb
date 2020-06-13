@@ -3,12 +3,12 @@
  * testlo.c
  *	  test using large objects with libpq
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/test/examples/testlo.c,v 1.31 2009/01/01 17:24:04 momjian Exp $
+ *	  src/test/examples/testlo.c
  *
  *-------------------------------------------------------------------------
  */
@@ -231,6 +231,17 @@ main(int argc, char **argv)
 				PQerrorMessage(conn));
 		exit_nicely(conn);
 	}
+
+	/* Set always-secure search path, so malicous users can't take control. */
+	res = PQexec(conn,
+				 "SELECT pg_catalog.set_config('search_path', '', false)");
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		fprintf(stderr, "SET failed: %s", PQerrorMessage(conn));
+		PQclear(res);
+		exit_nicely(conn);
+	}
+	PQclear(res);
 
 	res = PQexec(conn, "begin");
 	PQclear(res);

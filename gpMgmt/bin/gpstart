@@ -32,13 +32,10 @@ try:
     from gppylib.commands.pg import PgControlData
     from gppylib.operations.startSegments import *
     from gppylib.utils import TableLogger
-    from gppylib.gp_dbid import GpDbidFile
     from gppylib.gp_era import GpEraFile
-    from gppylib.operations.filespace import CheckFilespaceConsistency, FileType, is_filespace_configured
 except ImportError, e:
     sys.exit('Cannot import modules.  Please check that you have sourced greenplum_path.sh.  Detail: ' + str(e))
 
-DEFAULT_NUM_WORKERS = 64
 logger = get_default_logger()
 
 
@@ -49,7 +46,7 @@ class GpStart:
                  wrapper,
                  wrapper_args,
                  skip_standby_check,
-                 parallel=DEFAULT_NUM_WORKERS,
+                 parallel=gp.DEFAULT_GPSTART_NUM_WORKERS,
                  quiet=False,
                  masteronly=False,
                  interactive=False,
@@ -78,16 +75,12 @@ class GpStart:
         #
         # Some variables that are set during execution
         #
-        self.dbidfile = None
         self.era = None
         self.gpversion = None
         self.gparray = None
         self.port = None
         self.gphome = None
         self.dburl = None
-        self.lc_collate = None
-        self.lc_monetary = None
-        self.lc_numeric = None
         self.max_connections = None
         logger.debug("Setting level of parallelism to: %d" % self.parallel)
 
@@ -100,15 +93,12 @@ class GpStart:
             if os.getenv('GPSTART_INTERNAL_MASTER_ONLY'):
                 logger.info('Master-only start requested for management utilities.')
             else:
-                if self.dbidfile.standby_dbid is not None:
-                    logger.warning("****************************************************************************")
-                    logger.warning("Master-only start requested in a configuration with a standby master.")
-                    logger.warning("This is advisable only under the direct supervision of Greenplum support. ")
-                    logger.warning("This mode of operation is not supported in a production environment and ")
-                    logger.warning("may lead to a split-brain condition and possible unrecoverable data loss.")
-                    logger.warning("****************************************************************************")
-                else:
-                    logger.info('Master-only start requested in configuration without a standby master.')
+                logger.warning("****************************************************************************")
+                logger.warning("Master-only start requested. Disruptive action if standby master configured.")
+                logger.warning("This is advisable only under the direct supervision of Greenplum support. ")
+                logger.warning("This mode of operation is not supported in a production environment and ")
+                logger.warning("may lead to a split-brain condition and possible unrecoverable data loss.")
+                logger.warning("****************************************************************************")
                 if self.interactive:
                     if not userinput.ask_yesno(None, "\nContinue with master-only startup", 'N'):
                         raise UserAbortedException()
@@ -124,84 +114,22 @@ class GpStart:
                 return 0
 
             if self.skip_heap_checksum_validation:
+                self.master_checksum_value = None
                 logger.warning("Because of --skip-heap-checksum-validation, the GUC for data_checksums "
-                               "will not be checked between master and segments")
+                                   "will not be checked between master and segments")
             else:
-                # check that checksum settings are consistent across the cluster
                 num_workers = min(len(self.gparray.get_hostlist()), self.parallel)
-                heap_checksum = HeapChecksum(gparray=self.gparray, num_workers=num_workers, logger=logger)
-                if self.gparray.hasStandbyMaster():
-                    if heap_checksum.get_master_value() != heap_checksum.get_standby_value():
-                        logger.warning("Heap checksum settings on standby master do not match master <<<<<<<<")
-                        logger.error("gpstart error: Heap checksum settings are not consistent across the cluster.")
-                        return 1
-
-                successes, failures = heap_checksum.get_segments_checksum_settings()
-                if len(successes) == 0:
-                    logger.fatal("No segments responded to ssh query for heap checksum. Not starting the array.")
-                    return 1
-
-                consistent, inconsistent, master_checksum_value = heap_checksum.check_segment_consistency(successes)
-
-                if not heap_checksum.are_segments_consistent(consistent, inconsistent):
-                    logger.fatal("Cluster heap checksum setting differences reported.")
-                    logger.fatal("Shutting down master")
-                    cmd = gp.GpStop("Shutting down master", masterOnly=True,
-                                    fast=True, quiet=logging_is_quiet(),
-                                    verbose=logging_is_verbose(),
-                                    datadir=self.master_datadir,
-                                    logfileDirectory=self.logfileDirectory)
-                    cmd.run()
-
-                    logger.fatal("Heap checksum settings on %d of %d segment instances do not match master <<<<<<<<"
-                                 % (len(inconsistent), len(inconsistent) + len(consistent)))
-                    logger.fatal("Review %s for details" % get_logfile())
-                    log_to_file_only("Failed checksum consistency validation:", logging.WARN)
-                    for gpdb in inconsistent:
-                        segment_id = gpdb.getSegmentDbId()
-                        checksum = gpdb.heap_checksum
-                        log_to_file_only("dbid: %s "
-                                         "checksum set to %s differs from master checksum set to %s" %
-                                         (segment_id, checksum, master_checksum_value), logging.WARN)
-
-                    return 1
-                logger.info("Heap checksum setting is consistent across the cluster")
-
-            # Do we have an even-number of recovered segments ?
-            if len(self.gparray.recoveredSegmentDbids) > 0 and len(self.gparray.recoveredSegmentDbids) % 2 == 0:
-                logger.info("Master start noticed recovered segments, updating configuration to rebalance.")
-                self.gparray.updateRoleForRecoveredSegs(self.dburl)
-                logger.info("Re-obtaining updated segment details from master...")
-                self.gparray = GpArray.initFromCatalog(self.dburl, utility=True)
+                self.master_checksum_value = HeapChecksum(gparray=self.gparray, num_workers=num_workers,
+                                                          logger=logger).get_master_value()
 
             if not self.skip_standby_check:
                 self._check_standby_activated()
             else:
                 logger.info("Skipping Standby activation status checking.")
 
-            filespace_configured = is_filespace_configured()
-            inconsistent_filespace = False
-            if filespace_configured:
-                # Check for filespace consistency
-                if not CheckFilespaceConsistency(self.gparray, FileType.TRANSACTION_FILES).run() or \
-                        not CheckFilespaceConsistency(self.gparray, FileType.TEMPORARY_FILES).run():
-                    logger.error('Filespaces are inconsistent. Abort Greenplum Database start.')
-                    inconsistent_filespace = True
-
             logger.info("Shutting down master")
-            cmd = gp.GpStop("Shutting down master", masterOnly=True,
-                            fast=True, quiet=logging_is_quiet(),
-                            verbose=logging_is_verbose(),
-                            datadir=self.master_datadir,
-                            logfileDirectory=self.logfileDirectory)
-            cmd.run()
-            logger.debug("results of forcing master shutdown: %s" % cmd)
+            self.shutdown_master_only()
             # TODO: check results of command.
-
-            # in order to fail out here we must have filespace configured and also
-            # have failed the consistency check
-            if filespace_configured and inconsistent_filespace:
-                return 1
 
         finally:
             # Reenable Ctrl-C
@@ -245,18 +173,14 @@ class GpStart:
         self._check_version()
         self._check_master_running()
 
-        if not os.path.exists(self.master_datadir + '/pg_log'):
-            os.mkdir(self.master_datadir + '/pg_log')
-
     ######
     def _basic_setup(self):
         self.gphome = gp.get_gphome()
         if self.master_datadir is None:
             self.master_datadir = gp.get_masterdatadir()
-        self.user = gp.get_user()
+        self.user = unix.getUserName()
         gp.check_permissions(self.user)
         self._read_postgresqlconf()
-        self.dbidfile = GpDbidFile(self.master_datadir, do_read=True, logger=get_logger_if_verbose())
 
     ######
     def _read_postgresqlconf(self):
@@ -294,14 +218,34 @@ class GpStart:
 
         self._remove_postmaster_tmpfile(self.port)
 
+    def shutdown_master_only(self):
+        cmd = gp.GpStop("Shutting down master", masterOnly=True,
+                        fast=True, quiet=logging_is_quiet(),
+                        verbose=logging_is_verbose(),
+                        datadir=self.master_datadir,
+                        parallel=self.parallel,
+                        logfileDirectory=self.logfileDirectory)
+        cmd.run()
+        logger.debug("results of forcing master shutdown: %s" % cmd)
+
     def fetch_tli(self, data_dir_path, remoteHost=None):
         if not remoteHost:
-            controldata = PgControlData("Latest checkpoint's TimeLineID", data_dir_path)
+            controldata = PgControlData("fetching pg_controldata locally", data_dir_path)
         else:
-            controldata = PgControlData("Latest checkpoint's TimeLineID", data_dir_path, REMOTE, remoteHost)
+            controldata = PgControlData("fetching pg_controldata remotely", data_dir_path, REMOTE, remoteHost)
 
-        controldata.run(validateAfter=True)
-        return int(controldata.get_value("Latest checkpoint's TimeLineID"))
+        try:
+            controldata.run(validateAfter=True)
+            return int(controldata.get_value("Latest checkpoint's TimeLineID"))
+        except base.ExecutionError as err:
+            logger.warning("Standby host is unreachable, cannot determine whether the standby is currently acting as the master. Received error: %s" % err)
+            logger.warning("Continue only if you are certain that the standby is not acting as the master.")
+            if not self.interactive or not userinput.ask_yesno(None, "\nContinue with startup", 'N'):
+                if not self.interactive:
+                    logger.warning("Non interactive mode detected. Not starting the cluster. Start the cluster in interactive mode.")
+                self.shutdown_master_only()
+                raise UserAbortedException()
+            return 0  # a 0 won't lead to standby promotion, as TimeLineIDs start at 1
 
     def _check_standby_activated(self):
         logger.debug("Checking if standby has been activated...")
@@ -321,6 +265,7 @@ class GpStart:
                 cmd = gp.GpStop("Shutting down master", masterOnly=True,
                                 fast=True, quiet=logging_is_quiet(),
                                 verbose=logging_is_verbose(),
+                                parallel=self.parallel,
                                 datadir=self.master_datadir)
                 cmd.run(validateAfter=True)
                 logger.info("Master Stopped...")
@@ -364,7 +309,7 @@ class GpStart:
         gp.GpStop.local("forcing master shutdown", masterOnly=True,
                         verbose=logging_is_verbose,
                         quiet=self.quiet, fast=False,
-                        force=True, datadir=self.master_datadir)
+                        force=True, datadir=self.master_datadir, parallel=self.parallel)
 
     ######
     def _remove_postmaster_tmpfile(self, port):
@@ -430,13 +375,8 @@ class GpStart:
     def _startMaster(self):
         logger.info("Starting Master instance in admin mode")
 
-        d = GpDbidFile(self.master_datadir)
-        d.read_gp_dbid()
-
-        numContentsInCluster = 0
         cmd = gp.MasterStart('master in utility mode', self.master_datadir,
-                             self.port, d.dbid, d.standby_dbid or 0,
-                             numContentsInCluster, self.era,
+                             self.port, self.era,
                              wrapper=self.wrapper, wrapper_args=self.wrapper_args,
                              specialMode=self.specialMode, timeout=self.timeout, utilityMode=True
                              )
@@ -452,16 +392,10 @@ class GpStart:
         self.dburl = dbconn.DbURL(port=self.port, dbname='template1')
         self.gparray = GpArray.initFromCatalog(self.dburl, utility=True)
 
-        logger.debug("Gathering collation settings...")
-        self.conn = dbconn.connect(self.dburl, utility=True)
-        (self.lc_collate, self.lc_monetary, self.lc_numeric) = catalog.getCollationSettings(self.conn)
-
         logger.info("Setting new master era")
         e = GpEraFile(self.master_datadir, logger=get_logger_if_verbose())
         e.new_era(self.gparray.master.hostname, self.port, time.strftime('%y%m%d%H%M%S'))
         self.era = e.era
-
-        self.conn.close()
 
     ######
     def _start(self, segmentsToStart, invalidSegments):
@@ -485,11 +419,10 @@ class GpStart:
         else:
             startMode = START_AS_MIRRORLESS
 
-        localeData = ":".join([self.lc_collate, self.lc_monetary, self.lc_numeric])
         # this will eventually start gpsegstart.py
-        segmentStartOp = StartSegmentsOperation(self.pool, self.quiet, localeData, self.gpversion,
-                                                self.gphome, self.master_datadir, self.timeout,
-                                                self.specialMode, self.wrapper, self.wrapper_args,
+        segmentStartOp = StartSegmentsOperation(self.pool, self.quiet, self.gpversion,
+                                                self.gphome, self.master_datadir, self.master_checksum_value,
+                                                self.timeout, self.specialMode, self.wrapper, self.wrapper_args, self.parallel,
                                                 logfileDirectory=self.logfileDirectory)
         segmentStartResult = segmentStartOp.startSegments(self.gparray, segmentsToStart, startMode, self.era)
 
@@ -529,40 +462,22 @@ class GpStart:
         # segments marked down
         invalid_segs = self.gparray.get_invalid_segdbs()
 
-        inactiveDbIds = {}
-        for segment in invalid_segs:
-            inactiveDbIds[segment.getSegmentDbId()] = True
-        invalid_segs = [segment for segment in invalid_segs if inactiveDbIds.get(segment.getSegmentDbId()) is None]
-
-        # now produce the list of segments to actually start
-        dbIdsToNotStart = {}
-        for segment in invalid_segs:
-            dbIdsToNotStart[segment.getSegmentDbId()] = True
-
         for seg in invalid_segs:
             logger.warning("Skipping startup of segment marked down in configuration: on %s directory %s <<<<<" % \
                            (seg.getSegmentHostName(), seg.getSegmentDataDirectory()))
-        logger.debug("dbIdsToNotStart has %d entries" % len(dbIdsToNotStart))
 
-        # we intend to dedup invalid_segs
-        assert len(dbIdsToNotStart) == len(invalid_segs)
-
-        toStart = [seg for seg in segs if dbIdsToNotStart.get(seg.getSegmentDbId()) is None]
-        return (toStart, invalid_segs)
+        return (segs, invalid_segs)
 
     ####
     def _verify_enough_segments(self, startResult, gparray):
         successfulSegments = startResult.getSuccessfulSegments()
-        mirroringFailures = [f.getSegment() for f in startResult.getFailedSegmentObjs() \
-                             if f.getReasonCode() == gp.SEGSTART_ERROR_MIRRORING_FAILURE]
 
         allSegmentsByContent = GpArray.getSegmentsByContentId(gparray.getSegDbList())
-        successfulSegmentsByDbId = GpArray.getSegmentsGroupedByValue(successfulSegments, GpDB.getSegmentDbId)
-        mirroringFailuresByDbId = GpArray.getSegmentsGroupedByValue(mirroringFailures, GpDB.getSegmentDbId)
+        successfulSegmentsByDbId = GpArray.getSegmentsGroupedByValue(successfulSegments, Segment.getSegmentDbId)
 
         #
-        # look at each content, see if there is a segment available (or one which can be made
-        #   available by the fault prober by switching to changetracking)
+        # look at each content, see if there is a segment available (or one
+        # which can be made available by failing over)
         #
         for primary in gparray.getSegDbList():
 
@@ -579,19 +494,8 @@ class GpStart:
                 # good, we can continue!
                 continue
 
-            if primary.getSegmentDbId() in mirroringFailuresByDbId \
-                    and not primary.isSegmentModeInChangeLogging():
-                #
-                # we have a mirroring failure so the fault prober can probably convert us to changetracking
-                #
-                #   note that if the primary is already in changetracking then a mirroring failure is
-                #   considered fatal here
-                #
-                continue
-
             if mirror is not None \
-                    and (
-                            mirror.getSegmentDbId() in successfulSegmentsByDbId or mirror.getSegmentDbId() in mirroringFailuresByDbId) \
+                    and mirror.getSegmentDbId() in successfulSegmentsByDbId \
                     and primary.isSegmentModeSynchronized():
                 #
                 # we could fail over to that mirror, so it's okay to start up like this
@@ -624,7 +528,6 @@ class GpStart:
         # stop them, stopping primaries before mirrors
         #
         for type in ["primary", "mirror"]:
-            dispatch_count = 0
             for hostName, segments in segmentsByHost.iteritems():
 
                 if type == "primary":
@@ -640,11 +543,11 @@ class GpStart:
                                           verbose=logging_is_verbose(),
                                           ctxt=base.REMOTE, remoteHost=hostName)
                     self.pool.addCommand(cmd)
-                    dispatch_count += 1
 
-            if dispatch_count > 0:
-                self.pool.wait_and_printdots(dispatch_count, self.quiet)
-        pass
+            if self.quiet:
+                self.pool.join()
+            else:
+                base.join_and_indicate_progress(self.pool)
 
     ######
     def _print_segment_start(self, segmentStartResult, invalidSegments, willShutdownSegments):
@@ -655,17 +558,11 @@ class GpStart:
         invalidSegments are those that we didn't even try to start because they are marked as down or should otherwise
            not be started
         """
-        mirroringFailures = [f for f in segmentStartResult.getFailedSegmentObjs() \
-                             if f.getReasonCode() == gp.SEGSTART_ERROR_MIRRORING_FAILURE]
-        nonMirroringFailures = [f for f in segmentStartResult.getFailedSegmentObjs() \
-                                if f.getReasonCode() != gp.SEGSTART_ERROR_MIRRORING_FAILURE]
-
         started = len(segmentStartResult.getSuccessfulSegments())
-        failedFromMirroring = len(mirroringFailures)
-        failedNotFromMirroring = len(nonMirroringFailures)
-        totalTriedToStart = started + failedFromMirroring + failedNotFromMirroring
+        failed = len(segmentStartResult.getFailedSegmentObjs())
+        totalTriedToStart = started + failed
 
-        if failedFromMirroring > 0 or failedNotFromMirroring > 0 or logging_is_verbose():
+        if failed or logging_is_verbose():
             logger.info("----------------------------------------------------")
             for failure in segmentStartResult.getFailedSegmentObjs():
                 segment = failure.getSegment()
@@ -681,14 +578,7 @@ class GpStart:
         tableLog.addSeparator()
         tableLog.info(["Successful segment starts", "= %d" % started])
 
-        if self.gparray.hasMirrors and failedFromMirroring > 0:
-            tableLog.warn(["Failed segment starts, from mirroring connection between primary and mirror",
-                           "= %d" % failedFromMirroring])
-            tableLog.infoOrWarn(failedNotFromMirroring > 0,
-                                ["Other failed segment starts", "= %d" % failedNotFromMirroring])
-        else:
-            assert failedFromMirroring == 0
-            tableLog.infoOrWarn(failedNotFromMirroring > 0, ["Failed segment starts", "= %d" % failedNotFromMirroring])
+        tableLog.infoOrWarn(failed, ["Failed segment starts", "= %d" % failed])
 
         tableLog.infoOrWarn(len(invalidSegments) > 0,
                             ["Skipped segment starts (segments are marked down in configuration)",
@@ -705,10 +595,10 @@ class GpStart:
                     (started, totalTriedToStart, skippedMsg, attentionFlag))
         logger.info("----------------------------------------------------")
 
-        if failedNotFromMirroring > 0 or failedFromMirroring > 0:
+        if failed:
             logger.warning("Segment instance startup failures reported")
             logger.warning("Failed start %d of %d segment instances %s" % \
-                           (failedNotFromMirroring + failedFromMirroring, totalTriedToStart, attentionFlag))
+                           (failed, totalTriedToStart, attentionFlag))
             logger.warning("Review %s" % get_logfile())
             if not willShutdownSegments:
                 logger.warning("For more details on segment startup failure(s)")
@@ -759,22 +649,15 @@ class GpStart:
         if self.restricted:
             restrict_txt = "in RESTRICTED mode"
 
-        standby_dbid = 0
-        if self.gparray.standbyMaster:
-            standby_dbid = self.gparray.standbyMaster.getSegmentDbId()
-
-        numContentsInCluster = self.gparray.getNumSegmentContents()
-
         logger.info("Starting Master instance %s directory %s %s" % (
         self.gparray.master.hostname, self.master_datadir, restrict_txt))
 
         # attempt to start master
         gp.MasterStart.local("Starting Master instance",
-                             self.master_datadir, self.port, self.gparray.master.dbid, standby_dbid,
-                             numContentsInCluster, self.era,
+                             self.master_datadir, self.port, self.era,
                              wrapper=self.wrapper, wrapper_args=self.wrapper_args,
                              specialMode=self.specialMode, restrictedMode=self.restricted, timeout=self.timeout,
-                             max_connections=self.max_connections, disableMasterMirror=(not self.start_standby)
+                             max_connections=self.max_connections
                              )
 
         # check that master is running now
@@ -788,6 +671,8 @@ class GpStart:
 
         msg = None
         try:
+            self.dburl.retries = 4
+            self.dburl.timeout = 15
             masterconn = dbconn.connect(self.dburl)
             masterconn.close()
 
@@ -818,10 +703,7 @@ class GpStart:
                 host = self.gparray.standbyMaster.hostname
                 datadir = self.gparray.standbyMaster.datadir
                 port = self.gparray.standbyMaster.port
-                dbid = self.gparray.standbyMaster.dbid
-                ncontents = self.gparray.getNumSegmentContents()
-                return gp.start_standbymaster(host, datadir, port, dbid,
-                                              ncontents, era=self.era,
+                return gp.start_standbymaster(host, datadir, port, era=self.era,
                                               wrapper=self.wrapper,
                                               wrapper_args=self.wrapper_args)
             except base.ExecutionError, e:
@@ -854,8 +736,8 @@ class GpStart:
                          help='start master instance only in maintenance mode')
         addTo.add_option('-y', '--no_standby', dest="start_standby", action='store_false', default=True,
                          help='do not start master standby server')
-        addTo.add_option('-B', '--parallel', type="int", default=DEFAULT_NUM_WORKERS, metavar="<parallel_processes>",
-                         help='number of segment hosts to run in parallel. Default is %d' % DEFAULT_NUM_WORKERS)
+        addTo.add_option('-B', '--parallel', type="int", default=gp.DEFAULT_GPSTART_NUM_WORKERS, metavar="<parallel_processes>",
+                         help='number of segment hosts to run in parallel. Default is %d' % gp.DEFAULT_GPSTART_NUM_WORKERS)
         addTo.add_option('-R', '--restricted', action='store_true',
                          help='start in restricted mode. Only users with superuser privilege are allowed to connect.')
         addTo.add_option('-t', '--timeout', dest='timeout', default=SEGMENT_TIMEOUT_DEFAULT, type='int',

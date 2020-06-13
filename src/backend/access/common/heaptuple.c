@@ -21,7 +21,7 @@
  * tuptoaster.c.
  *
  * This change will break any code that assumes it needn't detoast values
- * that have been put into a tuple but never sent to disk.	Hopefully there
+ * that have been put into a tuple but never sent to disk.  Hopefully there
  * are few such places.
  *
  * Varlenas still have alignment 'i' (or 'd') in pg_type/pg_attribute, since
@@ -47,28 +47,25 @@
  *
  * Portions Copyright (c) 2006-2009, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/access/common/heaptuple.c,v 1.120.2.1 2009/03/30 04:09:09 tgl Exp $
+ *	  src/backend/access/common/heaptuple.c
  *
  *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
 
-#include "access/heapam.h"
 #include "access/sysattr.h"
-#include "access/transam.h"
 #include "access/tuptoaster.h"
 #include "executor/tuptable.h"
+#include "utils/expandeddatum.h"
 
 #include "catalog/pg_type.h"
-#include "cdb/cdbvars.h"                /* Gp_segment */
-
-#include "utils/debugbreak.h"
+#include "cdb/cdbvars.h"                /* GpIdentity.segindex */
 
 /* Does att's datatype allow packing into the 1-byte-header varlena format? */
 #define ATT_IS_PACKABLE(att) \
@@ -109,13 +106,15 @@ heap_compute_data_size(TupleDesc tupleDesc,
 	for (i = 0; i < numberOfAttributes; i++)
 	{
 		Datum		val;
+		Form_pg_attribute atti;
 
 		if (isnull[i])
 			continue;
 
 		val = values[i];
+		atti = att[i];
 
-		if (ATT_IS_PACKABLE(att[i]) &&
+		if (ATT_IS_PACKABLE(atti) &&
 			VARATT_CAN_MAKE_SHORT(DatumGetPointer(val)))
 		{
 			/*
@@ -124,11 +123,21 @@ heap_compute_data_size(TupleDesc tupleDesc,
 			 */
 			data_length += VARATT_CONVERTED_SHORT_SIZE(DatumGetPointer(val));
 		}
+		else if (atti->attlen == -1 &&
+				 VARATT_IS_EXTERNAL_EXPANDED(DatumGetPointer(val)))
+		{
+			/*
+			 * we want to flatten the expanded value so that the constructed
+			 * tuple doesn't depend on it
+			 */
+			data_length = att_align_nominal(data_length, atti->attalign);
+			data_length += EOH_get_flat_size(DatumGetEOHP(val));
+		}
 		else
 		{
-			data_length = att_align_datum(data_length, att[i]->attalign,
-										  att[i]->attlen, val);
-			data_length = att_addlength_datum(data_length, att[i]->attlen,
+			data_length = att_align_datum(data_length, atti->attalign,
+										  atti->attlen, val);
+			data_length = att_addlength_datum(data_length, atti->attlen,
 											  val);
 		}
 	}
@@ -208,7 +217,7 @@ heap_fill_tuple(TupleDesc tupleDesc,
 		if (att[i]->attbyval)
 		{
 			/* pass-by-value */
-			data = (char *) att_align_nominal((long) data, att[i]->attalign);
+			data = (char *) att_align_nominal(data, att[i]->attalign);
 			store_att_byval(data, values[i], att[i]->attlen);
 			data_length = att[i]->attlen;
 		}
@@ -220,10 +229,26 @@ heap_fill_tuple(TupleDesc tupleDesc,
 			*infomask |= HEAP_HASVARWIDTH;
 			if (VARATT_IS_EXTERNAL(val))
 			{
-				*infomask |= HEAP_HASEXTERNAL;
-				/* no alignment, since it's short by definition */
-				data_length = VARSIZE_EXTERNAL(val);
-				memcpy(data, val, data_length);
+				if (VARATT_IS_EXTERNAL_EXPANDED(val))
+				{
+					/*
+					 * we want to flatten the expanded value so that the
+					 * constructed tuple doesn't depend on it
+					 */
+					ExpandedObjectHeader *eoh = DatumGetEOHP(values[i]);
+
+					data = (char *) att_align_nominal(data,
+													  att[i]->attalign);
+					data_length = EOH_get_flat_size(eoh);
+					EOH_flatten_into(eoh, data, data_length);
+				}
+				else
+				{
+					*infomask |= HEAP_HASEXTERNAL;
+					/* no alignment, since it's short by definition */
+					data_length = VARSIZE_EXTERNAL(val);
+					memcpy(data, val, data_length);
+				}
 			}
 			else if (VARATT_IS_SHORT(val))
 			{
@@ -242,7 +267,7 @@ heap_fill_tuple(TupleDesc tupleDesc,
 			else
 			{
 				/* full 4-byte header varlena */
-				data = (char *) att_align_nominal((long) data,
+				data = (char *) att_align_nominal(data,
 												  att[i]->attalign);
 				data_length = VARSIZE(val);
 				memcpy(data, val, data_length);
@@ -259,7 +284,7 @@ heap_fill_tuple(TupleDesc tupleDesc,
 		else
 		{
 			/* fixed-length pass-by-reference */
-			data = (char *) att_align_nominal((long) data, att[i]->attalign);
+			data = (char *) att_align_nominal(data, att[i]->attalign);
 			Assert(att[i]->attlen > 0);
 			data_length = att[i]->attlen;
 			memcpy(data, DatumGetPointer(values[i]), data_length);
@@ -285,7 +310,7 @@ heap_fill_tuple(TupleDesc tupleDesc,
 bool
 heap_attisnull(HeapTuple tup, int attnum)
 {
-	Assert(!is_heaptuple_memtuple(tup));
+	Assert(!is_memtuple((GenericTuple) tup));
 
 	if (attnum > (int) HeapTupleHeaderGetNatts(tup->t_data))
 		return true;
@@ -360,7 +385,7 @@ nocachegetattr(HeapTuple tuple,
 	bool		slow = false;	/* do we have to walk attrs? */
 	int			off;			/* current offset within data */
 
-	Assert(!is_heaptuple_memtuple(tuple));
+	Assert(!is_memtuple((GenericTuple) tuple));
 
 	/* ----------------
 	 *	 Three cases:
@@ -371,68 +396,32 @@ nocachegetattr(HeapTuple tuple,
 	 * ----------------
 	 */
 
-#ifdef IN_MACRO
-/* This is handled in the macro */
-	Assert(attnum > 0);
-
-	if (isnull)
-		*isnull = false;
-#endif
-
 	attnum--;
 
-	if (HeapTupleNoNulls(tuple))
-	{
-#ifdef IN_MACRO
-/* This is handled in the macro */
-		if (att[attnum]->attcacheoff >= 0)
-		{
-			return fetchatt(att[attnum],
-							(char *) tup + tup->t_hoff +
-							att[attnum]->attcacheoff);
-		}
-#endif
-	}
-	else
+	if (!HeapTupleNoNulls(tuple))
 	{
 		/*
 		 * there's a null somewhere in the tuple
 		 *
-		 * check to see if desired att is null
+		 * check to see if any preceding bits are null...
 		 */
+		int			byte = attnum >> 3;
+		int			finalbit = attnum & 0x07;
 
-#ifdef IN_MACRO
-/* This is handled in the macro */
-		if (att_isnull(attnum, bp))
+		/* check for nulls "before" final bit of last byte */
+		if ((~bp[byte]) & ((1 << finalbit) - 1))
+			slow = true;
+		else
 		{
-			if (isnull)
-				*isnull = true;
-			return (Datum) NULL;
-		}
-#endif
+			/* check for nulls in any "earlier" bytes */
+			int			i;
 
-		/*
-		 * Now check to see if any preceding bits are null...
-		 */
-		{
-			int			byte = attnum >> 3;
-			int			finalbit = attnum & 0x07;
-
-			/* check for nulls "before" final bit of last byte */
-			if ((~bp[byte]) & ((1 << finalbit) - 1))
-				slow = true;
-			else
+			for (i = 0; i < byte; i++)
 			{
-				/* check for nulls in any "earlier" bytes */
-				int			i;
-
-				for (i = 0; i < byte; i++)
+				if (bp[i] != 0xFF)
 				{
-					if (bp[i] != 0xFF)
-					{
-						slow = true;
-						break;
-					}
+					slow = true;
+					break;
 				}
 			}
 		}
@@ -454,7 +443,7 @@ nocachegetattr(HeapTuple tuple,
 
 		/*
 		 * Otherwise, check for non-fixed-length attrs up to and including
-		 * target.	If there aren't any, it's safe to cheaply initialize the
+		 * target.  If there aren't any, it's safe to cheaply initialize the
 		 * cached offsets for these attrs.
 		 */
 		if (HeapTupleHasVarWidth(tuple))
@@ -524,7 +513,7 @@ nocachegetattr(HeapTuple tuple,
 		 *
 		 * Note - This loop is a little tricky.  For each non-null attribute,
 		 * we have to first account for alignment padding before the attr,
-		 * then advance over the attr based on its length.	Nulls have no
+		 * then advance over the attr based on its length.  Nulls have no
 		 * storage and no alignment padding either.  We can use/set
 		 * attcacheoff until we reach either a null or a var-width attribute.
 		 */
@@ -590,16 +579,15 @@ nocachegetattr(HeapTuple tuple,
  * ----------------
  */
 Datum
-heap_getsysattr(HeapTuple tup, int attnum, bool *isnull)
+heap_getsysattr(HeapTuple tup, int attnum, TupleDesc tupleDesc, bool *isnull)
 {
 	Datum		result;
 
 	Assert(tup);
-	Assert(!is_heaptuple_memtuple(tup));
+	Assert(!is_memtuple((GenericTuple) tup));
 
 	/* Currently, no sys attribute ever reads as NULL. */
-	if (isnull)
-		*isnull = false;
+	*isnull = false;
 
 	switch (attnum)
 	{
@@ -611,17 +599,17 @@ heap_getsysattr(HeapTuple tup, int attnum, bool *isnull)
 			result = ObjectIdGetDatum(HeapTupleGetOid(tup));
 			break;
 		case MinTransactionIdAttributeNumber:
-			result = TransactionIdGetDatum(HeapTupleHeaderGetXmin(tup->t_data));
+			result = TransactionIdGetDatum(HeapTupleHeaderGetRawXmin(tup->t_data));
 			break;
 		case MaxTransactionIdAttributeNumber:
-			result = TransactionIdGetDatum(HeapTupleHeaderGetXmax(tup->t_data));
+			result = TransactionIdGetDatum(HeapTupleHeaderGetRawXmax(tup->t_data));
 			break;
 		case MinCommandIdAttributeNumber:
 		case MaxCommandIdAttributeNumber:
 
 			/*
 			 * cmin and cmax are now both aliases for the same field, which
-			 * can in fact also be a combo command id.	XXX perhaps we should
+			 * can in fact also be a combo command id.  XXX perhaps we should
 			 * return the "real" cmin or cmax if possible, that is if we are
 			 * inside the originating transaction?
 			 */
@@ -633,7 +621,7 @@ heap_getsysattr(HeapTuple tup, int attnum, bool *isnull)
 			elog(ERROR, "Invalid reference to \"tableoid\" system attribute");
 			break;
 		case GpSegmentIdAttributeNumber:                       /*CDB*/
-			result = Int32GetDatum(Gp_segment);
+			result = Int32GetDatum(GpIdentity.segindex);
 			break;
 		default:
 			elog(ERROR, "invalid attnum: %d", attnum);
@@ -661,7 +649,7 @@ heaptuple_copy_to(HeapTuple tuple, HeapTuple dest, uint32 *destlen)
 	if (!HeapTupleIsValid(tuple) || tuple->t_data == NULL)
 		return NULL;
 
-	Assert(!is_heaptuple_memtuple(tuple));
+	Assert(!is_memtuple((GenericTuple) tuple));
 
 	len = HEAPTUPLESIZE + tuple->t_len;
 	if(destlen && *destlen < len)
@@ -703,12 +691,47 @@ heap_copytuple_with_tuple(HeapTuple src, HeapTuple dest)
 		return;
 	}
 
-	Assert(!is_heaptuple_memtuple(src));
+	Assert(!is_memtuple((GenericTuple) src));
 
 	dest->t_len = src->t_len;
 	dest->t_self = src->t_self;
 	dest->t_data = (HeapTupleHeader) palloc(src->t_len);
 	memcpy((char *) dest->t_data, (char *) src->t_data, src->t_len);
+}
+
+/* ----------------
+ *		heap_copy_tuple_as_datum
+ *
+ *		copy a tuple as a composite-type Datum
+ * ----------------
+ */
+Datum
+heap_copy_tuple_as_datum(HeapTuple tuple, TupleDesc tupleDesc)
+{
+	HeapTupleHeader td;
+
+	/*
+	 * If the tuple contains any external TOAST pointers, we have to inline
+	 * those fields to meet the conventions for composite-type Datums.
+	 */
+	if (HeapTupleHasExternal(tuple))
+		return toast_flatten_tuple_to_datum(tuple->t_data,
+											tuple->t_len,
+											tupleDesc);
+
+	/*
+	 * Fast path for easy case: just make a palloc'd copy and insert the
+	 * correct composite-Datum header fields (since those may not be set if
+	 * the given tuple came from disk, rather than from heap_form_tuple).
+	 */
+	td = (HeapTupleHeader) palloc(tuple->t_len);
+	memcpy((char *) td, (char *) tuple->t_data, tuple->t_len);
+
+	HeapTupleHeaderSetDatumLength(td, tuple->t_len);
+	HeapTupleHeaderSetTypeId(td, tupleDesc->tdtypeid);
+	HeapTupleHeaderSetTypMod(td, tupleDesc->tdtypmod);
+
+	return PointerGetDatum(td);
 }
 
 /*
@@ -728,7 +751,6 @@ heaptuple_form_to(TupleDesc tupleDescriptor, Datum *values, bool *isnull, HeapTu
 				data_len;
 	int			hoff;
 	bool		hasnull = false;
-	Form_pg_attribute *att = tupleDescriptor->attrs;
 	int			numberOfAttributes = tupleDescriptor->natts;
 	int			i;
 
@@ -739,28 +761,14 @@ heaptuple_form_to(TupleDesc tupleDescriptor, Datum *values, bool *isnull, HeapTu
 						numberOfAttributes, MaxTupleAttributeNumber)));
 
 	/*
-	 * Check for nulls and embedded tuples; expand any toasted attributes in
-	 * embedded tuples.  This preserves the invariant that toasting can only
-	 * go one level deep.
-	 *
-	 * We can skip calling toast_flatten_tuple_attribute() if the attribute
-	 * couldn't possibly be of composite type.  All composite datums are
-	 * varlena and have alignment 'd'; furthermore they aren't arrays. Also,
-	 * if an attribute is already toasted, it must have been sent to disk
-	 * already and so cannot contain toasted attributes.
+	 * Check for nulls
 	 */
 	for (i = 0; i < numberOfAttributes; i++)
 	{
 		if (isnull[i])
-			hasnull = true;
-		else if (att[i]->attlen == -1 &&
-				 att[i]->attalign == 'd' &&
-				 att[i]->attndims == 0 &&
-				 !VARATT_IS_EXTENDED(DatumGetPointer(values[i])))
 		{
-			values[i] = toast_flatten_tuple_attribute(values[i],
-													  att[i]->atttypid,
-													  att[i]->atttypmod);
+			hasnull = true;
+			break;
 		}
 	}
 
@@ -797,14 +805,15 @@ heaptuple_form_to(TupleDesc tupleDescriptor, Datum *values, bool *isnull, HeapTu
 		tuple = (HeapTuple) palloc0(HEAPTUPLESIZE + len);
 
 	/*
-	 * Allocate and zero the space needed.	Note that the tuple body and
+	 * Allocate and zero the space needed.  Note that the tuple body and
 	 * HeapTupleData management structure are allocated in one chunk.
 	 */
 	tuple->t_data = td = (HeapTupleHeader) ((char *) tuple + HEAPTUPLESIZE);
 
 	/*
 	 * And fill in the information.  Note we fill the Datum fields even though
-	 * this tuple may never become a Datum.
+	 * this tuple may never become a Datum.  This lets HeapTupleHeaderGetDatum
+	 * identify the tuple type if needed.
 	 */
 	tuple->t_len = len;
 	ItemPointerSetInvalid(&(tuple->t_self));
@@ -812,6 +821,8 @@ heaptuple_form_to(TupleDesc tupleDescriptor, Datum *values, bool *isnull, HeapTu
 	HeapTupleHeaderSetDatumLength(td, len);
 	HeapTupleHeaderSetTypeId(td, tupleDescriptor->tdtypeid);
 	HeapTupleHeaderSetTypMod(td, tupleDescriptor->tdtypmod);
+	/* We also make sure that t_ctid is invalid unless explicitly set */
+	ItemPointerSetInvalid(&(td->t_ctid));
 
 	HeapTupleHeaderSetNatts(td, numberOfAttributes);
 	td->t_hoff = hoff;
@@ -828,43 +839,10 @@ heaptuple_form_to(TupleDesc tupleDescriptor, Datum *values, bool *isnull, HeapTu
 								 (hasnull ? td->t_bits : NULL));
 
 	Assert(data_len == actual_len);
-	Assert(!is_heaptuple_memtuple(tuple));
+	Assert(!is_memtuple((GenericTuple) tuple));
 
 	return tuple;
 }
-
-/*
- *		heap_formtuple
- *
- *		construct a tuple from the given values[] and nulls[] arrays
- *
- *		Null attributes are indicated by a 'n' in the appropriate byte
- *		of nulls[]. Non-null attributes are indicated by a ' ' (space).
- *
- * OLD API with char 'n'/' ' convention for indicating nulls.
- * This is deprecated and should not be used in new code, but we keep it
- * around for use by old add-on modules.
- */
-HeapTuple
-heap_formtuple(TupleDesc tupleDescriptor,
-			   Datum *values,
-			   char *nulls)
-{
-	HeapTuple	tuple;			/* return tuple */
-	int			numberOfAttributes = tupleDescriptor->natts;
-	bool	   *boolNulls = (bool *) palloc(numberOfAttributes * sizeof(bool));
-	int			i;
-
-	for (i = 0; i < numberOfAttributes; i++)
-		boolNulls[i] = (nulls[i] == 'n');
-
-	tuple = heap_form_tuple(tupleDescriptor, values, boolNulls);
-
-	pfree(boolNulls);
-
-	return tuple;
-}
-
 
 /*
  * heap_modify_tuple
@@ -890,14 +868,14 @@ heap_modify_tuple(HeapTuple tuple,
 	bool	   *isnull;
 	HeapTuple	newTuple;
 
-	Assert(!is_heaptuple_memtuple(tuple));
+	Assert(!is_memtuple((GenericTuple) tuple));
 
 	/*
 	 * allocate and fill values and isnull arrays from either the tuple or the
 	 * repl information, as appropriate.
 	 *
 	 * NOTE: it's debatable whether to use heap_deform_tuple() here or just
-	 * heap_getattr() only the non-replaced colums.  The latter could win if
+	 * heap_getattr() only the non-replaced columns.  The latter could win if
 	 * there are many replaced columns and few non-replaced ones. However,
 	 * heap_deform_tuple costs only O(N) while the heap_getattr way would cost
 	 * O(N^2) if there are many non-replaced columns, so it seems better to
@@ -938,48 +916,13 @@ heap_modify_tuple(HeapTuple tuple,
 }
 
 /*
- *		heap_modifytuple
- *
- *		forms a new tuple from an old tuple and a set of replacement values.
- *		returns a new palloc'ed tuple.
- *
- * OLD API with char 'n'/' ' convention for indicating nulls, and
- * char 'r'/' ' convention for indicating whether to replace columns.
- * This is deprecated and should not be used in new code, but we keep it
- * around for use by old add-on modules.
- */
-HeapTuple
-heap_modifytuple(HeapTuple tuple,
-				 TupleDesc tupleDesc,
-				 Datum *replValues,
-				 char *replNulls,
-				 char *replActions)
-{
-	bool *replIsNull = (bool *) palloc(sizeof(bool) * tupleDesc->natts);
-	bool *doRepl = (bool *) palloc(sizeof(bool) * tupleDesc->natts);
-	HeapTuple ret;
-
-	int i;
-	for(i=0; i<tupleDesc->natts; ++i)
-	{
-		replIsNull[i] = (replNulls[i] != ' ');
-		doRepl[i] = (replActions[i] == 'r');
-	}
-
-	ret = heap_modify_tuple(tuple, tupleDesc, replValues, replIsNull, doRepl);
-	pfree(replIsNull);
-	pfree(doRepl);
-
-	return ret;
-}
-
-/*
  * heap_deform_tuple
  *		Given a tuple, extract data into values/isnull arrays; this is
  *		the inverse of heap_form_tuple.
  *
  *		Storage for the values/isnull arrays is provided by the caller;
- *		it should be sized according to tupleDesc->natts not tuple->t_natts.
+ *		it should be sized according to tupleDesc->natts not
+ *		HeapTupleHeaderGetNatts(tuple->t_data).
  *
  *		Note that for pass-by-reference datatypes, the pointer placed
  *		in the Datum will point into the given tuple.
@@ -1004,7 +947,7 @@ heap_deform_tuple(HeapTuple tuple, TupleDesc tupleDesc,
 	bits8	   *bp = tup->t_bits;		/* ptr to null bitmap in tuple */
 	bool		slow = false;	/* can we use/set attcacheoff? */
 
-	Assert(!is_heaptuple_memtuple(tuple));
+	Assert(!is_memtuple((GenericTuple) tuple));
 	natts = HeapTupleHeaderGetNatts(tup);
 
 	/*
@@ -1081,119 +1024,6 @@ heap_deform_tuple(HeapTuple tuple, TupleDesc tupleDesc,
 }
 
 /*
- *		heap_deformtuple
- *
- *		Given a tuple, extract data into values/nulls arrays; this is
- *		the inverse of heap_formtuple.
- *
- *		Storage for the values/nulls arrays is provided by the caller;
- *		it should be sized according to tupleDesc->natts not tuple->t_natts.
- *
- *		Note that for pass-by-reference datatypes, the pointer placed
- *		in the Datum will point into the given tuple.
- *
- *		When all or most of a tuple's fields need to be extracted,
- *		this routine will be significantly quicker than a loop around
- *		heap_getattr; the loop will become O(N^2) as soon as any
- *		noncacheable attribute offsets are involved.
- *
- * OLD API with char 'n'/' ' convention for indicating nulls.
- * This is deprecated and should not be used in new code, but we keep it
- * around for use by old add-on modules.
- */
-void
-heap_deformtuple(HeapTuple tuple,
-				 TupleDesc tupleDesc,
-				 Datum *values,
-				 char *nulls)
-{
-	HeapTupleHeader tup = tuple->t_data;
-	bool		hasnulls = HeapTupleHasNulls(tuple);
-	Form_pg_attribute *att = tupleDesc->attrs;
-	int			tdesc_natts = tupleDesc->natts;
-	int			natts;			/* number of atts to extract */
-	int			attnum;
-	char	   *tp;				/* ptr to tuple data */
-	long		off;			/* offset in tuple data */
-	bits8	   *bp = tup->t_bits;		/* ptr to null bitmap in tuple */
-	bool		slow = false;	/* can we use/set attcacheoff? */
-
-	natts = HeapTupleHeaderGetNatts(tup);
-
-	/*
-	 * In inheritance situations, it is possible that the given tuple actually
-	 * has more fields than the caller is expecting.  Don't run off the end of
-	 * the caller's arrays.
-	 */
-	natts = Min(natts, tdesc_natts);
-
-	tp = (char *) tup + tup->t_hoff;
-
-	off = 0;
-
-	for (attnum = 0; attnum < natts; attnum++)
-	{
-		Form_pg_attribute thisatt = att[attnum];
-
-		if (hasnulls && att_isnull(attnum, bp))
-		{
-			values[attnum] = (Datum) 0;
-			nulls[attnum] = 'n';
-			slow = true;		/* can't use attcacheoff anymore */
-			continue;
-		}
-
-		nulls[attnum] = ' ';
-
-		if (!slow && thisatt->attcacheoff >= 0)
-			off = thisatt->attcacheoff;
-		else if (thisatt->attlen == -1)
-		{
-			/*
-			 * We can only cache the offset for a varlena attribute if the
-			 * offset is already suitably aligned, so that there would be no
-			 * pad bytes in any case: then the offset will be valid for either
-			 * an aligned or unaligned value.
-			 */
-			if (!slow &&
-				off == att_align_nominal(off, thisatt->attalign))
-				thisatt->attcacheoff = off;
-			else
-			{
-				off = att_align_pointer(off, thisatt->attalign, -1,
-										tp + off);
-				slow = true;
-			}
-		}
-		else
-		{
-			/* not varlena, so safe to use att_align_nominal */
-			off = att_align_nominal(off, thisatt->attalign);
-
-			if (!slow)
-				thisatt->attcacheoff = off;
-		}
-
-		values[attnum] = fetchatt(thisatt, tp + off);
-
-		off = att_addlength_pointer(off, thisatt->attlen, tp + off);
-
-		if (thisatt->attlen <= 0)
-			slow = true;		/* can't use attcacheoff anymore */
-	}
-
-	/*
-	 * If tuple doesn't have all the atts indicated by tupleDesc, read the
-	 * rest as null
-	 */
-	for (; attnum < tdesc_natts; attnum++)
-	{
-		values[attnum] = (Datum) 0;
-		nulls[attnum] = 'n';
-	}
-}
-
-/*
  * slot_deform_tuple
  *		Given a TupleTableSlot, extract data from the slot's physical tuple
  *		into its Datum/isnull arrays.  Data is extracted up through the
@@ -1204,10 +1034,7 @@ heap_deformtuple(HeapTuple tuple,
  *		re-computing information about previously extracted attributes.
  *		slot->tts_nvalid is the number of attributes already extracted.
  */
-#ifndef USE_CODEGEN
-static
-#endif
-void
+static void
 slot_deform_tuple(TupleTableSlot *slot, int natts)
 {
 	HeapTuple	tuple = TupGetHeapTuple(slot); 
@@ -1339,6 +1166,7 @@ _slot_getsomeattrs(TupleTableSlot *slot, int attnum)
 
 	slot_deform_tuple(slot, attno);
 
+
 	/*
 	 * If tuple doesn't have all the atts indicated by tupleDesc, read the
 	 * rest as null
@@ -1351,6 +1179,34 @@ _slot_getsomeattrs(TupleTableSlot *slot, int attnum)
 	slot->PRIVATE_tts_nvalid = attnum;
 	TupSetVirtualTuple(slot);
 }
+
+#if 0
+/*
+ * slot_getsysattr
+ *		This function fetches a system attribute of the slot's current tuple.
+ *		Unlike slot_getattr, if the slot does not contain system attributes,
+ *		this will return false (with a NULL attribute value) instead of
+ *		throwing an error.
+ */
+bool
+slot_getsysattr(TupleTableSlot *slot, int attnum,
+				Datum *value, bool *isnull)
+{
+	HeapTuple	tuple = slot->tts_tuple;
+
+	Assert(attnum < 0);			/* else caller error */
+	if (tuple == NULL ||
+		tuple == &(slot->tts_minhdr))
+	{
+		/* No physical tuple, or minimal tuple, so fail */
+		*value = (Datum) 0;
+		*isnull = true;
+		return false;
+	}
+	*value = heap_getsysattr(tuple, attnum, slot->tts_tupleDescriptor, isnull);
+	return true;
+}
+#endif
 
 /*
  * heap_freetuple
@@ -1383,7 +1239,6 @@ heap_form_minimal_tuple(TupleDesc tupleDescriptor,
 				data_len;
 	int			hoff;
 	bool		hasnull = false;
-	Form_pg_attribute *att = tupleDescriptor->attrs;
 	int			numberOfAttributes = tupleDescriptor->natts;
 	int			i;
 
@@ -1394,35 +1249,21 @@ heap_form_minimal_tuple(TupleDesc tupleDescriptor,
 						numberOfAttributes, MaxTupleAttributeNumber)));
 
 	/*
-	 * Check for nulls and embedded tuples; expand any toasted attributes in
-	 * embedded tuples.  This preserves the invariant that toasting can only
-	 * go one level deep.
-	 *
-	 * We can skip calling toast_flatten_tuple_attribute() if the attribute
-	 * couldn't possibly be of composite type.  All composite datums are
-	 * varlena and have alignment 'd'; furthermore they aren't arrays. Also,
-	 * if an attribute is already toasted, it must have been sent to disk
-	 * already and so cannot contain toasted attributes.
+	 * Check for nulls
 	 */
 	for (i = 0; i < numberOfAttributes; i++)
 	{
 		if (isnull[i])
-			hasnull = true;
-		else if (att[i]->attlen == -1 &&
-				 att[i]->attalign == 'd' &&
-				 att[i]->attndims == 0 &&
-				 !VARATT_IS_EXTENDED(values[i]))
 		{
-			values[i] = toast_flatten_tuple_attribute(values[i],
-													  att[i]->atttypid,
-													  att[i]->atttypmod);
+			hasnull = true;
+			break;
 		}
 	}
 
 	/*
 	 * Determine total space needed
 	 */
-	len = offsetof(MinimalTupleData, t_bits);
+	len = SizeofMinimalTupleHeader;
 
 	if (hasnull)
 		len += BITMAPLEN(numberOfAttributes);
@@ -1529,56 +1370,4 @@ minimal_tuple_from_heap_tuple(HeapTuple htup)
 	memcpy(result, (char *) htup->t_data + MINIMAL_TUPLE_OFFSET, len);
 	result->t_len = len;
 	return result;
-}
-
-
-/* ----------------
- *		heap_addheader
- *
- * This routine forms a HeapTuple by copying the given structure (tuple
- * data) and adding a generic header.  Note that the tuple data is
- * presumed to contain no null fields and no varlena fields.
- *
- * This routine is really only useful for certain system tables that are
- * known to be fixed-width and null-free.  Currently it is only used for
- * pg_attribute tuples.
- * ----------------
- */
-HeapTuple
-heap_addheader(int natts,		/* max domain index */
-			   bool withoid,	/* reserve space for oid */
-			   Size structlen,	/* its length */
-			   void *structure) /* pointer to the struct */
-{
-	HeapTuple	tuple;
-	HeapTupleHeader td;
-	Size		len;
-	int			hoff;
-
-	AssertArg(natts > 0);
-
-	/* header needs no null bitmap */
-	hoff = offsetof(HeapTupleHeaderData, t_bits);
-	if (withoid)
-		hoff += sizeof(Oid);
-	hoff = MAXALIGN(hoff);
-	len = hoff + structlen;
-
-	tuple = (HeapTuple) palloc0(HEAPTUPLESIZE + len);
-	tuple->t_data = td = (HeapTupleHeader) ((char *) tuple + HEAPTUPLESIZE);
-
-	tuple->t_len = len;
-	ItemPointerSetInvalid(&(tuple->t_self));
-
-	/* we don't bother to fill the Datum fields */
-
-	HeapTupleHeaderSetNatts(td, natts);
-	td->t_hoff = hoff;
-
-	if (withoid)				/* else leave infomask = 0 */
-		td->t_infomask = HEAP_HASOID;
-
-	memcpy((char *) td + hoff, structure, structlen);
-
-	return tuple;
 }

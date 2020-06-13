@@ -1,7 +1,7 @@
 /*
  * FreeSec: libcrypt for NetBSD
  *
- * $PostgreSQL: pgsql/contrib/pgcrypto/crypt-des.c,v 1.15 2006/07/13 04:15:24 neilc Exp $
+ * contrib/pgcrypto/crypt-des.c
  *
  * Copyright (c) 1994 David Burren
  * All rights reserved.
@@ -61,8 +61,8 @@
  */
 
 #include "postgres.h"
+#include "miscadmin.h"
 
-#include "px.h"
 #include "px-crypt.h"
 
 /* for ntohl/htonl */
@@ -408,8 +408,8 @@ des_setkey(const char *key)
 	if (!des_initialised)
 		des_init();
 
-	rawkey0 = ntohl(*(uint32 *) key);
-	rawkey1 = ntohl(*(uint32 *) (key + 4));
+	rawkey0 = ntohl(*(const uint32 *) key);
+	rawkey1 = ntohl(*(const uint32 *) (key + 4));
 
 	if ((rawkey0 | rawkey1)
 		&& rawkey0 == old_rawkey0
@@ -541,6 +541,8 @@ do_des(uint32 l_in, uint32 r_in, uint32 *l_out, uint32 *r_out, int count)
 
 	while (count--)
 	{
+		CHECK_FOR_INTERRUPTS();
+
 		/*
 		 * Do each round.
 		 */
@@ -636,6 +638,8 @@ des_cipher(const char *in, char *out, long salt, int count)
 	rawr = ntohl(buffer[1]);
 
 	retval = do_des(rawl, rawr, &l_out, &r_out, count);
+	if (retval)
+		return (retval);
 
 	buffer[0] = htonl(l_out);
 	buffer[1] = htonl(r_out);
@@ -682,9 +686,19 @@ px_crypt_des(const char *key, const char *setting)
 	if (*setting == _PASSWORD_EFMT1)
 	{
 		/*
-		 * "new"-style: setting - underscore, 4 bytes of count, 4 bytes of
-		 * salt key - unlimited characters
+		 * "new"-style: setting must be a 9-character (underscore, then 4
+		 * bytes of count, then 4 bytes of salt) string. See CRYPT(3) under
+		 * the "Extended crypt" heading for further details.
+		 *
+		 * Unlimited characters of the input key are used. This is known as
+		 * the "Extended crypt" DES method.
+		 *
 		 */
+		if (strlen(setting) < 9)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid salt")));
+
 		for (i = 1, count = 0L; i < 5; i++)
 			count |= ascii_to_bin(setting[i]) << (i - 1) * 6;
 
@@ -709,24 +723,29 @@ px_crypt_des(const char *key, const char *setting)
 			if (des_setkey((char *) keybuf))
 				return (NULL);
 		}
-		strncpy(output, setting, 9);
+		StrNCpy(output, setting, 10);
 
 		/*
 		 * Double check that we weren't given a short setting. If we were, the
-		 * above code will probably have created wierd values for count and
+		 * above code will probably have created weird values for count and
 		 * salt, but we don't really care. Just make sure the output string
 		 * doesn't have an extra NUL in it.
 		 */
-		output[9] = '\0';
 		p = output + strlen(output);
 	}
 	else
 #endif   /* !DISABLE_XDES */
 	{
 		/*
-		 * "old"-style: setting - 2 bytes of salt key - up to 8 characters
+		 * "old"-style: setting - 2 bytes of salt key - only up to the first 8
+		 * characters of the input key are used.
 		 */
 		count = 25;
+
+		if (strlen(setting) < 2)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid salt")));
 
 		salt = (ascii_to_bin(setting[1]) << 6)
 			| ascii_to_bin(setting[0]);

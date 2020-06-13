@@ -79,7 +79,7 @@ main (void)
      
    
   
-  	 
+	 
 	 
    
   
@@ -93,7 +93,7 @@ main (void)
  c ptr = NULL ;
  
 #line 36 "type.pgc"
- struct varchar_vc { 
+ struct varchar { 
 #line 34 "type.pgc"
  int len ;
  
@@ -110,7 +110,7 @@ main (void)
   ECPGdebug (1, stderr);
 
   empl.idnum = 1;
-  { ECPGconnect(__LINE__, 0, "regress1" , NULL, NULL , NULL, 0); }
+  { ECPGconnect(__LINE__, 0, "ecpg1_regression" , NULL, NULL , NULL, 0); }
 #line 43 "type.pgc"
 
   if (sqlca.sqlcode)
@@ -140,17 +140,17 @@ main (void)
   { ECPGdo(__LINE__, 0, 1, NULL, 0, ECPGst_normal, "select idnum , name , accs , string1 , string2 , string3 from empl where idnum = $1 ", 
 	ECPGt_long,&(empl.idnum),(long)1,(long)1,sizeof(long), 
 	ECPGt_NO_INDICATOR, NULL , 0L, 0L, 0L, ECPGt_EOIT, 
-	ECPGt_long,&(empl.idnum),(long)1,(long)1,sizeof(long), 
+	ECPGt_long,&(empl.idnum),(long)1,(long)1,sizeof( struct TBempl ), 
 	ECPGt_NO_INDICATOR, NULL , 0L, 0L, 0L, 
-	ECPGt_char,&(empl.name),(long)21,(long)1,(21)*sizeof(char), 
+	ECPGt_char,&(empl.name),(long)21,(long)1,sizeof( struct TBempl ), 
 	ECPGt_NO_INDICATOR, NULL , 0L, 0L, 0L, 
-	ECPGt_short,&(empl.accs),(long)1,(long)1,sizeof(short), 
+	ECPGt_short,&(empl.accs),(long)1,(long)1,sizeof( struct TBempl ), 
 	ECPGt_NO_INDICATOR, NULL , 0L, 0L, 0L, 
 	ECPGt_char,(str),(long)11,(long)1,(11)*sizeof(char), 
 	ECPGt_NO_INDICATOR, NULL , 0L, 0L, 0L, 
 	ECPGt_char,&(ptr),(long)0,(long)1,(1)*sizeof(char), 
 	ECPGt_NO_INDICATOR, NULL , 0L, 0L, 0L, 
-	ECPGt_varchar,&(vc),(long)10,(long)1,sizeof(struct varchar_vc), 
+	ECPGt_varchar,&(vc),(long)10,(long)1,sizeof(struct varchar), 
 	ECPGt_NO_INDICATOR, NULL , 0L, 0L, 0L, ECPGt_EORT);}
 #line 68 "type.pgc"
 

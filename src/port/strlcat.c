@@ -1,5 +1,5 @@
 /*
- * $PostgreSQL: pgsql/src/port/strlcat.c,v 1.4 2009/06/11 14:49:15 momjian Exp $
+ * src/port/strlcat.c
  *
  *	$OpenBSD: strlcat.c,v 1.13 2005/08/08 08:05:37 espie Exp $	*/
 
@@ -25,7 +25,7 @@
 /*
  * Appends src to string dst of size siz (unlike strncat, siz is the
  * full size of dst, not space left).  At most siz-1 characters
- * will be copied.	Always NUL terminates (unless siz <= strlen(dst)).
+ * will be copied.  Always NUL terminates (unless siz <= strlen(dst)).
  * Returns strlen(src) + MIN(siz, strlen(initial dst)).
  * If retval >= siz, truncation occurred.
  */

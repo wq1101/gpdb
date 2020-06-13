@@ -10,7 +10,6 @@ try:
     from gppylib import gplog, pgconf
     from gppylib.commands import gp
     from gppylib.commands.base import Command, ExecutionError
-    from gppylib.commands.unix import curr_platform, SUNOS
     from gppylib.db import dbconn
     from gppylib.gparray import GpArray
     from gppylib.gpversion import GpVersion
@@ -21,6 +20,7 @@ try:
     from gppylib.operations.unix import ListFilesByPattern
 
     import yaml
+    import platform
 except ImportError, ex:
     sys.exit('Cannot import modules.  Please check that you have sourced greenplum_path.sh.  Detail: ' + str(ex))
 
@@ -45,6 +45,7 @@ class GpPkgProgram:
         self.clean = options.clean
         self.migrate = options.migrate
         self.interactive = options.interactive
+        self.filename = options.filename
 
         # only one of the following may be provided: --install, --remove, --update, --query, --build, --clean, --migrate
         count = sum([1 for opt in ['install', 'remove', 'update', 'query', 'build', 'clean', 'migrate'] if getattr(self, opt)])
@@ -73,6 +74,18 @@ class GpPkgProgram:
                 raise ExceptionNoStackTraceNeeded('Invalid syntax, expecting "gppkg --migrate <from_gphome> <to_gphome>".')
             self.migrate = (args[0], args[1])
 
+        # gppkg should check gpexpand status unless in build mode.
+        #
+        # Build mode does not use any information from the cluster and does not
+        # affect its running status, in fact it does not require a cluster
+        # exists at all.
+        if not self.build:
+            check_result, msg = gp.conflict_with_gpexpand("gppkg",
+                                                          refuse_phase1=True,
+                                                          refuse_phase2=False)
+            if not check_result:
+                raise ExceptionNoStackTraceNeeded(msg)
+
     @staticmethod
     def create_parser():
         parser = OptParser(option_class=OptChecker,
@@ -90,7 +103,7 @@ class GpPkgProgram:
 
         addMasterDirectoryOptionForSingleClusterProgram(add_to)
 
-        # TODO: AK: Eventually, these options may need to be flexible enough to accept mutiple packages
+        # TODO: AK: Eventually, these options may need to be flexible enough to accept multiple packages
         # in one invocation. If so, the structure of this parser may need to change.
         add_to.add_option('-i', '--install', help='install the given gppkg', metavar='<package>')
         add_to.add_option('-u', '--update', help='update the given gppkg', metavar='<package>')
@@ -99,6 +112,7 @@ class GpPkgProgram:
         add_to.add_option('-b', '--build', help='build a gppkg', metavar='<directory>')
         add_to.add_option('-c', '--clean', help='clean the cluster of the given gppkg', action='store_true')
         add_to.add_option('--migrate', help='migrate gppkgs from a separate $GPHOME', metavar='<from_gphome> <to_gphome>', action='store_true', default=False)
+        add_to.add_option('-f', '--filename', help='set specific package name', metavar='<name>')
 
         add_to = OptionGroup(parser, 'Query Options')
         parser.add_option_group(add_to)
@@ -169,26 +183,34 @@ class GpPkgProgram:
 
     def run(self):
         if self.build:
-            BuildGppkg(self.build).run()
+            if self.filename:
+                BuildGppkg(self.build, self.filename).run()
+            else:
+                BuildGppkg(self.build, None).run()
             return
 
-        #Check for RPM and Solaris OS
-        if curr_platform == SUNOS:
-            raise ExceptionNoStackTraceNeeded('gppkg is not supported on Solaris')
+        if platform.linux_distribution()[0] == 'Ubuntu':
+            try:
+                cmd = Command(name='Check for dpkg', cmdStr='dpkg --version')
+                cmd.run(validateAfter=True)
+                cmd = Command(name='Check for fakeroot', cmdStr='fakeroot --version')
+                cmd.run(validateAfter=True)
+            except Exception, ex:
+                raise ExceptionNoStackTraceNeeded('fakeroot and dpkg are both required by gppkg')
+        else:
+            try:
+                cmd = Command(name = 'Check for rpm', cmdStr = 'rpm --version')
+                cmd.run(validateAfter = True)
+                results = cmd.get_results().stdout.strip()
+                rpm_version_string = results.split(' ')[-1]
 
-        try:
-            cmd = Command(name = 'Check for rpm', cmdStr = 'rpm --version')
-            cmd.run(validateAfter = True)
-            results = cmd.get_results().stdout.strip()
-            rpm_version_string = results.split(' ')[-1]
+                if not rpm_version_string.startswith('4.'):
+                    raise ExceptionNoStackTraceNeeded('gppkg requires rpm version 4.x')
 
-            if not rpm_version_string.startswith('4.'):
-                raise ExceptionNoStackTraceNeeded('gppkg requires rpm version 4.x')
-
-        except ExecutionError, ex:
-            results = ex.cmd.get_results().stderr.strip()
-            if len(results) != 0 and 'not found' in results:
-                raise ExceptionNoStackTraceNeeded('gppkg requires RPM to be available in PATH')
+            except ExecutionError, ex:
+                results = ex.cmd.get_results().stderr.strip()
+                if len(results) != 0 and 'not found' in results:
+                    raise ExceptionNoStackTraceNeeded('gppkg requires RPM to be available in PATH')
 
         if self.master_datadir is None:
             self.master_datadir = gp.get_masterdatadir()

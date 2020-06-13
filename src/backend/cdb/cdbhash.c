@@ -15,55 +15,43 @@
  */
 #include "postgres.h"
 
-#include "access/tuptoaster.h"
-#include "utils/builtins.h"
-#include "catalog/pg_type.h"
-#include "parser/parse_type.h"
-#include "utils/numeric.h"
-#include "utils/inet.h"
-#include "utils/timestamp.h"
-#include "utils/array.h"
-#include "utils/date.h"
-#include "utils/cash.h"
-#include "utils/datetime.h"
-#include "utils/nabstime.h"
-#include "utils/varbit.h"
-#include "utils/uuid.h"
+#include "access/hash.h"
+#include "access/heapam.h"
+#include "access/htup_details.h"
+#include "catalog/indexing.h"
+#include "catalog/pg_am.h"
+#include "catalog/pg_amop.h"
+#include "catalog/pg_amproc.h"
+#include "catalog/pg_opclass.h"
+#include "cdb/cdbhash.h"
+#include "commands/defrem.h"
 #include "fmgr.h"
+#include "utils/builtins.h"
+#include "utils/catcache.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
-#include "utils/complex_type.h"
-#include "cdb/cdbhash.h"
-#include "cdb/cdbutil.h"
+#include "utils/typcache.h"
 
-/* 32 bit FNV-1  non-zero initial basis */
-#define FNV1_32_INIT ((uint32)0x811c9dc5)
-
-/* Constant prime value used for an FNV1 hash */
-#define FNV_32_PRIME ((uint32)0x01000193)
-
-/* Constant used for hashing a NULL value */
-#define NULL_VAL ((uint32)0XF0F0F0F1)
-
-/* Constant used for hashing a NAN value  */
-#define NAN_VAL ((uint32)0XE0E0E0E1)
-
-/* Constant used for hashing an invalid value  */
-#define INVALID_VAL ((uint32)0XD0D0D0D1) 
-
-/* Constant used to help defining upper limit for random generator */
-#define UPPER_VAL ((uint32)0XA0B0C0D1)
+/*
+ * GUC to enable use of legacy hash opclasses by default. If set,
+ * and a CREATE TABLE command doesn't specify opclasses for distribution
+ * keys, the legacy hash opclasses are used instead of the default
+ * PostgreSQL hash opclasses. If a datatype doesn't have legacy hash
+ * opclasses, the normal defaults are still used.
+ *
+ * This is normally set as a database-level setting, on databases
+ * that have been pg_upgraded from a previous version. But it can also be
+ * handy to set it with SET or in postgresql.conf for testing purposes.
+ */
+bool gp_use_legacy_hashops = false;
 
 /* Fast mod using a bit mask, assuming that y is a power of 2 */
 #define FASTMOD(x,y)		((x) & ((y)-1))
 
 /* local function declarations */
-static uint32 fnv1_32_buf(void *buf, size_t len, uint32 hashval);
-static int	inet_getkey(inet *addr, unsigned char *inet_key, int key_size);
-static int	ignoreblanks(char *data, int len);
 static int	ispowof2(int numsegs);
-
+static inline int32 jump_consistent_hash(uint64 key, int32 num_segments);
 
 /*================================================================
  *
@@ -81,17 +69,20 @@ static int	ispowof2(int numsegs);
  *
  * 1 - number of segments in Greenplum Database.
  * 2 - reduction method.
+ * 3 - distribution key column hash functions.
  *
  * The hash value itself will be initialized for every tuple in cdbhashinit()
  */
 CdbHash *
-makeCdbHash(int numsegs)
+makeCdbHash(int numsegs, int natts, Oid *hashfuncs)
 {
 	CdbHash    *h;
+	int			i;
+	bool		is_legacy_hash = false;
 
 	Assert(numsegs > 0);		/* verify number of segments is legal. */
 
-	/* Create a pointer to a CdbHash that includes the hash properties */
+	/* Allocate a new CdbHash, with space for the datatype OIDs. */
 	h = palloc(sizeof(CdbHash));
 
 	/*
@@ -100,36 +91,62 @@ makeCdbHash(int numsegs)
 	h->hash = 0;
 	h->numsegs = numsegs;
 
+	/* Load hash function info */
+	h->hashfuncs = (FmgrInfo *) palloc(natts * sizeof(FmgrInfo));
+	for (i = 0; i < natts; i++)
+	{
+		Oid			funcid = hashfuncs[i];
+
+		if (isLegacyCdbHashFunction(funcid))
+			is_legacy_hash = true;
+
+		fmgr_info(funcid, &h->hashfuncs[i]);
+	}
+	h->natts = natts;
+	h->is_legacy_hash = is_legacy_hash;
+
 	/*
 	 * set the reduction algorithm: If num_segs is power of 2 use bit mask,
 	 * else use lazy mod (h mod n)
 	 */
-	if (ispowof2(numsegs))
-	{
-		h->reducealg = REDUCE_BITMASK;
-	}
+	if (is_legacy_hash)
+		h->reducealg = ispowof2(numsegs) ? REDUCE_BITMASK : REDUCE_LAZYMOD;
 	else
-	{
-		h->reducealg = REDUCE_LAZYMOD;
-	}
+		h->reducealg = REDUCE_JUMP_HASH;
 
-	/*
-	 * if we distribute into a relation with an empty partitioning policy, 
-	 * we will round robin the tuples starting off from this index. Note that 
-	 * the random number is created one per makeCdbHash. This means that commands 
-	 * that create a cdbhash object only once for all tuples (like COPY, 
-	 * INSERT-INTO-SELECT) behave more like a round-robin distribution, while 
-	 * commands that create a cdbhash per row (like INSERT) behave more like a 
-	 * random distribution.
-	 */
-	h->rrindex = cdb_randint(0, UPPER_VAL);
-		
 	ereport(DEBUG4,
-		(errmsg("CDBHASH hashing into %d segment databases", h->numsegs)));
+			(errmsg("CDBHASH hashing into %d segment databases", h->numsegs)));
 
 	return h;
 }
 
+/*
+ * Convenience routine, to create a CdbHash according to a relation's
+ * distribution policy.
+ */
+CdbHash *
+makeCdbHashForRelation(Relation rel)
+{
+	GpPolicy   *policy = rel->rd_cdbpolicy;
+	Oid		   *hashfuncs;
+	int			i;
+	TupleDesc	desc = RelationGetDescr(rel);
+
+	hashfuncs = palloc(policy->nattrs * sizeof(Oid));
+
+	for (i = 0; i < policy->nattrs; i++)
+	{
+		AttrNumber	attnum = policy->attrs[i];
+		Oid			typeoid = desc->attrs[attnum - 1]->atttypid;
+		Oid			opfamily;
+
+		opfamily = get_opclass_family(policy->opclasses[i]);
+
+		hashfuncs[i] = cdb_hashproc_in_opfamily(opfamily, typeoid);
+	}
+
+	return makeCdbHash(policy->numsegments, policy->nattrs, hashfuncs);
+}
 
 /*
  * Initialize CdbHash for hashing the next tuple values.
@@ -137,514 +154,81 @@ makeCdbHash(int numsegs)
 void
 cdbhashinit(CdbHash *h)
 {
-	/* reset the hash value to the initial offset basis */
-	h->hash = FNV1_32_INIT;
-}
-
-/*
- * Implements datumHashFunction
- */
-static void
-addToCdbHash(void *cdbHash, void *buf, size_t len)
-{
-	CdbHash *h = (CdbHash*)cdbHash;
-	h->hash = fnv1_32_buf(buf, len, h->hash);
+	if (!h->is_legacy_hash)
+		h->hash = 0;
+	else
+	{
+		/* reset the hash value to the initial offset basis */
+		h->hash = FNV1_32_INIT;
+	}
 }
 
 /*
  * Add an attribute to the CdbHash calculation.
+ *
+ * Note: this must be called for each attribute, in order. If you try to hash
+ * the attributes in a different order, you get a different hash value.
  */
 void
-cdbhash(CdbHash *h, Datum datum, Oid type)
+cdbhash(CdbHash *h, int attno, Datum datum, bool isnull)
 {
-	hashDatum(datum, type, addToCdbHash, (void*)h);
-}
+	uint32		hashkey = h->hash;
 
-/*
- * Add an attribute to the hash calculation.
- * **IMPORTANT: any new hard coded support for a data type in here
- * must be added to isGreenplumDbHashable() below!
- *
- * Note that the caller should provide the base type if the datum is
- * of a domain type. It is quite expensive to call get_typtype() and
- * getBaseType() here since this function gets called a lot for the
- * same set of Datums.
- *
- * @param hashFn called to update the hash value.
- * @param clientData passed to hashFn.
- */
-void
-hashDatum(Datum datum, Oid type, datumHashFunction hashFn, void *clientData)
-{
-	void	   *buf = NULL;		/* pointer to the data */
-	size_t		len = 0;		/* length for the data buffer */
-	
-	int64		intbuf;			/* an 8 byte buffer for all integer sizes */
-		
-	float4		buf_f4;
-	float8		buf_f8;
-	Timestamp	tsbuf;			/* timestamp data dype is either a double or
-								 * int8 (determined in compile time) */
-	TimestampTz tstzbuf;
-	DateADT		datebuf;
-	TimeADT		timebuf;
-	TimeTzADT  *timetzptr;
-	Interval   *intervalptr;
-	AbsoluteTime abstime_buf;
-	RelativeTime reltime_buf;
-	TimeInterval tinterval;
-	AbsoluteTime tinterval_len;
-	
-	Numeric		num;
-	bool		bool_buf;
-	char        char_buf;
-	Name		namebuf;
-	
-	ArrayType  *arrbuf;
-	inet		 *inetptr; /* inet/cidr */
-	unsigned char inet_hkey[sizeof(inet_struct)];
-	macaddr		*macptr; /* MAC address */
-	
-	VarBit		*vbitptr;
-	
-	oidvector  *oidvec_buf;
-	Complex		*complex_ptr;
-	Complex		complex_buf;
-	double		complex_real;
-	double		complex_imag;
-	
-	Cash		cash_buf;
-	pg_uuid_t  *uuid_buf;
-
-	/*
-	 * special case buffers
-	 */
-	uint32		nanbuf;
-	uint32		invalidbuf;
-
-	void *tofree = NULL;
-
-	if (typeIsEnumType(type))
-		type = ANYENUMOID;
-
-	/*
-	 * Select the hash to be performed according to the field type we are adding to the
-	 * hash.
-	 */
-	switch (type)
+	if (!h->is_legacy_hash)
 	{
-		/*
-		 * ======= NUMERIC TYPES ========
-		 */
-		case INT2OID:			/* -32 thousand to 32 thousand, 2-byte storage */
-			intbuf = (int64) DatumGetInt16(datum);		/* cast to 8 byte before
-														 * hashing */
-			buf = &intbuf;
-			len = sizeof(intbuf);
-			break;
+		/* rotate hashkey left 1 bit at each step */
+		hashkey = (hashkey << 1) | ((hashkey & 0x80000000) ? 1 : 0);
 
-		case INT4OID:			/* -2 billion to 2 billion integer, 4-byte
-								 * storage */
-			intbuf = (int64) DatumGetInt32(datum);		/* cast to 8 byte before
-														 * hashing */
-			buf = &intbuf;
-			len = sizeof(intbuf);
-			break;
-			
-		case INT8OID:			/* ~18 digit integer, 8-byte storage */
-			intbuf = DatumGetInt64(datum);		/* cast to 8 byte before
-												 * hashing */
-			buf = &intbuf;
-			len = sizeof(intbuf);
-			break;
+		if (!isnull)
+		{
+			FunctionCallInfoData fcinfo;
+			uint32		hkey;
 
-		case FLOAT4OID: /* single-precision floating point number,
-								 * 4-byte storage */
-			buf_f4 = DatumGetFloat4(datum);
+			InitFunctionCallInfoData(fcinfo, &h->hashfuncs[attno - 1], 1,
+									 InvalidOid,
+									 NULL, NULL);
 
-			/*
-			 * On IEEE-float machines, minus zero and zero have different bit
-			 * patterns but should compare as equal.  We must ensure that they
-			 * have the same hash value, which is most easily done this way:
-			 */
-			if (buf_f4 == (float4) 0)
-				buf_f4 = 0.0;
+			fcinfo.arg[0] = datum;
+			fcinfo.argnull[0] = false;
 
-			buf = &buf_f4;
-			len = sizeof(buf_f4);
-			break;
+			hkey = DatumGetUInt32(FunctionCallInvoke(&fcinfo));
 
-		case FLOAT8OID: /* double-precision floating point number,
-								 * 8-byte storage */
-			buf_f8 = DatumGetFloat8(datum);
+			/* Check for null result, since caller is clearly not expecting one */
+			if (fcinfo.isnull)
+				elog(ERROR, "function %u returned NULL", fcinfo.flinfo->fn_oid);
 
-			/*
-			 * On IEEE-float machines, minus zero and zero have different bit
-			 * patterns but should compare as equal.  We must ensure that they
-			 * have the same hash value, which is most easily done this way:
-			 */
-			if (buf_f8 == (float8) 0)
-				buf_f8 = 0.0;
+			hashkey ^= hkey;
+		}
+	}
+	else
+	{
+		magic_hash_stash = hashkey;
+		if (!isnull)
+		{
+			FunctionCallInfoData fcinfo;
+			uint32		hkey;
 
-			buf = &buf_f8;
-			len = sizeof(buf_f8);
-			break;
+			InitFunctionCallInfoData(fcinfo, &h->hashfuncs[attno - 1], 1,
+									 InvalidOid,
+									 NULL, NULL);
 
-		case NUMERICOID:
+			fcinfo.arg[0] = datum;
+			fcinfo.argnull[0] = false;
 
-			num = DatumGetNumeric(datum);
+			hkey = DatumGetUInt32(FunctionCallInvoke(&fcinfo));
 
-			if (NUMERIC_IS_NAN(num))
-			{
-				nanbuf = NAN_VAL;
-				buf = &nanbuf;
-				len = sizeof(nanbuf);
-			}
-			else
-				/* not a nan */
-			{
-				buf = num->n_data;
-				len = (VARSIZE(num) - NUMERIC_HDRSZ);
-			}
+			/* Check for null result, since caller is clearly not expecting one */
+			if (fcinfo.isnull)
+				elog(ERROR, "function %u returned NULL", fcinfo.flinfo->fn_oid);
 
-            /* 
-             * If we did a pg_detoast_datum, we need to remember to pfree, 
-             * or we will leak memory.  Because of the 1-byte varlena header stuff.
-             */
-            if (num != (Numeric) DatumGetPointer(datum)) 
-                tofree = num;
-
-			break;
-		
-		/*
-		 * ====== CHARACTER TYPES =======
-		 */
-		case CHAROID:			/* char(1), single character */
-			char_buf = DatumGetChar(datum);
-			buf = &char_buf;
-			len = 1;
-			break;
-
-		case BPCHAROID: /* char(n), blank-padded string, fixed storage */
-		case TEXTOID:   /* text */
-		case VARCHAROID: /* varchar */ 
-		case BYTEAOID:   /* bytea */
-			{
-				int tmplen;
-				varattrib_untoast_ptr_len(datum, (char **) &buf, &tmplen, &tofree);
-				/* adjust length to not include trailing blanks */
-				if (type != BYTEAOID && tmplen > 1)
-					tmplen = ignoreblanks((char *) buf, tmplen);
-
-				len = tmplen;
-				break;
-			}
-
-		case NAMEOID:
-			namebuf = DatumGetName(datum);
-			len = NAMEDATALEN;
-			buf = NameStr(*namebuf);
-
-			/* adjust length to not include trailing blanks */
-			if (len > 1)
-				len = ignoreblanks((char *) buf, len);
-			break;
-		
-		/*
-		 * ====== OBJECT IDENTIFIER TYPES ======
-		 */
-		case OIDOID:				/* object identifier(oid), maximum 4 billion */
-		case REGPROCOID:			/* function name */
-		case REGPROCEDUREOID:		/* function name with argument types */
-		case REGOPEROID:			/* operator name */
-		case REGOPERATOROID:		/* operator with argument types */
-		case REGCLASSOID:			/* relation name */
-		case REGTYPEOID:			/* data type name */
-		case ANYENUMOID:			/* enum type name */
-			intbuf = (int64) DatumGetUInt32(datum);	/* cast to 8 byte before hashing */
-			buf = &intbuf;
-			len = sizeof(intbuf);
-			break;
-
-        case TIDOID:                /* tuple id (6 bytes) */
-            buf = DatumGetPointer(datum);
-            len = SizeOfIptrData;
-            break;
-			
-		/*
-		 * ====== DATE/TIME TYPES ======
-		 */
-		case TIMESTAMPOID:		/* date and time */
-			tsbuf = DatumGetTimestamp(datum);
-			buf = &tsbuf;
-			len = sizeof(tsbuf);
-			break;
-
-		case TIMESTAMPTZOID:	/* date and time with time zone */
-			tstzbuf = DatumGetTimestampTz(datum);
-			buf = &tstzbuf;
-			len = sizeof(tstzbuf);
-			break;
-
-		case DATEOID:			/* ANSI SQL date */
-			datebuf = DatumGetDateADT(datum);
-			buf = &datebuf;
-			len = sizeof(datebuf);
-			break;
-
-		case TIMEOID:			/* hh:mm:ss, ANSI SQL time */
-			timebuf = DatumGetTimeADT(datum);
-			buf = &timebuf;
-			len = sizeof(timebuf);
-			break;
-
-		case TIMETZOID: /* time with time zone */
-			
-			/*
-			 * will not compare to TIMEOID on equal values.
-			 * Postgres never attempts to compare the two as well.
-			 */
-			timetzptr = DatumGetTimeTzADTP(datum);
-			buf = (unsigned char *) timetzptr;
-			
-			/*
-			 * Specify hash length as sizeof(double) + sizeof(int4), not as
-			 * sizeof(TimeTzADT), so that any garbage pad bytes in the structure
-			 * won't be included in the hash!
-			 */
-			len = sizeof(timetzptr->time) + sizeof(timetzptr->zone);
-			break;
-
-		case INTERVALOID:		/* @ <number> <units>, time interval */
-			intervalptr = DatumGetIntervalP(datum);
-			buf = (unsigned char *) intervalptr;
-			/*
-			 * Specify hash length as sizeof(double) + sizeof(int4), not as
-			 * sizeof(Interval), so that any garbage pad bytes in the structure
-			 * won't be included in the hash!
-			 */
-			len = sizeof(intervalptr->time) + sizeof(intervalptr->month);
-			break;
-			
-		case ABSTIMEOID:
-			abstime_buf = DatumGetAbsoluteTime(datum);
-			
-			if (abstime_buf == INVALID_ABSTIME)
-			{
-				/* hash to a constant value */
-				invalidbuf = INVALID_VAL;
-				len = sizeof(invalidbuf);
-				buf = &invalidbuf;
-			}
-			else
-			{
-				len = sizeof(abstime_buf);
-				buf = &abstime_buf;
-			}
-					
-			break;
-
-		case RELTIMEOID:
-			reltime_buf = DatumGetRelativeTime(datum);
-			
-			if (reltime_buf == INVALID_RELTIME)
-			{
-				/* hash to a constant value */
-				invalidbuf = INVALID_VAL;
-				len = sizeof(invalidbuf);
-				buf = &invalidbuf;
-			}
-			else
-			{
-				len = sizeof(reltime_buf);
-				buf = &reltime_buf;
-			}
-				
-			break;
-			
-		case TINTERVALOID:
-			tinterval = DatumGetTimeInterval(datum);
-			
-			/*
-			 * check if a valid interval. the '0' status code
-			 * stands for T_INTERVAL_INVAL which is defined in
-			 * nabstime.c. We use the actual value instead
-			 * of defining it again here.
-			 */
-			if (tinterval->status == 0 ||
-			   tinterval->data[0] == INVALID_ABSTIME ||
-			   tinterval->data[1] == INVALID_ABSTIME)
-			{
-				/* hash to a constant value */
-				invalidbuf = INVALID_VAL;
-				len = sizeof(invalidbuf);
-				buf = &invalidbuf;				
-			}
-			else
-			{
-				/* normalize on length of the time interval */
-				tinterval_len = tinterval->data[1] -  tinterval->data[0];
-				len = sizeof(tinterval_len);
-				buf = &tinterval_len;	
-			}
-
-			break;
-			
-		/*
-		 * ======= NETWORK TYPES ========
-		 */
-		case INETOID:
-		case CIDROID:
-			
-			inetptr = DatumGetInetP(datum);
-			len = inet_getkey(inetptr, inet_hkey, sizeof(inet_hkey)); /* fill-in inet_key & get len */
-			buf = inet_hkey;
-			break;
-		
-		case MACADDROID:
-			
-			macptr = DatumGetMacaddrP(datum);
-			len = sizeof(macaddr);
-			buf = (unsigned char *) macptr;
-			break;
-			
-		/*
-		 * ======== BIT STRINGS ========
-		 */
-		case BITOID:
-		case VARBITOID:
-			
-			/*
-			 * Note that these are essentially strings.
-			 * we don't need to worry about '10' and '010'
-			 * to compare, b/c they will not, by design.
-			 * (see SQL standard, and varbit.c)
-			 */
-			vbitptr = DatumGetVarBitP(datum);
-			len = VARBITBYTES(vbitptr);
-			buf = (char *) VARBITS(vbitptr);
-			break;
-
-		/*
-		 * ======= other types =======
-		 */
-		case BOOLOID:			/* boolean, 'true'/'false' */
-			bool_buf = DatumGetBool(datum);
-			buf = &bool_buf;
-			len = sizeof(bool_buf);
-			break;
-			
-		/*
-		 * ANYARRAY is a pseudo-type. We use it to include
-		 * any of the array types (OIDs 1007-1033 in pg_type.h).
-		 * caller needs to be sure the type is ANYARRAYOID
-		 * before calling cdbhash on an array (INSERT and COPY do so).
-		 */
-		case ANYARRAYOID:	
-					
-			arrbuf = DatumGetArrayTypeP(datum);
-			len = VARSIZE(arrbuf) - VARHDRSZ;
-			buf = VARDATA(arrbuf);
-			break;
-			
-		case OIDVECTOROID:	
-			oidvec_buf = (oidvector *) DatumGetPointer(datum);
-			len = oidvec_buf->dim1 * sizeof(Oid);
-			buf = oidvec_buf->values;
-			break;
-			
-		case CASHOID: /* cash is stored in int64 internally */
-			cash_buf = (* (Cash *)DatumGetPointer(datum));
-			len = sizeof(Cash);
-			buf = &cash_buf;
-			break;
-
-		/* pg_uuid_t is defined as a char array of size UUID_LEN in uuid.c */
-		case UUIDOID:
-			uuid_buf = DatumGetUUIDP(datum);
-			len = UUID_LEN;
-			buf = (char *)uuid_buf;
-			break;
-				
-		case COMPLEXOID:		
-			complex_ptr  = DatumGetComplexP(datum);
-			complex_real = re(complex_ptr);
-			complex_imag = im(complex_ptr);
-			/*
-			* On IEEE-float machines, minus zero and zero have different bit
-			* patterns but should compare as equal.  We must ensure that they
-			* have the same hash value, which is most easily done this way:
-			*/
-			if (complex_real == (float8) 0)
-			{
-				complex_real = 0.0;
-			}
-			if (complex_imag == (float8) 0)
-			{
-				complex_imag = 0.0;
-			}
-				
-			INIT_COMPLEX(&complex_buf, complex_real, complex_imag);
-			len = sizeof(Complex);
-			buf = (unsigned char *) &complex_buf;
-			break;
-
-		default:
-			ereport(ERROR,
-					(errcode(ERRCODE_CDB_FEATURE_NOT_YET),
-					 errmsg("Type %u is not hashable.", type)));
-
-	}							/* switch(type) */
-
-	/* do the hash using the selected algorithm */
-	hashFn(clientData, buf, len);
-	if (tofree)
-		pfree(tofree);
+			hashkey = hkey;
+		}
+		else
+			hashkey = cdblegacyhash_null();
+		magic_hash_stash = FNV1_32_INIT;
+	}
+	h->hash = hashkey;
 }
-
-/*
- * Add a NULL attribute to the hash calculation.
- */
-void
-cdbhashnull(CdbHash *h)
-{
-	hashNullDatum(addToCdbHash, (void*)h);
-}
-
-/*
- * Update the hash value for a null Datum
- *
- * @param hashFn called to update the hash value.
- * @param clientData passed to hashFn.
- */
-void
-hashNullDatum(datumHashFunction hashFn, void *clientData)
-{
-	uint32		nullbuf = NULL_VAL;		/* stores the constant value that
-										 * represents a NULL */
-	void	   *buf = &nullbuf; /* stores the address of the buffer					*/
-	size_t		len = sizeof(nullbuf);	/* length of the value								*/
-
-	hashFn(clientData, buf, len);
-}
-
-/*
- * Hash a tuple of a relation with an empty policy (no hash 
- * key exists) via round robin with a random initial value.
- */
-void
-cdbhashnokey(CdbHash *h)
-{
-	uint32		rrbuf = h->rrindex;			
-	void	   *buf = &rrbuf;
-	size_t		len = sizeof(rrbuf);
-	
-	/* compute the hash */
-	h->hash = fnv1_32_buf(buf, len, h->hash);
-	
-	h->rrindex++; /* increment for next time around */
-}
-
 
 /*
  * Reduce the hash to a segment number.
@@ -652,14 +236,16 @@ cdbhashnokey(CdbHash *h)
 unsigned int
 cdbhashreduce(CdbHash *h)
 {
-
 	int			result = 0;		/* TODO: what is a good initialization value?
 								 * could we guarantee at this point that there
-								 * will not be a negative segid in Greenplum Database and
-								 * therefore initialize to this value for
-								 * error checking? */
+								 * will not be a negative segid in Greenplum
+								 * Database and therefore initialize to this
+								 * value for error checking? */
 
-	Assert(h->reducealg == REDUCE_BITMASK || h->reducealg == REDUCE_LAZYMOD);
+	Assert(h->reducealg == REDUCE_BITMASK ||
+		   h->reducealg == REDUCE_LAZYMOD ||
+		   h->reducealg == REDUCE_JUMP_HASH);
+	Assert(h->natts > 0);
 
 	/*
 	 * Reduce our 32-bit hash value to a segment number
@@ -667,187 +253,239 @@ cdbhashreduce(CdbHash *h)
 	switch (h->reducealg)
 	{
 		case REDUCE_BITMASK:
-			result = FASTMOD(h->hash, (uint32) h->numsegs);		/* fast mod (bitmask) */
+			result = FASTMOD(h->hash, (uint32) h->numsegs); /* fast mod (bitmask) */
 			break;
 
 		case REDUCE_LAZYMOD:
 			result = (h->hash) % (h->numsegs);	/* simple mod */
+			break;
+
+		case REDUCE_JUMP_HASH:
+			result = jump_consistent_hash(h->hash, h->numsegs);
 			break;
 	}
 
 	return result;
 }
 
-bool
-typeIsArrayType(Oid typeoid)
+/*
+ * Return a random segment number, for randomly distributed policy.
+ */
+unsigned int
+cdbhashrandomseg(int numsegs)
 {
-	Type tup = typeidType(typeoid);
-	Form_pg_type typeform;
-	bool res = false;
-
-	typeform = (Form_pg_type)GETSTRUCT(tup);
-	
-	if (typeform->typelem != InvalidOid &&
-		typeform->typtype != 'd' &&
-		NameStr(typeform->typname)[0] == '_' &&
-		typeform->typinput == F_ARRAY_IN)
-		res = true;
-
-	ReleaseSysCache(tup);
-	return res;
-}
-
-bool
-typeIsEnumType(Oid typeoid)
-{
-	Type tup = typeidType(typeoid);
-	Form_pg_type typeform;
-	bool res = false;
-
-	typeform = (Form_pg_type) GETSTRUCT(tup);
-
-	if (typeform->typtype == 'e' && typeform->typinput == F_ENUM_IN)
-		res = true;
-
-	ReleaseSysCache(tup);
-	return res;
-}
-
-bool
-isGreenplumDbHashable(Oid typid)
-{
-	/* we can hash all arrays */
-	if (typeIsArrayType(typid))
-		return true;
-
-	/* if this type is a domain type, get its base type */
-	if (get_typtype(typid) == 'd')
-		typid = getBaseType(typid);
-	
-	/* we can hash all enums */
-	if (typeIsEnumType(typid))
-		return true;
-
 	/*
-	 * NB: Every GPDB-hashable datatype must also be mergejoinable, i.e.
-	 * must have a B-tree operator family. There is a sanity check for
-	 * that in the opr_sanity_gp regression test. If you modify the list
-	 * below, please also update the list in opr_sanity_gp!
+	 * Note: Using modulo like this has a bias towards low values. But that's
+	 * acceptable for our use case.
+	 *
+	 * For example, if MAX_RANDOM_VALUE was 5, and you did "random() % 4",
+	 * value 0 would occur twice as often as others, because you would get 0
+	 * when random() returns 0 or 4, while other values would only be returned
+	 * with one return value of random(). But in reality, MAX_RANDOM_VALUE is
+	 * 2^31, and the effect is not significant when the upper bound is much
+	 * smaller than MAX_RANDOM_VALUE. This function is intended for choosing a
+	 * segment in random, and the number of segments is much smaller than
+	 * 2^31, so we're good.
 	 */
-	switch(typid)
+	return random() % numsegs;
+}
+
+
+/*================================================================
+ *
+ * CATALOG LOOKUP FUNCTIONS
+ *
+ *================================================================
+ */
+
+/*
+ * Get the operator class to use for column definition.
+ *
+ * This is used when parsing the DISTRIBUTED BY of CREATE TABLE and ALTER TABLE,
+ * to determine the operator class to use.
+ *
+ * Mostly the same as GetIndexOpClass(), but this knows about the
+ * gp_use_legacy_hashops GUC, and gives a slightly more appropriate
+ * error message if no opclass is found.
+ */
+Oid
+cdb_get_opclass_for_column_def(List *opclassName, Oid attrType)
+{
+	Oid			opclass = InvalidOid;
+
+	if (opclassName)
 	{
-		case INT2OID:		
-		case INT4OID:		
-		case INT8OID:		
-		case FLOAT4OID:
-		case FLOAT8OID:
-		case NUMERICOID:
-		case CHAROID:			
-		case BPCHAROID: 
-		case TEXTOID:	
-		case VARCHAROID:
-		case BYTEAOID:
-		case NAMEOID:
-		case OIDOID:
-        case TIDOID:
-		case REGPROCOID:		
-		case REGPROCEDUREOID:		
-		case REGOPEROID:		
-		case REGOPERATOROID:		
-		case REGCLASSOID:			
-		case REGTYPEOID:		
-		case TIMESTAMPOID:		
-		case TIMESTAMPTZOID:	
-		case DATEOID:			
-		case TIMEOID:			
-		case TIMETZOID: 
-		case INTERVALOID:		
-		case ABSTIMEOID:
-		case RELTIMEOID:
-		case TINTERVALOID:
-		case INETOID:
-		case CIDROID:
-		case MACADDROID:
-		case BITOID:
-		case VARBITOID:
-		case BOOLOID:			
-		case ANYARRAYOID:	
-		case OIDVECTOROID:	
-		case CASHOID: 
-		case UUIDOID:
-		case COMPLEXOID:
-			return true;
-		default:
-			return false;
+		opclass = GetIndexOpClass(opclassName, attrType,
+								  "hash", HASH_AM_OID);
 	}
+	else
+	{
+		if (gp_use_legacy_hashops)
+			opclass = get_legacy_cdbhash_opclass_for_base_type(attrType);
+
+		if (!opclass)
+			opclass = cdb_default_distribution_opclass_for_type(attrType);
+
+		/*
+		 * Same error message as in GetIndexOpClass, except for the hint, for
+		 * consistency.
+		 */
+		if (!OidIsValid(opclass))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("data type %s has no default operator class for access method \"%s\"",
+							format_type_be(attrType), "hash"),
+					 errhint("You must specify an operator class or define a default operator class for the data type.")));
+	}
+
+	Assert(OidIsValid(opclass));
+	return opclass;
 }
 
 /*
- * fnv1_32_buf - perform a 32 bit FNV 1 hash on a buffer
+ * Return the default operator family to use for distributing the given type.
  *
- * input:
- *	buf - start of buffer to hash
- *	len - length of buffer in octets (bytes)
- *	hval	- previous hash value or FNV1_32_INIT if first call.
- *
- * returns:
- *	32 bit hash as a static hash type
+ * This is used when redistributing data, e.g. for GROUP BY, or DISTINCT.
  */
-static uint32
-fnv1_32_buf(void *buf, size_t len, uint32 hval)
+Oid
+cdb_default_distribution_opfamily_for_type(Oid typeoid)
 {
-	unsigned char *bp = (unsigned char *) buf;	/* start of buffer */
-	unsigned char *be = bp + len;		/* beyond end of buffer */
+	TypeCacheEntry *tcache;
 
-	/*
-	 * FNV-1 hash each octet in the buffer
-	 */
-	while (bp < be)
-	{
-		/* multiply by the 32 bit FNV magic prime mod 2^32 */
-#if defined(NO_FNV_GCC_OPTIMIZATION)
-		hval *= FNV_32_PRIME;
-#else
-		hval += (hval << 1) + (hval << 4) + (hval << 7) + (hval << 8) + (hval << 24);
-#endif
+	tcache = lookup_type_cache(typeoid,
+							   TYPECACHE_HASH_OPFAMILY |
+							   TYPECACHE_HASH_PROC |
+							   TYPECACHE_EQ_OPR);
 
-		/* xor the bottom with the current octet */
-		hval ^= (uint32) *bp++;
-	}
+	if (!tcache->hash_opf)
+		return InvalidOid;
+	if (!tcache->hash_proc)
+		return InvalidOid;
+	if (!tcache->eq_opr)
+		return InvalidOid;
 
-	/* return our new hash value */
-	return hval;
+	return tcache->hash_opf;
 }
 
 /*
- * Support function for hashing on inet/cidr (see network.c)
+ * Return the default operator class to use for distributing the given type.
  *
- * Since network_cmp considers only ip_family, ip_bits, and ip_addr,
- * only these fields may be used in the hash; in particular don't use type.
+ * Like cdb_default_distribution_opfamily_for_type(), but returns the
+ * operator class, instead of the family. This is used e.g when choosing
+ * distribution keys during CREATE TABLE.
  */
-static int
-inet_getkey(inet *addr, unsigned char *inet_key, int key_size)
+Oid
+cdb_default_distribution_opclass_for_type(Oid typeoid)
 {
-	int			addrsize;
-	
-	switch (((inet_struct *)VARDATA_ANY(addr))->family)
+	Oid			opfamily;
+
+	opfamily = cdb_default_distribution_opfamily_for_type(typeoid);
+	if (!opfamily)
+		return InvalidOid;
+
+	return GetDefaultOpClass(typeoid, HASH_AM_OID);
+}
+
+/*
+ * Look up the hash function, for given datatype, in given op family.
+ */
+Oid
+cdb_hashproc_in_opfamily(Oid opfamily, Oid typeoid)
+{
+	Oid			hashfunc;
+	CatCList   *catlist;
+	int			i;
+
+	/* First try a simple lookup. */
+	hashfunc = get_opfamily_proc(opfamily, typeoid, typeoid, HASHPROC);
+	if (hashfunc)
+		return hashfunc;
+
+	/*
+	 * Not found. Check for the case that there is a function for another datatype
+	 * that's nevertheless binary coercible. (At least 'varchar' ops rely on this,
+	 * to leverage the text operator.
+	 */
+	catlist = SearchSysCacheList1(AMPROCNUM, ObjectIdGetDatum(opfamily));
+
+	for (i = 0; i < catlist->n_members; i++)
 	{
-		case PGSQL_AF_INET:
-			addrsize = 4;
+		HeapTuple	tuple = &catlist->members[i]->tuple;
+		Form_pg_amproc amproc_form = (Form_pg_amproc) GETSTRUCT(tuple);
+
+		if (amproc_form->amprocnum != HASHPROC)
+			continue;
+
+		if (amproc_form->amproclefttype != amproc_form->amprocrighttype)
+			continue;
+
+		if (IsBinaryCoercible(typeoid, amproc_form->amproclefttype))
+		{
+			/* found it! */
+			hashfunc = amproc_form->amproc;
 			break;
-		case PGSQL_AF_INET6:
-			addrsize = 16;
-			break;
-		default:
-			addrsize = 0;
+		}
 	}
-	
-	Assert(addrsize + 2 <= key_size);
-	inet_key[0] = ((inet_struct *)VARDATA_ANY(addr))->family;
-	inet_key[1] = ((inet_struct *)VARDATA_ANY(addr))->bits;
-	memcpy(inet_key + 2, ((inet_struct *)VARDATA_ANY(addr))->ipaddr, addrsize);
-	
-	return (addrsize + 2);
+
+	ReleaseSysCacheList(catlist);
+
+	if (!hashfunc)
+		elog(ERROR, "could not find hash function for type %u in operator family %u",
+			 typeoid, opfamily);
+
+	return hashfunc;
+}
+
+/*
+ * Look up an equality operator for given datatype, in given op family.
+ */
+Oid
+cdb_eqop_in_hash_opfamily(Oid opfamily, Oid typeoid)
+{
+	Oid			eqop;
+	CatCList   *catlist;
+	int			i;
+
+	/* First try a simple lookup. */
+	eqop = get_opfamily_member(opfamily, typeoid, typeoid, HTEqualStrategyNumber);
+	if (eqop)
+		return eqop;
+
+	/*
+	 * Not found. Check for the case that there is a function for another datatype
+	 * that's nevertheless binary coercible. (At least 'varchar' ops rely on this,
+	 * to leverage the text operator.
+	 */
+	catlist = SearchSysCacheList1(AMOPSTRATEGY, ObjectIdGetDatum(opfamily));
+
+	for (i = 0; i < catlist->n_members; i++)
+	{
+		HeapTuple	tuple = &catlist->members[i]->tuple;
+		Form_pg_amop amop_form = (Form_pg_amop) GETSTRUCT(tuple);
+
+		Assert(amop_form->amopmethod = HASH_AM_OID);
+
+		if (amop_form->amopstrategy != HTEqualStrategyNumber)
+			continue;
+
+		if (amop_form->amoplefttype != amop_form->amoprighttype)
+			continue;
+
+		if (IsBinaryCoercible(typeoid, amop_form->amoplefttype))
+		{
+			/* found it! */
+			eqop = amop_form->amopopr;
+			break;
+		}
+	}
+
+	ReleaseSysCacheList(catlist);
+
+	if (!eqop)
+		elog(ERROR, "could not find equality operator for type %u in operator family %u",
+			 typeoid, opfamily);
+
+	return eqop;
 }
 
 /*================================================================
@@ -858,33 +496,30 @@ inet_getkey(inet *addr, unsigned char *inet_key, int key_size)
  */
 
 /*
- * Given the original length of the data array this function is
- * recalculating the length after ignoring any trailing blanks. The
- * actual data remains unmodified.
- */
-static int
-ignoreblanks(char *data, int len)
-{
-	/* look for trailing blanks and skip them in the hash calculation */
-	while (data[len - 1] == ' ')
-	{
-		len--;
-		/*
-		 * If only 1 char is left, leave it alone! The string is either empty
-		 * or has 1 char
-		 */
-		if (len == 1)
-			break;
-	}
-
-	return len;
-}
-
-/*
  * returns 1 is the input int is a power of 2 and 0 otherwise.
  */
 static int
 ispowof2(int numsegs)
 {
 	return !(numsegs & (numsegs - 1));
+}
+
+/*
+ * The following jump consistent hash algorithm is
+ * just the one from the original paper:
+ * https://arxiv.org/abs/1406.2294
+ */
+
+static inline int32
+jump_consistent_hash(uint64 key, int32 num_segments)
+{
+	int64 b = -1;
+	int64 j = 0;
+	while (j < num_segments)
+	{
+		b = j;
+		key = key * 2862933555777941757ULL + 1;
+		j = (b + 1) * ((double)(1LL << 31) / (double)((key >> 33) + 1));
+	}
+	return b;
 }

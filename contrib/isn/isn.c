@@ -3,11 +3,11 @@
  * isn.c
  *	  PostgreSQL type definitions for ISNs (ISBN, ISMN, ISSN, EAN13, UPC)
  *
- * Copyright (c) 2004-2006, Germán Méndez Bravo (Kronuz)
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Author:	German Mendez Bravo (Kronuz)
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/contrib/isn/isn.c,v 1.11 2009/06/11 14:48:51 momjian Exp $
+ *	  contrib/isn/isn.c
  *
  *-------------------------------------------------------------------------
  */
@@ -33,7 +33,7 @@ enum isn_type
 	INVALID, ANY, EAN13, ISBN, ISMN, ISSN, UPC
 };
 
-static const char * const isn_names[] = {"EAN13/UPC/ISxN", "EAN13/UPC/ISxN", "EAN13", "ISBN", "ISMN", "ISSN", "UPC"};
+static const char *const isn_names[] = {"EAN13/UPC/ISxN", "EAN13/UPC/ISxN", "EAN13", "ISBN", "ISMN", "ISSN", "UPC"};
 
 static bool g_weak = false;
 static bool g_initialized = false;
@@ -160,7 +160,7 @@ dehyphenate(char *bufO, char *bufI)
  *				  into bufO using the given hyphenation range TABLE.
  *				  Assumes the input string to be used is of only digits.
  *
- * Returns the number of characters acctually hyphenated.
+ * Returns the number of characters actually hyphenated.
  */
 static unsigned
 hyphenate(char *bufO, char *bufI, const char *(*TABLE)[2], const unsigned TABLE_index[10][2])
@@ -336,13 +336,12 @@ checkdig(char *num, unsigned size)
  * If errorOK is true, just return "false" for bad input.
  */
 static bool
-ean2isn(ean13 ean, bool errorOK, ean13 * result, enum isn_type accept)
+ean2isn(ean13 ean, bool errorOK, ean13 *result, enum isn_type accept)
 {
 	enum isn_type type = INVALID;
 
 	char		buf[MAXEAN13LEN + 1];
-	char	   *firstdig,
-			   *aux;
+	char	   *aux;
 	unsigned	digval;
 	unsigned	search;
 	ean13		ret = ean;
@@ -354,7 +353,7 @@ ean2isn(ean13 ean, bool errorOK, ean13 * result, enum isn_type accept)
 
 	/* convert the number */
 	search = 0;
-	firstdig = aux = buf + 13;
+	aux = buf + 13;
 	*aux = '\0';				/* terminate string; aux points to last digit */
 	do
 	{
@@ -366,19 +365,19 @@ ean2isn(ean13 ean, bool errorOK, ean13 * result, enum isn_type accept)
 		*--aux = '0';			/* fill the remaining EAN13 with '0' */
 
 	/* find out the data type: */
-	if (!strncmp("978", buf, 3))
+	if (strncmp("978", buf, 3) == 0)
 	{							/* ISBN */
 		type = ISBN;
 	}
-	else if (!strncmp("977", buf, 3))
+	else if (strncmp("977", buf, 3) == 0)
 	{							/* ISSN */
 		type = ISSN;
 	}
-	else if (!strncmp("9790", buf, 4))
+	else if (strncmp("9790", buf, 4) == 0)
 	{							/* ISMN */
 		type = ISMN;
 	}
-	else if (!strncmp("979", buf, 3))
+	else if (strncmp("979", buf, 3) == 0)
 	{							/* ISBN-13 */
 		type = ISBN;
 	}
@@ -444,16 +443,23 @@ ean2ISBN(char *isn)
 	char	   *aux;
 	unsigned	check;
 
-	/* the number should come in this format: 978-0-000-00000-0 */
-	/* Strip the first part and calculate the new check digit */
-	hyphenate(isn, isn + 4, NULL, NULL);
-	check = weight_checkdig(isn, 10);
-	aux = strchr(isn, '\0');
-	while (!isdigit((unsigned char) *--aux));
-	if (check == 10)
-		*aux = 'X';
-	else
-		*aux = check + '0';
+	/*
+	 * The number should come in this format: 978-0-000-00000-0 or may be an
+	 * ISBN-13 number, 979-..., which does not have a short representation. Do
+	 * the short output version if possible.
+	 */
+	if (strncmp("978-", isn, 4) == 0)
+	{
+		/* Strip the first part and calculate the new check digit */
+		hyphenate(isn, isn + 4, NULL, NULL);
+		check = weight_checkdig(isn, 10);
+		aux = strchr(isn, '\0');
+		while (!isdigit((unsigned char) *--aux));
+		if (check == 10)
+			*aux = 'X';
+		else
+			*aux = check + '0';
+	}
 }
 
 static inline void
@@ -512,7 +518,7 @@ str2ean(const char *num)
 }
 
 /*
- * ean2string --- Try to convert an ean13 number to an hyphenated string.
+ * ean2string --- Try to convert an ean13 number to a hyphenated string.
  *				  Assumes there's enough space in result to hold
  *				  the string (maximum MAXEAN13LEN+1 bytes)
  *				  This doesn't verify for a valid check digit.
@@ -528,8 +534,7 @@ ean2string(ean13 ean, bool errorOK, char *result, bool shortType)
 	const unsigned (*TABLE_index)[2];
 	enum isn_type type = INVALID;
 
-	char	   *firstdig,
-			   *aux;
+	char	   *aux;
 	unsigned	digval;
 	unsigned	search;
 	char		valid = '\0';	/* was the number initially written with a
@@ -546,7 +551,7 @@ ean2string(ean13 ean, bool errorOK, char *result, bool shortType)
 
 	/* convert the number */
 	search = 0;
-	firstdig = aux = result + MAXEAN13LEN;
+	aux = result + MAXEAN13LEN;
 	*aux = '\0';				/* terminate string; aux points to last digit */
 	*--aux = valid;				/* append '!' for numbers with invalid but
 								 * corrected check digit */
@@ -572,26 +577,33 @@ ean2string(ean13 ean, bool errorOK, char *result, bool shortType)
 	}
 
 	/* find out what type of hyphenation is needed: */
-	if (!strncmp("978-", result, search))
-	{							/* ISBN */
+	if (strncmp("978-", result, search) == 0)
+	{							/* ISBN -13 978-range */
 		/* The string should be in this form: 978-??000000000-0" */
 		type = ISBN;
 		TABLE = ISBN_range;
 		TABLE_index = ISBN_index;
 	}
-	else if (!strncmp("977-", result, search))
+	else if (strncmp("977-", result, search) == 0)
 	{							/* ISSN */
 		/* The string should be in this form: 977-??000000000-0" */
 		type = ISSN;
 		TABLE = ISSN_range;
 		TABLE_index = ISSN_index;
 	}
-	else if (!strncmp("979-0", result, search + 1))
+	else if (strncmp("979-0", result, search + 1) == 0)
 	{							/* ISMN */
 		/* The string should be in this form: 979-0?000000000-0" */
 		type = ISMN;
 		TABLE = ISMN_range;
 		TABLE_index = ISMN_index;
+	}
+	else if (strncmp("979-", result, search) == 0)
+	{							/* ISBN-13 979-range */
+		/* The string should be in this form: 979-??000000000-0" */
+		type = ISBN;
+		TABLE = ISBN_range_new;
+		TABLE_index = ISBN_index_new;
 	}
 	else if (*result == '0')
 	{							/* UPC */
@@ -668,7 +680,7 @@ eantoobig:
  * (even if the check digit is valid)
  */
 static bool
-string2ean(const char *str, bool errorOK, ean13 * result,
+string2ean(const char *str, bool errorOK, ean13 *result,
 		   enum isn_type accept)
 {
 	bool		digit,
@@ -736,7 +748,7 @@ string2ean(const char *str, bool errorOK, ean13 * result,
 		}
 		else if (*aux2 == '!' && *(aux2 + 1) == '\0')
 		{
-			/* the invalid check digit sufix was found, set it */
+			/* the invalid check digit suffix was found, set it */
 			if (!magic)
 				valid = false;
 			magic = true;
@@ -808,30 +820,30 @@ string2ean(const char *str, bool errorOK, ean13 * result,
 			/* now get the subtype of EAN13: */
 			if (buf[3] == '0')
 				type = UPC;
-			else if (!strncmp("977", buf + 3, 3))
+			else if (strncmp("977", buf + 3, 3) == 0)
 				type = ISSN;
-			else if (!strncmp("978", buf + 3, 3))
+			else if (strncmp("978", buf + 3, 3) == 0)
 				type = ISBN;
-			else if (!strncmp("9790", buf + 3, 4))
+			else if (strncmp("9790", buf + 3, 4) == 0)
 				type = ISMN;
-			else if (!strncmp("979", buf + 3, 3))
+			else if (strncmp("979", buf + 3, 3) == 0)
 				type = ISBN;
 			if (accept != EAN13 && accept != ANY && type != accept)
 				goto eanwrongtype;
 			break;
 		case ISMN:
-			strncpy(buf, "9790", 4);	/* this isn't for sure yet, for now
+			memcpy(buf, "9790", 4);		/* this isn't for sure yet, for now
 										 * ISMN it's only 9790 */
-			valid = (valid && ((rcheck = checkdig(buf + 3, 10)) == check || magic));
+			valid = (valid && ((rcheck = checkdig(buf, 13)) == check || magic));
 			break;
 		case ISBN:
-			strncpy(buf, "978", 3);
+			memcpy(buf, "978", 3);
 			valid = (valid && ((rcheck = weight_checkdig(buf + 3, 10)) == check || magic));
 			break;
 		case ISSN:
-			strncpy(buf + 10, "00", 2); /* append 00 as the normal issue
+			memcpy(buf + 10, "00", 2);	/* append 00 as the normal issue
 										 * publication code */
-			strncpy(buf, "977", 3);
+			memcpy(buf, "977", 3);
 			valid = (valid && ((rcheck = weight_checkdig(buf + 3, 8)) == check || magic));
 			break;
 		case UPC:

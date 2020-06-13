@@ -53,7 +53,13 @@ select c, percentile_cont(0.9999) within group (order by ts2::timestamptz -ts1::
 
 -- DATE
 
-select c, percentile_cont(0.9999) within group (order by ts2::date -ts1::date) from perctint group by c order by 2 limit 10;
+-- The test frame work now does not sort the output of
+-- `select ... order by` statement. This is not enough.
+-- Because there are tuples with the same order-by key
+-- but different other cols. Their order is important
+-- to the correctness of the case. So we add more order-by
+-- keys here.
+select * from (select c, percentile_cont(0.9999) within group (order by ts2::date -ts1::date) from perctint group by c order by 2 limit 10) r order by 2,1;
 
 select c, percentile_cont(0.9999) within group (order by ts2::date + integer '10' ) from perctint group by c order by 2 limit 10;
 
@@ -242,7 +248,7 @@ select DISTINCT percentile_cont(0.7) within group (order by a) from perct group 
 create view idf_v1 as select median (( select median((select median(a) from perct)) from perct ));
 -- end_ignore
 select pg_get_viewdef('idf_v1');  
- 
+
 -- VIEW with IDF and its definition -- Percentile function with wrong input
 -- start_ignore
 create view idf_v4 as select percentile_disc(1.5) within group (order by a) as percentile_disc_a, percentile_disc( 0.9) within group (order by b) as percentile_disc_b  from perct;

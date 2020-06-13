@@ -20,16 +20,27 @@
 
 #include "postgres.h"
 
+#include "access/amapi.h"
+#include "access/amvalidate.h"
 #include "access/genam.h"
 #include "access/bitmap.h"
+#include "access/nbtree.h"		/* for btree_or_bitmap_validate() */
 #include "access/xact.h"
 #include "catalog/index.h"
+#include "catalog/pg_am.h"
+#include "catalog/pg_amproc.h"
+#include "catalog/pg_opfamily.h"
+#include "catalog/pg_opclass.h"
 #include "miscadmin.h"
 #include "nodes/tidbitmap.h"
 #include "storage/lmgr.h"
 #include "storage/smgr.h"
 #include "parser/parse_oper.h"
 #include "utils/memutils.h"
+#include "utils/index_selfuncs.h"
+#include "utils/syscache.h"
+
+#include "nodes/execnodes.h"
 
 static void bmbuildCallback(Relation index,	ItemPointer tupleId, Datum *attdata,
 							bool *nulls, bool tupleIsAlive,	void *state);
@@ -37,9 +48,8 @@ static bool words_get_match(BMBatchWords *words, BMIterateResult *result,
                             BlockNumber blockno, PagetableEntry *entry,
 							bool newentry);
 static IndexScanDesc copy_scan_desc(IndexScanDesc scan);
-static void stream_free(StreamNode *self);
 static void indexstream_free(StreamNode *self);
-static bool pull_stream(StreamNode *self, PagetableEntry *e);
+static bool pull_stream(StreamBMIterator *iterator, PagetableEntry *e);
 static void cleanup_pos(BMScanPosition pos);
 
 /* type to hide BM specific stream state */
@@ -51,24 +61,64 @@ typedef struct BMStreamOpaque
 	bool is_done;
 } BMStreamOpaque;
 
+static void stream_free(BMStreamOpaque *so);
+
+/*
+ * Bitmap index handler function: return IndexAmRoutine with access method parameters
+ * and callbacks.
+ */
+Datum
+bmhandler(PG_FUNCTION_ARGS)
+{
+	IndexAmRoutine *amroutine = makeNode(IndexAmRoutine);
+
+	/* these are mostly the same as B-tree */
+	amroutine->amstrategies = BTMaxStrategyNumber;
+	amroutine->amsupport = BTNProcs;
+	amroutine->amcanorder = false;
+	amroutine->amcanorderbyop = false;
+	amroutine->amcanbackward = false;
+	amroutine->amcanunique = true;
+	amroutine->amcanmulticol = true;
+	amroutine->amoptionalkey = true;
+	amroutine->amsearcharray = false;
+	amroutine->amsearchnulls = false;
+	amroutine->amstorage = false;
+	amroutine->amclusterable = false;
+	amroutine->ampredlocks = false;
+	amroutine->amkeytype = InvalidOid;
+
+	amroutine->ambuild = bmbuild;
+	amroutine->ambuildempty = bmbuildempty;
+	amroutine->aminsert = bminsert;
+	amroutine->ambulkdelete = bmbulkdelete;
+	amroutine->amvacuumcleanup = bmvacuumcleanup;
+	amroutine->amcanreturn = NULL;
+	amroutine->amcostestimate = bmcostestimate;
+	amroutine->amoptions = bmoptions;
+	amroutine->amproperty = NULL;
+	amroutine->amvalidate = bmvalidate;
+	amroutine->ambeginscan = bmbeginscan;
+	amroutine->amrescan = bmrescan;
+	amroutine->amgettuple = bmgettuple;
+	amroutine->amgetbitmap = bmgetbitmap;
+	amroutine->amendscan = bmendscan;
+	amroutine->ammarkpos = bmmarkpos;
+	amroutine->amrestrpos = bmrestrpos;
+
+	PG_RETURN_POINTER(amroutine);
+}
+
 /*
  * bmbuild() -- Build a new bitmap index.
  */
-Datum
-bmbuild(PG_FUNCTION_ARGS)
+IndexBuildResult *
+bmbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 {
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_DECLARE;
-
-	Relation    heap = (Relation) PG_GETARG_POINTER(0);
-	Relation    index = (Relation) PG_GETARG_POINTER(1);
-	IndexInfo  *indexInfo = (IndexInfo *) PG_GETARG_POINTER(2);
 	double      reltuples;
 	BMBuildState bmstate;
 	IndexBuildResult *result;
 	TupleDesc	tupDesc;
-	bool		useWal;
-
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_ENTER;
 
 	if (indexInfo->ii_Concurrent)
 		ereport(ERROR,
@@ -80,15 +130,12 @@ bmbuild(PG_FUNCTION_ARGS)
 		ereport (ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				errmsg("index \"%s\" already contains data",
-				RelationGetRelationName(index)),
-				errSendAlert(true)));
+				RelationGetRelationName(index))));
 
 	tupDesc = RelationGetDescr(index);
 
-	useWal = (!XLog_UnconvertedCanBypassWal() && !index->rd_istemp);
-
-	/* initialize the bitmap index. */
-	_bitmap_init(index, useWal);
+	/* initialize the bitmap index for MAIN_FORKNUM. */
+	_bitmap_init(index, RelationNeedsWAL(index), false);
 
 	/* initialize the build state. */
 	_bitmap_init_buildstate(index, &bmstate);
@@ -98,23 +145,6 @@ bmbuild(PG_FUNCTION_ARGS)
 							  bmbuildCallback, (void *)&bmstate);
 	/* clean up the build state */
 	_bitmap_cleanup_buildstate(index, &bmstate);
-
-	/*
-	 * fsync the relevant files to disk, unless we're building
-	 * a temporary index
-	 */
-    if (!useWal)
-    {
-		FlushRelationBuffers(bmstate.bm_lov_heap);
-        smgrimmedsync(bmstate.bm_lov_heap->rd_smgr);
-
-		FlushRelationBuffers(bmstate.bm_lov_index);
-		smgrimmedsync(bmstate.bm_lov_index->rd_smgr);
-
-		FlushRelationBuffers(index);
-		/* FlushRelationBuffers will have opened rd_smgr */
-        smgrimmedsync(index->rd_smgr);
-    }
 	
 	/* return statistics */
 	result = (IndexBuildResult *) palloc0(sizeof(IndexBuildResult));
@@ -122,49 +152,42 @@ bmbuild(PG_FUNCTION_ARGS)
 	result->heap_tuples = reltuples;
 	result->index_tuples = bmstate.ituples;
 
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_EXIT;
-
-	PG_RETURN_POINTER(result);
+	return result;
 }
 
+/*
+ *	bmbuildempty() -- build an empty bitmap index in the initialization fork
+ */
+void
+bmbuildempty(Relation indexrel)
+{
+	/* initialize meta page and first LOV page for INIT_FORKNUM */
+	_bitmap_init(indexrel, true, true);
+}
 
 /*
  * bminsert() -- insert an index tuple into a bitmap index.
  */
-Datum
-bminsert(PG_FUNCTION_ARGS)
+bool
+bminsert(Relation rel, Datum *values, bool *isnull,
+		 ItemPointer ht_ctid, Relation heapRel,
+		 IndexUniqueCheck checkUnique)
 {
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_DECLARE;
-
-	Relation	rel = (Relation) PG_GETARG_POINTER(0);
-	Datum		*datum = (Datum *) PG_GETARG_POINTER(1);
-	bool		*nulls = (bool *) PG_GETARG_POINTER(2);
-	ItemPointer	ht_ctid = (ItemPointer) PG_GETARG_POINTER(3);
-
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_ENTER;
-
-	_bitmap_doinsert(rel, *ht_ctid, datum, nulls);
-
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_EXIT;
-
-	PG_RETURN_BOOL(true);
+	_bitmap_doinsert(rel, *ht_ctid, values, isnull);
+	return true;
 }
 
 /*
  * bmgettuple() -- return the next tuple in a scan.
  */
-Datum
-bmgettuple(PG_FUNCTION_ARGS)
+bool
+bmgettuple(IndexScanDesc scan, ScanDirection dir)
 {
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_DECLARE;
+	BMScanOpaque  so = (BMScanOpaque) scan->opaque;
+	bool		res;
 
-	IndexScanDesc scan = (IndexScanDesc) PG_GETARG_POINTER(0);
-	ScanDirection dir = (ScanDirection) PG_GETARG_INT32(1);
-	BMScanOpaque  so = (BMScanOpaque)scan->opaque;
-
-	bool res;
-
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_ENTER;
+	/* This implementation of a bitmap index is never lossy */
+	scan->xs_recheck = false;
 
 	/* 
 	 * If we have already begun our scan, continue in the same direction.
@@ -175,80 +198,73 @@ bmgettuple(PG_FUNCTION_ARGS)
 	else
 		res = _bitmap_first(scan, dir);
 
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_EXIT;
+	return res;
+}
 
-	PG_RETURN_BOOL(res);
+static void
+stream_end_iterate(StreamBMIterator *self)
+{
+	/* opaque may be NULL */
+	if (self->opaque) {
+		stream_free(self->opaque);
+		self->opaque = NULL;
+	}
+}
+
+static void
+stream_begin_iterate(StreamNode *self, StreamBMIterator *iterator)
+{
+	BMStreamOpaque *so;
+	IndexScanDesc scan = self->opaque;
+
+	iterator->pull = pull_stream;
+	iterator->end_iterate = stream_end_iterate;
+
+	if (scan == NULL)
+	{
+		iterator->opaque = NULL;
+	}
+	else
+	{
+		so = palloc(sizeof(BMStreamOpaque));
+		so->scan = copy_scan_desc(scan);
+		so->entry = NULL;
+		so->is_done = false;
+
+		iterator->opaque = so;
+	}
 }
 
 /*
- * bmgetmulti() -- return a stream bitmap.
+ * bmgetbitmap() -- return a stream bitmap.
  */
-Datum
-bmgetmulti(PG_FUNCTION_ARGS)
+Node *
+bmgetbitmap(IndexScanDesc scan, Node *bm)
 {
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_DECLARE;
-
 	/* We ignore the second argument as we're returning a hash bitmap */
-	IndexScanDesc scan = (IndexScanDesc) PG_GETARG_POINTER(0);
-	Node		 *bm = (Node *)PG_GETARG_POINTER(1);
 	IndexStream	 *is;
 	BMScanPosition	scanPos;
 	bool res;
-
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_ENTER;
 
 	res = _bitmap_firstbatchwords(scan, ForwardScanDirection);
 
 	scanPos = ((BMScanOpaque)scan->opaque)->bm_currPos;
 	scanPos->bm_result.nextTid = 1;
 
+	/* perhaps this should be in a special context? */
+	is = (IndexStream *)palloc0(sizeof(IndexStream));
+	is->type = BMS_INDEX;
+	is->begin_iterate = stream_begin_iterate;
+	is->free = indexstream_free;
+	is->set_instrument = NULL;
+	is->upd_instrument = NULL;
+	is->opaque = NULL;
+
 	if (res)
 	{
-		BMScanPosition  sp;
-		IndexScanDesc copy = copy_scan_desc(scan);
-		BMStreamOpaque *so;
 		int vec;
 
-		/* perhaps this should be in a special context? */
-		is = (IndexStream *)palloc0(sizeof(IndexStream));
-		is->type = BMS_INDEX;
-		is->pull = pull_stream;
-		is->nextblock = 0;
-		is->free = indexstream_free;
-		is->set_instrument = NULL;
-		is->upd_instrument = NULL;
-
-		/* create a memory context for the stream */
-
-		so = palloc(sizeof(BMStreamOpaque));
-		sp = ((BMScanOpaque)copy->opaque)->bm_currPos;
-		so->scan = copy;
-		so->entry = NULL;
-		so->is_done = false;
-		is->opaque = (void *)so;
-
-		if(!bm)
-		{
-			/* 
-			 * We must create the StreamBitmap outside of our temporary
-			 * memory context. The reason is, because we glue all the 
-			 * related streams together, bitmap_stream_free() will
-			 * descend the stream tree and free up all the nodes by
-			 * killing their memory context. If we lose the StreamBitmap
-			 * memory, we'll be reading invalid memory.
-			 */
-			StreamBitmap *sb = makeNode(StreamBitmap);
-			sb->streamNode = is;
-			bm = (Node *)sb;
-		}
-		else if(IsA(bm, StreamBitmap))
-		{
-			stream_add_node((StreamBitmap *)bm, is, BMS_OR);
-		}
-		else
-		{
-			elog(ERROR, "non stream bitmap"); 
-		}
+		is->opaque = copy_scan_desc(scan);
 
 		/*
 		 * Since we have made a copy for this scan, we reset the lov buffers
@@ -262,58 +278,58 @@ bmgetmulti(PG_FUNCTION_ARGS)
 		}
 	}
 
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_EXIT;
+	if (!bm)
+	{
+		StreamBitmap *sb = makeNode(StreamBitmap);
+		sb->streamNode = is;
+		bm = (Node *)sb;
+	}
+	else if (IsA(bm, StreamBitmap))
+	{
+		stream_add_node((StreamBitmap *)bm, is, BMS_OR);
+	}
+	else
+	{
+		elog(ERROR, "non stream bitmap");
+	}
 
-	PG_RETURN_POINTER(bm);
+	return bm;
 }
 
 /*
  * bmbeginscan() -- start a scan on the bitmap index.
  */
-Datum
-bmbeginscan(PG_FUNCTION_ARGS)
+IndexScanDesc
+bmbeginscan(Relation rel, int nkeys, int norderbys)
 {
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_DECLARE;
-
-	Relation	rel = (Relation) PG_GETARG_POINTER(0);
-	int			nkeys = PG_GETARG_INT32(1);
-	ScanKey		scankey = (ScanKey) PG_GETARG_POINTER(2);
 	IndexScanDesc scan;
+	BMScanOpaque	so;
 
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_ENTER;
+	/* no order by operators allowed */
+	Assert(norderbys == 0);
 
 	/* get the scan */
-	scan = RelationGetIndexScan(rel, nkeys, scankey);
+	scan = RelationGetIndexScan(rel, nkeys, norderbys);
 
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_EXIT;
+	/* allocate private workspace */
+	so = (BMScanOpaque) palloc(sizeof(BMScanOpaqueData));
+	so->bm_currPos = NULL;
+	so->bm_markPos = NULL;
+	so->cur_pos_valid = false;
+	so->mark_pos_valid = false;
+	scan->opaque = so;
 
-	PG_RETURN_POINTER(scan);
+	return scan;
 }
 
 /*
  * bmrescan() -- restart a scan on the bitmap index.
  */
-Datum
-bmrescan(PG_FUNCTION_ARGS)
+void
+bmrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
+		 ScanKey orderbys, int norderbys)
 {
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_DECLARE;
-
-	IndexScanDesc	scan = (IndexScanDesc) PG_GETARG_POINTER(0);
-	ScanKey			scankey = (ScanKey) PG_GETARG_POINTER(1);
 	BMScanOpaque	so = (BMScanOpaque) scan->opaque;
-
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_ENTER;
-
-	/* so will be NULL if we were called via index_rescan() */
-	if (so == NULL)
-	{
-		so = (BMScanOpaque) palloc(sizeof(BMScanOpaqueData));
-		so->bm_currPos = NULL;
-		so->bm_markPos = NULL;
-		so->cur_pos_valid = false;
-		so->mark_pos_valid = false;
-		scan->opaque = so;
-	}
 
 	if (so->bm_currPos != NULL)
 	{
@@ -332,24 +348,15 @@ bmrescan(PG_FUNCTION_ARGS)
 	if (scankey && scan->numberOfKeys > 0)
 		memmove(scan->keyData, scankey,
 				scan->numberOfKeys * sizeof(ScanKeyData));
-
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_EXIT;
-
-	PG_RETURN_VOID();
 }
 
 /*
  * bmendscan() -- close a scan.
  */
-Datum
-bmendscan(PG_FUNCTION_ARGS)
+void
+bmendscan(IndexScanDesc scan)
 {
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_DECLARE;
-
-	IndexScanDesc	scan = (IndexScanDesc) PG_GETARG_POINTER(0);
 	BMScanOpaque	so = (BMScanOpaque) scan->opaque;
-
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_ENTER;
 
 	/* free the space */
 	if (so->bm_currPos != NULL)
@@ -358,45 +365,31 @@ bmendscan(PG_FUNCTION_ARGS)
 		 * release the buffers that have been stored for each related 
 		 * bitmap vector.
 		 */
-		if (so->bm_currPos->nvec > 1)
-			 _bitmap_cleanup_batchwords(so->bm_currPos->bm_batchWords);
-		_bitmap_cleanup_scanpos(so->bm_currPos->posvecs,
-								so->bm_currPos->nvec);
+		cleanup_pos(so->bm_currPos);
 		pfree(so->bm_currPos);
 		so->bm_currPos = NULL;
 	}
 
 	if (so->bm_markPos != NULL)
 	{
-		if (so->bm_markPos->nvec > 1)
-			 _bitmap_cleanup_batchwords(so->bm_markPos->bm_batchWords);
-		_bitmap_cleanup_scanpos(so->bm_markPos->posvecs,
-								so->bm_markPos->nvec);
+		cleanup_pos(so->bm_markPos);
+		pfree(so->bm_markPos);
 		so->bm_markPos = NULL;
 	}
 
 	pfree(so);
 	scan->opaque = NULL;
-
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_EXIT;
-
-	PG_RETURN_VOID();
 }
 
 /*
  * bmmarkpos() -- save the current scan position.
  */
-Datum
-bmmarkpos(PG_FUNCTION_ARGS)
+void
+bmmarkpos(IndexScanDesc scan)
 {
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_DECLARE;
-
-	IndexScanDesc	scan = (IndexScanDesc) PG_GETARG_POINTER(0);
 	BMScanOpaque	so = (BMScanOpaque) scan->opaque;
 	BMVector	bmScanPos;
 	uint32 vectorNo;
-
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_ENTER;
 
 	/* free the space */
 	if (so->mark_pos_valid)
@@ -444,27 +437,18 @@ bmmarkpos(PG_FUNCTION_ARGS)
 
 		so->mark_pos_valid = true;
 	}
-
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_EXIT;
-
-	PG_RETURN_VOID();
 }
 
 /*
  * bmrestrpos() -- restore a scan to the last saved position.
  */
-Datum
-bmrestrpos(PG_FUNCTION_ARGS)
+void
+bmrestrpos(IndexScanDesc scan)
 {
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_DECLARE;
-
-	IndexScanDesc	scan = (IndexScanDesc) PG_GETARG_POINTER(0);
 	BMScanOpaque	so = (BMScanOpaque) scan->opaque;
 
 	BMVector	bmScanPos;
 	uint32 vectorNo;
-
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_ENTER;
 
 	/* free space */
 	if (so->cur_pos_valid)
@@ -509,10 +493,6 @@ bmrestrpos(PG_FUNCTION_ARGS)
 		memcpy(so->bm_currPos, so->bm_markPos, size);
 		so->cur_pos_valid = true;
 	}
-
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_EXIT;
-
-	PG_RETURN_VOID();
 }
 
 /*
@@ -521,36 +501,29 @@ bmrestrpos(PG_FUNCTION_ARGS)
  * Re-index is performed before retrieving the number of tuples
  * indexed in this index.
  */
-Datum
-bmbulkdelete(PG_FUNCTION_ARGS)
+IndexBulkDeleteResult *
+bmbulkdelete(IndexVacuumInfo *info,
+			 IndexBulkDeleteResult *stats,
+			 IndexBulkDeleteCallback callback,
+			 void *callback_state)
 {
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_DECLARE;
-
-	IndexVacuumInfo *info = (IndexVacuumInfo *) PG_GETARG_POINTER(0);
 	Relation	rel = info->index;
-	IndexBulkDeleteResult* volatile result =
-		(IndexBulkDeleteResult *) PG_GETARG_POINTER(1);
-
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_ENTER;
 
 	/* allocate stats if first time through, else re-use existing struct */
-	if (result == NULL)
-		result = (IndexBulkDeleteResult *)
+	if (stats == NULL)
+		stats = (IndexBulkDeleteResult *)
 			palloc0(sizeof(IndexBulkDeleteResult));	
 
-	reindex_index(RelationGetRelid(rel));
+	reindex_index(RelationGetRelid(rel), true, rel->rd_rel->relpersistence, 0);
 
 	CommandCounterIncrement();
 
-	result = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
-	result->num_pages = RelationGetNumberOfBlocks(rel);
+	stats->num_pages = RelationGetNumberOfBlocks(rel);
 	/* Since we re-build the index, set this to number of heap tuples. */
-	result->num_index_tuples = info->num_heap_tuples;
-	result->tuples_removed = 0;
+	stats->num_index_tuples = info->num_heap_tuples;
+	stats->tuples_removed = 0;
 
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_EXIT;
-
-	PG_RETURN_POINTER(result);
+	return stats;
 }
 
 /*
@@ -558,17 +531,11 @@ bmbulkdelete(PG_FUNCTION_ARGS)
  *
  * We do nothing useful here.
  */
-Datum
-bmvacuumcleanup(PG_FUNCTION_ARGS)
+IndexBulkDeleteResult *
+bmvacuumcleanup(IndexVacuumInfo *info,
+				IndexBulkDeleteResult *stats)
 {
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_DECLARE;
-
-	IndexVacuumInfo *info = (IndexVacuumInfo *) PG_GETARG_POINTER(0);
 	Relation	rel = info->index;
-	IndexBulkDeleteResult *stats = 
-			(IndexBulkDeleteResult *) PG_GETARG_POINTER(1);
-
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_ENTER;
 
 	if(stats == NULL)
 		stats = (IndexBulkDeleteResult *)palloc0(sizeof(IndexBulkDeleteResult));
@@ -580,9 +547,7 @@ bmvacuumcleanup(PG_FUNCTION_ARGS)
 	/* XXX: dodgy hack to shutup index_scan() and vacuum_index() */
 	stats->num_index_tuples = info->num_heap_tuples;
 
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_EXIT;
-
-	PG_RETURN_POINTER(stats);
+	return stats;
 }
 
 /*
@@ -590,22 +555,60 @@ bmvacuumcleanup(PG_FUNCTION_ARGS)
  */
 static void
 bmbuildCallback(Relation index, ItemPointer tupleId, Datum *attdata,
-				bool *nulls, bool tupleIsAlive __attribute__((unused)),	void *state)
+				bool *nulls, bool tupleIsAlive pg_attribute_unused(),	void *state)
 {
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_DECLARE;
-
 	BMBuildState *bstate = (BMBuildState *) state;
-
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_ENTER;
 
 	_bitmap_buildinsert(index, *tupleId, attdata, nulls, bstate);
 	bstate->ituples += 1;
 
 	if (((int)bstate->ituples) % 1000 == 0)
 		CHECK_FOR_INTERRUPTS();
+}
 
-	MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_EXIT;
+/*
+ * Free an IndexScanDesc created by copy_scan_desc(). If releaseBuffers is true,
+ * any Buffers pointed to by the BMScanPositions will be released as well.
+ */
+static void
+free_scan_desc(IndexScanDesc scan, bool releaseBuffers)
+{
+	BMScanOpaque s = scan->opaque;
+	int vec;
 
+	if (s->bm_currPos)
+	{
+		if (!releaseBuffers)
+		{
+			for (vec = 0; vec < s->bm_currPos->nvec; vec++)
+			{
+				BMVector bmvec = &(s->bm_currPos->posvecs[vec]);
+				bmvec->bm_lovBuffer = InvalidBuffer;
+			}
+		}
+
+		cleanup_pos(s->bm_currPos);
+		pfree(s->bm_currPos);
+		s->bm_currPos = NULL;
+	}
+	if (s->bm_markPos)
+	{
+		if (!releaseBuffers)
+		{
+			for (vec = 0; vec < s->bm_markPos->nvec; vec++)
+			{
+				BMVector bmvec = &(s->bm_markPos->posvecs[vec]);
+				bmvec->bm_lovBuffer = InvalidBuffer;
+			}
+		}
+
+		cleanup_pos(s->bm_markPos);
+		pfree(s->bm_markPos);
+		s->bm_markPos = NULL;
+	}
+
+	pfree(s);
+	pfree(scan);
 }
 
 /*
@@ -613,36 +616,18 @@ bmbuildCallback(Relation index, ItemPointer tupleId, Datum *attdata,
  */
 
 static void
-stream_free(StreamNode *self)
+stream_free(BMStreamOpaque *so)
 {
-	IndexStream *is = self;
-	BMStreamOpaque *so = (BMStreamOpaque *)is->opaque;
-
 	/* opaque may be NULL */
 	if (so)
 	{
-		IndexScanDesc scan = so->scan;
-		BMScanOpaque s = (BMScanOpaque)scan->opaque;
-
-		is->opaque = NULL;
-		if(s->bm_currPos)
-		{
-			cleanup_pos(s->bm_currPos);
-			pfree(s->bm_currPos);
-			s->bm_currPos = NULL;
-		}
-		if(s->bm_markPos)
-		{
-			cleanup_pos(s->bm_markPos);
-			pfree(s->bm_markPos);
-			s->bm_markPos = NULL;
-		}
+		free_scan_desc(so->scan, false /* we can't release the underlying
+										  Buffers yet as there may be other
+										  iterators in operation */);
 
 		if (so->entry != NULL)
 			pfree(so->entry);
 
-		pfree(s);
-		pfree(scan);
 		pfree(so);
 	}
 }
@@ -652,8 +637,9 @@ stream_free(StreamNode *self)
  */
 static void
 indexstream_free(StreamNode *self) {
-	stream_free(self);
-
+	IndexScanDesc scan = self->opaque;
+	if (scan)
+		free_scan_desc(scan, true /* we can release the scanned Buffers now */);
 	pfree(self);
 }
 
@@ -669,7 +655,11 @@ cleanup_pos(BMScanPosition pos)
 	 * case.
 	 */
 	if (pos->nvec > 1)
-		 _bitmap_cleanup_batchwords(pos->bm_batchWords);
+	{
+		_bitmap_cleanup_batchwords(pos->bm_batchWords);
+		if (pos->bm_batchWords != NULL)
+			pfree(pos->bm_batchWords);
+	}
 	_bitmap_cleanup_scanpos(pos->posvecs, pos->nvec);
 }
 
@@ -679,41 +669,39 @@ cleanup_pos(BMScanPosition pos)
  */
 
 static bool 
-pull_stream(StreamNode *self, PagetableEntry *e)
+pull_stream(StreamBMIterator *iterator, PagetableEntry *e)
 {
-	StreamNode 	   *n = self;
 	bool			res = false;
 	bool 			newentry = true;
-	IndexStream    *is = (IndexStream *)n;
 	PagetableEntry *next;
 	BMScanPosition	scanPos;
 	IndexScanDesc	scan;
-	BMStreamOpaque *so;
+	BMStreamOpaque *so = iterator->opaque;
 
-	so = (BMStreamOpaque *)is->opaque;
 	/* empty bitmap vector */
 	if(so == NULL)
 		return false;
 	next = so->entry;
 
 	/* have we already got an entry? */
-	if(next && is->nextblock <= next->blockno)
+	if(next && iterator->nextblock <= next->blockno)
 	{
 		memcpy(e, next, sizeof(PagetableEntry));
 		return true;
 	}
 	else if (so->is_done)
 	{
-		stream_free(n);
-		is->opaque = NULL;
+		/* Just free opaque state early so that we could short circuit. */
+		if (iterator->opaque) {
+			stream_free(iterator->opaque);
+			iterator->opaque = NULL;
+		}
 		return false;
 	}
-	
-	MemSet(e, 0, sizeof(PagetableEntry));
 
 	scan = so->scan;
 	scanPos = ((BMScanOpaque)scan->opaque)->bm_currPos;
-	e->blockno = is->nextblock;
+	e->blockno = iterator->nextblock;
 
 	so->is_done = false;
 
@@ -730,7 +718,7 @@ pull_stream(StreamNode *self, PagetableEntry *e)
 			elog(ERROR, "scan position uninitialized");
 
 		found = words_get_match(scanPos->bm_batchWords, &(scanPos->bm_result),
-							   is->nextblock, e, newentry);
+							   iterator->nextblock, e, newentry);
 
 		if(found)
 		{
@@ -753,7 +741,7 @@ pull_stream(StreamNode *self, PagetableEntry *e)
 				 * tell words_get_match() to continue looking at the page
 				 * it finished at
 				 */
-				is->nextblock = e->blockno;
+				iterator->nextblock = e->blockno;
 				newentry = false;
 			}
 		}
@@ -764,9 +752,9 @@ pull_stream(StreamNode *self, PagetableEntry *e)
 	 * contain possible query results, since in AO index cases, this range
 	 * can be very large.
 	 */
-	is->nextblock = e->blockno + 1;
+	iterator->nextblock = e->blockno + 1;
 	if (scanPos->bm_result.nextTid / BM_MAX_TUPLES_PER_PAGE > e->blockno + 1)
-		is->nextblock = scanPos->bm_result.nextTid / BM_MAX_TUPLES_PER_PAGE;
+		iterator->nextblock = scanPos->bm_result.nextTid / BM_MAX_TUPLES_PER_PAGE;
 	if (so->entry == NULL)
 		so->entry = (PagetableEntry *) palloc(sizeof(PagetableEntry));
 	memcpy(so->entry, e, sizeof(PagetableEntry));
@@ -792,8 +780,6 @@ copy_scan_desc(IndexScanDesc scan)
 	/* we only need a few fields */
 	s = (IndexScanDesc)palloc0(sizeof(IndexScanDescData));
 	s->opaque = palloc(sizeof(BMScanOpaqueData));
-	spcopy = palloc0(sizeof(BMScanPositionData));
-	w = (BMBatchWords *)palloc(sizeof(BMBatchWords));
 
 	s->indexRelation = scan->indexRelation;
 	so = (BMScanOpaque)scan->opaque;
@@ -803,29 +789,20 @@ copy_scan_desc(IndexScanDesc scan)
 	{
 		int vec;
 
+		spcopy = palloc0(sizeof(BMScanPositionData));
+
 		spcopy->done = sp->done;
 		spcopy->nvec = sp->nvec;
-		spcopy->bm_batchWords = w;
 
 		/* now the batch words */
-		w->maxNumOfWords = sp->bm_batchWords->maxNumOfWords;
-		w->nwordsread = sp->bm_batchWords->nwordsread;
-		w->nextread = sp->bm_batchWords->nextread;
-		w->firstTid = sp->bm_batchWords->firstTid;
-		w->startNo = sp->bm_batchWords->startNo;
-		w->nwords = sp->bm_batchWords->nwords;
-
-		/* the actual words now */
-		/* use copy */
+		w = (BMBatchWords *)palloc(sizeof(BMBatchWords));
 	    w->hwords = palloc0(sizeof(BM_HRL_WORD) * 
 					BM_CALC_H_WORDS(sp->bm_batchWords->maxNumOfWords));
     	w->cwords = palloc0(sizeof(BM_HRL_WORD) * 
 					sp->bm_batchWords->maxNumOfWords);
 
-		memcpy(w->hwords, sp->bm_batchWords->hwords,
-			BM_CALC_H_WORDS(sp->bm_batchWords->maxNumOfWords) * sizeof(BM_HRL_WORD));
-		memcpy(w->cwords, sp->bm_batchWords->cwords,
-			sp->bm_batchWords->maxNumOfWords * sizeof(BM_HRL_WORD));
+		_bitmap_copy_batchwords(sp->bm_batchWords, w);
+		spcopy->bm_batchWords = w;
 
 		memcpy(&spcopy->bm_result, &sp->bm_result, sizeof(BMIterateResult));
 
@@ -1090,8 +1067,6 @@ restart:
 void 
 GetBitmapIndexAuxOids(Relation index, Oid *heapId, Oid *indexId)
 {
-	MIRROREDLOCK_BUFMGR_DECLARE;
-
 	Buffer     metabuf;
 	BMMetaPage metapage;
 	
@@ -1103,9 +1078,6 @@ GetBitmapIndexAuxOids(Relation index, Oid *heapId, Oid *indexId)
 		*indexId = InvalidOid;
 		return;
 	}
-		
-	// -------- MirroredLock ----------
-	MIRROREDLOCK_BUFMGR_LOCK;
 	
 	metabuf = _bitmap_getbuf(index, BM_METAPAGE, BM_READ);
 	metapage = _bitmap_get_metapage_data(index, metabuf);
@@ -1114,8 +1086,18 @@ GetBitmapIndexAuxOids(Relation index, Oid *heapId, Oid *indexId)
 	*indexId = metapage->bm_lov_indexId;
 
 	_bitmap_relbuf(metabuf);
-	
-	MIRROREDLOCK_BUFMGR_UNLOCK;
-	// -------- MirroredLock ----------
-	
+}
+
+/*
+ * Ask appropriate access method to validate the specified opclass.
+ */
+bool
+bmvalidate(Oid opclassoid)
+{
+	/*
+	 * Bitmap indexes use the same opclass support functions and strategies
+	 * as B-tree indexes. In fact, we use a real B-tree index for the LOV
+	 * tree. So borrow B-tree's validate function.
+	 */
+	return btree_or_bitmap_validate(opclassoid, "bitmap");
 }

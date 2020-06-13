@@ -28,10 +28,10 @@ use IO::File;
 # than changing the parser to handle both cases.
 #
 # Parse_node:
-#   InitPlan entries in greenplum are in separate slices, so explain.pl
-#   prefixes them with an arrow (and adds a fake cost) to make them
-#   look like a top-level execution node.  Again, this technique was
-#   easier than modifying the parser to special case InitPlan.
+#   InitPlan entries in greenplum are in separate slices sometimes, so
+#   explain.pl prefixes them with an arrow (and adds a fake cost) to make them
+#   look like a top-level execution node.  Again, this technique was easier
+#   than modifying the parser to special case InitPlan.
 #
 #  Plan parsing in general:
 #  The original code only dealt with the TPCH formatted output:
@@ -556,106 +556,12 @@ sub analyze_node
 #            print "short fixup: $node->{short}\n\n\n";
         }
 
+        if (exists($node->{child}))
         {
-            if ($node->{txt} =~ m/(\d+(\.\d*)?)(\s*ms\s*to\s*end)/i)
-            {
-
-                my @ggg =
-                    ($node->{txt} =~ m/(\d+(\.\d*)?)(\s*ms\s*to\s*end)/i);
-
-#                print join('*', @ggg), "\n";
-
-                my $tt = $ggg[0];
-
-                $node->{to_end} = $tt;
-
-                $parse_ctx->{alltimes}->{$tt} = 1;
-
-                if (exists($parse_ctx->{h_to_end}->{$tt}))
-                {
-                    push @{$parse_ctx->{h_to_end}->{$tt}}, '"'. $node->{id} .'"';
-                }
-                else
-                {
-                    $parse_ctx->{h_to_end}->{$tt} = ['"'. $node->{id} . '"'];
-                }
-
-
-
-            }
-            if ($node->{txt} =~ m/(\d+(\.\d*)?)(\s*ms\s*to\s*first\s*row)/i)
-            {
-
-                my @ggg =
-                    ($node->{txt} =~ m/(\d+(\.\d*)?)(\s*ms\s*to\s*first\s*row)/i);
-
-#                print join('*', @ggg), "\n";
-
-                my $tt = $ggg[0];
-
-                $node->{to_first} = $tt;
-
-                $parse_ctx->{alltimes}->{$tt} = 1;
-
-                if (exists($parse_ctx->{h_to_first}->{$tt}))
-                {
-                    push @{$parse_ctx->{h_to_first}->{$tt}}, '"' . $node->{id} . '"' ;
-                }
-                else
-                {
-                    $parse_ctx->{h_to_first}->{$tt} = [ '"' . $node->{id} . '"'];
-                }
-
-            }
-
-            if ($node->{txt} =~ m/start offset by (\d+(\.\d*)?)(\s*ms)/i)
-            {
-
-                my @ggg =
-                    ($node->{txt} =~ m/start offset by (\d+(\.\d*)?)(\s*ms)/i);
-
-#                print join('*', @ggg), "\n";
-
-                my $tt = $ggg[0];
-
-                $node->{to_startoff} = $tt;
-
-                $parse_ctx->{allstarttimes}->{$tt} = 1;
-
-                if (exists($parse_ctx->{h_to_startoff}->{$tt}))
-                {
-                    push @{$parse_ctx->{h_to_startoff}->{$tt}}, '"'. $node->{id} .'"';
-                }
-                else
-                {
-                    $parse_ctx->{h_to_startoff}->{$tt} = ['"'. $node->{id} . '"'];
-                }
-            }
-
-            if (exists($node->{to_end}))
-            {
-                $node->{total_time} =
-                    (exists($node->{to_first})) ?
-                    ($node->{to_end} - $node->{to_first}) :
-                    $node->{to_end};
-            }
-
-
+            delete $node->{child}
+            unless (defined($node->{child}) && scalar(@{$node->{child}}));
         }
-
-        if (1)
-        {
-            if (exists($node->{child}))
-            {
-                delete $node->{child}
-                  unless (defined($node->{child})
-                          && scalar(@{$node->{child}}));
-            }
-        }
-
-
     }
-
 }
 
 sub parse_node
@@ -697,7 +603,7 @@ sub parse_node
         # XXX XXX XXX XXX XXX XXX XXX XXX XXX XXX XXX XXX XXX XXX XXX
         # make initplan into a fake node so the graphs look nicer (eg
         # tpch query 15).  Prefix it with an arrow and add a fake cost.
-        if ($row =~ m/\|(\s)*InitPlan(.*)slice/)
+        if ($row =~ m/\|(\s)*InitPlan/)
         {
             $row =~ s/InitPlan/\-\>  InitPlan/;
             if ($row !~ m/\(cost=/)
@@ -1013,18 +919,10 @@ sub run
         my $id = 0;
 
         $parse_ctx->{alltimes} = {};
-        $parse_ctx->{h_to_end} = {};
-        $parse_ctx->{h_to_first} = {};
 
-        $parse_ctx->{allstarttimes} = {};
-        $parse_ctx->{h_to_startoff} = {};
         $parse_ctx->{explain_analyze_stats} = {};
 
         my $plantree = parse_node(\$id, $parse_ctx, 0, $pr);
-
-#        my @timelist = sort {$a <=> $b} keys (%{$parse_ctx->{alltimes}});
-        my @timelist = sort {$a <=> $b} keys (%{$parse_ctx->{allstarttimes}});
-
 
         if (defined($glob_prune))
         {
@@ -1036,8 +934,6 @@ sub run
                 treeMap($plantree, undef, $map_expr);
 
                 # additional statistics
-                $map_expr = 'delete $node->{to_startoff};';
-                treeMap($plantree, undef, $map_expr);
                 $map_expr = 'delete $node->{total_time};';
                 treeMap($plantree, undef, $map_expr);
                 $map_expr = 'delete $node->{statistics};';
@@ -1152,11 +1048,6 @@ sub run
         {
             doDataDump($plantree);
         }
-        if ($glob_optn =~ m/dot|graph/i)
-        {
-            dodotfile($plantree, \@timelist, $qqq, $parse_ctx,
-                      $glob_direction);
-        }
         if ($glob_optn =~ m/operator/i)
         {
             doOperatorDump($plantree);
@@ -1185,9 +1076,6 @@ sub run
             open (STDOUT, ">$tmpnam" ) or die "can't open STDOUT: $!";
 
             select STDOUT; $| = 1;      # make unbuffered
-
-            dodotfile($plantree, \@timelist, $qqq, $parse_ctx,
-                      $glob_direction);
 
             close STDOUT;
             open STDOUT, ">&", $oldout or die "Can't dup \$oldout: $!";
@@ -1385,6 +1273,18 @@ sub prune_heavily
     return
         unless (exists($node->{short}));
 
+    # example: (slice1; gang3; segments: 3)
+    if ($node->{short} =~ m/.*\(slice\d+; gang(\d+);.*\).*/)
+    {
+        $node->{gangid} = int($1);
+    }
+
+    # example: (slice1; segments: 3)
+    if ($node->{short} =~ m/.*\(.*segment.*:\s+(\d+).*\).*/)
+    {
+        $node->{segments} = int($1);
+    }
+
     if ($node->{short} =~ m/Delete\s*\(slice.*segment.*\)\s*\(row.*width.*\)/)
     {
         # QA-1309: fix strange DELETE operator formatting
@@ -1395,10 +1295,13 @@ sub prune_heavily
                 # QA-1309: fix strange UPDATE operator formatting
                 $node->{short} = "Update";
         }
-    elsif ($node->{short} =~ m/\d+\:\d+/)
+    elsif ($node->{short} =~ m/(\d+)\:(\d+)/)
     {
 
         # example: Gather Motion 8:1 (slice4);
+
+        $node->{sendsize} = int($1);
+        $node->{recvsize} = int($2);
 
         # strip the number of nodes and slice information
         $node->{short} =~ s/\s+\d+\:\d+.*//;
@@ -1552,14 +1455,13 @@ sub human_num
     return $esti;
 }
 
-# label left and right for nest loops
-sub nestedloop_fixup
+# label left and right children
+sub label_fixup
 {
     my ($node, $ctx) = @_;
 
     return
-        unless (exists($node->{short}) &&
-                ($node->{short} =~ m/Nested Loop/));
+        unless (exists($node->{short}));
 
     my @kidlist;
 
@@ -1567,139 +1469,36 @@ sub nestedloop_fixup
     {
         for my $kid (@{$node->{child}})
         {
-            push @kidlist, $kid;
+            # Ignore InitPlans when deciding inner/outer child
+            if ($kid->{txt} !~ /InitPlan/)
+            {
+                push @kidlist, $kid;
+            }
         }
     }
 
-    return
-        unless (2 == scalar(@kidlist));
+    my $nkids;
+    $nkids = scalar(@kidlist);
 
-    if ($kidlist[0]->{id} < $kidlist[1]->{id})
+    return
+        unless ($nkids >= 2);
+
+    # sort kidlist by id for labeling
+    my @sortedkidlist = sort { $a->{id} <=> $b->{id} } @kidlist;
+
+    if ($nkids == 2 && $node->{txt} !~ /Append/)
     {
-        $kidlist[0]->{nested_loop_position} = "left";
-        $kidlist[1]->{nested_loop_position} = "right";
+        $sortedkidlist[0]->{label} = "outer";
+        $sortedkidlist[1]->{label} = "inner";
     }
     else
     {
-        $kidlist[1]->{nested_loop_position} = "left";
-        $kidlist[0]->{nested_loop_position} = "right";
+        for my $i (0 .. $nkids)
+        {
+            $sortedkidlist[$i]->{label} = "child$i"
+        }
     }
-
 }
-
-# find rows out information
-sub get_rows_out
-{
-    my ($node, $ctx, $edge) = @_;
-
-    return
-        unless ($node->{txt} =~ m/(Rows out\:)|(\(cost\=.*\s+rows=.*\s+width\=.*\))/);
-
-    my $long = ($edge =~ m/long|med/i);
-
-    if ($node->{txt} =~ m/Rows out\:\s+Avg.*\s+rows\s+x\s+.*\s+workers/)
-    {
-        if (!$long)
-        {
-            # short result
-            my @foo =
-                ($node->{txt} =~
-                 m/Rows out\:\s+Avg\s+(.*)\s+rows\s+x\s+(.*)\s+workers/);
-
-            goto L_get_est unless (2 == scalar(@foo));
-
-            # calculate row count as avg x num workers
-            $node->{rows_out} = $foo[0] * $foo[1];
-        }
-        else
-        {
-            my @foo =
-                ($node->{txt} =~
-                 m/Rows out\:\s+(Avg.*workers)/);
-
-            goto L_get_est unless (1 == scalar(@foo));
-
-            # just print the string
-            $node->{rows_out} = $foo[0];
-
-            if ($edge =~ m/med/i)
-            {
-                $node->{rows_out} =~ s/Avg\s+//;
-                $node->{rows_out} =~ s/rows\s+//;
-                $node->{rows_out} =~ s/\s*workers\s*//;
-            }
-
-        }
-    }
-    elsif ($node->{txt} =~ m/Rows out\:\s+.*\s+rows/)
-    {
-        my @foo =
-            ($node->{txt} =~
-             m/Rows out\:\s+(.*)\s+rows/);
-
-        goto L_get_est unless (1 == scalar(@foo));
-
-        $node->{rows_out} = $foo[0];
-    }
-
-    if (
-        exists($node->{rows_out}) &&
-        length($node->{rows_out})
-        )
-    {
-        if (
-            ($node->{rows_out} !~ m/avg/i) &&
-            ($node->{rows_out} =~ m/x/))
-        {
-            my @foo = ($node->{rows_out} =~ m/(x.*)$/);
-
-            my $tail = $foo[0];
-
-            @foo = ($node->{rows_out} =~ m/(.*)\s+x.*/);
-
-            my $head = $foo[0];
-
-            if (defined($tail) && defined($head))
-            {
-                $head = human_num($head);
-
-                $node->{rows_out} = $head . " " . $tail;
-            }
-
-        }
-        elsif ($node->{rows_out} =~ m/^\d+$/)
-        {
-            $node->{rows_out} = human_num($node->{rows_out});
-        }
-    }
-
-L_get_est:
-
-    # add row estimates
-    if ($long &&
-        ($node->{txt} =~ m/\(cost\=.*\s+rows=.*\s+width\=.*\)/))
-    {
-        my @foo = ($node->{txt} =~ m/cost\=.*\s+rows=(\d+)\s+width\=.*/);
-
-        if (scalar(@foo))
-        {
-            require POSIX;
-
-            my $esti = $foo[0];
-
-            $esti = human_num($esti);
-
-            unless (exists($node->{rows_out}) &&
-                    length($node->{rows_out}))
-            {
-                $node->{rows_out} = "";
-            }
-
-            $node->{rows_out} .= " (est $esti)";
-        }
-    }
-
-} # end get_rows_out
 
 sub calc_color_rank
 {
@@ -1812,19 +1611,11 @@ sub dodotfile
             undef,
             $ctx);
 
-    # always label the left/right sides of nested loop
+    # always label the left/right sides
     treeMap($plantree,
-            'nestedloop_fixup($node, $ctx); ',
+            'label_fixup($node, $ctx); ',
             undef,
             $ctx);
-
-    if (defined($glob_edge) && length($glob_edge))
-    {
-        treeMap($plantree,
-                'get_rows_out($node, $ctx, $glob_edge); ',
-                undef,
-                $ctx);
-    }
 
     my $dotimeline = $glob_timeline;
 
@@ -1882,9 +1673,9 @@ sub dotkid
 
             print $outfh '"' . $kid->{id} . '" -> "' . $node->{id} . '"';
 
-            if (exists($kid->{nested_loop_position}))
+            if (exists($kid->{label}))
             {
-                $edge_label .= $kid->{nested_loop_position};
+                $edge_label .= $kid->{label};
             }
 
             if (exists($kid->{rows_out}))
@@ -2080,12 +1871,6 @@ sub makedotfile
         print $outfh "}\n";
 
         print $outfh "node [shape=box];\n";
-
-        while ( my ($kk, $vv) = each(%{$parse_ctx->{h_to_startoff}}))
-        {
-            print $outfh '{ rank = same; ' . $kk . '; ' . join("; ", @{$vv}) . "; }\n";
-        }
-
     }
 
     print $outfh "rankdir=$direction;\n";

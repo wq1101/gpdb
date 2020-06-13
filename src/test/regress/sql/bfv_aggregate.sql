@@ -43,7 +43,7 @@ select 1, to_char(col1, 'YYYY'), median(col2) from d group by 1, 2;
 
 -- SETUP
 create table toy(id,val) as select i,i from generate_series(1,5) i;
-create aggregate mysum1(int4) (sfunc = int4_sum, prefunc=int8pl, stype=bigint);
+create aggregate mysum1(int4) (sfunc = int4_sum, combinefunc=int8pl, stype=bigint);
 create aggregate mysum2(int4) (sfunc = int4_sum, stype=bigint);
 
 -- TEST
@@ -125,10 +125,10 @@ select count_operator('select count(*) from multi_stage_test group by b;','Group
 
 --CLEANUP
 reset optimizer_segments;
-set optimizer_force_multistage_agg = off;
+reset optimizer_force_multistage_agg;
 
 --
--- Testing not picking HashAgg for aggregates without preliminary functions
+-- Testing not picking HashAgg for aggregates without combine functions
 --
 -- SETUP
 set optimizer_print_missing_stats = off;
@@ -143,7 +143,7 @@ ELSE $1 || $2 END;'
      LANGUAGE SQL
      IMMUTABLE
      RETURNS NULL ON NULL INPUT;
--- UDA definition. No PREFUNC exists
+-- UDA definition. No COMBINEFUNC exists
 CREATE AGGREGATE concat(text) (
    --text/string concatenation
    SFUNC = do_concat, --Function to call for each string that builds the aggregate
@@ -153,14 +153,15 @@ CREATE AGGREGATE concat(text) (
 
 -- TEST
 -- cook some stats
-set allow_system_table_mods='DML';
+set allow_system_table_mods=true;
 UPDATE pg_class set reltuples=524592::real, relpages=2708::integer where oid = 'attribute_table'::regclass;
 select count_operator('select product_id,concat(E''#attribute_''||attribute_id::varchar||E'':''||attribute) as attr FROM attribute_table GROUP BY product_id;','HashAggregate');
 
 -- CLEANUP
 
 --
--- Testing fallback to planner when the agg used in window does not have either prelim or inverse prelim function.
+-- Testing fallback to planner when the agg used in window does not have
+-- a combine function.
 --
 
 -- SETUP
@@ -169,19 +170,19 @@ create table foo(a int, b text) distributed by (a);
 -- TEST
 insert into foo values (1,'aaa'), (2,'bbb'), (3,'ccc');
 -- should fall back
-select string_agg(b) over (partition by a) from foo order by 1;
-select string_agg(b) over (partition by a,b) from foo order by 1;
+select string_agg(b, '') over (partition by a) from foo order by 1;
+select string_agg(b, '') over (partition by a,b) from foo order by 1;
 -- should not fall back
 select max(b) over (partition by a) from foo order by 1;
-select count_operator('select max(b) over (partition by a) from foo order by 1;', 'Table Scan');
+select count_operator('select max(b) over (partition by a) from foo order by 1;', 'Pivotal Optimizer (GPORCA)');
 -- fall back
-select string_agg(b) over (partition by a+1) from foo order by 1;
-select string_agg(b || 'txt') over (partition by a) from foo order by 1;
-select string_agg(b || 'txt') over (partition by a+1) from foo order by 1;
--- fall back and planner's plan produces unsupported execution
-select string_agg(b) over (partition by a order by a) from foo order by 1;
-select string_agg(b || 'txt') over (partition by a,b order by a,b) from foo order by 1;
-select '1' || string_agg(b) over (partition by a+1 order by a+1) from foo;
+select string_agg(b, '') over (partition by a+1) from foo order by 1;
+select string_agg(b || 'txt', '') over (partition by a) from foo order by 1;
+select string_agg(b || 'txt', '') over (partition by a+1) from foo order by 1;
+-- fall back
+select string_agg(b, '') over (partition by a order by a) from foo order by 1;
+select string_agg(b || 'txt', '') over (partition by a,b order by a,b) from foo order by 1;
+select '1' || string_agg(b, '') over (partition by a+1 order by a+1) from foo;
 
 
 -- Test for a bug in memtuple compute_null_save() function, where the result value
@@ -1350,6 +1351,87 @@ select c0, c1, array_length(ARRAY[
  SUM(c4 % 5665), SUM(c4 % 5666), SUM(c4 % 5667), SUM(c4 % 5668), SUM(c4 % 5669),
  SUM(c4 % 5670), SUM(c4 % 5671)], 1)
 from mtup1 where c0 = 'foo' group by c0, c1 limit 10;
+
+-- MPP-29042 Multistage aggregation plans should have consistent targetlists in
+-- case of same column aliases and grouping on them.
+DROP TABLE IF EXISTS t1;
+CREATE TABLE t1 (a varchar, b character varying) DISTRIBUTED RANDOMLY;
+INSERT INTO t1 VALUES ('aaaaaaa', 'cccccccccc');
+INSERT INTO t1 VALUES ('aaaaaaa', 'ddddd');
+INSERT INTO t1 VALUES ('bbbbbbb', 'eeee');
+INSERT INTO t1 VALUES ('bbbbbbb', 'eeef');
+INSERT INTO t1 VALUES ('bbbbb', 'dfafa');
+SELECT substr(a, 1) as a FROM (SELECT ('-'||a)::varchar as a FROM (SELECT a FROM t1) t2) t3 GROUP BY a ORDER BY a;
+SELECT array_agg(f ORDER BY f)  FROM (SELECT b::text as f FROM t1 GROUP BY b ORDER BY b) q;
+
+
+-- Check that ORDER BY NULLS FIRST/LAST in an aggregate is respected (these are
+-- variants of similar query in PostgreSQL's aggregates test)
+create temporary table aggordertest (a int4, b int4) distributed by (a);
+insert into aggordertest values (1,1), (2,2), (1,3), (3,4), (null,5), (2,null);
+
+select array_agg(a order by a nulls first) from aggordertest;
+select array_agg(a order by a nulls last) from aggordertest;
+select array_agg(a order by a desc nulls first) from aggordertest;
+select array_agg(a order by a desc nulls last) from aggordertest;
+select array_agg(a order by b nulls first) from aggordertest;
+select array_agg(a order by b nulls last) from aggordertest;
+select array_agg(a order by b desc nulls first) from aggordertest;
+select array_agg(a order by b desc nulls last) from aggordertest;
+
+-- begin MPP-14125: if combine function is missing, do not choose hash agg.
+create temp table mpp14125 as select repeat('a', a) a, a % 10 b from generate_series(1, 100)a;
+explain select string_agg(a, '') from mpp14125 group by b;
+-- end MPP-14125
+
+-- Test unsupported ORCA feature: agg(set returning function)
+CREATE TABLE tbl_agg_srf (foo int[]) DISTRIBUTED RANDOMLY;
+INSERT INTO tbl_agg_srf VALUES (array[1,2,3]);
+EXPLAIN SELECT count(unnest(foo)) FROM tbl_agg_srf;
+SELECT count(unnest(foo)) FROM tbl_agg_srf;
+
+-- Test that integer AVG() aggregate is accurate with large values. We used to
+-- use float8 to hold the running sums, which did not have enough precision
+-- for this.
+select avg('1000000000000000000'::int8) from generate_series(1, 100000);
+
+-- Test cases where the planner would like to distribute on a column, to implement
+-- grouping or distinct, but can't because the datatype isn't GPDB-hashable.
+-- These are all variants of the same issue; all of these used to miss the
+-- check on whether the column is GPDB_hashble, producing an assertion failure.
+create table int2vectortab (distkey int, t int2vector,t2 int2vector) distributed by (distkey);
+insert into int2vectortab values
+  (1, '1', '1'),
+  (2, '1 2', '1 2'),
+  (3, '1 2 3', '1 2 3'),
+  (22,'22', '1 2 3 4'),
+  (22,'1 2', '1 2 3 4 5');
+
+select distinct t from int2vectortab group by distkey, t;
+select t from int2vectortab union select t from int2vectortab;
+select count(*) over (partition by t) from int2vectortab;
+select count(distinct t) from int2vectortab;
+select count(distinct t), count(distinct t2) from int2vectortab;
+
+--
+-- Testing aggregate above FULL JOIN
+--
+
+-- SETUP
+CREATE TABLE pagg_tab1(x int, y int) DISTRIBUTED BY (x);
+CREATE TABLE pagg_tab2(x int, y int) DISTRIBUTED BY (x);
+
+INSERT INTO pagg_tab1 SELECT i % 30, i % 20 FROM generate_series(0, 299, 2) i;
+INSERT INTO pagg_tab2 SELECT i % 20, i % 30 FROM generate_series(0, 299, 3) i;
+
+ANALYZE pagg_tab1;
+ANALYZE pagg_tab2;
+
+-- TEST
+-- should have Redistribute Motion above the FULL JOIN
+EXPLAIN (COSTS OFF)
+SELECT a.x, sum(b.x) FROM pagg_tab1 a FULL OUTER JOIN pagg_tab2 b ON a.x = b.y GROUP BY a.x ORDER BY 1 NULLS LAST;
+SELECT a.x, sum(b.x) FROM pagg_tab1 a FULL OUTER JOIN pagg_tab2 b ON a.x = b.y GROUP BY a.x ORDER BY 1 NULLS LAST;
 
 
 -- CLEANUP

@@ -45,24 +45,18 @@
  * nodes when the DDL command is dispatched, and for the QE nodes to use the
  * same, pre-assigned, OIDs for the objects.
  *
- * This same mechanism can be used to preserve OIDs during pg_upgrade. In
- * PostgreSQL, pg_upgrade only needs to preserve the OIDs of a few objects,
- * like types, but in GPDB we need to preserve most OIDs, because they need
- * to be kept in sync between the nodes. (Strictly speaking, we only need to
- * ensure that all the nodes use the same OIDs in the upgraded clusters, but
- * they wouldn't need to be the same as before upgrade. However, the most
- * straightforward way to achieve that is to use the same OIDs as before
- * upgrade.)
+ * This same mechanism is used to preserve OIDs when upgrading a GPDB cluster
+ * using pg_upgrade. pg_upgrade in PostgreSQL is using a set of global vars to
+ * communicate the next OID for an object during upgrade, a strategy GPDB
+ * doesn't employ due to the need for multiple OIDs for auxiliary objects.
+ * pg_upgrade records the OIDs from the old cluster and inserts them into the
+ * same 'preassigned_oids' list to restore them, that we use to assign specific
+ * OIDs in a QE node at dispatch. Additionally, to ensure that object creation
+ * that isn't bound by preassigned OIDs isn't consuming an OID that will later
+ * in the restore process be preassigned, a separate list of all such OIDs is
+ * maintained and queried before assigning a new non-preassigned OID.
  *
- * pg_upgrade has its own mechanism to record the OIDs from the old cluster
- * but when restoring the schema in the new cluster, it uses the same
- * 'preassigned_oids' list to restore them, that we use to assign specific
- * OIDs in a QE node at dispatch.
- *
- * (XXX: All the pg_upgrade code described above is to-be-done, as of
- * this writing),
- *
- * Portions Copyright 2016 Pivotal Software, Inc.
+ * Portions Copyright 2016-Present Pivotal Software, Inc.
  * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -75,44 +69,71 @@
 
 #include "postgres.h"
 
+#include "catalog/pg_am.h"
 #include "catalog/pg_amop.h"
 #include "catalog/pg_amproc.h"
 #include "catalog/pg_attrdef.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_cast.h"
+#include "catalog/pg_collation.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_conversion.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_default_acl.h"
 #include "catalog/pg_enum.h"
 #include "catalog/pg_extension.h"
 #include "catalog/pg_extprotocol.h"
-#include "catalog/pg_filespace.h"
+#include "catalog/pg_event_trigger.h"
+#include "catalog/pg_foreign_data_wrapper.h"
+#include "catalog/pg_foreign_server.h"
 #include "catalog/pg_language.h"
+#include "catalog/pg_largeobject_metadata.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_opfamily.h"
 #include "catalog/pg_partition.h"
 #include "catalog/pg_partition_rule.h"
+#include "catalog/pg_policy.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_resqueue.h"
+#include "catalog/pg_resqueuecapability.h"
 #include "catalog/pg_resgroup.h"
+#include "catalog/pg_resgroupcapability.h"
 #include "catalog/pg_rewrite.h"
 #include "catalog/pg_tablespace.h"
+#include "catalog/pg_transform.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_ts_config.h"
 #include "catalog/pg_ts_dict.h"
 #include "catalog/pg_ts_parser.h"
 #include "catalog/pg_ts_template.h"
 #include "catalog/pg_type.h"
+#include "catalog/pg_user_mapping.h"
 #include "catalog/oid_dispatch.h"
 #include "cdb/cdbvars.h"
-#include "nodes/pg_list.h"
 #include "executor/execdesc.h"
-#include "utils/memutils.h"
+#include "lib/rbtree.h"
 #include "miscadmin.h"
+#include "nodes/pg_list.h"
+#include "utils/memutils.h"
 
 /* #define OID_DISPATCH_DEBUG */
+
+/*
+ * In upstream PostgreSQL, the below variables are set before object creation
+ * in binary upgrade mode, while Greenplum use the Oid dispatcher functionality
+ * for binary upgrade as well.  We do however need these for signalling the
+ * TOAST code to ensure that toast tables are created in the new cluster iff
+ * they exist in the old. Since Greenplum creates partitioned tables with a
+ * single CREATE TABLE statement, the below variables are used as reference
+ * counters rather than single-use signals. The fact that Oids are defined as
+ * unsigned integers is abused to keep the datatype aligned with upstream and
+ * avoid merge conflicts. See documentation in create_toast_table() for a
+ * longer discussion on this.
+ */
+extern Oid			binary_upgrade_next_toast_pg_class_oid;
+extern Oid			binary_upgrade_next_toast_pg_type_oid;
 
 /*
  * These were received from the QD, and should be consumed by the current
@@ -125,6 +146,54 @@ static List *preassigned_oids = NIL;
  */
 static List *dispatch_oids = NIL;
 
+static MemoryContext oids_context = NULL;
+
+static bool preserve_oids_on_commit = false;
+
+/*
+ * These will be used by the schema restoration process during binary upgrade,
+ * so any new object must not use any Oid in this structure or else there will
+ * be collisions.
+ */
+typedef struct
+{
+	RBNode		rbnode;
+	Oid			oid;
+} OidPreassignment;
+
+static RBTree *binary_upgrade_preassigned_oids;
+
+static MemoryContext
+get_oids_context(void)
+{
+	if (!oids_context)
+		oids_context = AllocSetContextCreate(TopMemoryContext,
+											 "Oid dispatch context",
+											 ALLOCSET_SMALL_SIZES);
+
+	return oids_context;
+}
+
+/*
+ * Some commands, like VACUUM, start transactions of their own. Normally,
+ * the list of assigned OIDs is reset at transaction commit, and warnings
+ * are printed for any assignments that haven't been dispatched to the
+ * segments. Calling PreserveOidAssignmentsOnCommit() changes that, so
+ * that the list of assigned OIDs is preserved across commits, until you
+ * call ClearOidAssignmentsOnCommit() to reset the flag. Abort always
+ * clears the list and resets the flag.
+ */
+void
+PreserveOidAssignmentsOnCommit(void)
+{
+	preserve_oids_on_commit = true;
+}
+
+void
+ClearOidAssignmentsOnCommit(void)
+{
+	preserve_oids_on_commit = false;
+}
 
 /*
  * Create an OidAssignment struct, for a catalog table tuple.
@@ -154,6 +223,13 @@ CreateKeyFromCatalogTuple(Relation catalogrel, HeapTuple tuple,
 
 	switch(catalogrel->rd_id)
 	{
+		case AccessMethodRelationId:
+			{
+				Form_pg_am amForm = (Form_pg_am) GETSTRUCT(tuple);
+
+				key.objname = NameStr(amForm->amname);
+				break;
+			}
 		case AccessMethodOperatorRelationId:
 			{
 				Form_pg_amop amopForm = (Form_pg_amop) GETSTRUCT(tuple);
@@ -184,6 +260,14 @@ CreateKeyFromCatalogTuple(Relation catalogrel, HeapTuple tuple,
 				key.keyOid2 = castForm->casttarget;
 				break;
 			}
+		case CollationRelationId:
+			{
+				Form_pg_collation collationForm = (Form_pg_collation) GETSTRUCT(tuple);
+
+				key.namespaceOid = collationForm->collnamespace;
+				key.objname = NameStr(collationForm->collname);
+				break;
+			}
 		case ConstraintRelationId:
 			{
 				Form_pg_constraint conForm = (Form_pg_constraint) GETSTRUCT(tuple);
@@ -207,6 +291,15 @@ CreateKeyFromCatalogTuple(Relation catalogrel, HeapTuple tuple,
 				Form_pg_database datForm = (Form_pg_database) GETSTRUCT(tuple);
 
 				key.objname = (char *) NameStr(datForm->datname);
+				break;
+			}
+		case DefaultAclRelationId:
+			{
+				Form_pg_default_acl daclForm = (Form_pg_default_acl) GETSTRUCT(tuple);
+
+				key.keyOid1 = daclForm->defaclrole;
+				key.namespaceOid = daclForm->defaclnamespace;
+				key.keyOid2 = (Oid) daclForm->defaclobjtype;
 				break;
 			}
 		case EnumRelationId:
@@ -236,11 +329,20 @@ CreateKeyFromCatalogTuple(Relation catalogrel, HeapTuple tuple,
 				key.objname = NameStr(protForm->ptcname);
 				break;
 			}
-		case FileSpaceRelationId:
+		case ForeignDataWrapperRelationId:
 			{
-				Form_pg_filespace fsForm = (Form_pg_filespace) GETSTRUCT(tuple);
+				Form_pg_foreign_data_wrapper fdwForm = (Form_pg_foreign_data_wrapper) GETSTRUCT(tuple);
 
-				key.objname = NameStr(fsForm->fsname);
+				key.keyOid1 = fdwForm->fdwowner;
+				key.objname = NameStr(fdwForm->fdwname);
+				break;
+			}
+		case ForeignServerRelationId:
+			{
+				Form_pg_foreign_server fsrvForm = (Form_pg_foreign_server) GETSTRUCT(tuple);
+
+				key.keyOid1 = fsrvForm->srvfdw;
+				key.objname = NameStr(fsrvForm->srvname);
 				break;
 			}
 		case LanguageRelationId:
@@ -280,6 +382,13 @@ CreateKeyFromCatalogTuple(Relation catalogrel, HeapTuple tuple,
 
 				key.namespaceOid = opfForm->opfnamespace;
 				key.objname = NameStr(opfForm->opfname);
+				break;
+			}
+		case PolicyRelationId:
+			{
+				Form_pg_policy polForm = (Form_pg_policy) GETSTRUCT(tuple);
+
+				key.objname = NameStr(polForm->polname);
 				break;
 			}
 		case ProcedureRelationId:
@@ -326,6 +435,10 @@ CreateKeyFromCatalogTuple(Relation catalogrel, HeapTuple tuple,
 				Form_pg_tablespace spcForm = (Form_pg_tablespace) GETSTRUCT(tuple);
 
 				key.objname = NameStr(spcForm->spcname);
+				break;
+			}
+		case TransformRelationId:
+			{
 				break;
 			}
 		case TSParserRelationId:
@@ -384,6 +497,14 @@ CreateKeyFromCatalogTuple(Relation catalogrel, HeapTuple tuple,
 				key.keyOid2 = (Oid) rsgCapForm->reslimittype;
 				break;
 			}
+		case UserMappingRelationId:
+			{
+				Form_pg_user_mapping usermapForm = (Form_pg_user_mapping) GETSTRUCT(tuple);
+
+				key.keyOid1 = usermapForm->umuser;
+				key.keyOid2 = usermapForm->umserver;
+				break;
+			}
 
 		/* These tables don't need to have their OIDs synchronized. */
 		case AccessMethodProcedureRelationId:
@@ -392,13 +513,28 @@ CreateKeyFromCatalogTuple(Relation catalogrel, HeapTuple tuple,
 			*exempt = true;
 			 break;
 
+		/* Event triggers are only stored and fired in the QD. */
+		case EventTriggerRelationId:
+			*exempt = true;
+			break;
+
+		/*
+		 * Large objects don't work very consistently in GPDB. They are not
+		 * distributed in the segments, but rather stored in the master node.
+		 * Or actually, it depends on which node the lo_create() function
+		 * happens to run, which isn't very deterministic.
+		 */
+		case LargeObjectMetadataRelationId:
+			*exempt = true;
+			break;
+
 		 /*
-		  * These objects need to have their OIDs synchronized, but there is bespoken
-		  * code to deal with it.
+		  * These objects need to have their OIDs synchronized, but there is
+		  * bespoken code to deal with it.
 		  */
 		case TriggerRelationId:
 			*exempt = true;
-			 break;
+			break;
 
 		default:
 			*recognized = false;
@@ -432,10 +568,10 @@ AddPreassignedOids(List *l)
 	 * oid was assigned. But I'm not sure if that's true for *all* commands,
 	 * and so we don't require it. It is OK if an OID assignment is included
 	 * in one dispatched command, but the command that needs the OID is only
-	 * dispatched later in the same transaction. Therefore, keep the
-	 * 'preassigned_oids' list in TopTransactionContext.
+	 * dispatched later in the same transaction. Therefore, don't reset the
+	 * 'preassigned_oids' list, when it's dispatched.
 	 */
-	old_context = MemoryContextSwitchTo(TopTransactionContext);
+	old_context = MemoryContextSwitchTo(get_oids_context());
 
 	foreach(lc, l)
 	{
@@ -559,55 +695,14 @@ GetPreassignedOidForTuple(Relation catalogrel, HeapTuple tuple)
 
 	if ((oid = GetPreassignedOid(&searchkey)) == InvalidOid)
 	{
-		bool		missing_ok = false;
-
 		/*
-		 * When binary-upgrading the QD node, we must preserve the OIDs of types,
-		 * relations from the old cluster, so we should have pre-assigned OIDs for
-		 * them.
-		 *
-		 * When binary-upgrading a QE node, we should have pre-assigned OIDs for
-		 * all objects, to ensure that the same OIDs are used for all objects
-		 * between the QD and the QEs.
+		 * During normal operation, all OIDs are preassigned unless the object
+		 * type is exempt (in which case we should never reach here). During
+		 * upgrades we do however allow objects to be created with new OIDs
+		 * since objects may be created in new cluster which didn't exist in
+		 * the old cluster.
 		 */
-		if (IsBinaryUpgrade && !IsBinaryUpgradeQE())
-		{
-			if (RelationGetRelid(catalogrel) == NamespaceRelationId)
-			{
-				/*
-				 * OIDs of schemas must be preserved. (Only because namespace
-				 * OIDs are part of the key of types and relations.) The only
-				 * exception is pg_temp which we exempt (by definition).
-				 */
-				if (strncmp(searchkey.objname, "pg_temp", strlen("pg_temp")) == 0 ||
-					strncmp(searchkey.objname, "pg_toast_temp", strlen("pg_toast_temp")) == 0)
-					missing_ok = true;
-				else
-					missing_ok = false;
-			}
-			else if (RelationGetRelid(catalogrel) == TypeRelationId)
-			{
-				/* No need to preserve the rowtype OIDs of these special relations. */
-				if (searchkey.namespaceOid == PG_BITMAPINDEX_NAMESPACE)
-					missing_ok = true;
-				if (searchkey.namespaceOid == PG_TOAST_NAMESPACE)
-					missing_ok = true;
-				if (searchkey.namespaceOid == PG_AOSEGMENT_NAMESPACE)
-					missing_ok = true;
-			}
-			else if (RelationGetRelid(catalogrel) == RelationRelationId)
-			{
-				/* pg_upgrading indexes is currently not supported, so this is OK */
-				if (searchkey.namespaceOid == PG_BITMAPINDEX_NAMESPACE)
-					missing_ok = true;
-			}
-			else
-			{
-				missing_ok = true;
-			}
-		}
-
-		if (!missing_ok)
+		if (!IsBinaryUpgrade)
 			elog(ERROR, "no pre-assigned OID for %s tuple \"%s\" (namespace:%u keyOid1:%u keyOid2:%u)",
 				 RelationGetRelationName(catalogrel), searchkey.objname ? searchkey.objname : "",
 				 searchkey.namespaceOid, searchkey.keyOid1, searchkey.keyOid2);
@@ -655,25 +750,31 @@ GetPreassignedOidForRelation(Oid namespaceOid, const char *relname)
 		 * Special handling for binary upgrading the QD node. See
 		 * GetPreassignedOidForTuple().
 		 */
-		if (IsBinaryUpgrade && !IsBinaryUpgradeQE())
-		{
-			if (namespaceOid == PG_BITMAPINDEX_NAMESPACE)
-				return InvalidOid;
+		if (IsBinaryUpgrade)
+			return InvalidOid;
 
-			if (namespaceOid == PG_AOSEGMENT_NAMESPACE)
-				return InvalidOid;
-		}
 		elog(ERROR, "no pre-assigned OID for relation \"%s\"", relname);
 	}
+	else
+	{
+		/* If a toast Oid was consumed, lower the flag */
+		if (strstr(relname, "pg_toast"))
+			binary_upgrade_next_toast_pg_class_oid--;
+	}
+
 	return oid;
 }
 
 /*
  * A specialized version of GetPreassignedOidForTuple(). To be used when we don't
  * have a whole pg_type tuple yet.
+ *
+ * The caller should set allowMissing if it can handle a missing preassignment
+ * for the type. This is useful in upgrade scenarios as new types are added.
  */
 Oid
-GetPreassignedOidForType(Oid namespaceOid, const char *typname)
+GetPreassignedOidForType(Oid namespaceOid, const char *typname,
+						 bool allowMissing)
 {
 	OidAssignment searchkey;
 	Oid			oid;
@@ -683,8 +784,13 @@ GetPreassignedOidForType(Oid namespaceOid, const char *typname)
 	searchkey.namespaceOid = namespaceOid;
 	searchkey.objname = (char *) typname;
 
-	if ((oid = GetPreassignedOid(&searchkey)) == InvalidOid)
+	if ((oid = GetPreassignedOid(&searchkey)) == InvalidOid && !allowMissing)
 		elog(ERROR, "no pre-assigned OID for type \"%s\"", typname);
+
+	/* If a toast type Oid was consumed, lower the flag */
+	if (strstr(typname, "pg_toast"))
+		binary_upgrade_next_toast_pg_type_oid--;
+
 	return oid;
 }
 
@@ -692,6 +798,79 @@ GetPreassignedOidForType(Oid namespaceOid, const char *typname)
  * Functions for use in binary-upgrade mode
  * ----------------------------------------------------------------
  */
+
+/*
+ * Support functions for the Red-Black Tree which is used to keep the Oid
+ * preassignments from the schema restore process during binary upgrade.
+ */
+static int
+rbtree_cmp(const RBNode *a, const RBNode *b, void *arg)
+{
+	const OidPreassignment *prea = (const OidPreassignment *) a;
+	const OidPreassignment *preb = (const OidPreassignment *) b;
+
+	return prea->oid - preb->oid;
+}
+
+static RBNode *
+rbtree_alloc(void *arg)
+{
+	return (RBNode *) palloc(sizeof(OidPreassignment));
+}
+
+static void
+rbtree_free(RBNode *node, void *arg)
+{
+	pfree(node);
+}
+
+/*
+ * The RB Tree combiner function will be called when a new node has the same
+ * key as an existing node (when rbtree_alloc() returns zero). For this
+ * particular usecase the only value we have is the key, so make it a no-op.
+ */
+static void
+rbtree_combine(RBNode *existing pg_attribute_unused(), const RBNode *new pg_attribute_unused(), void *arg)
+{
+	return;
+}
+
+/*
+ * Remember an Oid which will be used in schema restoration during binary
+ * upgrade, such that we can prohibit any new object to consume Oids which
+ * will lead to collision.
+ */
+void
+MarkOidPreassignedFromBinaryUpgrade(Oid oid)
+{
+	MemoryContext		oldcontext;
+	OidPreassignment	node;
+	bool				isnew;
+
+	if (!IsBinaryUpgrade)
+		elog(ERROR, "MarkOidPreassignedFromBinaryUpgrade called, but not in binary upgrade mode");
+
+	if (oid == InvalidOid)
+		return;
+
+	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+
+	if (!binary_upgrade_preassigned_oids)
+	{
+		binary_upgrade_preassigned_oids = rb_create(sizeof(OidPreassignment),
+													rbtree_cmp,
+													rbtree_combine,
+													rbtree_alloc,
+													rbtree_free,
+													NULL);
+	}
+
+	node.oid = oid;
+	rb_insert(binary_upgrade_preassigned_oids, (RBNode *) &node, &isnew);
+
+	MemoryContextSwitchTo(oldcontext);
+}
+
 
 /*
  * Remember an OID which is set from loading a database dump performed
@@ -784,7 +963,7 @@ AddDispatchOidFromTuple(Relation catalogrel, HeapTuple tuple)
 		return;
 	}
 
-	oldcontext = MemoryContextSwitchTo(TopTransactionContext);
+	oldcontext = MemoryContextSwitchTo(get_oids_context());
 
 	assignment.oid = HeapTupleGetOid(tuple);
 	dispatch_oids = lappend(dispatch_oids, copyObject(&assignment));
@@ -820,6 +999,13 @@ GetAssignedOidsForDispatch(void)
 void
 AtEOXact_DispatchOids(bool isCommit)
 {
+	if (preserve_oids_on_commit)
+	{
+		if (isCommit)
+			return;
+		preserve_oids_on_commit = false;
+	}
+
 	/*
 	 * Reset the list of to-be-dispatched OIDs. (in QD)
 	 *
@@ -871,6 +1057,8 @@ AtEOXact_DispatchOids(bool isCommit)
 		}
 #endif
 		preassigned_oids = NIL;
+
+		MemoryContextReset(get_oids_context());
 	}
 }
 
@@ -886,6 +1074,7 @@ bool
 IsOidAcceptable(Oid oid)
 {
 	ListCell *lc;
+	OidPreassignment pre;
 
 	foreach(lc, preassigned_oids)
 	{
@@ -895,5 +1084,9 @@ IsOidAcceptable(Oid oid)
 			return false;
 	}
 
-	return true;
+	if (binary_upgrade_preassigned_oids == NULL)
+		return true;
+
+	pre.oid = oid;
+	return (rb_find(binary_upgrade_preassigned_oids, (RBNode *) &pre) == NULL);
 }

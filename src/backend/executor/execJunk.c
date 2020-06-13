@@ -3,12 +3,12 @@
  * execJunk.c
  *	  Junk attribute support stuff....
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/executor/execJunk.c,v 1.57 2008/01/01 19:45:49 momjian Exp $
+ *	  src/backend/executor/execJunk.c
  *
  *-------------------------------------------------------------------------
  */
@@ -34,17 +34,15 @@
  * called 'resjunk'. If the value of this field is true then the
  * corresponding attribute is a "junk" attribute.
  *
- * When we initialize a plan we call ExecInitJunkFilter to create
- * and store the appropriate information in the es_junkFilter attribute of
- * EState.
+ * When we initialize a plan we call ExecInitJunkFilter to create a filter.
  *
  * We then execute the plan, treating the resjunk attributes like any others.
  *
  * Finally, when at the top level we get back a tuple, we can call
  * ExecFindJunkAttribute/ExecGetJunkAttribute to retrieve the values of the
- * junk attributes we are interested in, and ExecFilterJunk or ExecRemoveJunk
- * to remove all the junk attributes from a tuple. This new "clean" tuple is
- * then printed, replaced, deleted or inserted.
+ * junk attributes we are interested in, and ExecFilterJunk to remove all the
+ * junk attributes from a tuple.  This new "clean" tuple is then printed,
+ * inserted, or updated.
  *
  *-------------------------------------------------------------------------
  */
@@ -54,8 +52,9 @@
  *
  * Initialize the Junk filter.
  *
- * The source targetlist is passed in.	The clean output tuple descriptor is
- * also passed in.
+ * The source targetlist is passed in.  The output tuple descriptor is
+ * built from the non-junk tlist entries, plus the passed specification
+ * of whether to include room for an OID or not.
  * An optional resultSlot can be passed as well.
  */
 JunkFilter *
@@ -209,9 +208,21 @@ ExecInitJunkFilterConversion(List *targetList,
 AttrNumber
 ExecFindJunkAttribute(JunkFilter *junkfilter, const char *attrName)
 {
+	return ExecFindJunkAttributeInTlist(junkfilter->jf_targetList, attrName);
+}
+
+/*
+ * ExecFindJunkAttributeInTlist
+ *
+ * Find a junk attribute given a subplan's targetlist (not necessarily
+ * part of a JunkFilter).
+ */
+AttrNumber
+ExecFindJunkAttributeInTlist(List *targetlist, const char *attrName)
+{
 	ListCell   *t;
 
-	foreach(t, junkfilter->jf_targetList)
+	foreach(t, targetlist)
 	{
 		TargetEntry *tle = lfirst(t);
 
@@ -305,16 +316,4 @@ ExecFilterJunk(JunkFilter *junkfilter, TupleTableSlot *slot)
 	 * And return the virtual tuple.
 	 */
 	return ExecStoreVirtualTuple(resultSlot);
-}
-
-/*
- * ExecRemoveJunk
- *
- * Convenience routine to generate a physical clean tuple,
- * rather than just a virtual slot.
- */
-HeapTuple
-ExecRemoveJunk(JunkFilter *junkfilter, TupleTableSlot *slot)
-{
-	return ExecCopySlotHeapTuple(ExecFilterJunk(junkfilter, slot));
 }

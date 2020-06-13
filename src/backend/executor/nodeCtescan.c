@@ -3,12 +3,12 @@
  * nodeCtescan.c
  *	  routines to handle CteScan nodes.
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/executor/nodeCtescan.c,v 1.1 2008/10/04 21:56:53 tgl Exp $
+ *	  src/backend/executor/nodeCtescan.c
  *
  *-------------------------------------------------------------------------
  */
@@ -108,19 +108,26 @@ CteScanNext(CteScanState *node)
 		}
 
 		/*
+		 * There are corner cases where the subplan could change which
+		 * tuplestore read pointer is active, so be sure to reselect ours
+		 * before storing the tuple we got.
+		 */
+		tuplestore_select_read_pointer(tuplestorestate, node->readptr);
+
+		/*
 		 * Append a copy of the returned tuple to tuplestore.  NOTE: because
 		 * our read pointer is certainly in EOF state, its read position will
 		 * move forward over the added tuple.  This is what we want.  Also,
-		 * any other readers will *not* move past the new tuple, which is
-		 * what they want.
+		 * any other readers will *not* move past the new tuple, which is what
+		 * they want.
 		 */
 		tuplestore_puttupleslot(tuplestorestate, cteslot);
 
 		/*
-		 * We MUST copy the CTE query's output tuple into our own slot.
-		 * This is because other CteScan nodes might advance the CTE query
-		 * before we are called again, and our output tuple must stay
-		 * stable over that.
+		 * We MUST copy the CTE query's output tuple into our own slot. This
+		 * is because other CteScan nodes might advance the CTE query before
+		 * we are called again, and our output tuple must stay stable over
+		 * that.
 		 */
 		return ExecCopySlot(slot, cteslot);
 	}
@@ -131,21 +138,30 @@ CteScanNext(CteScanState *node)
 	return ExecClearTuple(slot);
 }
 
+/*
+ * CteScanRecheck -- access method routine to recheck a tuple in EvalPlanQual
+ */
+static bool
+CteScanRecheck(CteScanState *node, TupleTableSlot *slot)
+{
+	/* nothing to check */
+	return true;
+}
+
 /* ----------------------------------------------------------------
  *		ExecCteScan(node)
  *
  *		Scans the CTE sequentially and returns the next qualifying tuple.
- *		It calls the ExecScan() routine and passes it the access method
- *		which retrieves tuples sequentially.
+ *		We call the ExecScan() routine and pass it the appropriate
+ *		access method functions.
  * ----------------------------------------------------------------
  */
 TupleTableSlot *
 ExecCteScan(CteScanState *node)
 {
-	/*
-	 * use CteScanNext as access method
-	 */
-	return ExecScan(&node->ss, (ExecScanAccessMtd) CteScanNext);
+	return ExecScan(&node->ss,
+					(ExecScanAccessMtd) CteScanNext,
+					(ExecScanRecheckMtd) CteScanRecheck);
 }
 
 
@@ -167,6 +183,12 @@ ExecInitCteScan(CteScan *node, EState *estate, int eflags)
 	 * we might be asked to rescan the CTE even though upper levels didn't
 	 * tell us to be prepared to do it efficiently.  Annoying, since this
 	 * prevents truncation of the tuplestore.  XXX FIXME
+	 *
+	 * Note: if we are in an EPQ recheck plan tree, it's likely that no access
+	 * to the tuplestore is needed at all, making this even more annoying.
+	 * It's not worth improving that as long as all the read pointers would
+	 * have REWIND anyway, but if we ever improve this logic then that aspect
+	 * should be considered too.
 	 */
 	eflags |= EXEC_FLAG_REWIND;
 
@@ -193,10 +215,10 @@ ExecInitCteScan(CteScan *node, EState *estate, int eflags)
 													 node->ctePlanId - 1);
 
 	/*
-	 * The Param slot associated with the CTE query is used to hold a
-	 * pointer to the CteState of the first CteScan node that initializes
-	 * for this CTE.  This node will be the one that holds the shared
-	 * state for all the CTEs.
+	 * The Param slot associated with the CTE query is used to hold a pointer
+	 * to the CteState of the first CteScan node that initializes for this
+	 * CTE.  This node will be the one that holds the shared state for all the
+	 * CTEs, particularly the shared tuplestore.
 	 */
 	prmdata = &(estate->es_param_exec_vals[node->cteParam]);
 	Assert(prmdata->execPlan == NULL);
@@ -215,9 +237,13 @@ ExecInitCteScan(CteScan *node, EState *estate, int eflags)
 	{
 		/* Not the leader */
 		Assert(IsA(scanstate->leader, CteScanState));
+		/* Create my own read pointer, and ensure it is at start */
 		scanstate->readptr =
 			tuplestore_alloc_read_pointer(scanstate->leader->cte_table,
 										  scanstate->eflags);
+		tuplestore_select_read_pointer(scanstate->leader->cte_table,
+									   scanstate->readptr);
+		tuplestore_rescan(scanstate->leader->cte_table);
 	}
 
 	/*
@@ -236,8 +262,6 @@ ExecInitCteScan(CteScan *node, EState *estate, int eflags)
 	scanstate->ss.ps.qual = (List *)
 		ExecInitExpr((Expr *) node->scan.plan.qual,
 					 (PlanState *) scanstate);
-
-#define CTESCAN_NSLOTS 2
 
 	/*
 	 * tuple table initialization
@@ -259,14 +283,6 @@ ExecInitCteScan(CteScan *node, EState *estate, int eflags)
 	ExecAssignScanProjectionInfo(&scanstate->ss);
 
 	return scanstate;
-}
-
-int
-ExecCountSlotsCteScan(CteScan *node)
-{
-	return ExecCountSlotsNode(outerPlan(node)) +
-		ExecCountSlotsNode(innerPlan(node)) +
-		CTESCAN_NSLOTS;
 }
 
 /* ----------------------------------------------------------------
@@ -293,44 +309,47 @@ ExecEndCteScan(CteScanState *node)
 	 * If I am the leader, free the tuplestore.
 	 */
 	if (node->leader == node)
+	{
 		tuplestore_end(node->cte_table);
+		node->cte_table = NULL;
+	}
 }
 
 /* ----------------------------------------------------------------
- *		ExecCteScanReScan
+ *		ExecReScanCteScan
  *
  *		Rescans the relation.
  * ----------------------------------------------------------------
  */
 void
-ExecCteScanReScan(CteScanState *node, ExprContext *exprCtxt)
+ExecReScanCteScan(CteScanState *node)
 {
-	Tuplestorestate *tuplestorestate;
-
-	tuplestorestate = node->leader->cte_table;
+	Tuplestorestate *tuplestorestate = node->leader->cte_table;
 
 	ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
 
-	if (node->leader == node)
+	ExecScanReScan(&node->ss);
+
+	/*
+	 * Clear the tuplestore if a new scan of the underlying CTE is required.
+	 * This implicitly resets all the tuplestore's read pointers.  Note that
+	 * multiple CTE nodes might redundantly clear the tuplestore; that's OK,
+	 * and not unduly expensive.  We'll stop taking this path as soon as
+	 * somebody has attempted to read something from the underlying CTE
+	 * (thereby causing its chgParam to be cleared).
+	 */
+	if (node->leader->cteplanstate->chgParam != NULL)
 	{
-		/*
-		 * The leader is responsible for clearing the tuplestore if a new
-		 * scan of the underlying CTE is required.
-		 */
-		if (node->cteplanstate->chgParam != NULL)
-		{
-			tuplestore_clear(tuplestorestate);
-			node->eof_cte = false;
-		}
-		else
-		{
-			tuplestore_select_read_pointer(tuplestorestate, node->readptr);
-			tuplestore_rescan(tuplestorestate);
-		}
+		tuplestore_clear(tuplestorestate);
+		node->leader->eof_cte = false;
 	}
 	else
 	{
-		/* Not leader, so just rewind my own pointer */
+		/*
+		 * Else, just rewind my own pointer.  Either the underlying CTE
+		 * doesn't need a rescan (and we can re-read what's in the tuplestore
+		 * now), or somebody else already took care of it.
+		 */
 		tuplestore_select_read_pointer(tuplestorestate, node->readptr);
 		tuplestore_rescan(tuplestorestate);
 	}

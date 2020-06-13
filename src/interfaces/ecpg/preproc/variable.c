@@ -1,4 +1,4 @@
-/* $PostgreSQL: pgsql/src/interfaces/ecpg/preproc/variable.c,v 1.49 2009/06/11 14:49:13 momjian Exp $ */
+/* src/interfaces/ecpg/preproc/variable.c */
 
 #include "postgres_fe.h"
 
@@ -44,12 +44,12 @@ find_struct_member(char *name, char *str, struct ECPGstruct_member * members, in
 				switch (members->type->type)
 				{
 					case ECPGt_array:
-						return (new_variable(name, ECPGmake_array_type(ECPGmake_simple_type(members->type->u.element->type, members->type->u.element->size, members->type->u.element->lineno), members->type->size), brace_level));
+						return (new_variable(name, ECPGmake_array_type(ECPGmake_simple_type(members->type->u.element->type, members->type->u.element->size, members->type->u.element->counter), members->type->size), brace_level));
 					case ECPGt_struct:
 					case ECPGt_union:
-						return (new_variable(name, ECPGmake_struct_type(members->type->u.members, members->type->type, members->type->struct_sizeof), brace_level));
+						return (new_variable(name, ECPGmake_struct_type(members->type->u.members, members->type->type, members->type->type_name, members->type->struct_sizeof), brace_level));
 					default:
-						return (new_variable(name, ECPGmake_simple_type(members->type->type, members->type->size, members->type->lineno), brace_level));
+						return (new_variable(name, ECPGmake_simple_type(members->type->type, members->type->size, members->type->counter), brace_level));
 				}
 			}
 			else
@@ -86,21 +86,25 @@ find_struct_member(char *name, char *str, struct ECPGstruct_member * members, in
 					case '\0':	/* found the end, but this time it has to be
 								 * an array element */
 						if (members->type->type != ECPGt_array)
-							mmerror(PARSE_ERROR, ET_FATAL, "incorrectly formed variable \"%s\"", name);
+							mmfatal(PARSE_ERROR, "incorrectly formed variable \"%s\"", name);
 
 						switch (members->type->u.element->type)
 						{
 							case ECPGt_array:
-								return (new_variable(name, ECPGmake_array_type(ECPGmake_simple_type(members->type->u.element->u.element->type, members->type->u.element->u.element->size, members->type->u.element->u.element->lineno), members->type->u.element->size), brace_level));
+								return (new_variable(name, ECPGmake_array_type(ECPGmake_simple_type(members->type->u.element->u.element->type, members->type->u.element->u.element->size, members->type->u.element->u.element->counter), members->type->u.element->size), brace_level));
 							case ECPGt_struct:
 							case ECPGt_union:
-								return (new_variable(name, ECPGmake_struct_type(members->type->u.element->u.members, members->type->u.element->type, members->type->u.element->struct_sizeof), brace_level));
+								return (new_variable(name, ECPGmake_struct_type(members->type->u.element->u.members, members->type->u.element->type, members->type->u.element->type_name, members->type->u.element->struct_sizeof), brace_level));
 							default:
-								return (new_variable(name, ECPGmake_simple_type(members->type->u.element->type, members->type->u.element->size, members->type->u.element->lineno), brace_level));
+								return (new_variable(name, ECPGmake_simple_type(members->type->u.element->type, members->type->u.element->size, members->type->u.element->counter), brace_level));
 						}
 						break;
 					case '-':
-						return (find_struct_member(name, end, members->type->u.element->u.members, brace_level));
+						if (members->type->type == ECPGt_array)
+							return (find_struct_member(name, ++end, members->type->u.element->u.members, brace_level));
+						else
+							return (find_struct_member(name, ++end, members->type->u.members, brace_level));
+						break;
 						break;
 					case '.':
 						if (members->type->type == ECPGt_array)
@@ -109,7 +113,7 @@ find_struct_member(char *name, char *str, struct ECPGstruct_member * members, in
 							return (find_struct_member(name, end, members->type->u.members, brace_level));
 						break;
 					default:
-						mmerror(PARSE_ERROR, ET_FATAL, "incorrectly formed variable \"%s\"", name);
+						mmfatal(PARSE_ERROR, "incorrectly formed variable \"%s\"", name);
 						break;
 				}
 			}
@@ -132,10 +136,10 @@ find_struct(char *name, char *next, char *end)
 	if (c == '-')
 	{
 		if (p->type->type != ECPGt_array)
-			mmerror(PARSE_ERROR, ET_FATAL, "variable \"%s\" is not a pointer", name);
+			mmfatal(PARSE_ERROR, "variable \"%s\" is not a pointer", name);
 
 		if (p->type->u.element->type != ECPGt_struct && p->type->u.element->type != ECPGt_union)
-			mmerror(PARSE_ERROR, ET_FATAL, "variable \"%s\" is not a pointer to a structure or a union", name);
+			mmfatal(PARSE_ERROR, "variable \"%s\" is not a pointer to a structure or a union", name);
 
 		/* restore the name, we will need it later */
 		*next = c;
@@ -147,7 +151,7 @@ find_struct(char *name, char *next, char *end)
 		if (next == end)
 		{
 			if (p->type->type != ECPGt_struct && p->type->type != ECPGt_union)
-				mmerror(PARSE_ERROR, ET_FATAL, "variable \"%s\" is neither a structure nor a union", name);
+				mmfatal(PARSE_ERROR, "variable \"%s\" is neither a structure nor a union", name);
 
 			/* restore the name, we will need it later */
 			*next = c;
@@ -157,10 +161,10 @@ find_struct(char *name, char *next, char *end)
 		else
 		{
 			if (p->type->type != ECPGt_array)
-				mmerror(PARSE_ERROR, ET_FATAL, "variable \"%s\" is not an array", name);
+				mmfatal(PARSE_ERROR, "variable \"%s\" is not an array", name);
 
 			if (p->type->u.element->type != ECPGt_struct && p->type->u.element->type != ECPGt_union)
-				mmerror(PARSE_ERROR, ET_FATAL, "variable \"%s\" is not a pointer to a structure or a union", name);
+				mmfatal(PARSE_ERROR, "variable \"%s\" is not a pointer to a structure or a union", name);
 
 			/* restore the name, we will need it later */
 			*next = c;
@@ -226,18 +230,18 @@ find_variable(char *name)
 				*next = '\0';
 				p = find_simple(name);
 				if (p == NULL)
-					mmerror(PARSE_ERROR, ET_FATAL, "variable \"%s\" is not declared", name);
+					mmfatal(PARSE_ERROR, "variable \"%s\" is not declared", name);
 
 				*next = c;
 				switch (p->type->u.element->type)
 				{
 					case ECPGt_array:
-						return (new_variable(name, ECPGmake_array_type(ECPGmake_simple_type(p->type->u.element->u.element->type, p->type->u.element->u.element->size, p->type->u.element->u.element->lineno), p->type->u.element->size), p->brace_level));
+						return (new_variable(name, ECPGmake_array_type(ECPGmake_simple_type(p->type->u.element->u.element->type, p->type->u.element->u.element->size, p->type->u.element->u.element->counter), p->type->u.element->size), p->brace_level));
 					case ECPGt_struct:
 					case ECPGt_union:
-						return (new_variable(name, ECPGmake_struct_type(p->type->u.element->u.members, p->type->u.element->type, p->type->u.element->struct_sizeof), p->brace_level));
+						return (new_variable(name, ECPGmake_struct_type(p->type->u.element->u.members, p->type->u.element->type, p->type->u.element->type_name, p->type->u.element->struct_sizeof), p->brace_level));
 					default:
-						return (new_variable(name, ECPGmake_simple_type(p->type->u.element->type, p->type->u.element->size, p->type->u.element->lineno), p->brace_level));
+						return (new_variable(name, ECPGmake_simple_type(p->type->u.element->type, p->type->u.element->size, p->type->u.element->counter), p->brace_level));
 				}
 			}
 		}
@@ -248,7 +252,7 @@ find_variable(char *name)
 		p = find_simple(name);
 
 	if (p == NULL)
-		mmerror(PARSE_ERROR, ET_FATAL, "variable \"%s\" is not declared", name);
+		mmfatal(PARSE_ERROR, "variable \"%s\" is not declared", name);
 
 	return (p);
 }
@@ -401,6 +405,31 @@ add_variable_to_tail(struct arguments ** list, struct variable * var, struct var
 		*list = new;
 }
 
+void
+remove_variable_from_list(struct arguments ** list, struct variable * var)
+{
+	struct arguments *p,
+			   *prev = NULL;
+	bool		found = false;
+
+	for (p = *list; p; p = p->next)
+	{
+		if (p->variable == var)
+		{
+			found = true;
+			break;
+		}
+		prev = p;
+	}
+	if (found)
+	{
+		if (prev)
+			prev->next = p->next;
+		else
+			*list = p->next;
+	}
+}
+
 /* Dump out a list of all the variable on this list.
    This is a recursive function that works from the end of the list and
    deletes the list as we go on.
@@ -408,8 +437,12 @@ add_variable_to_tail(struct arguments ** list, struct variable * var, struct var
 void
 dump_variables(struct arguments * list, int mode)
 {
+	char	   *str_zero;
+
 	if (list == NULL)
 		return;
+
+	str_zero = mm_strdup("0");
 
 	/*
 	 * The list is build up from the beginning so lets first dump the end of
@@ -419,13 +452,15 @@ dump_variables(struct arguments * list, int mode)
 	dump_variables(list->next, mode);
 
 	/* Then the current element and its indicator */
-	ECPGdump_a_type(yyout, list->variable->name, list->variable->type,
-					list->indicator->name, list->indicator->type,
-					NULL, NULL, make_str("0"), NULL, NULL);
+	ECPGdump_a_type(base_yyout, list->variable->name, list->variable->type, list->variable->brace_level,
+					list->indicator->name, list->indicator->type, list->indicator->brace_level,
+					NULL, NULL, str_zero, NULL, NULL);
 
 	/* Then release the list element. */
 	if (mode != 0)
 		free(list);
+
+	free(str_zero);
 }
 
 void
@@ -466,9 +501,9 @@ get_typedef(char *name)
 {
 	struct typedefs *this;
 
-	for (this = types; this && strcmp(this->name, name); this = this->next);
+	for (this = types; this && strcmp(this->name, name) != 0; this = this->next);
 	if (!this)
-		mmerror(PARSE_ERROR, ET_FATAL, "unrecognized data type name \"%s\"", name);
+		mmfatal(PARSE_ERROR, "unrecognized data type name \"%s\"", name);
 
 	return (this);
 }
@@ -479,7 +514,7 @@ adjust_array(enum ECPGttype type_enum, char **dimension, char **length, char *ty
 	if (atoi(type_index) >= 0)
 	{
 		if (atoi(*length) >= 0)
-			mmerror(PARSE_ERROR, ET_FATAL, "multidimensional arrays are not supported");
+			mmfatal(PARSE_ERROR, "multidimensional arrays are not supported");
 
 		*length = type_index;
 	}
@@ -487,7 +522,7 @@ adjust_array(enum ECPGttype type_enum, char **dimension, char **length, char *ty
 	if (atoi(type_dimension) >= 0)
 	{
 		if (atoi(*dimension) >= 0 && atoi(*length) >= 0)
-			mmerror(PARSE_ERROR, ET_FATAL, "multidimensional arrays are not supported");
+			mmfatal(PARSE_ERROR, "multidimensional arrays are not supported");
 
 		if (atoi(*dimension) >= 0)
 			*length = *dimension;
@@ -496,18 +531,18 @@ adjust_array(enum ECPGttype type_enum, char **dimension, char **length, char *ty
 	}
 
 	if (pointer_len > 2)
-		mmerror(PARSE_ERROR, ET_FATAL, ngettext("multilevel pointers (more than 2 levels) are not supported; found %d level",
-												"multilevel pointers (more than 2 levels) are not supported; found %d levels", pointer_len),
+		mmfatal(PARSE_ERROR, ngettext("multilevel pointers (more than 2 levels) are not supported; found %d level",
+									  "multilevel pointers (more than 2 levels) are not supported; found %d levels", pointer_len),
 				pointer_len);
 
-	if (pointer_len > 1 && type_enum != ECPGt_char && type_enum != ECPGt_unsigned_char)
-		mmerror(PARSE_ERROR, ET_FATAL, "pointer to pointer is not supported for this data type");
+	if (pointer_len > 1 && type_enum != ECPGt_char && type_enum != ECPGt_unsigned_char && type_enum != ECPGt_string)
+		mmfatal(PARSE_ERROR, "pointer to pointer is not supported for this data type");
 
 	if (pointer_len > 1 && (atoi(*length) >= 0 || atoi(*dimension) >= 0))
-		mmerror(PARSE_ERROR, ET_FATAL, "multidimensional arrays are not supported");
+		mmfatal(PARSE_ERROR, "multidimensional arrays are not supported");
 
 	if (atoi(*length) >= 0 && atoi(*dimension) >= 0 && pointer_len)
-		mmerror(PARSE_ERROR, ET_FATAL, "multidimensional arrays are not supported");
+		mmfatal(PARSE_ERROR, "multidimensional arrays are not supported");
 
 	switch (type_enum)
 	{
@@ -517,38 +552,39 @@ adjust_array(enum ECPGttype type_enum, char **dimension, char **length, char *ty
 			if (pointer_len)
 			{
 				*length = *dimension;
-				*dimension = make_str("0");
+				*dimension = mm_strdup("0");
 			}
 
 			if (atoi(*length) >= 0)
-				mmerror(PARSE_ERROR, ET_FATAL, "multidimensional arrays for structures are not supported");
+				mmfatal(PARSE_ERROR, "multidimensional arrays for structures are not supported");
 
 			break;
 		case ECPGt_varchar:
 			/* pointer has to get dimension 0 */
 			if (pointer_len)
-				*dimension = make_str("0");
+				*dimension = mm_strdup("0");
 
 			/* one index is the string length */
 			if (atoi(*length) < 0)
 			{
 				*length = *dimension;
-				*dimension = make_str("-1");
+				*dimension = mm_strdup("-1");
 			}
 
 			break;
 		case ECPGt_char:
 		case ECPGt_unsigned_char:
+		case ECPGt_string:
 			/* char ** */
 			if (pointer_len == 2)
 			{
-				*length = *dimension = make_str("0");
+				*length = *dimension = mm_strdup("0");
 				break;
 			}
 
 			/* pointer has to get length 0 */
 			if (pointer_len == 1)
-				*length = make_str("0");
+				*length = mm_strdup("0");
 
 			/* one index is the string length */
 			if (atoi(*length) < 0)
@@ -563,13 +599,13 @@ adjust_array(enum ECPGttype type_enum, char **dimension, char **length, char *ty
 					 * do not change this for typedefs since it will be
 					 * changed later on when the variable is defined
 					 */
-					*length = make_str("1");
+					*length = mm_strdup("1");
 				else if (strcmp(*dimension, "0") == 0)
-					*length = make_str("-1");
+					*length = mm_strdup("-1");
 				else
 					*length = *dimension;
 
-				*dimension = make_str("-1");
+				*dimension = mm_strdup("-1");
 			}
 			break;
 		default:
@@ -577,11 +613,11 @@ adjust_array(enum ECPGttype type_enum, char **dimension, char **length, char *ty
 			if (pointer_len)
 			{
 				*length = *dimension;
-				*dimension = make_str("0");
+				*dimension = mm_strdup("0");
 			}
 
 			if (atoi(*length) >= 0)
-				mmerror(PARSE_ERROR, ET_FATAL, "multidimensional arrays for simple data types are not supported");
+				mmfatal(PARSE_ERROR, "multidimensional arrays for simple data types are not supported");
 
 			break;
 	}

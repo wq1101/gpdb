@@ -8,7 +8,7 @@ INSERT INTO xmltest VALUES (3, '<wrong');
 ERROR:  invalid XML content
 LINE 1: INSERT INTO xmltest VALUES (3, '<wrong');
                                        ^
-DETAIL:  Entity: line 1: parser error : Couldn't find end of Start Tag wrong line 1
+DETAIL:  line 1: Couldn't find end of Start Tag wrong line 1
 SELECT * FROM xmltest;
  id |        data        
 ----+--------------------
@@ -60,7 +60,7 @@ SELECT xmlconcat('bad', '<syntax');
 ERROR:  invalid XML content
 LINE 1: SELECT xmlconcat('bad', '<syntax');
                                 ^
-DETAIL:  Entity: line 1: parser error : Couldn't find end of Start Tag syntax line 1
+DETAIL:  line 1: Couldn't find end of Start Tag syntax line 1
 SELECT xmlconcat('<foo/>', NULL, '<?xml version="1.1" standalone="no"?><bar/>');
   xmlconcat   
 --------------
@@ -190,6 +190,18 @@ SELECT xmlelement(name foo, xmlattributes('<>&"''' as funny, xml 'b<a/>r' as fun
  <foo funny="&lt;&gt;&amp;&quot;'" funnier="b&lt;a/&gt;r"/>
 (1 row)
 
+SELECT xmlparse(content '');
+ xmlparse 
+----------
+ 
+(1 row)
+
+SELECT xmlparse(content '  ');
+ xmlparse 
+----------
+   
+(1 row)
+
 SELECT xmlparse(content 'abc');
  xmlparse 
 ----------
@@ -202,15 +214,91 @@ SELECT xmlparse(content '<abc>x</abc>');
  <abc>x</abc>
 (1 row)
 
+SELECT xmlparse(content '<invalidentity>&</invalidentity>');
+ERROR:  invalid XML content
+DETAIL:  line 1: xmlParseEntityRef: no name
+<invalidentity>&</invalidentity>
+                ^
+line 1: chunk is not well balanced
+SELECT xmlparse(content '<undefinedentity>&idontexist;</undefinedentity>');
+ERROR:  invalid XML content
+DETAIL:  line 1: Entity 'idontexist' not defined
+<undefinedentity>&idontexist;</undefinedentity>
+                             ^
+line 1: chunk is not well balanced
+SELECT xmlparse(content '<invalidns xmlns=''&lt;''/>');
+         xmlparse          
+---------------------------
+ <invalidns xmlns='&lt;'/>
+(1 row)
+
+SELECT xmlparse(content '<relativens xmlns=''relative''/>');
+            xmlparse            
+--------------------------------
+ <relativens xmlns='relative'/>
+(1 row)
+
+SELECT xmlparse(content '<twoerrors>&idontexist;</unbalanced>');
+ERROR:  invalid XML content
+DETAIL:  line 1: Entity 'idontexist' not defined
+<twoerrors>&idontexist;</unbalanced>
+                       ^
+line 1: Opening and ending tag mismatch: twoerrors line 1 and unbalanced
+line 1: chunk is not well balanced
+SELECT xmlparse(content '<nosuchprefix:tag/>');
+      xmlparse       
+---------------------
+ <nosuchprefix:tag/>
+(1 row)
+
+SELECT xmlparse(document '   ');
+ERROR:  invalid XML document
+DETAIL:  line 1: Start tag expected, '<' not found
 SELECT xmlparse(document 'abc');
 ERROR:  invalid XML document
-DETAIL:  Entity: line 1: parser error : Start tag expected, '<' not found
+DETAIL:  line 1: Start tag expected, '<' not found
 abc
 ^
 SELECT xmlparse(document '<abc>x</abc>');
    xmlparse   
 --------------
  <abc>x</abc>
+(1 row)
+
+SELECT xmlparse(document '<invalidentity>&</abc>');
+ERROR:  invalid XML document
+DETAIL:  line 1: xmlParseEntityRef: no name
+<invalidentity>&</abc>
+                ^
+line 1: Opening and ending tag mismatch: invalidentity line 1 and abc
+SELECT xmlparse(document '<undefinedentity>&idontexist;</abc>');
+ERROR:  invalid XML document
+DETAIL:  line 1: Entity 'idontexist' not defined
+<undefinedentity>&idontexist;</abc>
+                             ^
+line 1: Opening and ending tag mismatch: undefinedentity line 1 and abc
+SELECT xmlparse(document '<invalidns xmlns=''&lt;''/>');
+         xmlparse          
+---------------------------
+ <invalidns xmlns='&lt;'/>
+(1 row)
+
+SELECT xmlparse(document '<relativens xmlns=''relative''/>');
+            xmlparse            
+--------------------------------
+ <relativens xmlns='relative'/>
+(1 row)
+
+SELECT xmlparse(document '<twoerrors>&idontexist;</unbalanced>');
+ERROR:  invalid XML document
+DETAIL:  line 1: Entity 'idontexist' not defined
+<twoerrors>&idontexist;</unbalanced>
+                       ^
+line 1: Opening and ending tag mismatch: twoerrors line 1 and unbalanced
+SELECT xmlparse(document '<nosuchprefix:tag/>');
+      xmlparse       
+---------------------
+ <nosuchprefix:tag/>
 (1 row)
 
 SELECT xmlpi(name foo);
@@ -342,7 +430,7 @@ SELECT xmlserialize(content data as character varying(20)) FROM xmltest;
 SELECT xmlserialize(content 'good' as char(10));
  xmlserialize 
 --------------
- good
+ good      
 (1 row)
 
 SELECT xmlserialize(document 'bad' as text);
@@ -375,7 +463,7 @@ SELECT '<>' IS NOT DOCUMENT;
 ERROR:  invalid XML content
 LINE 1: SELECT '<>' IS NOT DOCUMENT;
                ^
-DETAIL:  Entity: line 1: parser error : StartTag: invalid element name
+DETAIL:  line 1: StartTag: invalid element name
 <>
  ^
 SELECT xmlagg(data order by id) FROM xmltest;
@@ -421,7 +509,7 @@ EXECUTE foo ('bad');
 ERROR:  invalid XML document
 LINE 1: EXECUTE foo ('bad');
                      ^
-DETAIL:  Entity: line 1: parser error : Start tag expected, '<' not found
+DETAIL:  line 1: Start tag expected, '<' not found
 bad
 ^
 SET XML OPTION CONTENT;
@@ -449,17 +537,18 @@ CREATE VIEW xmlview8 AS SELECT xmlserialize(content 'good' as char(10));
 CREATE VIEW xmlview9 AS SELECT xmlserialize(content 'good' as text);
 SELECT table_name, view_definition FROM information_schema.views
   WHERE table_name LIKE 'xmlview%' ORDER BY 1;
- table_name |                                                      view_definition                                                       
-------------+----------------------------------------------------------------------------------------------------------------------------
- xmlview1   | SELECT xmlcomment('test'::text) AS xmlcomment;
- xmlview2   | SELECT XMLCONCAT('hello'::xml, 'you'::xml) AS "xmlconcat";
- xmlview3   | SELECT XMLELEMENT(NAME element, XMLATTRIBUTES(1 AS ":one:", 'deuce' AS two), 'content&') AS "xmlelement";
- xmlview4   | SELECT XMLELEMENT(NAME employee, XMLFOREST(emp.name AS name, emp.age AS age, emp.salary AS pay)) AS "xmlelement" FROM emp;
- xmlview5   | SELECT XMLPARSE(CONTENT '<abc>x</abc>'::text STRIP WHITESPACE) AS "xmlparse";
- xmlview6   | SELECT XMLPI(NAME foo, 'bar'::text) AS "xmlpi";
- xmlview7   | SELECT XMLROOT('<foo/>'::xml, VERSION NO VALUE, STANDALONE YES) AS "xmlroot";
- xmlview8   | SELECT (XMLSERIALIZE(CONTENT 'good'::xml AS character(10)))::character(10) AS "xmlserialize";
- xmlview9   | SELECT XMLSERIALIZE(CONTENT 'good'::xml AS text) AS "xmlserialize";
+ table_name |                                                  view_definition                                                  
+------------+-------------------------------------------------------------------------------------------------------------------
+ xmlview1   |  SELECT xmlcomment('test'::text) AS xmlcomment;
+ xmlview2   |  SELECT XMLCONCAT('hello'::xml, 'you'::xml) AS "xmlconcat";
+ xmlview3   |  SELECT XMLELEMENT(NAME element, XMLATTRIBUTES(1 AS ":one:", 'deuce' AS two), 'content&') AS "xmlelement";
+ xmlview4   |  SELECT XMLELEMENT(NAME employee, XMLFOREST(emp.name AS name, emp.age AS age, emp.salary AS pay)) AS "xmlelement"+
+            |    FROM emp;
+ xmlview5   |  SELECT XMLPARSE(CONTENT '<abc>x</abc>'::text STRIP WHITESPACE) AS "xmlparse";
+ xmlview6   |  SELECT XMLPI(NAME foo, 'bar'::text) AS "xmlpi";
+ xmlview7   |  SELECT XMLROOT('<foo/>'::xml, VERSION NO VALUE, STANDALONE YES) AS "xmlroot";
+ xmlview8   |  SELECT (XMLSERIALIZE(CONTENT 'good'::xml AS character(10)))::character(10) AS "xmlserialize";
+ xmlview9   |  SELECT XMLSERIALIZE(CONTENT 'good'::xml AS text) AS "xmlserialize";
 (9 rows)
 
 -- Text XPath expressions evaluation
@@ -501,9 +590,9 @@ SELECT xpath('//loc:piece', '<local:data xmlns:local="http://127.0.0.1"><local:p
 SELECT xpath('//loc:piece', '<local:data xmlns:local="http://127.0.0.1" xmlns="http://127.0.0.2"><local:piece id="1"><internal>number one</internal><internal2/></local:piece><local:piece id="2" /></local:data>', ARRAY[ARRAY['loc', 'http://127.0.0.1']]);
                                         xpath                                         
 --------------------------------------------------------------------------------------
- {"<local:piece xmlns:local=\"http://127.0.0.1\" xmlns=\"http://127.0.0.2\" id=\"1\"> 
-   <internal>number one</internal>                                                    
-   <internal2/>                                                                       
+ {"<local:piece xmlns:local=\"http://127.0.0.1\" xmlns=\"http://127.0.0.2\" id=\"1\">+
+   <internal>number one</internal>                                                   +
+   <internal2/>                                                                      +
  </local:piece>","<local:piece xmlns:local=\"http://127.0.0.1\" id=\"2\"/>"}
 (1 row)
 
@@ -513,6 +602,89 @@ SELECT xpath('//b', '<a>one <b>two</b> three <b>etc</b></a>');
  {<b>two</b>,<b>etc</b>}
 (1 row)
 
+SELECT xpath('//text()', '<root>&lt;</root>');
+ xpath  
+--------
+ {&lt;}
+(1 row)
+
+SELECT xpath('//@value', '<root value="&lt;"/>');
+ xpath  
+--------
+ {&lt;}
+(1 row)
+
+SELECT xpath('''<<invalid>>''', '<root/>');
+           xpath           
+---------------------------
+ {&lt;&lt;invalid&gt;&gt;}
+(1 row)
+
+SELECT xpath('count(//*)', '<root><sub/><sub/></root>');
+ xpath 
+-------
+ {3}
+(1 row)
+
+SELECT xpath('count(//*)=0', '<root><sub/><sub/></root>');
+  xpath  
+---------
+ {false}
+(1 row)
+
+SELECT xpath('count(//*)=3', '<root><sub/><sub/></root>');
+ xpath  
+--------
+ {true}
+(1 row)
+
+SELECT xpath('name(/*)', '<root><sub/><sub/></root>');
+ xpath  
+--------
+ {root}
+(1 row)
+
+SELECT xpath('/nosuchtag', '<root/>');
+ xpath 
+-------
+ {}
+(1 row)
+
+-- Round-trip non-ASCII data through xpath().
+DO $$
+DECLARE
+  xml_declaration text := '<?xml version="1.0" encoding="ISO-8859-1"?>';
+  degree_symbol text;
+  res xml[];
+BEGIN
+  -- Per the documentation, except when the server encoding is UTF8, xpath()
+  -- may not work on non-ASCII data.  The untranslatable_character and
+  -- undefined_function traps below, currently dead code, will become relevant
+  -- if we remove this limitation.
+  IF current_setting('server_encoding') <> 'UTF8' THEN
+    RAISE LOG 'skip: encoding % unsupported for xpath',
+      current_setting('server_encoding');
+    RETURN;
+  END IF;
+
+  degree_symbol := convert_from('\xc2b0', 'UTF8');
+  res := xpath('text()', (xml_declaration ||
+    '<x>' || degree_symbol || '</x>')::xml);
+  IF degree_symbol <> res[1]::text THEN
+    RAISE 'expected % (%), got % (%)',
+      degree_symbol, convert_to(degree_symbol, 'UTF8'),
+      res[1], convert_to(res[1]::text, 'UTF8');
+  END IF;
+EXCEPTION
+  -- character with byte sequence 0xc2 0xb0 in encoding "UTF8" has no equivalent in encoding "LATIN8"
+  WHEN untranslatable_character
+  -- default conversion function for encoding "UTF8" to "MULE_INTERNAL" does not exist
+  OR undefined_function
+  -- unsupported XML feature
+  OR feature_not_supported THEN
+    RAISE LOG 'skip: %', SQLERRM;
+END
+$$;
 -- Test xmlexists and xpath_exists
 SELECT xmlexists('//town[text() = ''Toronto'']' PASSING BY REF '<towns><town>Bidford-on-Avon</town><town>Cwmbran</town><town>Bristol</town></towns>');
  xmlexists 
@@ -526,6 +698,12 @@ SELECT xmlexists('//town[text() = ''Cwmbran'']' PASSING BY REF '<towns><town>Bid
  t
 (1 row)
 
+SELECT xmlexists('count(/nosuchtag)' PASSING BY REF '<root/>');
+ xmlexists 
+-----------
+ t
+(1 row)
+
 SELECT xpath_exists('//town[text() = ''Toronto'']','<towns><town>Bidford-on-Avon</town><town>Cwmbran</town><town>Bristol</town></towns>'::xml);
  xpath_exists 
 --------------
@@ -533,6 +711,12 @@ SELECT xpath_exists('//town[text() = ''Toronto'']','<towns><town>Bidford-on-Avon
 (1 row)
 
 SELECT xpath_exists('//town[text() = ''Cwmbran'']','<towns><town>Bidford-on-Avon</town><town>Cwmbran</town><town>Bristol</town></towns>'::xml);
+ xpath_exists 
+--------------
+ t
+(1 row)
+
+SELECT xpath_exists('count(/nosuchtag)', '<root/>'::xml);
  xpath_exists 
 --------------
  t
@@ -690,11 +874,74 @@ SELECT xml_is_well_formed('<pg:foo xmlns:pg="http://postgresql.org/stuff">bar</p
  t
 (1 row)
 
+SELECT xml_is_well_formed('<invalidentity>&</abc>');
+ xml_is_well_formed 
+--------------------
+ f
+(1 row)
+
+SELECT xml_is_well_formed('<undefinedentity>&idontexist;</abc>');
+ xml_is_well_formed 
+--------------------
+ f
+(1 row)
+
+SELECT xml_is_well_formed('<invalidns xmlns=''&lt;''/>');
+ xml_is_well_formed 
+--------------------
+ t
+(1 row)
+
+SELECT xml_is_well_formed('<relativens xmlns=''relative''/>');
+ xml_is_well_formed 
+--------------------
+ t
+(1 row)
+
+SELECT xml_is_well_formed('<twoerrors>&idontexist;</unbalanced>');
+ xml_is_well_formed 
+--------------------
+ f
+(1 row)
+
 SET xmloption TO CONTENT;
 SELECT xml_is_well_formed('abc');
  xml_is_well_formed 
 --------------------
  t
+(1 row)
+
+-- Since xpath() deals with namespaces, it's a bit stricter about
+-- what's well-formed and what's not. If we don't obey these rules
+-- (i.e. ignore namespace-related errors from libxml), xpath()
+-- fails in subtle ways. The following would for example produce
+-- the xml value
+--   <invalidns xmlns='<'/>
+-- which is invalid because '<' may not appear un-escaped in
+-- attribute values.
+-- Since different libxml versions emit slightly different
+-- error messages, we suppress the DETAIL in this test.
+\set VERBOSITY terse
+SELECT xpath('/*', '<invalidns xmlns=''&lt;''/>');
+ERROR:  could not parse XML document
+\set VERBOSITY default
+-- Again, the XML isn't well-formed for namespace purposes
+SELECT xpath('/*', '<nosuchprefix:tag/>');
+ERROR:  could not parse XML document
+DETAIL:  line 1: Namespace prefix nosuchprefix on tag is not defined
+<nosuchprefix:tag/>
+                 ^
+CONTEXT:  SQL function "xpath" statement 1
+-- XPath deprecates relative namespaces, but they're not supposed to
+-- throw an error, only a warning.
+SELECT xpath('/*', '<relativens xmlns=''relative''/>');
+WARNING:  line 1: xmlns: URI relative is not absolute
+<relativens xmlns='relative'/>
+                            ^
+CONTEXT:  SQL function "xpath" statement 1
+                xpath                 
+--------------------------------------
+ {"<relativens xmlns=\"relative\"/>"}
 (1 row)
 
 -- External entity references should not leak filesystem information.

@@ -49,7 +49,7 @@ static inline bool
 testmode_inject_fault(int percent)
 {
 	if (udp_testmode &&
-		(gp_udpic_dropseg == UNDEF_SEGMENT || gp_udpic_dropseg == Gp_segment))
+		(gp_udpic_dropseg == UNDEF_SEGMENT || gp_udpic_dropseg == GpIdentity.segindex))
 	{
 			if (random() % 100 < percent)
 				return true;
@@ -212,7 +212,7 @@ testmode_sendto(const char *caller_name, int socket, const void *buffer,
 				break;
 			FAULT_INJECT_BACKUP_PKT();
 			msg->srcPid = -1;	/* There is no such pid. */
-			msg->icId = gp_interconnect_id;
+			msg->icId = 0;
 			msg->seq = 1;
 			write_log("inject fault to sendto: FINC_PKT_MISMATCH");
 			break;

@@ -21,19 +21,16 @@ from threading import Thread
 
 import os
 import signal
-import subprocess
+try:
+    import subprocess32 as subprocess
+except:
+    import subprocess
 import sys
 import time
 
 from gppylib import gplog
 from gppylib import gpsubprocess
 from pygresql.pg import DB
-
-# paramiko prints deprecation warnings which are ugly to the end-user
-import warnings
-
-warnings.simplefilter('ignore', DeprecationWarning)
-import paramiko, getpass
 
 logger = gplog.get_default_logger()
 
@@ -51,26 +48,26 @@ class WorkerPool(object):
 
     halt_command = 'halt command'
 
-    def __init__(self, numWorkers=16, items=None, daemonize=False):
+    def __init__(self, numWorkers=16, items=None, daemonize=False, logger=gplog.get_default_logger()):
         if numWorkers <= 0:
             raise Exception("WorkerPool(): numWorkers should be greater than 0.")
         self.workers = []
         self.should_stop = False
         self.work_queue = Queue()
         self.completed_queue = Queue()
-        self.num_assigned = 0
+        self._assigned = 0
         self.daemonize = daemonize
+        self.logger = logger
+
         if items is not None:
             for item in items:
-                self.work_queue.put(item)
-                self.num_assigned += 1
+                self.addCommand(item)
 
         for i in range(0, numWorkers):
             w = Worker("worker%d" % i, self)
             self.workers.append(w)
             w.start()
         self.numWorkers = numWorkers
-        self.logger = logger
 
     ###
     def getNumWorkers(self):
@@ -89,43 +86,67 @@ class WorkerPool(object):
     def addCommand(self, cmd):
         self.logger.debug("Adding cmd to work_queue: %s" % cmd.cmdStr)
         self.work_queue.put(cmd)
-        self.num_assigned += 1
+        self._assigned += 1
 
-    def wait_and_printdots(self, command_count, quiet=True):
-        while self.completed_queue.qsize() < command_count:
-            time.sleep(1)
+    def _join_work_queue_with_timeout(self, timeout):
+        """
+        Queue.join() unfortunately doesn't take a timeout (see
+        https://bugs.python.org/issue9634). Fake it here, with a solution
+        inspired by notes on that bug report.
 
-            if not quiet:
-                sys.stdout.write(".")
-                sys.stdout.flush()
-        if not quiet:
-            print " "
-        self.join()
+        XXX This solution uses undocumented Queue internals (though they are not
+        underscore-prefixed...).
+        """
+        done_condition = self.work_queue.all_tasks_done
+        done_condition.acquire()
+        try:
+            while self.work_queue.unfinished_tasks:
+                if (timeout <= 0):
+                    # Timed out.
+                    return False
 
-    def print_progress(self, command_count):
-        while True:
-            num_completed = self.completed_queue.qsize()
-            num_completed_percentage = 0
-            if command_count:
-                num_completed_percentage = float(num_completed) / command_count
-            logger.info('%0.2f%% of jobs completed' % (num_completed_percentage * 100))
-            if num_completed >= command_count:
-                return
-            time.sleep(10)
+                start_time = time.time()
+                done_condition.wait(timeout)
+                timeout -= (time.time() - start_time)
+        finally:
+            done_condition.release()
 
-    def join(self):
-        self.work_queue.join()
         return True
+
+    def join(self, timeout=None):
+        """
+        Waits (up to an optional timeout) for the worker queue to be fully
+        completed, and returns True if the pool is now done with its work.
+
+        A None timeout indicates that join() should wait forever; the return
+        value is always True in this case. Zero and negative timeouts indicate
+        that join() will query the queue status and return immediately, whether
+        the queue is done or not.
+        """
+        if timeout is None:
+            self.work_queue.join()
+            return True
+
+        return self._join_work_queue_with_timeout(timeout)
 
     def joinWorkers(self):
         for w in self.workers:
             w.join()
 
+    def _pop_completed(self):
+        """
+        Pops an item off the completed queue and decrements the assigned count.
+        If the queue is empty, throws Queue.Empty.
+        """
+        item = self.completed_queue.get(False)
+        self._assigned -= 1
+        return item
+
     def getCompletedItems(self):
         completed_list = []
         try:
             while True:
-                item = self.completed_queue.get(False)  # will throw Empty
+                item = self._pop_completed() # will throw Empty
                 if item is not None:
                     completed_list.append(item)
         except Empty:
@@ -139,7 +160,7 @@ class WorkerPool(object):
         """
         try:
             while True:
-                item = self.completed_queue.get(False)
+                item = self._pop_completed() # will throw Empty
                 if not item.get_results().wasSuccessful():
                     raise ExecutionError("Error Executing Command: ", item)
         except Empty:
@@ -147,11 +168,29 @@ class WorkerPool(object):
 
     def empty_completed_items(self):
         while not self.completed_queue.empty():
-            self.completed_queue.get(False)
+            self._pop_completed()
 
     def isDone(self):
         # TODO: not sure that qsize() is safe
-        return (self.num_assigned == self.completed_queue.qsize())
+        return (self.assigned == self.completed_queue.qsize())
+
+    @property
+    def assigned(self):
+        """
+        A read-only count of the number of commands that have been added to the
+        pool. This count is only decremented when items are removed from the
+        completed queue via getCompletedItems(), empty_completed_items(), or
+        check_results().
+        """
+        return self._assigned
+
+    @property
+    def completed(self):
+        """
+        A read-only count of the items in the completed queue. Will be reset to
+        zero after a call to empty_completed_items() or getCompletedItems().
+        """
+        return self.completed_queue.qsize()
 
     def haltWork(self):
         self.logger.debug("WorkerPool haltWork()")
@@ -159,6 +198,25 @@ class WorkerPool(object):
         for w in self.workers:
             w.haltWork()
             self.work_queue.put(self.halt_command)
+
+
+def join_and_indicate_progress(pool, outfile=sys.stdout, interval=1):
+    """
+    Waits for a WorkerPool to complete its work, flushing dots to stdout every
+    second. If any dots are printed (i.e. the work takes longer than the
+    printing interval), a newline is also printed upon completion.
+
+    The file to print to and the interval between printings can be overridden.
+    """
+    printed = False
+
+    while not pool.join(interval):
+        outfile.write('.')
+        outfile.flush()
+        printed = True
+
+    if printed:
+        outfile.write('\n')
 
 
 class OperationWorkerPool(WorkerPool):
@@ -281,7 +339,6 @@ class CommandResult():
         self.stderr = stderr
         self.completed = completed
         self.halt = halt
-        pass
 
     def printResult(self):
         res = "cmd had rc=%d completed=%s halted=%s\n  stdout='%s'\n  " \
@@ -322,28 +379,26 @@ class ExecutionError(Exception):
 
     def __str__(self):
         # TODO: improve dumping of self.cmd
-        return "ExecutionError: '%s' occured.  Details: '%s'  %s" % \
+        return "ExecutionError: '%s' occurred.  Details: '%s'  %s" % \
                (self.summary, self.cmd.cmdStr, self.cmd.get_results().printResult())
 
 
 # specify types of execution contexts.
 LOCAL = 1
 REMOTE = 2
-RMI = 3
-NAKED = 4
 
 gExecutionContextFactory = None
 
 
 #
-# @param factory needs to have a createExecutionContext(self, execution_context_id, remoteHost, stdin, nakedExecutionInfo) function
+# @param factory needs to have a createExecutionContext(self, execution_context_id, remoteHost, stdin) function
 #
 def setExecutionContextFactory(factory):
     global gExecutionContextFactory
     gExecutionContextFactory = factory
 
 
-def createExecutionContext(execution_context_id, remoteHost, stdin, nakedExecutionInfo=None, gphome=None):
+def createExecutionContext(execution_context_id, remoteHost, stdin, gphome=None):
     if gExecutionContextFactory is not None:
         return gExecutionContextFactory.createExecutionContext(execution_context_id, remoteHost, stdin)
     elif execution_context_id == LOCAL:
@@ -352,15 +407,6 @@ def createExecutionContext(execution_context_id, remoteHost, stdin, nakedExecuti
         if remoteHost is None:
             raise Exception("Programmer Error.  Specified REMOTE execution context but didn't provide a remoteHost")
         return RemoteExecutionContext(remoteHost, stdin, gphome)
-    elif execution_context_id == RMI:
-        return RMIExecutionContext()
-    elif execution_context_id == NAKED:
-        if remoteHost is None:
-            raise Exception("Programmer Error.  Specified NAKED execution context but didn't provide a remoteHost")
-        if nakedExecutionInfo is None:
-            raise Exception(
-                "Programmer Error.  Specified NAKED execution context but didn't provide a NakedExecutionInfo")
-        return NakedExecutionContext(remoteHost, stdin, nakedExecutionInfo)
 
 
 class ExecutionContext():
@@ -375,10 +421,10 @@ class ExecutionContext():
     def execute(self, cmd):
         pass
 
-    def interrupt(self, cmd):
+    def interrupt(self):
         pass
 
-    def cancel(self, cmd):
+    def cancel(self):
         pass
 
 
@@ -415,188 +461,17 @@ class LocalExecutionContext(ExecutionContext):
             cmd.set_results(CommandResult(
                 rc, "".join(stdout_value), "".join(stderr_value), self.completed, self.halt))
 
-    def cancel(self, cmd):
+    def cancel(self):
         if self.proc:
             try:
                 os.kill(self.proc.pid, signal.SIGTERM)
             except OSError:
                 pass
 
-    def interrupt(self, cmd):
+    def interrupt(self):
         self.halt = True
         if self.proc:
             self.proc.cancel()
-
-
-##########################################################################
-# Naked Execution is used to run commands where ssh keys are not exchanged
-class NakedExecutionInfo:
-    SFTP_NONE = 0
-    SFTP_PUT = 1
-    SFTP_GET = 2
-
-    def __init__(self, passwordMap, sftp_operation=SFTP_NONE, sftp_remote=None, sftp_local=None):
-        self.passwordMap = passwordMap
-        self.sftp_operation = sftp_operation
-        self.sftp_remote = sftp_remote
-        self.sftp_local = sftp_local
-
-
-class NakedExecutionPasswordMap:
-    def __init__(self, hostlist):
-        self.hostlist = hostlist
-        self.mapping = dict()
-        self.unique_passwords = set()
-        self.complete = False
-
-    # this method throws exceptions on error to create a valid list
-    def discover(self):
-
-        for host in self.hostlist:
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-            # TRY NO PASSWORD
-            try:
-                client.connect(host)
-                self.mapping[host] = None
-                client.close()
-                continue  # next host
-            except Exception, e:
-                pass
-
-            try:
-                client.close()
-            except Exception, e:
-                pass
-
-            # TRY EXISTING PASSWORDS
-            foundit = False
-            for passwd in self.unique_passwords:
-                try:
-                    client.connect(host, password=passwd)
-                    foundit = True
-                    self.mapping[host] = passwd
-                    break
-                except Exception, e:
-                    pass
-
-            if foundit:
-                continue
-
-            # ASK USER
-            foundit = False
-            for attempt in range(5):
-                try:
-                    passwd = getpass.getpass('  *** Enter password for %s: ' % (host), sys.stderr)
-                    client.connect(host, password=passwd)
-                    foundit = True
-                    self.mapping[host] = passwd
-                    if passwd not in self.unique_passwords:
-                        self.unique_passwords.add(passwd)
-                    break
-                except Exception, e:
-                    pass
-
-            try:
-                client.close()
-            except Exception, e:
-                pass
-
-            if not foundit:
-                raise Exception("Did not get a valid password for host " + host)
-
-        if len(self.mapping.keys()) == len(self.hostlist) and len(self.hostlist) > 0:
-            self.complete = True
-
-
-class NakedExecutionContext(LocalExecutionContext):
-    def __init__(self, targetHost, stdin, nakedCommandInfo):
-
-        LocalExecutionContext.__init__(self, stdin)
-        self.targetHost = targetHost
-        self.passwordMap = nakedCommandInfo.passwordMap
-        self.sftp_operation = nakedCommandInfo.sftp_operation
-        self.sftp_remote = nakedCommandInfo.sftp_remote
-        self.sftp_local = nakedCommandInfo.sftp_local
-        self.client = None
-
-    def execute(self, cmd):
-
-        self.client = paramiko.SSHClient()
-        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-        try:
-            self.client.connect(self.targetHost, password=self.passwordMap.mapping[self.targetHost])
-        except paramiko.AuthenticationException:
-            self.client.close()
-            cmd.set_results(CommandResult(1, "", "password validation on %s failed" % self.targetHost, False, False))
-            return
-        except Exception, e:
-            cmd.set_results(
-                CommandResult(1, "", "conection to host " + self.targetHost + " failed: " + e.__str__(), False, False))
-            return
-
-        if self.sftp_operation == NakedExecutionInfo.SFTP_NONE:
-            self.execute_ssh(cmd)
-        elif self.sftp_operation == NakedExecutionInfo.SFTP_PUT:
-            self.execute_sftp_put(cmd)
-        elif self.sftp_operation == NakedExecutionInfo.SFTP_GET:
-            self.execute_sftp_get(cmd)
-        else:
-            raise Exception("bad NakedExecutionInfo.sftp_operation")
-
-    def execute_ssh(self, cmd):
-
-        try:
-            stdin, stdout, stderr = self.client.exec_command(cmd.cmdStr)
-            rc = stdout.channel.recv_exit_status()
-            self.completed = True
-            cmd.set_results(CommandResult(rc, stdout.readlines(), stderr.readlines(), self.completed, self.halt))
-            stdin.close()
-            stdout.close()
-            stderr.close()
-        except Exception, e:
-            cmd.set_results(CommandResult(1, "", e.__str__(), False, False))
-        finally:
-            self.client.close()
-
-    def execute_sftp_put(self, cmd):
-
-        ftp = None
-        try:
-            ftp = self.client.open_sftp()
-            ftp.put(self.sftp_local, self.sftp_remote)
-            self.completed = True
-            cmd.set_results(CommandResult(0, "", "", self.completed, self.halt))
-        except Exception, e:
-            cmd.set_results(CommandResult(1, "", e.__str__(), False, False))
-        finally:
-            ftp.close()
-            self.client.close()
-
-    def execute_sftp_get(self, cmd):
-
-        ftp = None
-        try:
-            ftp = self.client.open_sftp()
-            ftp.get(self.sftp_remote, self.sftp_local)
-            self.completed = True
-            cmd.set_results(CommandResult(0, "", "", self.completed, self.halt))
-        except Exception, e:
-            cmd.set_results(CommandResult(1, "", e.__str__(), False, False))
-        finally:
-            ftp.close()
-            self.client.close()
-
-    def interrupt(self, cmd):
-        self.halt = True
-        self.client.close()
-        cmd.set_results(CommandResult(1, "", "command on host " + self.targetHost + " interrupted ", False, False))
-
-    def cancel(self, cmd):
-        self.client.close()
-        cmd.set_results(CommandResult(1, "", "command on host " + self.targetHost + " canceled ", False, False))
 
 
 class RemoteExecutionContext(LocalExecutionContext):
@@ -625,7 +500,7 @@ class RemoteExecutionContext(LocalExecutionContext):
 
         # Escape " for remote execution otherwise it interferes with ssh
         cmd.cmdStr = cmd.cmdStr.replace('"', '\\"')
-        cmd.cmdStr = "ssh -o 'StrictHostKeyChecking no' " \
+        cmd.cmdStr = "ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=60 " \
                      "{targethost} \"{gphome} {cmdstr}\"".format(targethost=self.targetHost,
                                                                  gphome=". %s/greenplum_path.sh;" % self.gphome,
                                                                  cmdstr=cmd.cmdStr)
@@ -642,17 +517,7 @@ class RemoteExecutionContext(LocalExecutionContext):
         if (cmd.get_results().stderr.startswith('ssh_exchange_identification: Connection closed by remote host')):
             self.__retry(cmd, count + 1)
 
-
-class RMIExecutionContext(ExecutionContext):
-    """ Leave this as a big old TODO: for now.  see agent.py for some more details"""
-
-    def __init__(self):
-        ExecutionContext.__init__(self)
-        raise Exception("RMIExecutionContext - Not implemented")
-        pass
-
-
-class Command:
+class Command(object):
     """ TODO:
     """
     name = None
@@ -661,12 +526,13 @@ class Command:
     exec_context = None
     propagate_env_map = {}  # specific environment variables for this command instance
 
-    def __init__(self, name, cmdStr, ctxt=LOCAL, remoteHost=None, stdin=None, nakedExecutionInfo=None, gphome=None):
+    def __init__(self, name, cmdStr, ctxt=LOCAL, remoteHost=None, stdin=None, gphome=None):
         self.name = name
         self.cmdStr = cmdStr
-        self.exec_context = createExecutionContext(ctxt, remoteHost, stdin=stdin, nakedExecutionInfo=nakedExecutionInfo,
+        self.exec_context = createExecutionContext(ctxt, remoteHost, stdin=stdin,
                                                    gphome=gphome)
         self.remoteHost = remoteHost
+        self.logger = gplog.get_default_logger()
 
     def __str__(self):
         if self.results:
@@ -683,6 +549,7 @@ class Command:
             return self.exec_context.proc
 
     def run(self, validateAfter=False):
+        self.logger.debug("Running Command: %s" % self.cmdStr)
         faultPoint = os.getenv('GP_COMMAND_FAULT_POINT')
         if not faultPoint or (self.name and not self.name.startswith(faultPoint)):
             self.exec_context.execute(self)
@@ -723,11 +590,11 @@ class Command:
 
     def cancel(self):
         if self.exec_context and isinstance(self.exec_context, ExecutionContext):
-            self.exec_context.cancel(self)
+            self.exec_context.cancel()
 
     def interrupt(self):
         if self.exec_context and isinstance(self.exec_context, ExecutionContext):
-            self.exec_context.interrupt(self)
+            self.exec_context.interrupt()
 
     def was_successful(self):
         if self.results is None:
@@ -738,6 +605,7 @@ class Command:
     def validate(self, expected_rc=0):
         """Plain vanilla validation which expects a 0 return code."""
         if self.results.rc != expected_rc:
+            self.logger.debug(self.results)
             raise ExecutionError("non-zero rc: %d" % self.results.rc, self)
 
 

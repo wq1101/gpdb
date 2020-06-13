@@ -1,11 +1,15 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/clusterdb.sgml,v 1.23 2007/12/11 19:57:32 tgl Exp $
+doc/src/sgml/ref/clusterdb.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="APP-CLUSTERDB">
+ <indexterm zone="app-clusterdb">
+  <primary>clusterdb</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="APP-CLUSTERDB-TITLE"><application>clusterdb</application></refentrytitle>
+  <refentrytitle><application>clusterdb</application></refentrytitle>
   <manvolnum>1</manvolnum>
   <refmiscinfo>Application</refmiscinfo>
  </refmeta>
@@ -15,23 +19,33 @@ PostgreSQL documentation
   <refpurpose>cluster a <productname>PostgreSQL</productname> database</refpurpose>
  </refnamediv>
 
- <indexterm zone="app-clusterdb">
-  <primary>clusterdb</primary>
- </indexterm>
-
  <refsynopsisdiv>
   <cmdsynopsis>
    <command>clusterdb</command>
    <arg rep="repeat"><replaceable>connection-option</replaceable></arg>
-   <arg>--table | -t <replaceable>table</replaceable> </arg>
-   <arg><replaceable>dbname</replaceable></arg>
-   <sbr>
+   <group choice="opt"><arg choice="plain"><option>--verbose</option></arg><arg choice="plain"><option>-v</option></arg></group>
+
+   <arg choice="plain" rep="repeat">
+     <arg choice="opt">
+       <group choice="plain">
+         <arg choice="plain"><option>--table</option></arg>
+         <arg choice="plain"><option>-t</option></arg>
+       </group>
+       <replaceable>table</replaceable>
+     </arg>
+   </arg>
+
+   <arg choice="opt"><replaceable>dbname</replaceable></arg>
+  </cmdsynopsis>
+
+  <cmdsynopsis>
    <command>clusterdb</command>
    <arg rep="repeat"><replaceable>connection-option</replaceable></arg>
-   <group><arg>--all</arg><arg>-a</arg></group>
+   <group choice="opt"><arg choice="plain"><option>--verbose</option></arg><arg choice="plain"><option>-v</option></arg></group>
+   <group choice="plain"><arg choice="plain"><option>--all</option></arg><arg choice="plain"><option>-a</option></arg></group>
   </cmdsynopsis>
  </refsynopsisdiv>
- 
+
 
  <refsect1>
   <title>Description</title>
@@ -46,7 +60,7 @@ PostgreSQL documentation
 
   <para>
    <application>clusterdb</application> is a wrapper around the SQL
-   command <xref linkend="SQL-CLUSTER" endterm="sql-cluster-title">.
+   command <xref linkend="SQL-CLUSTER">.
    There is no effective difference between clustering databases via
    this utility and via other methods for accessing the server.
   </para>
@@ -59,7 +73,7 @@ PostgreSQL documentation
 
    <para>
     <application>clusterdb</application> accepts the following command-line arguments:
-    
+
     <variablelist>
      <varlistentry>
       <term><option>-a</></term>
@@ -73,7 +87,7 @@ PostgreSQL documentation
 
      <varlistentry>
       <term><option><optional>-d</> <replaceable class="parameter">dbname</replaceable></></term>
-      <term><option><optional>--dbname</> <replaceable class="parameter">dbname</replaceable></></term>
+      <term><option><optional>--dbname=</><replaceable class="parameter">dbname</replaceable></></term>
       <listitem>
        <para>
         Specifies the name of the database to be clustered.
@@ -109,25 +123,58 @@ PostgreSQL documentation
 
      <varlistentry>
       <term><option>-t <replaceable class="parameter">table</replaceable></></term>
-      <term><option>--table <replaceable class="parameter">table</replaceable></></term>
+      <term><option>--table=<replaceable class="parameter">table</replaceable></></term>
       <listitem>
        <para>
         Cluster <replaceable class="parameter">table</replaceable> only.
+        Multiple tables can be clustered by writing multiple
+        <option>-t</> switches.
        </para>
       </listitem>
      </varlistentry>
+
+     <varlistentry>
+      <term><option>-v</></term>
+      <term><option>--verbose</></term>
+      <listitem>
+       <para>
+        Print detailed information during processing.
+       </para>
+      </listitem>
+     </varlistentry>
+
+    <varlistentry>
+      <term><option>-V</></term>
+      <term><option>--version</></term>
+      <listitem>
+      <para>
+      Print the <application>clusterdb</application> version and exit.
+      </para>
+      </listitem>
+    </varlistentry>
+
+    <varlistentry>
+      <term><option>-?</></term>
+      <term><option>--help</></term>
+      <listitem>
+      <para>
+      Show help about <application>clusterdb</application> command line
+      arguments, and exit.
+      </para>
+      </listitem>
+    </varlistentry>
 
     </variablelist>
    </para>
 
    <para>
-    <application>clusterdb</application> also accepts 
+    <application>clusterdb</application> also accepts
     the following command-line arguments for connection parameters:
 
     <variablelist>
      <varlistentry>
       <term><option>-h <replaceable class="parameter">host</replaceable></></term>
-      <term><option>--host <replaceable class="parameter">host</replaceable></></term>
+      <term><option>--host=<replaceable class="parameter">host</replaceable></></term>
       <listitem>
        <para>
         Specifies the host name of the machine on which the server is
@@ -139,10 +186,10 @@ PostgreSQL documentation
 
      <varlistentry>
       <term><option>-p <replaceable class="parameter">port</replaceable></></term>
-      <term><option>--port <replaceable class="parameter">port</replaceable></></term>
+      <term><option>--port=<replaceable class="parameter">port</replaceable></></term>
       <listitem>
        <para>
-        Specifies the TCP port or local Unix domain socket file 
+        Specifies the TCP port or local Unix domain socket file
         extension on which the server
         is listening for connections.
        </para>
@@ -151,10 +198,25 @@ PostgreSQL documentation
 
      <varlistentry>
       <term><option>-U <replaceable class="parameter">username</replaceable></></term>
-      <term><option>--username <replaceable class="parameter">username</replaceable></></term>
+      <term><option>--username=<replaceable class="parameter">username</replaceable></></term>
       <listitem>
        <para>
         User name to connect as.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><option>-w</></term>
+      <term><option>--no-password</></term>
+      <listitem>
+       <para>
+        Never issue a password prompt.  If the server requires
+        password authentication and a password is not available by
+        other means such as a <filename>.pgpass</filename> file, the
+        connection attempt will fail.  This option can be useful in
+        batch jobs and scripts where no user is present to enter a
+        password.
        </para>
       </listitem>
      </varlistentry>
@@ -165,7 +227,7 @@ PostgreSQL documentation
       <listitem>
        <para>
         Force <application>clusterdb</application> to prompt for a
-        password before connecting to a database.  
+        password before connecting to a database.
        </para>
 
        <para>
@@ -176,6 +238,18 @@ PostgreSQL documentation
         connection attempt finding out that the server wants a password.
         In some cases it is worth typing <option>-W</> to avoid the extra
         connection attempt.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><option>--maintenance-db=<replaceable class="parameter">dbname</replaceable></></term>
+      <listitem>
+       <para>
+         Specifies the name of the database to connect to discover what other
+         databases should be clustered. If not specified, the
+         <literal>postgres</literal> database will be used,
+         and if that does not exist, <literal>template1</literal> will be used.
        </para>
       </listitem>
      </varlistentry>
@@ -215,8 +289,8 @@ PostgreSQL documentation
   <title>Diagnostics</title>
 
   <para>
-   In case of difficulty, see <xref linkend="SQL-CLUSTER"
-   endterm="sql-cluster-title"> and <xref linkend="APP-PSQL"> for
+   In case of difficulty, see <xref linkend="SQL-CLUSTER">
+   and <xref linkend="APP-PSQL"> for
    discussions of potential problems and error messages.
    The database server must be running at the
    targeted host.  Also, any default connection settings and environment
@@ -243,8 +317,7 @@ PostgreSQL documentation
     <literal>xyzzy</literal>:
 <screen>
 <prompt>$ </prompt><userinput>clusterdb --table foo xyzzy</userinput>
-</screen>
-   </para>
+</screen></para>
 
  </refsect1>
 
@@ -252,7 +325,7 @@ PostgreSQL documentation
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-cluster" endterm="sql-cluster-title"></member>
+   <member><xref linkend="sql-cluster"></member>
   </simplelist>
  </refsect1>
 

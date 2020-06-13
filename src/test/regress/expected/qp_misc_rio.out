@@ -55,12 +55,14 @@ select sum((select count(*) from t11_t group by b having b = s.b)) as sum_col fr
 -- ----------------------------------------------------------------------
 -- Test: 15
 -- ----------------------------------------------------------------------
--- aggregate over partition by 
+-- aggregate over partition by
+-- GPDB_10_MERGE_FIXME: Here we cast the unknown typed literal to text. After
+-- we move past postgres 10 we can drop the cast.
 select state,
        sum(revenue) over (partition by state)
 from
-   (select 'A' as enc_email, 1 as revenue) b
-   join (select 'A' as enc_email, 'B' as state ) c using(enc_email)
+   (select 'A'::text as enc_email, 1 as revenue) b
+   join (select 'A'::text as enc_email, 'B'::text as state ) c using(enc_email)
 group by 1,b.revenue;
  state | sum 
 -------+-----
@@ -115,9 +117,9 @@ JOIN (SELECT s1,
 	   AS miro_foo
 ON testtable0001.s1 = miro_foo.s1;
 SELECT MIN(s1_xform), MIN(s1_xform) FROM testtable0002;
-    min    |    min    
------------+-----------
- -0.010000 | -0.010000
+           min           |           min           
+-------------------------+-------------------------
+ -0.01000000000000000000 | -0.01000000000000000000
 (1 row)
 
 SELECT s1,
@@ -146,9 +148,9 @@ JOIN (SELECT s2,
 	   AS miro_foo
 ON testtable0002.s2 = miro_foo.s2;
 SELECT MIN(s2_xform), MIN(s2_xform) FROM testtable0003;
-    min    |    min    
------------+-----------
- -0.020000 | -0.020000
+           min           |           min           
+-------------------------+-------------------------
+ -0.02000000000000000000 | -0.02000000000000000000
 (1 row)
 
 SELECT s2,
@@ -177,9 +179,9 @@ JOIN (SELECT s3,
 	   AS miro_foo
 ON testtable0003.s3 = miro_foo.s3;
 SELECT MIN(s3_xform), MIN(s3_xform) FROM testtable0004;
-    min    |    min    
------------+-----------
- -0.030000 | -0.030000
+           min           |           min           
+-------------------------+-------------------------
+ -0.03000000000000000000 | -0.03000000000000000000
 (1 row)
 
 SELECT s3,
@@ -208,9 +210,9 @@ JOIN (SELECT s4,
 	   AS miro_foo
 ON testtable0004.s4 = miro_foo.s4;
 SELECT MIN(s4_xform), MIN(s4_xform) FROM testtable0005;
-    min    |    min    
------------+-----------
- -0.040000 | -0.040000
+           min           |           min           
+-------------------------+-------------------------
+ -0.04000000000000000000 | -0.04000000000000000000
 (1 row)
 
 SELECT s4,
@@ -239,9 +241,9 @@ JOIN (SELECT s5,
 	   AS miro_foo
 ON testtable0005.s5 = miro_foo.s5;
 SELECT MIN(s5_xform), MIN(s5_xform) FROM testtable0006;
-    min    |    min    
------------+-----------
- -0.050000 | -0.050000
+           min           |           min           
+-------------------------+-------------------------
+ -0.05000000000000000000 | -0.05000000000000000000
 (1 row)
 
 SELECT s5,
@@ -358,20 +360,20 @@ CREATE TABLE tbl_truncate_load (c1 int, c2 int) DISTRIBUTED BY (c1);
 SELECT current_setting('gp_autostats_mode');
  current_setting 
 -----------------
- ON_NO_STATS
+ on_no_stats
 (1 row)
 
 SELECT current_setting('gp_autostats_mode_in_functions');
  current_setting 
 -----------------
- NONE
+ none
 (1 row)
 
 -- test function with GUC value for gp_autostats_mode_in_functions as ON_NO_STATS
 SELECT set_config('gp_autostats_mode_in_functions', 'ON_NO_STATS', False);
  set_config  
 -------------
- ON_NO_STATS
+ on_no_stats
 (1 row)
 
 TRUNCATE TABLE tbl_truncate_load;
@@ -418,7 +420,7 @@ SELECT count(*) FROM tbl_truncate_load;
 SELECT set_config('gp_autostats_mode_in_functions', 'NONE', False);
  set_config 
 ------------
- NONE
+ none
 (1 row)
 
 TRUNCATE TABLE tbl_truncate_load;
@@ -469,13 +471,35 @@ RESET ALL;
 CREATE TABLE nt (i INT, j INT) DISTRIBUTED BY (j);
 INSERT INTO nt SELECT i, i FROM generate_series(1,10) i;
 SELECT lag(j) OVER (ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM nt;
-ERROR:  window function "lag" cannot be used with a framed window specification
-LINE 1: SELECT lag(j) OVER (ORDER BY i ROWS BETWEEN UNBOUNDED PRECED...
-               ^
+ lag 
+-----
+    
+   1
+   2
+   3
+   4
+   5
+   6
+   7
+   8
+   9
+(10 rows)
+
 SELECT lag(j) OVER (w) FROM nt WINDOW w AS (ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING);
-ERROR:  window function "lag" cannot be used with a framed window specification
-LINE 1: SELECT lag(j) OVER (w) FROM nt WINDOW w AS (ORDER BY i ROWS ...
-               ^
+ lag 
+-----
+    
+   1
+   2
+   3
+   4
+   5
+   6
+   7
+   8
+   9
+(10 rows)
+
 SELECT lag(x) OVER (wx) FROM (SELECT 1 AS x, 2 AS y, 3 AS z) s WINDOW w AS (PARTITION BY y ORDER BY z), wx AS (w);
  lag 
 -----
@@ -483,13 +507,35 @@ SELECT lag(x) OVER (wx) FROM (SELECT 1 AS x, 2 AS y, 3 AS z) s WINDOW w AS (PART
 (1 row)
 
 SELECT lead(j) OVER (ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM nt;
-ERROR:  window function "lead" cannot be used with a framed window specification
-LINE 1: SELECT lead(j) OVER (ORDER BY i ROWS BETWEEN UNBOUNDED PRECE...
-               ^
+ lead 
+------
+     
+    2
+    3
+    4
+    5
+    6
+    7
+    8
+    9
+   10
+(10 rows)
+
 SELECT lead(j) OVER (w) FROM nt WINDOW w AS (ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING);
-ERROR:  window function "lead" cannot be used with a framed window specification
-LINE 1: SELECT lead(j) OVER (w) FROM nt WINDOW w AS (ORDER BY i ROWS...
-               ^
+ lead 
+------
+     
+    2
+    3
+    4
+    5
+    6
+    7
+    8
+    9
+   10
+(10 rows)
+
 SELECT lead(x) OVER (wx) FROM (SELECT 1 AS x, 2 AS y, 3 AS z) s WINDOW w AS (PARTITION BY y ORDER BY z), wx AS (w);
  lead 
 ------
@@ -512,7 +558,7 @@ select * from ccdd1;
 -- Test: 34
 -- ----------------------------------------------------------------------
 -- This is expected to fail, with an error along the lines of:
--- function cannot execute on segment because it accesses relation "qp_misc_rio.testdata_in"
+-- function cannot execute on a QE slice because it accesses relation "qp_misc_rio.testdata_in"
 set search_path to qp_misc_rio;
 CREATE TABLE testdata_in ( c1 INT, c2 INT ) DISTRIBUTED BY (c1);
 INSERT INTO testdata_in SELECT i, i FROM generate_series(1,10) i;
@@ -522,9 +568,8 @@ AS $$
         return plpy.execute(sqlstm);
 $$ LANGUAGE plpythonu;
 INSERT INTO testdata_in SELECT * FROM func_plpythonu(2);
-ERROR:  plpy.SPIError: function cannot execute on segment because it accesses relation "qp_misc_rio.testdata_in"  (entry db krajaraman:15432 pid=63091)
-DETAIL:  
-Traceback (most recent call last):
+ERROR:  spiexceptions.FeatureNotSupported: function cannot execute on a QE slice because it accesses relation "qp_misc_rio.testdata_in"  (entry db krajaraman:15432 pid=63091)
+CONTEXT:  Traceback (most recent call last):
   PL/Python function "func_plpythonu", line 3, in <module>
     return plpy.execute(sqlstm);
 PL/Python function "func_plpythonu"
@@ -542,8 +587,6 @@ AS $$
  $$ LANGUAGE plpythonu;
 SELECT func_plpythonu2(200);
 NOTICE:  table "tbl_plpythonu" does not exist, skipping
-CONTEXT:  SQL statement "DROP TABLE IF EXISTS tbl_plpythonu;"
-PL/Python function "func_plpythonu2"
  func_plpythonu2 
 -----------------
              200
@@ -666,20 +709,43 @@ from
 ) sub1
 group by a
 order by a;
- median | avg 
---------+-----
-      1 |   1
-      2 |   2
-      3 |   3
-      4 |   4
-      5 |   5
-      6 |   6
-      7 |   7
-      8 |   8
-      9 |   9
-     10 |  10
+ median |          avg           
+--------+------------------------
+      1 | 1.00000000000000000000
+      2 |     2.0000000000000000
+      3 |     3.0000000000000000
+      4 |     4.0000000000000000
+      5 |     5.0000000000000000
+      6 |     6.0000000000000000
+      7 |     7.0000000000000000
+      8 |     8.0000000000000000
+      9 |     9.0000000000000000
+     10 |    10.0000000000000000
 (10 rows)
 
+-- ----------------------------------------------------------------------
+-- Test: to_date() boundaries.
+--
+-- to_date() used to not check the input like the date input function
+-- does. The fix was submitted to upstream PostgreSQL and fixed there in
+-- version 8.4.16 (commit 5c4eb9166e.)
+-- ----------------------------------------------------------------------
+select to_date('-4713-11-23', 'yyyy-mm-dd');
+ERROR:  date out of range: "-4713-11-23"
+select to_date('-4713-11-24', 'yyyy-mm-dd');
+    to_date    
+---------------
+ 11-24-4714 BC
+(1 row)
+
+select to_date('5874897-12-31', 'yyyy-mm-dd');
+    to_date    
+---------------
+ 12-31-5874897
+(1 row)
+
+select to_date('5874898-01-01', 'yyyy-mm-dd');
+ERROR:  date out of range: "5874898-01-01"
 -- start_ignore
 drop schema qp_misc_rio cascade;
 NOTICE:  drop cascades to table qp_misc_rio.ccdd1

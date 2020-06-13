@@ -1,12 +1,4 @@
---
--- first, define the datatype.  Turn off echoing so that expected file
--- does not depend on contents of tsearch2.sql.
---
-SET client_min_messages = warning;
-\set ECHO none
-\i tsearch2.sql
-\set ECHO all
-RESET client_min_messages;
+CREATE EXTENSION tsearch2;
 
 --tsvector
 SELECT '1'::tsvector;
@@ -170,8 +162,8 @@ SELECT length(to_tsvector('english', '345 qwe@efd.r '' http://www.com/ http://ae
 <i <b> wow  < jqw <> qwerty'));
 
 
-select to_tsquery('english', 'qwe & sKies '); 
-select to_tsquery('simple', 'qwe & sKies '); 
+select to_tsquery('english', 'qwe & sKies ');
+select to_tsquery('simple', 'qwe & sKies ');
 select to_tsquery('english', '''the wether'':dc & ''           sKies '':BC ');
 select to_tsquery('english', 'asd&(and|fghj)');
 select to_tsquery('english', '(asd&and)|fghj');
@@ -240,14 +232,14 @@ select rank(' a:1 s:2 d g'::tsvector, 'a & s');
 
 insert into test_tsvector (t) values ('foo bar foo the over foo qq bar');
 drop trigger tsvectorupdate on test_tsvector;
-select * from stat('select a from test_tsvector') order by ndoc desc, nentry desc, word;
+select * from stat('select a from test_tsvector') order by ndoc desc, nentry desc, word collate "C";
 insert into test_tsvector values ('1', 'a:1a,2,3b b:5a,6a,7c,8');
 insert into test_tsvector values ('1', 'a:1a,2,3c b:5a,6b,7c,8b');
-select * from stat('select a from test_tsvector','a') order by ndoc desc, nentry desc, word;
-select * from stat('select a from test_tsvector','b') order by ndoc desc, nentry desc, word;
-select * from stat('select a from test_tsvector','c') order by ndoc desc, nentry desc, word;
-select * from stat('select a from test_tsvector','d') order by ndoc desc, nentry desc, word;
-select * from stat('select a from test_tsvector','ad') order by ndoc desc, nentry desc, word;
+select * from stat('select a from test_tsvector','a') order by ndoc desc, nentry desc, word collate "C";
+select * from stat('select a from test_tsvector','b') order by ndoc desc, nentry desc, word collate "C";
+select * from stat('select a from test_tsvector','c') order by ndoc desc, nentry desc, word collate "C";
+select * from stat('select a from test_tsvector','d') order by ndoc desc, nentry desc, word collate "C";
+select * from stat('select a from test_tsvector','ad') order by ndoc desc, nentry desc, word collate "C";
 
 select to_tsquery('english', 'skies & books');
 
@@ -290,7 +282,7 @@ An hour of storm to place
 The sculpture of these granite seams,
 Upon a woman s face. E.  J.  Pratt  (1882 1964)
 ', to_tsquery('sea&thousand&years'));
- 
+
 select headline('Erosion It took the sea a thousand years,
 A thousand years to trace
 The granite features of this cliff
@@ -300,7 +292,7 @@ An hour of storm to place
 The sculpture of these granite seams,
 Upon a woman s face. E.  J.  Pratt  (1882 1964)
 ', to_tsquery('granite&sea'));
- 
+
 select headline('Erosion It took the sea a thousand years,
 A thousand years to trace
 The granite features of this cliff
@@ -323,7 +315,7 @@ ff-bg
        document.write(15);
 </script>
 </body>
-</html>', 
+</html>',
 to_tsquery('sea&foo'), 'HighlightAll=true');
 --check debug
 select * from public.ts_debug('Tsearch module for PostgreSQL 7.3.3');
@@ -342,4 +334,3 @@ SELECT count(*) FROM test_tsvector WHERE a @@ 'eq&yt';
 SELECT count(*) FROM test_tsvector WHERE a @@ 'eq|yt';
 SELECT count(*) FROM test_tsvector WHERE a @@ '(eq&yt)|(wr&qh)';
 SELECT count(*) FROM test_tsvector WHERE a @@ '(eq|yt)&(wr|qh)';
-

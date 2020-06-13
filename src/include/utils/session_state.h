@@ -14,6 +14,9 @@
 #ifndef SESSIONSTATE_H
 #define SESSIONSTATE_H
 
+#include "storage/spin.h"
+#include "utils/timestamp.h"
+
 /* The runaway status of a session based on vmem usage */
 typedef enum RunawayStatus
 {
@@ -88,6 +91,14 @@ typedef struct SessionState
 	 * next entry would point to the next used entry */
 	struct SessionState *next;
 
+	/*
+	 * Resource group per-session slot information.
+	 */
+	void *resGroupSlot;
+
+	/* gp_command_count of the latest cursor command in this session */
+	int latestCursorCommandId;
+
 #ifdef USE_ASSERT_CHECKING
 	/* If we modify the sessionId in ProcMppSessionId, this field is turned on */
 	bool isModifiedSessionId;
@@ -110,10 +121,9 @@ typedef struct SessionStateArray
 	SessionState *freeList;
 	/* Head of the list of used entries */
 	SessionState *usedList;
-	/* Pointer to the head of the entries */
-	SessionState	   *sessions;
-	/* Placeholder to find the address where the array of entries begin */
-	void *data;
+
+	/* Head of the entries */
+	SessionState sessions[1];		/* VARIABLE LENGTH ARRAY */
 } SessionStateArray;
 
 extern volatile SessionState *MySessionState;

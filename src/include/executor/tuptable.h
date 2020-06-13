@@ -4,10 +4,10 @@
  *	  tuple table support stuff
  *
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/executor/tuptable.h,v 1.38.2.1 2009/03/30 04:09:09 tgl Exp $
+ * src/include/executor/tuptable.h
  *
  *-------------------------------------------------------------------------
  */
@@ -15,11 +15,10 @@
 #define TUPTABLE_H
 
 #include "access/htup.h"
-#include "access/tupdesc.h"
-#include "access/heapam.h"
+#include "access/htup_details.h"
 #include "access/memtup.h"
+#include "access/tupdesc.h"
 #include "storage/buf.h"
-#include "codegen/codegen_wrapper.h"
 
 /*----------
  * The executor stores tuples in a "tuple table" which is a List of
@@ -37,7 +36,7 @@
  *
  * A "minimal" tuple is handled similarly to a palloc'd regular tuple.
  * At present, minimal tuples never are stored in buffers, so there is no
- * parallel to case 1.	Note that a minimal tuple has no "system columns".
+ * parallel to case 1.  Note that a minimal tuple has no "system columns".
  * (Actually, it could have an OID, but we have no need to access the OID.)
  *
  * A "virtual" tuple is an optimization used to minimize physical data
@@ -47,7 +46,7 @@
  * a lower plan node's output TupleTableSlot, or to a function result
  * constructed in a plan node's per-tuple econtext.  It is the responsibility
  * of the generating plan node to be sure these resources are not released
- * for as long as the virtual tuple needs to be valid.	We only use virtual
+ * for as long as the virtual tuple needs to be valid.  We only use virtual
  * tuples in the result slots of plan nodes --- tuples to be copied anywhere
  * else need to be "materialized" into physical tuples.  Note also that a
  * virtual tuple does not have any "system columns".
@@ -61,11 +60,11 @@
  * payloads when this is the case.
  *
  * The Datum/isnull arrays of a TupleTableSlot serve double duty.  When the
- * slot contains a virtual tuple, they are the authoritative data.	When the
+ * slot contains a virtual tuple, they are the authoritative data.  When the
  * slot contains a physical tuple, the arrays contain data extracted from
  * the tuple.  (In this state, any pass-by-reference Datums point into
  * the physical tuple.)  The extracted information is built "lazily",
- * ie, only as needed.	This serves to avoid repeated extraction of data
+ * ie, only as needed.  This serves to avoid repeated extraction of data
  * from the physical tuple.
  *
  * A TupleTableSlot can also be "empty", holding no valid data.  This is
@@ -92,7 +91,7 @@
  * buffer page.)
  *
  * tts_nvalid indicates the number of valid columns in the tts_values/isnull
- * arrays.	When the slot is holding a "virtual" tuple this must be equal
+ * arrays.  When the slot is holding a "virtual" tuple this must be equal
  * to the descriptor's natts.  When the slot is holding a physical tuple
  * this is equal to the number of columns we have extracted (we always
  * extract columns from left to right, so there are no holes).
@@ -152,6 +151,8 @@ typedef struct TupleTableSlot
     Oid         tts_tableOid;
 } TupleTableSlot;
 
+#ifndef FRONTEND
+
 static inline bool TupIsNull(TupleTableSlot *slot)
 {
 	return (slot == NULL || (slot->PRIVATE_tts_flags & TTS_ISEMPTY) != 0);
@@ -191,7 +192,6 @@ static inline bool TupHasVirtualTuple(TupleTableSlot *slot)
 static inline HeapTuple TupGetHeapTuple(TupleTableSlot *slot)
 {
 	Assert(TupHasHeapTuple(slot));
-	Assert(!is_heaptuple_memtuple(slot->PRIVATE_tts_heaptuple));
 	return slot->PRIVATE_tts_heaptuple; 
 }
 static inline MemTuple TupGetMemTuple(TupleTableSlot *slot)
@@ -271,7 +271,8 @@ slot_getallattrs(TupleTableSlot *slot)
 	slot_getsomeattrs(slot, slot->tts_tupleDescriptor->natts);
 }
 
-extern Datum slot_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull);
+extern bool slot_getsysattr(TupleTableSlot *slot, int attnum,
+				Datum *value, bool *isnull);
 
 /*
  * Set the synthetic ctid to a given ctid value.
@@ -297,8 +298,6 @@ static inline void slot_set_ctid(TupleTableSlot *slot, ItemPointer new_ctid)
 		slot->PRIVATE_tts_synthetic_ctid = *new_ctid;
 }
 
-extern void slot_set_ctid_from_fake(TupleTableSlot *slot, ItemPointerData *fake_ctid);
-
 /*
  * Retrieve the synthetic ctid value from the slot.
  *
@@ -316,17 +315,25 @@ static inline ItemPointer slot_get_ctid(TupleTableSlot *slot)
 	return &(slot->PRIVATE_tts_synthetic_ctid);
 }
 
+/* GPDB_94_MERGE_FIXME: We really should move some large functions out of header files. */
+
 /*
  * Get an attribute from the tuple table slot.
  */
 static inline Datum slot_getattr(TupleTableSlot *slot, int attnum, bool *isnull)
 {
+	Datum value;
+
 	Assert(!TupIsNull(slot));
 	Assert(attnum <= slot->tts_tupleDescriptor->natts);
 
 	/* System attribute */
 	if(attnum <= 0)
-		return slot_getsysattr(slot, attnum, isnull);
+	{
+		if (slot_getsysattr(slot, attnum, &value, isnull) == false)
+			elog(ERROR, "Fail to get system attribute with attnum: %d", attnum);
+		return value;
+	}
 
 	/* fast path for virtual tuple */
 	if(TupHasVirtualTuple(slot) && slot->PRIVATE_tts_nvalid >= attnum)
@@ -366,11 +373,6 @@ static inline bool slot_attisnull(TupleTableSlot *slot, int attnum)
 	return memtuple_attisnull(slot->PRIVATE_tts_memtuple, slot->tts_mt_bind, attnum);
 }
 
-#ifdef GPDB_83_MERGE_FIXME
-#define TTS_HAS_PHYSICAL_TUPLE(slot)  \
-	((slot)->tts_tuple != NULL && (slot)->tts_tuple != &((slot)->tts_minhdr))
-#endif
-
 /* in executor/execTuples.c */
 extern void init_slot(TupleTableSlot *slot, TupleDesc tupdesc);
 
@@ -398,37 +400,41 @@ extern MemTuple ExecCopySlotMemTuple(TupleTableSlot *slot);
 extern MemTuple ExecCopySlotMemTupleTo(TupleTableSlot *slot, MemoryContext pctxt, char *dest, unsigned int *len);
 
 extern HeapTuple ExecFetchSlotHeapTuple(TupleTableSlot *slot);
-extern MemTuple ExecFetchSlotMemTuple(TupleTableSlot *slot, bool inline_toast);
-
+extern MemTuple ExecFetchSlotMemTuple(TupleTableSlot *slot);
 extern Datum ExecFetchSlotTupleDatum(TupleTableSlot *slot);
 
-static inline void *ExecFetchSlotGenericTuple(TupleTableSlot *slot, bool mtup_inline_toast)
+static inline GenericTuple
+ExecFetchSlotGenericTuple(TupleTableSlot *slot)
 {
 	Assert(!TupIsNull(slot));
 	if (slot->PRIVATE_tts_memtuple == NULL && slot->PRIVATE_tts_heaptuple != NULL)
-		return (void *) slot->PRIVATE_tts_heaptuple;
+		return (GenericTuple) slot->PRIVATE_tts_heaptuple;
 
-	return ExecFetchSlotMemTuple(slot, mtup_inline_toast);
+	return (GenericTuple) ExecFetchSlotMemTuple(slot);
 }
 
-static inline TupleTableSlot *ExecStoreGenericTuple(void *tup, TupleTableSlot *slot, bool shouldFree)
+static inline TupleTableSlot *
+ExecStoreGenericTuple(GenericTuple tup, TupleTableSlot *slot, bool shouldFree)
 {
-	if (is_heaptuple_memtuple((HeapTuple) tup))
+	if (is_memtuple(tup))
 		return ExecStoreMinimalTuple((MemTuple) tup, slot, shouldFree);
 
 	return ExecStoreHeapTuple((HeapTuple) tup, slot, InvalidBuffer, shouldFree);
 }
 
-static inline HeapTuple ExecCopyGenericTuple(TupleTableSlot *slot)
+static inline GenericTuple
+ExecCopyGenericTuple(TupleTableSlot *slot)
 {
 	Assert(!TupIsNull(slot));
 	if(slot->PRIVATE_tts_heaptuple != NULL && slot->PRIVATE_tts_memtuple == NULL)
-		return ExecCopySlotHeapTuple(slot);
-	return (HeapTuple) ExecCopySlotMemTuple(slot);
+		return (GenericTuple) ExecCopySlotHeapTuple(slot);
+	return (GenericTuple) ExecCopySlotMemTuple(slot);
 }
 
-extern TupleTableSlot *ExecCopySlot(TupleTableSlot *dstslot, TupleTableSlot *srcslot);
+extern HeapTuple ExecMaterializeSlot(TupleTableSlot *slot);
+extern TupleTableSlot *ExecCopySlot(TupleTableSlot *dstslot,
+			 TupleTableSlot *srcslot);
 
-extern void ExecModifyMemTuple(TupleTableSlot *slot, Datum *values, bool *isnull, bool *doRepl);
+#endif /* !FRONTEND */
 
 #endif   /* TUPTABLE_H */

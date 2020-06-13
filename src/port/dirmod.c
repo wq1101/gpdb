@@ -3,14 +3,14 @@
  * dirmod.c
  *	  directory handling functions
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *	This includes replacement versions of functions that work on
  *	Win32 (NT4 and newer).
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/port/dirmod.c,v 1.51.2.5 2009/09/13 18:32:27 heikki Exp $
+ *	  src/port/dirmod.c
  *
  *-------------------------------------------------------------------------
  */
@@ -28,7 +28,6 @@
 #endif
 
 #include <unistd.h>
-#include <dirent.h>
 #include <sys/stat.h>
 
 #if defined(WIN32) || defined(__CYGWIN__)
@@ -39,72 +38,6 @@
 #include <w32api/winioctl.h>
 #endif
 #endif
-
-
-#ifndef FRONTEND
-
-/*
- *	On Windows, call non-macro versions of palloc; we can't reference
- *	CurrentMemoryContext in this file because of PGDLLIMPORT conflict.
- */
-#if defined(WIN32) || defined(__CYGWIN__)
-#undef palloc
-#undef pstrdup
-#define palloc(sz)		pgport_palloc(sz)
-#define pstrdup(str)	pgport_pstrdup(str)
-#endif
-#else							/* FRONTEND */
-
-/*
- *	In frontend, fake palloc behavior with these
- */
-#undef palloc
-#undef pstrdup
-#define palloc(sz)		fe_palloc(sz)
-#define pstrdup(str)	fe_pstrdup(str)
-#define repalloc(pointer,sz)	fe_repalloc(pointer,sz)
-#define pfree(pointer)	free(pointer)
-
-static void *
-fe_palloc(Size size)
-{
-	void	   *res;
-
-	if ((res = malloc(size)) == NULL)
-	{
-		fprintf(stderr, _("out of memory\n"));
-		exit(1);
-	}
-	return res;
-}
-
-static char *
-fe_pstrdup(const char *string)
-{
-	char	   *res;
-
-	if ((res = strdup(string)) == NULL)
-	{
-		fprintf(stderr, _("out of memory\n"));
-		exit(1);
-	}
-	return res;
-}
-
-static void *
-fe_repalloc(void *pointer, Size size)
-{
-	void	   *res;
-
-	if ((res = realloc(pointer, size)) == NULL)
-	{
-		fprintf(stderr, _("out of memory\n"));
-		exit(1);
-	}
-	return res;
-}
-#endif   /* FRONTEND */
-
 
 #if defined(WIN32) || defined(__CYGWIN__)
 
@@ -210,8 +143,8 @@ typedef struct
 	WORD		SubstituteNameLength;
 	WORD		PrintNameOffset;
 	WORD		PrintNameLength;
-	WCHAR		PathBuffer[1];
-}	REPARSE_JUNCTION_DATA_BUFFER;
+	WCHAR		PathBuffer[FLEXIBLE_ARRAY_MEMBER];
+} REPARSE_JUNCTION_DATA_BUFFER;
 
 #define REPARSE_JUNCTION_DATA_BUFFER_HEADER_SIZE   \
 		FIELD_OFFSET(REPARSE_JUNCTION_DATA_BUFFER, SubstituteNameOffset)
@@ -227,7 +160,7 @@ pgsymlink(const char *oldpath, const char *newpath)
 {
 	HANDLE		dirhandle;
 	DWORD		len;
-	char		buffer[MAX_PATH * sizeof(WCHAR) + sizeof(REPARSE_JUNCTION_DATA_BUFFER)];
+	char		buffer[MAX_PATH * sizeof(WCHAR) + offsetof(REPARSE_JUNCTION_DATA_BUFFER, PathBuffer)];
 	char		nativeTarget[MAX_PATH];
 	char	   *p = nativeTarget;
 	REPARSE_JUNCTION_DATA_BUFFER *reparseBuf = (REPARSE_JUNCTION_DATA_BUFFER *) buffer;
@@ -241,12 +174,12 @@ pgsymlink(const char *oldpath, const char *newpath)
 		return -1;
 
 	/* make sure we have an unparsed native win32 path */
-	if (memcmp("\\??\\", oldpath, 4))
-		sprintf(nativeTarget, "\\??\\%s", oldpath);
+	if (memcmp("\\??\\", oldpath, 4) != 0)
+		snprintf(nativeTarget, sizeof(nativeTarget), "\\??\\%s", oldpath);
 	else
-		strcpy(nativeTarget, oldpath);
+		strlcpy(nativeTarget, oldpath, sizeof(nativeTarget));
 
-	while ((p = strchr(p, '/')) != 0)
+	while ((p = strchr(p, '/')) != NULL)
 		*p++ = '\\';
 
 	len = strlen(nativeTarget) * sizeof(WCHAR);
@@ -273,7 +206,9 @@ pgsymlink(const char *oldpath, const char *newpath)
 		LPSTR		msg;
 
 		errno = 0;
-		FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM,
+		FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER |
+					  FORMAT_MESSAGE_IGNORE_INSERTS |
+					  FORMAT_MESSAGE_FROM_SYSTEM,
 					  NULL, GetLastError(),
 					  MAKELANGID(LANG_ENGLISH, SUBLANG_DEFAULT),
 					  (LPSTR) &msg, 0, NULL);
@@ -297,206 +232,127 @@ pgsymlink(const char *oldpath, const char *newpath)
 
 	return 0;
 }
-#endif   /* defined(WIN32) && !defined(__CYGWIN__) */
-
 
 /*
- * pgfnames
- *
- * return a list of the names of objects in the argument directory.  Caller
- * must call pgfnames_cleanup later to free the memory allocated by this
- * function.
+ *	pgreadlink - uses Win32 junction points
  */
-char **
-pgfnames(const char *path)
+int
+pgreadlink(const char *path, char *buf, size_t size)
 {
-	DIR		   *dir;
-	struct dirent *file;
-	char	  **filenames;
-	int			numnames = 0;
-	int			fnsize = 200;	/* enough for many small dbs */
+	DWORD		attr;
+	HANDLE		h;
+	char		buffer[MAX_PATH * sizeof(WCHAR) + offsetof(REPARSE_JUNCTION_DATA_BUFFER, PathBuffer)];
+	REPARSE_JUNCTION_DATA_BUFFER *reparseBuf = (REPARSE_JUNCTION_DATA_BUFFER *) buffer;
+	DWORD		len;
+	int			r;
 
-	dir = opendir(path);
-	if (dir == NULL)
+	attr = GetFileAttributes(path);
+	if (attr == INVALID_FILE_ATTRIBUTES)
 	{
-#ifndef FRONTEND
-		elog(WARNING, "could not open directory \"%s\": %m", path);
-#else
-		fprintf(stderr, _("could not open directory \"%s\": %s\n"),
-				path, strerror(errno));
-#endif
-		return NULL;
+		_dosmaperr(GetLastError());
+		return -1;
+	}
+	if ((attr & FILE_ATTRIBUTE_REPARSE_POINT) == 0)
+	{
+		errno = EINVAL;
+		return -1;
 	}
 
-	filenames = (char **) palloc(fnsize * sizeof(char *));
-
-	errno = 0;
-	while ((file = readdir(dir)) != NULL)
+	h = CreateFile(path,
+				   GENERIC_READ,
+				   FILE_SHARE_READ | FILE_SHARE_WRITE,
+				   NULL,
+				   OPEN_EXISTING,
+				   FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+				   0);
+	if (h == INVALID_HANDLE_VALUE)
 	{
-		if (strcmp(file->d_name, ".") != 0 && strcmp(file->d_name, "..") != 0)
-		{
-			if (numnames + 1 >= fnsize)
-			{
-				fnsize *= 2;
-				filenames = (char **) repalloc(filenames,
-											   fnsize * sizeof(char *));
-			}
-			filenames[numnames++] = pstrdup(file->d_name);
-		}
+		_dosmaperr(GetLastError());
+		return -1;
+	}
+
+	if (!DeviceIoControl(h,
+						 FSCTL_GET_REPARSE_POINT,
+						 NULL,
+						 0,
+						 (LPVOID) reparseBuf,
+						 sizeof(buffer),
+						 &len,
+						 NULL))
+	{
+		LPSTR		msg;
+
 		errno = 0;
+		FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER |
+					  FORMAT_MESSAGE_IGNORE_INSERTS |
+					  FORMAT_MESSAGE_FROM_SYSTEM,
+					  NULL, GetLastError(),
+					  MAKELANGID(LANG_ENGLISH, SUBLANG_DEFAULT),
+					  (LPSTR) &msg, 0, NULL);
+#ifndef FRONTEND
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not get junction for \"%s\": %s",
+						path, msg)));
+#else
+		fprintf(stderr, _("could not get junction for \"%s\": %s\n"),
+				path, msg);
+#endif
+		LocalFree(msg);
+		CloseHandle(h);
+		errno = EINVAL;
+		return -1;
 	}
-#ifdef WIN32
+	CloseHandle(h);
+
+	/* Got it, let's get some results from this */
+	if (reparseBuf->ReparseTag != IO_REPARSE_TAG_MOUNT_POINT)
+	{
+		errno = EINVAL;
+		return -1;
+	}
+
+	r = WideCharToMultiByte(CP_ACP, 0,
+							reparseBuf->PathBuffer, -1,
+							buf,
+							size,
+							NULL, NULL);
+
+	if (r <= 0)
+	{
+		errno = EINVAL;
+		return -1;
+	}
 
 	/*
-	 * This fix is in mingw cvs (runtime/mingwex/dirent.c rev 1.4), but not in
-	 * released version
+	 * If the path starts with "\??\", which it will do in most (all?) cases,
+	 * strip those out.
 	 */
-	if (GetLastError() == ERROR_NO_MORE_FILES)
-		errno = 0;
-#endif
-	if (errno)
+	if (r > 4 && strncmp(buf, "\\??\\", 4) == 0)
 	{
-#ifndef FRONTEND
-		elog(WARNING, "could not read directory \"%s\": %m", path);
-#else
-		fprintf(stderr, _("could not read directory \"%s\": %s\n"),
-				path, strerror(errno));
-#endif
+		memmove(buf, buf + 4, strlen(buf + 4) + 1);
+		r -= 4;
 	}
-
-	filenames[numnames] = NULL;
-
-	closedir(dir);
-
-	return filenames;
+	return r;
 }
 
-
 /*
- *	pgfnames_cleanup
- *
- *	deallocate memory used for filenames
- */
-void
-pgfnames_cleanup(char **filenames)
-{
-	char	  **fn;
-
-	for (fn = filenames; *fn; fn++)
-		pfree(*fn);
-
-	pfree(filenames);
-}
-
-
-/*
- *	rmtree
- *
- *	Delete a directory tree recursively.
- *	Assumes path points to a valid directory.
- *	Deletes everything under path.
- *	If rmtopdir is true deletes the directory too.
- *	Returns true if successful, false if there was any problem.
- *	(The details of the problem are reported already, so caller
- *	doesn't really have to say anything more, but most do.)
+ * Assumes the file exists, so will return false if it doesn't
+ * (since a nonexistant file is not a junction)
  */
 bool
-rmtree(const char *path, bool rmtopdir)
+pgwin32_is_junction(char *path)
 {
-	bool		result = true;
-	char		pathbuf[MAXPGPATH];
-	char	  **filenames;
-	char	  **filename;
-	struct stat statbuf;
+	DWORD		attr = GetFileAttributes(path);
 
-	/*
-	 * we copy all the names out of the directory before we start modifying
-	 * it.
-	 */
-	filenames = pgfnames(path);
-
-	if (filenames == NULL)
+	if (attr == INVALID_FILE_ATTRIBUTES)
+	{
+		_dosmaperr(GetLastError());
 		return false;
-
-	/* now we have the names we can start removing things */
-	for (filename = filenames; *filename; filename++)
-	{
-		snprintf(pathbuf, MAXPGPATH, "%s/%s", path, *filename);
-
-		/*
-		 * It's ok if the file is not there anymore; we were just about to
-		 * delete it anyway.
-		 *
-		 * This is not an academic possibility. One scenario where this
-		 * happens is when bgwriter has a pending unlink request for a file
-		 * in a database that's being dropped. In dropdb(), we call
-		 * ForgetDatabaseFsyncRequests() to flush out any such pending unlink
-		 * requests, but because that's asynchronous, it's not guaranteed
-		 * that the bgwriter receives the message in time.
-		 */
-		if (lstat(pathbuf, &statbuf) != 0)
-		{
-			if (errno != ENOENT)
-			{
-#ifndef FRONTEND
-				elog(WARNING, "could not stat file or directory \"%s\": %m",
-					 pathbuf);
-#else
-				fprintf(stderr, _("could not stat file or directory \"%s\": %s\n"),
-						pathbuf, strerror(errno));
-#endif
-				result = false;
-			}
-			continue;
-		}
-
-		if (S_ISDIR(statbuf.st_mode))
-		{
-			/* call ourselves recursively for a directory */
-			if (!rmtree(pathbuf, true))
-			{
-				/* we already reported the error */
-				result = false;
-			}
-		}
-		else
-		{
-			if (unlink(pathbuf) != 0)
-			{
-				if (errno != ENOENT)
-				{
-#ifndef FRONTEND
-					elog(WARNING, "could not remove file or directory \"%s\": %m",
-						 pathbuf);
-#else
-					fprintf(stderr, _("could not remove file or directory \"%s\": %s\n"),
-							pathbuf, strerror(errno));
-#endif
-					result = false;
-				}
-			}
-		}
 	}
-
-	if (rmtopdir)
-	{
-		if (rmdir(path) != 0)
-		{
-#ifndef FRONTEND
-			elog(WARNING, "could not remove file or directory \"%s\": %m",
-				 path);
-#else
-			fprintf(stderr, _("could not remove file or directory \"%s\": %s\n"),
-					path, strerror(errno));
-#endif
-			result = false;
-		}
-	}
-
-	pgfnames_cleanup(filenames);
-
-	return result;
+	return ((attr & FILE_ATTRIBUTE_REPARSE_POINT) == FILE_ATTRIBUTE_REPARSE_POINT);
 }
+#endif   /* defined(WIN32) && !defined(__CYGWIN__) */
 
 
 #if defined(WIN32) && !defined(__CYGWIN__)
@@ -535,8 +391,8 @@ pgwin32_safestat(const char *path, struct stat *buf)
 	}
 
 	/*
-	 * XXX no support for large files here, but we don't do that in
-	 * general on Win32 yet.
+	 * XXX no support for large files here, but we don't do that in general on
+	 * Win32 yet.
 	 */
 	buf->st_size = attr.nFileSizeLow;
 

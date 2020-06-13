@@ -94,7 +94,7 @@ create or replace temp view v1 as
   select 2+2+4+(select max(unique1) from tenk1) as f1;
 select cache_test_2();
 
---- Check that change of search_path is ignored by replans
+--- Check that change of search_path is honored when re-using cached plan
 
 create schema s1
   create table abc (f1 int);
@@ -162,3 +162,37 @@ end$$ language plpgsql;
 
 select cachebug();
 select cachebug();
+
+
+-- Test plan_cache_mode
+
+create table test_mode (a int);
+insert into test_mode select 1 from generate_series(1,1000) union all select 2;
+create index on test_mode (a);
+analyze test_mode;
+
+prepare test_mode_pp (int) as select count(*) from test_mode where a = $1;
+
+-- up to 5 executions, custom plan is used
+explain (costs off) execute test_mode_pp(2);
+
+-- force generic plan
+set plan_cache_mode to force_generic_plan;
+explain (costs off) execute test_mode_pp(2);
+
+-- get to generic plan by 5 executions
+set plan_cache_mode to auto;
+execute test_mode_pp(1); -- 1x
+execute test_mode_pp(1); -- 2x
+execute test_mode_pp(1); -- 3x
+execute test_mode_pp(1); -- 4x
+execute test_mode_pp(1); -- 5x
+
+-- we should now get a really bad plan
+explain (costs off) execute test_mode_pp(2);
+
+-- but we can force a custom plan
+set plan_cache_mode to force_custom_plan;
+explain (costs off) execute test_mode_pp(2);
+
+drop table test_mode;

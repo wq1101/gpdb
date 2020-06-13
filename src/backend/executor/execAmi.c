@@ -3,15 +3,17 @@
  * execAmi.c
  *	  miscellaneous executor access method routines
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- *	$PostgreSQL: pgsql/src/backend/executor/execAmi.c,v 1.99 2008/10/04 21:56:53 tgl Exp $
+ *	src/backend/executor/execAmi.c
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
+#include "access/amapi.h"
+#include "access/htup_details.h"
 #include "executor/execdebug.h"
 #include "executor/instrument.h"
 #include "executor/nodeAgg.h"
@@ -19,39 +21,56 @@
 #include "executor/nodeBitmapAnd.h"
 #include "executor/nodeBitmapHeapscan.h"
 #include "executor/nodeBitmapIndexscan.h"
+#include "executor/nodeDynamicBitmapHeapscan.h"
+#include "executor/nodeDynamicBitmapIndexscan.h"
 #include "executor/nodeBitmapOr.h"
+#include "executor/nodeCtescan.h"
+#include "executor/nodeCustom.h"
+#include "executor/nodeForeignscan.h"
 #include "executor/nodeFunctionscan.h"
+#include "executor/nodeGather.h"
 #include "executor/nodeHash.h"
 #include "executor/nodeHashjoin.h"
+#include "executor/nodeIndexonlyscan.h"
 #include "executor/nodeIndexscan.h"
 #include "executor/nodeLimit.h"
+#include "executor/nodeLockRows.h"
 #include "executor/nodeMaterial.h"
+#include "executor/nodeMergeAppend.h"
 #include "executor/nodeMergejoin.h"
+#include "executor/nodeModifyTable.h"
 #include "executor/nodeNestloop.h"
 #include "executor/nodeRecursiveunion.h"
 #include "executor/nodeResult.h"
+#include "executor/nodeSamplescan.h"
+#include "executor/nodeSeqscan.h"
 #include "executor/nodeSetOp.h"
 #include "executor/nodeSort.h"
 #include "executor/nodeSubplan.h"
 #include "executor/nodeSubqueryscan.h"
 #include "executor/nodeTidscan.h"
+#include "executor/nodeTupleSplit.h"
 #include "executor/nodeUnique.h"
 #include "executor/nodeValuesscan.h"
-#include "executor/nodeCtescan.h"
+#include "executor/nodeWindowAgg.h"
 #include "executor/nodeWorktablescan.h"
 #include "executor/nodeAssertOp.h"
-#include "executor/nodeTableScan.h"
-#include "executor/nodeDynamicTableScan.h"
+#include "executor/nodeDynamicSeqscan.h"
 #include "executor/nodeDynamicIndexscan.h"
-#include "executor/nodeExternalscan.h"
-#include "executor/nodeBitmapTableScan.h"
 #include "executor/nodeMotion.h"
 #include "executor/nodeSequence.h"
 #include "executor/nodeTableFunction.h"
 #include "executor/nodePartitionSelector.h"
-#include "executor/nodeBitmapAppendOnlyscan.h"
-#include "executor/nodeWindow.h"
 #include "executor/nodeShareInputScan.h"
+#include "nodes/nodeFuncs.h"
+#include "nodes/relation.h"
+#include "utils/rel.h"
+#include "utils/syscache.h"
+
+
+static bool TargetListSupportsBackwardScan(List *targetlist);
+static bool IndexSupportsBackwardScan(Oid indexid);
+
 
 /*
  * ExecReScan
@@ -59,21 +78,16 @@
  *
  * Note that if the plan node has parameters that have changed value,
  * the output might be different from last time.
- *
- * The second parameter is currently only used to pass a NestLoop plan's
- * econtext down to its inner child plan, in case that is an indexscan that
- * needs access to variables of the current outer tuple.  (The handling of
- * this parameter is currently pretty inconsistent: some callers pass NULL
- * and some pass down their parent's value; so don't rely on it in other
- * situations.	It'd probably be better to remove the whole thing and use
- * the generalized parameter mechanism instead.)
  */
 void
-ExecReScan(PlanState *node, ExprContext *exprCtxt)
+ExecReScan(PlanState *node)
 {
 	/* If collecting timing stats, update them */
 	if (node->instrument)
 		InstrEndLoop(node->instrument);
+
+	/* no longer squelched */
+	node->squelched = false;
 
 	/*
 	 * If we have changed parameters, propagate that info.
@@ -97,6 +111,13 @@ ExecReScan(PlanState *node, ExprContext *exprCtxt)
 			SubPlanState *sstate = (SubPlanState *) lfirst(l);
 			PlanState  *splan = sstate->planstate;
 
+			/*
+			 * If 'splan' is NULL, then InitPlan() thought it was "alien".  We
+			 * should not get here then, but let's sanity check.
+			 */
+			if (splan == NULL)
+				elog(ERROR, "subplan not initialized in this slice");
+
 			if (splan->plan->extParam != NULL)	/* don't care about child
 												 * local Params */
 				UpdateChangedParamSet(splan, node->chgParam);
@@ -107,6 +128,13 @@ ExecReScan(PlanState *node, ExprContext *exprCtxt)
 		{
 			SubPlanState *sstate = (SubPlanState *) lfirst(l);
 			PlanState  *splan = sstate->planstate;
+
+			/*
+			 * If 'splan' is NULL, then InitPlan() thought it was "alien".  We
+			 * should not get here then, but let's sanity check.
+			 */
+			if (splan == NULL)
+				elog(ERROR, "subplan not initialized in this slice");
 
 			if (splan->plan->extParam != NULL)
 				UpdateChangedParamSet(splan, node->chgParam);
@@ -126,156 +154,186 @@ ExecReScan(PlanState *node, ExprContext *exprCtxt)
 	switch (nodeTag(node))
 	{
 		case T_ResultState:
-			ExecReScanResult((ResultState *) node, exprCtxt);
+			ExecReScanResult((ResultState *) node);
+			break;
+
+		case T_ModifyTableState:
+			ExecReScanModifyTable((ModifyTableState *) node);
 			break;
 
 		case T_AppendState:
-			ExecReScanAppend((AppendState *) node, exprCtxt);
+			ExecReScanAppend((AppendState *) node);
+			break;
+
+		case T_MergeAppendState:
+			ExecReScanMergeAppend((MergeAppendState *) node);
 			break;
 
 		case T_RecursiveUnionState:
-			ExecRecursiveUnionReScan((RecursiveUnionState *) node, exprCtxt);
+			ExecReScanRecursiveUnion((RecursiveUnionState *) node);
 			break;
 
 		case T_AssertOpState:
-			ExecReScanAssertOp((AssertOpState *) node, exprCtxt);
+			ExecReScanAssertOp((AssertOpState *) node);
 			break;
 
 		case T_BitmapAndState:
-			ExecReScanBitmapAnd((BitmapAndState *) node, exprCtxt);
+			ExecReScanBitmapAnd((BitmapAndState *) node);
 			break;
 
 		case T_BitmapOrState:
-			ExecReScanBitmapOr((BitmapOrState *) node, exprCtxt);
+			ExecReScanBitmapOr((BitmapOrState *) node);
 			break;
 
 		case T_SeqScanState:
-		case T_AppendOnlyScanState:
-		case T_AOCSScanState:
-			insist_log(false, "SeqScan/AppendOnlyScan/AOCSScan are defunct");
+			ExecReScanSeqScan((SeqScanState *) node);
+			break;
+
+		case T_SampleScanState:
+			ExecReScanSampleScan((SampleScanState *) node);
+			break;
+
+		case T_GatherState:
+			ExecReScanGather((GatherState *) node);
 			break;
 
 		case T_IndexScanState:
-			ExecIndexReScan((IndexScanState *) node, exprCtxt);
+			ExecReScanIndexScan((IndexScanState *) node);
 			break;
 
-		case T_ExternalScanState:
-			ExecExternalReScan((ExternalScanState *) node, exprCtxt);
-			break;			
-
-		case T_TableScanState:
-			ExecTableReScan((TableScanState *) node, exprCtxt);
-			break;
-
-		case T_DynamicTableScanState:
-			ExecDynamicTableReScan((DynamicTableScanState *) node, exprCtxt);
-			break;
-
-		case T_BitmapTableScanState:
-			ExecBitmapTableReScan((BitmapTableScanState *) node, exprCtxt);
+		case T_DynamicSeqScanState:
+			ExecReScanDynamicSeqScan((DynamicSeqScanState *) node);
 			break;
 
 		case T_DynamicIndexScanState:
-			ExecDynamicIndexReScan((DynamicIndexScanState *) node, exprCtxt);
+			ExecReScanDynamicIndex((DynamicIndexScanState *) node);
+			break;
+
+		case T_IndexOnlyScanState:
+			ExecReScanIndexOnlyScan((IndexOnlyScanState *) node);
 			break;
 
 		case T_BitmapIndexScanState:
-			ExecBitmapIndexReScan((BitmapIndexScanState *) node, exprCtxt);
+			ExecReScanBitmapIndexScan((BitmapIndexScanState *) node);
+			break;
+
+		case T_DynamicBitmapIndexScanState:
+			ExecReScanDynamicBitmapIndex((DynamicBitmapIndexScanState *) node);
 			break;
 
 		case T_BitmapHeapScanState:
-			ExecBitmapHeapReScan((BitmapHeapScanState *) node, exprCtxt);
+			ExecReScanBitmapHeapScan((BitmapHeapScanState *) node);
+			break;
+
+		case T_DynamicBitmapHeapScanState:
+			ExecReScanDynamicBitmapHeapScan((DynamicBitmapHeapScanState *) node);
 			break;
 
 		case T_TidScanState:
-			ExecTidReScan((TidScanState *) node, exprCtxt);
+			ExecReScanTidScan((TidScanState *) node);
 			break;
 
 		case T_SubqueryScanState:
-			ExecSubqueryReScan((SubqueryScanState *) node, exprCtxt);
+			ExecReScanSubqueryScan((SubqueryScanState *) node);
 			break;
 
 		case T_SequenceState:
-			ExecReScanSequence((SequenceState *) node, exprCtxt);
+			ExecReScanSequence((SequenceState *) node);
 			break;
 
 		case T_FunctionScanState:
-			ExecFunctionReScan((FunctionScanState *) node, exprCtxt);
+			ExecReScanFunctionScan((FunctionScanState *) node);
+			break;
+
+		case T_TableFunctionState:
+			ExecReScanTableFunction((TableFunctionState *) node);
 			break;
 
 		case T_ValuesScanState:
-			ExecValuesReScan((ValuesScanState *) node, exprCtxt);
+			ExecReScanValuesScan((ValuesScanState *) node);
 			break;
 
 		case T_CteScanState:
-			ExecCteScanReScan((CteScanState *) node, exprCtxt);
+			ExecReScanCteScan((CteScanState *) node);
 			break;
 
 		case T_WorkTableScanState:
-			ExecWorkTableScanReScan((WorkTableScanState *) node, exprCtxt);
+			ExecReScanWorkTableScan((WorkTableScanState *) node);
 			break;
 
-		case T_BitmapAppendOnlyScanState:
-			ExecBitmapAppendOnlyReScan((BitmapAppendOnlyScanState *) node, exprCtxt);
+		case T_ForeignScanState:
+			ExecReScanForeignScan((ForeignScanState *) node);
+			break;
+
+		case T_CustomScanState:
+			ExecReScanCustomScan((CustomScanState *) node);
 			break;
 
 		case T_NestLoopState:
-			ExecReScanNestLoop((NestLoopState *) node, exprCtxt);
+			ExecReScanNestLoop((NestLoopState *) node);
 			break;
 
 		case T_MergeJoinState:
-			ExecReScanMergeJoin((MergeJoinState *) node, exprCtxt);
+			ExecReScanMergeJoin((MergeJoinState *) node);
 			break;
 
 		case T_HashJoinState:
-			ExecReScanHashJoin((HashJoinState *) node, exprCtxt);
+			ExecReScanHashJoin((HashJoinState *) node);
 			break;
 
 		case T_MaterialState:
-			ExecMaterialReScan((MaterialState *) node, exprCtxt);
+			ExecReScanMaterial((MaterialState *) node);
 			break;
 
 		case T_SortState:
-			ExecReScanSort((SortState *) node, exprCtxt);
+			ExecReScanSort((SortState *) node);
 			break;
 
 		case T_AggState:
-			ExecReScanAgg((AggState *) node, exprCtxt);
+			ExecReScanAgg((AggState *) node);
+			break;
+
+		case T_TupleSplit:
+			ExecReScanTupleSplit((TupleSplitState *) node);
+			break;
+
+		case T_WindowAggState:
+			ExecReScanWindowAgg((WindowAggState *) node);
 			break;
 
 		case T_UniqueState:
-			ExecReScanUnique((UniqueState *) node, exprCtxt);
+			ExecReScanUnique((UniqueState *) node);
 			break;
 
 		case T_HashState:
-			ExecReScanHash((HashState *) node, exprCtxt);
+			ExecReScanHash((HashState *) node);
 			break;
 
 		case T_SetOpState:
-			ExecReScanSetOp((SetOpState *) node, exprCtxt);
+			ExecReScanSetOp((SetOpState *) node);
+			break;
+
+		case T_LockRowsState:
+			ExecReScanLockRows((LockRowsState *) node);
 			break;
 
 		case T_LimitState:
-			ExecReScanLimit((LimitState *) node, exprCtxt);
+			ExecReScanLimit((LimitState *) node);
 			break;
 
 		case T_MotionState:
-			ExecReScanMotion((MotionState *) node, exprCtxt);
+			ExecReScanMotion((MotionState *) node);
 			break;
 
 		case T_TableFunctionScan:
-			ExecReScanTableFunction((TableFunctionState *) node, exprCtxt);
-			break;
-
-		case T_WindowState:
-			ExecReScanWindow((WindowState *) node, exprCtxt);
+			ExecReScanTableFunction((TableFunctionState *) node);
 			break;
 
 		case T_ShareInputScanState:
-			ExecShareInputScanReScan((ShareInputScanState *) node, exprCtxt);
+			ExecReScanShareInputScan((ShareInputScanState *) node);
 			break;
 		case T_PartitionSelectorState:
-			ExecReScanPartitionSelector((PartitionSelectorState *) node, exprCtxt);
+			ExecReScanPartitionSelector((PartitionSelectorState *) node);
 			break;
 			
 		default:
@@ -294,40 +352,30 @@ ExecReScan(PlanState *node, ExprContext *exprCtxt)
  * ExecMarkPos
  *
  * Marks the current scan position.
+ *
+ * NOTE: mark/restore capability is currently needed only for plan nodes
+ * that are the immediate inner child of a MergeJoin node.  Since MergeJoin
+ * requires sorted input, there is never any need to support mark/restore in
+ * node types that cannot produce sorted output.  There are some cases in
+ * which a node can pass through sorted data from its child; if we don't
+ * implement mark/restore for such a node type, the planner compensates by
+ * inserting a Material node above that node.
  */
 void
 ExecMarkPos(PlanState *node)
 {
 	switch (nodeTag(node))
 	{
-		case T_TableScanState:
-			ExecTableMarkPos((TableScanState *) node);
-			break;
-
-		case T_DynamicTableScanState:
-			ExecDynamicTableMarkPos((DynamicTableScanState *) node);
-			break;
-
-		case T_SeqScanState:
-		case T_AppendOnlyScanState:
-		case T_AOCSScanState:
-			insist_log(false, "SeqScan/AppendOnlyScan/AOCSScan are defunct");
-			break;
-
 		case T_IndexScanState:
 			ExecIndexMarkPos((IndexScanState *) node);
 			break;
 
-		case T_ExternalScanState:
-			elog(ERROR, "Marking scan position for external relation is not supported");
-			break;			
-
-		case T_TidScanState:
-			ExecTidMarkPos((TidScanState *) node);
+		case T_IndexOnlyScanState:
+			ExecIndexOnlyMarkPos((IndexOnlyScanState *) node);
 			break;
 
-		case T_ValuesScanState:
-			ExecValuesMarkPos((ValuesScanState *) node);
+		case T_CustomScanState:
+			ExecCustomMarkPos((CustomScanState *) node);
 			break;
 
 		case T_MaterialState:
@@ -344,9 +392,13 @@ ExecMarkPos(PlanState *node)
 
 		case T_MotionState:
 			ereport(ERROR, (
-				errcode(ERRCODE_CDB_INTERNAL_ERROR),
+				errcode(ERRCODE_INTERNAL_ERROR),
 				errmsg("unsupported call to mark position of Motion operator")
 				));
+			break;
+
+		case T_ForeignScanState:
+			elog(ERROR, "Marking scan position for foreign relation is not supported");
 			break;
 
 		default:
@@ -363,7 +415,7 @@ ExecMarkPos(PlanState *node)
  *
  * NOTE: the semantics of this are that the first ExecProcNode following
  * the restore operation will yield the same tuple as the first one following
- * the mark operation.	It is unspecified what happens to the plan node's
+ * the mark operation.  It is unspecified what happens to the plan node's
  * result TupleTableSlot.  (In most cases the result slot is unchanged by
  * a restore, but the node may choose to clear it or to load it with the
  * restored-to tuple.)	Hence the caller should discard any previously
@@ -374,34 +426,16 @@ ExecRestrPos(PlanState *node)
 {
 	switch (nodeTag(node))
 	{
-		case T_TableScanState:
-			ExecTableRestrPos((TableScanState *) node);
-			break;
-
-		case T_DynamicTableScanState:
-			ExecDynamicTableRestrPos((DynamicTableScanState *) node);
-			break;
-
-		case T_SeqScanState:
-		case T_AppendOnlyScanState:
-		case T_AOCSScanState:
-			insist_log(false, "SeqScan/AppendOnlyScan/AOCSScan are defunct");
-			break;
-
 		case T_IndexScanState:
 			ExecIndexRestrPos((IndexScanState *) node);
 			break;
 
-		case T_ExternalScanState:
-			elog(ERROR, "Restoring scan position is not yet supported for external relation scan");
-			break;			
-
-		case T_TidScanState:
-			ExecTidRestrPos((TidScanState *) node);
+		case T_IndexOnlyScanState:
+			ExecIndexOnlyRestrPos((IndexOnlyScanState *) node);
 			break;
 
-		case T_ValuesScanState:
-			ExecValuesRestrPos((ValuesScanState *) node);
+		case T_CustomScanState:
+			ExecCustomRestrPos((CustomScanState *) node);
 			break;
 
 		case T_MaterialState:
@@ -418,9 +452,13 @@ ExecRestrPos(PlanState *node)
 
 		case T_MotionState:
 			ereport(ERROR, (
-				errcode(ERRCODE_CDB_INTERNAL_ERROR),
+				errcode(ERRCODE_INTERNAL_ERROR),
 				errmsg("unsupported call to restore position of Motion operator")
 				));
+			break;
+
+		case T_ForeignScanState:
+			elog(ERROR, "Restoring scan position is not yet supported for foreign relation scan");
 			break;
 
 		default:
@@ -430,41 +468,52 @@ ExecRestrPos(PlanState *node)
 }
 
 /*
- * ExecSupportsMarkRestore - does a plan type support mark/restore?
+ * ExecSupportsMarkRestore - does a Path support mark/restore?
  *
- * XXX Ideally, all plan node types would support mark/restore, and this
- * wouldn't be needed.  For now, this had better match the routines above.
- * But note the test is on Plan nodetype, not PlanState nodetype.
- *
- * (However, since the only present use of mark/restore is in mergejoin,
- * there is no need to support mark/restore in any plan type that is not
- * capable of generating ordered output.  So the seqscan, tidscan,
- * and valuesscan support is actually useless code at present.)
+ * This is used during planning and so must accept a Path, not a Plan.
+ * We keep it here to be adjacent to the routines above, which also must
+ * know which plan types support mark/restore.
  */
 bool
-ExecSupportsMarkRestore(NodeTag plantype)
+ExecSupportsMarkRestore(Path *pathnode)
 {
-	switch (plantype)
+	/*
+	 * For consistency with the routines above, we do not examine the nodeTag
+	 * but rather the pathtype, which is the Plan node type the Path would
+	 * produce.
+	 */
+	switch (pathnode->pathtype)
 	{
-		case T_SeqScan:
 		case T_IndexScan:
-		case T_TidScan:
-		case T_ValuesScan:
+		case T_IndexOnlyScan:
 		case T_Material:
 		case T_Sort:
 		case T_ShareInputScan:
 			return true;
 
+		case T_CustomScan:
+			Assert(IsA(pathnode, CustomPath));
+			if (((CustomPath *) pathnode)->flags & CUSTOMPATH_SUPPORT_MARK_RESTORE)
+				return true;
+			return false;
+
 		case T_Result:
 
 			/*
-			 * T_Result only supports mark/restore if it has a child plan that
-			 * does, so we do not have enough information to give a really
-			 * correct answer.	However, for current uses it's enough to
-			 * always say "false", because this routine is not asked about
-			 * gating Result plans, only base-case Results.
+			 * Result supports mark/restore iff it has a child plan that does.
+			 *
+			 * We have to be careful here because there is more than one Path
+			 * type that can produce a Result plan node.
 			 */
-			return false;
+			if (IsA(pathnode, ProjectionPath))
+				return ExecSupportsMarkRestore(((ProjectionPath *) pathnode)->subpath);
+			else if (IsA(pathnode, MinMaxAggPath))
+				return false;	/* childless Result */
+			else
+			{
+				Assert(IsA(pathnode, ResultPath));
+				return false;	/* childless Result */
+			}
 
 		default:
 			break;
@@ -487,11 +536,20 @@ ExecSupportsBackwardScan(Plan *node)
 	if (node == NULL)
 		return false;
 
+	/*
+	 * Parallel-aware nodes return a subset of the tuples in each worker, and
+	 * in general we can't expect to have enough bookkeeping state to know
+	 * which ones we returned in this worker as opposed to some other worker.
+	 */
+	if (node->parallel_aware)
+		return false;
+
 	switch (nodeTag(node))
 	{
 		case T_Result:
 			if (outerPlan(node) != NULL)
-				return ExecSupportsBackwardScan(outerPlan(node));
+				return ExecSupportsBackwardScan(outerPlan(node)) &&
+					TargetListSupportsBackwardScan(node->targetlist);
 			else
 				return false;
 
@@ -504,29 +562,57 @@ ExecSupportsBackwardScan(Plan *node)
 					if (!ExecSupportsBackwardScan((Plan *) lfirst(l)))
 						return false;
 				}
+				/* need not check tlist because Append doesn't evaluate it */
 				return true;
 			}
 
 		case T_SeqScan:
-		case T_IndexScan:
 		case T_TidScan:
 		case T_FunctionScan:
 		case T_ValuesScan:
 		case T_CteScan:
 		case T_WorkTableScan:
-			return true;
+			return TargetListSupportsBackwardScan(node->targetlist);
+
+		case T_SampleScan:
+			/* Simplify life for tablesample methods by disallowing this */
+			return false;
+
+		case T_Gather:
+			return false;
+
+		case T_IndexScan:
+			return IndexSupportsBackwardScan(((IndexScan *) node)->indexid) &&
+				TargetListSupportsBackwardScan(node->targetlist);
+
+		case T_IndexOnlyScan:
+			return IndexSupportsBackwardScan(((IndexOnlyScan *) node)->indexid) &&
+				TargetListSupportsBackwardScan(node->targetlist);
 
 		case T_SubqueryScan:
-			return ExecSupportsBackwardScan(((SubqueryScan *) node)->subplan);
+			return ExecSupportsBackwardScan(((SubqueryScan *) node)->subplan) &&
+				TargetListSupportsBackwardScan(node->targetlist);
 
 		case T_ShareInputScan:
 			return true;
+		case T_CustomScan:
+			{
+				uint32		flags = ((CustomScan *) node)->flags;
+
+				if ((flags & CUSTOMPATH_SUPPORT_BACKWARD_SCAN) &&
+					TargetListSupportsBackwardScan(node->targetlist))
+					return true;
+			}
+			return false;
 
 		case T_Material:
 		case T_Sort:
+			/* these don't evaluate tlist */
 			return true;
 
+		case T_LockRows:
 		case T_Limit:
+			/* these don't evaluate tlist */
 			return ExecSupportsBackwardScan(outerPlan(node));
 
 		default:
@@ -535,336 +621,244 @@ ExecSupportsBackwardScan(Plan *node)
 }
 
 /*
- * ExecMayReturnRawTuples
- *		Check whether a plan tree may return "raw" disk tuples (that is,
- *		pointers to original data in disk buffers, as opposed to temporary
- *		tuples constructed by projection steps).  In the case of Append,
- *		some subplans may return raw tuples and others projected tuples;
- *		we return "true" if any of the returned tuples could be raw.
+ * ExecSquelchNode
  *
- * This must be passed an already-initialized planstate tree, because we
- * need to look at the results of ExecAssignScanProjectionInfo().
+ * When a node decides that it will not consume any more input tuples from a
+ * subtree that has not yet returned end-of-data, it must call
+ * ExecSquelchNode() on the subtree.
+ *
+ * This is necessary, to avoid deadlock with Motion nodes. There might be a
+ * receiving Motion node in the subtree, and it needs to let the sender side
+ * of the Motion know that we will not be reading any more tuples. We might
+ * have sibling QE processes in other segments that are still waiting for
+ * tuples from the sender Motion, but if the sender's send queue is full, it
+ * will never send them. By explicitly telling the sender that we will not be
+ * reading any more tuples, it knows to not wait for us, and can skip over,
+ * and send tuples to the other QEs that might be waiting.
+ *
+ * This also gives memory-hungry nodes a chance to release memory earlier, so
+ * that other nodes higher up in the plan can make use of it. The Squelch
+ * function for many node call a separate node-specific ExecEagerFree*()
+ * function to do that.
+ *
+ * After a node has been squelched, you mustn't try to read more tuples from
+ * it. However, ReScanning the node will "un-squelch" it, allowing to read
+ * again. Squelching a node is roughly equivalent to fetching and discarding
+ * all tuples from it.
  */
-bool
-ExecMayReturnRawTuples(PlanState *node)
+void
+ExecSquelchNode(PlanState *node)
 {
-	/*
-	 * At a table scan node, we check whether ExecAssignScanProjectionInfo
-	 * decided to do projection or not.  Most non-scan nodes always project
-	 * and so we can return "false" immediately.  For nodes that don't project
-	 * but just pass up input tuples, we have to recursively examine the input
-	 * plan node.
-	 *
-	 * Note: Hash and Material are listed here because they sometimes return
-	 * an original input tuple, not a copy.  But Sort and SetOp never return
-	 * an original tuple, so they can be treated like projecting nodes.
-	 */
+	ListCell   *lc;
+
+	if (!node)
+		return;
+
+	if (node->squelched)
+		return;
+
 	switch (nodeTag(node))
 	{
-			/* Table scan nodes */
-		case T_TableScanState:
-		case T_DynamicTableScanState:
-		case T_DynamicIndexScanState:
-		case T_IndexScanState:
-		case T_BitmapHeapScanState:
-		case T_TidScanState:
-			if (node->ps_ProjInfo == NULL)
-				return true;
+		case T_MotionState:
+			ExecSquelchMotion((MotionState *) node);
 			break;
 
-		case T_SeqScanState:
-			insist_log(false, "SeqScan/AppendOnlyScan/AOCSScan are defunct");
+		case T_ModifyTableState:
+			ExecSquelchModifyTable((ModifyTableState *) node);
+			return;
+
+			/*
+			 * Node types that need custom code to recurse.
+			 */
+		case T_AppendState:
+			ExecSquelchAppend((AppendState *) node);
+			break;
+
+		case T_MergeAppendState:
+			ExecSquelchMergeAppend((MergeAppendState *) node);
+			break;
+
+		case T_SequenceState:
+			ExecSquelchSequence((SequenceState *) node);
 			break;
 
 		case T_SubqueryScanState:
-			/* If not projecting, look at input plan */
-			if (node->ps_ProjInfo == NULL)
-				return ExecMayReturnRawTuples(((SubqueryScanState *) node)->subplan);
+			ExecSquelchSubqueryScan((SubqueryScanState *) node);
 			break;
 
-			/* Non-projecting nodes */
-		case T_MotionState:
-			if (node->lefttree == NULL)
-				return false;
-		case T_HashState:
-		case T_MaterialState:
-		case T_UniqueState:
-		case T_LimitState:
-			return ExecMayReturnRawTuples(node->lefttree);
-
-		case T_AppendState:
-			{
-				/*
-				 * Always return true since we don't initialize the subplan
-				 * nodes, so we don't know.
-				 */
-				return true;
-			}
-
-			/* All projecting node types come here */
-		default:
-			break;
-	}
-	return false;
-}
-
-/*
- * ExecEagerFree
- *    Eager free the memory that is used by the given node.
- */
-void
-ExecEagerFree(PlanState *node)
-{
-	switch (nodeTag(node))
-	{
-		/* No need for eager free */
-		case T_AppendState:
+			/*
+			 * Node types that need no special handling, just recurse to
+			 * children.
+			 */
 		case T_AssertOpState:
 		case T_BitmapAndState:
 		case T_BitmapOrState:
-		case T_BitmapIndexScanState:
+		case T_DynamicBitmapHeapScanState:
 		case T_LimitState:
-		case T_MotionState:
+		case T_LockRowsState:
 		case T_NestLoopState:
-		case T_RepeatState:
-		case T_ResultState:
+		case T_MergeJoinState:
 		case T_SetOpState:
-		case T_SubqueryScanState:
-		case T_TidScanState:
 		case T_UniqueState:
 		case T_HashState:
-		case T_ValuesScanState:
-		case T_TableFunctionState:
-		case T_DynamicTableScanState:
-		case T_DynamicIndexScanState:
-		case T_SequenceState:
 		case T_PartitionSelectorState:
 		case T_WorkTableScanState:
-			break;
-
-		case T_TableScanState:
-			ExecEagerFreeTableScan((TableScanState *)node);
-			break;
-			
-		case T_SeqScanState:
-		case T_AppendOnlyScanState:
-		case T_AOCSScanState:
-			insist_log(false, "SeqScan/AppendOnlyScan/AOCSScan are defunct");
-			break;
-			
-		case T_ExternalScanState:
-			ExecEagerFreeExternalScan((ExternalScanState *)node);
-			break;
-			
-		case T_IndexScanState:
-			ExecEagerFreeIndexScan((IndexScanState *)node);
-			break;
-			
-		case T_BitmapHeapScanState:
-			ExecEagerFreeBitmapHeapScan((BitmapHeapScanState *)node);
-			break;
-			
-		case T_BitmapAppendOnlyScanState:
-			ExecEagerFreeBitmapAppendOnlyScan((BitmapAppendOnlyScanState *)node);
-			break;
-			
-		case T_BitmapTableScanState:
-			ExecEagerFreeBitmapTableScan((BitmapTableScanState *)node);
-			break;
-
-		case T_FunctionScanState:
-			ExecEagerFreeFunctionScan((FunctionScanState *)node);
-			break;
-			
-		case T_MergeJoinState:
-			ExecEagerFreeMergeJoin((MergeJoinState *)node);
-			break;
-			
-		case T_HashJoinState:
-			ExecEagerFreeHashJoin((HashJoinState *)node);
-			break;
-			
-		case T_MaterialState:
-			ExecEagerFreeMaterial((MaterialState*)node);
-			break;
-			
-		case T_SortState:
-			ExecEagerFreeSort((SortState *)node);
-			break;
-			
-		case T_AggState:
-			ExecEagerFreeAgg((AggState*)node);
-			break;
-
-		case T_WindowState:
-			ExecEagerFreeWindow((WindowState *)node);
-			break;
-
-		case T_ShareInputScanState:
-			ExecEagerFreeShareInputScan((ShareInputScanState *)node);
-			break;
-
-		case T_RecursiveUnionState:
-			ExecEagerFreeRecursiveUnion((RecursiveUnionState *)node);
-			break;
-
-		default:
-			Insist(false);
-			break;
-	}
-}
-
-/*
- * EagerFreeChildNodesContext
- *    Store the context info for eager freeing child nodes.
- */
-typedef struct EagerFreeChildNodesContext
-{
-	/*
-	 * Indicate whether the eager free is called when a subplan
-	 * is finished. This is used to indicate whether we should
-	 * free the Material node under the Result (to support
-	 * correlated subqueries (CSQ)).
-	 */
-	bool subplanDone;
-} EagerFreeChildNodesContext;
-
-/*
- * EagerFreeWalker
- *    Walk the tree, and eager free the memory.
- */
-static CdbVisitOpt
-EagerFreeWalker(PlanState *node, void *context)
-{
-	EagerFreeChildNodesContext *ctx = (EagerFreeChildNodesContext *)context;
-
-	if (node == NULL)
-	{
-		return CdbVisit_Walk;
-	}
-	
-	if (IsA(node, MotionState))
-	{
-		/* Skip the subtree */
-		return CdbVisit_Skip;
-	}
-
-	if (IsA(node, ResultState))
-	{
-		ResultState *resultState = (ResultState *)node;
-		PlanState *lefttree = resultState->ps.lefttree;
-
-		/*
-		 * If the child node for the Result node is a Material, and the child node for
-		 * the Material is a Broadcast Motion, we can't eagerly free the memory for
-		 * the Material node until the subplan is done.
-		 */
-		if (!ctx->subplanDone && lefttree != NULL && IsA(lefttree, MaterialState))
-		{
-			PlanState *matLefttree = lefttree->lefttree;
-			Assert(matLefttree != NULL);
-			
-			if (IsA(matLefttree, MotionState) &&
-				((Motion*)matLefttree->plan)->motionType == MOTIONTYPE_FIXED)
-			{
-				ExecEagerFree(node);
-
-				/* Skip the subtree */
-				return CdbVisit_Skip;
-			}
-		}
-	}
-
-	ExecEagerFree(node);
-	
-	return CdbVisit_Walk;
-}
-
-/*
- * ExecEagerFreeChildNodes
- *    Eager free the memory for the child nodes.
- *
- * If this function is called when a subplan is finished, this function eagerly frees
- * the memory for all child nodes. Otherwise, it stops when it sees a Result node on top of
- * a Material and a Broadcast Motion. The reason that the Material node below the
- * Result can not be freed until the parent node of the subplan is finished.
- */
-void
-ExecEagerFreeChildNodes(PlanState *node, bool subplanDone)
-{
-	EagerFreeChildNodesContext ctx;
-	ctx.subplanDone = subplanDone;
-	
-	switch(nodeTag(node))
-	{
-		case T_AssertOpState:
-		case T_BitmapIndexScanState:
-		case T_LimitState:
-		case T_RepeatState:
 		case T_ResultState:
-		case T_SetOpState:
-		case T_ShareInputScanState:
-		case T_SubqueryScanState:
-		case T_TidScanState:
-		case T_UniqueState:
-		case T_HashState:
-		case T_ValuesScanState:
-		case T_TableScanState:
-		case T_DynamicTableScanState:
-		case T_DynamicIndexScanState:
-		case T_ExternalScanState:
-		case T_IndexScanState:
-		case T_BitmapHeapScanState:
-		case T_BitmapAppendOnlyScanState:
-		case T_FunctionScanState:
-		case T_MaterialState:
-		case T_SortState:
-		case T_AggState:
-		case T_WindowState:
-		{
-			planstate_walk_node(outerPlanState(node), EagerFreeWalker, &ctx);
+			ExecSquelchNode(outerPlanState(node));
+			ExecSquelchNode(innerPlanState(node));
 			break;
-		}
 
+			/*
+			 * These node types have nothing to do, and have no children.
+			 */
 		case T_SeqScanState:
-		case T_AppendOnlyScanState:
-		case T_AOCSScanState:
-			insist_log(false, "SeqScan/AppendOnlyScan/AOCSScan are defunct");
+		case T_IndexScanState:
+		case T_DynamicSeqScanState:
+		case T_DynamicIndexScanState:
+		case T_IndexOnlyScanState:
+		case T_DynamicBitmapIndexScanState:
+		case T_BitmapIndexScanState:
+		case T_ValuesScanState:
+		case T_TidScanState:
+		case T_TableFunctionState:
+		case T_SampleScanState:
 			break;
 
-		case T_NestLoopState:
-		case T_MergeJoinState:
-		case T_BitmapAndState:
-		case T_BitmapOrState:
-		case T_HashJoinState:
+			/*
+			 * Node types that consume resources that we want to free eagerly,
+			 * as soon as possible.
+			 */
 		case T_RecursiveUnionState:
-		{
-			planstate_walk_node(innerPlanState(node), EagerFreeWalker, &ctx);
-			planstate_walk_node(outerPlanState(node), EagerFreeWalker, &ctx);
+			ExecSquelchRecursiveUnion((RecursiveUnionState *) node);
 			break;
-		}
-		
-		case T_AppendState:
-		{
-			AppendState *appendState = (AppendState *)node;
-			for (int planNo = 0; planNo < appendState->as_nplans; planNo++)
-			{
-				planstate_walk_node(appendState->appendplans[planNo], EagerFreeWalker, &ctx);
-			}
-			
+
+		case T_ForeignScanState:
+			ExecSquelchForeignScan((ForeignScanState *) node);
 			break;
-		}
-			
-		case T_MotionState:
-		{
-			/* do nothing */
+
+		case T_BitmapHeapScanState:
+			ExecSquelchBitmapHeapScan((BitmapHeapScanState *) node);
 			break;
-		}
-			
+
+		case T_FunctionScanState:
+			ExecSquelchFunctionScan((FunctionScanState *) node);
+			break;
+
+		case T_HashJoinState:
+			ExecSquelchHashJoin((HashJoinState *) node);
+			break;
+
+		case T_MaterialState:
+			ExecSquelchMaterial((MaterialState*) node);
+			break;
+
+		case T_SortState:
+			ExecSquelchSort((SortState *) node);
+			break;
+
+		case T_AggState:
+			ExecSquelchAgg((AggState*) node);
+			break;
+
+		case T_TupleSplitState:
+			ExecSquelchTupleSplit((TupleSplitState*) node);
+			break;
+
+		case T_WindowAggState:
+			ExecSquelchWindowAgg((WindowAggState *) node);
+			break;
+
+		case T_ShareInputScanState:
+			ExecSquelchShareInputScan((ShareInputScanState *) node);
+			break;
+
 		default:
-		{
-			Insist(false);
+			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(node));
 			break;
-		}
 	}
+
+	/*
+	 * Also recurse into subplans, if any. (InitPlans are handled as a separate step,
+	 * at executor startup, and don't need squelching.)
+	 */
+	foreach(lc, node->subPlan)
+	{
+		SubPlanState *sps = (SubPlanState *) lfirst(lc);
+		PlanState  *ips = sps->planstate;
+
+		if (!ips)
+			elog(ERROR, "subplan has no planstate");
+		ExecSquelchNode(ips);
+	}
+
+	node->squelched = true;
+}
+
+/*
+ * If the tlist contains set-returning functions, we can't support backward
+ * scan, because the TupFromTlist code is direction-ignorant.
+ */
+static bool
+TargetListSupportsBackwardScan(List *targetlist)
+{
+	if (expression_returns_set((Node *) targetlist))
+		return false;
+	return true;
+}
+
+/*
+ * An IndexScan or IndexOnlyScan node supports backward scan only if the
+ * index's AM does.
+ */
+static bool
+IndexSupportsBackwardScan(Oid indexid)
+{
+	bool		result;
+	HeapTuple	ht_idxrel;
+	Form_pg_class idxrelrec;
+	IndexAmRoutine *amroutine;
+
+	/* Fetch the pg_class tuple of the index relation */
+	ht_idxrel = SearchSysCache1(RELOID, ObjectIdGetDatum(indexid));
+	if (!HeapTupleIsValid(ht_idxrel))
+		elog(ERROR, "cache lookup failed for relation %u", indexid);
+	idxrelrec = (Form_pg_class) GETSTRUCT(ht_idxrel);
+
+	/* Fetch the index AM's API struct */
+	amroutine = GetIndexAmRoutineByAmId(idxrelrec->relam, false);
+
+	result = amroutine->amcanbackward;
+
+	pfree(amroutine);
+	ReleaseSysCache(ht_idxrel);
+
+	return result;
+}
+
+/*
+ * ExecMaterializesOutput - does a plan type materialize its output?
+ *
+ * Returns true if the plan node type is one that automatically materializes
+ * its output (typically by keeping it in a tuplestore).  For such plans,
+ * a rescan without any parameter change will have zero startup cost and
+ * very low per-tuple cost.
+ */
+bool
+ExecMaterializesOutput(NodeTag plantype)
+{
+	switch (plantype)
+	{
+		case T_Material:
+		case T_FunctionScan:
+		case T_CteScan:
+		case T_WorkTableScan:
+		case T_Sort:
+		case T_ShareInputScan:
+			return true;
+
+		default:
+			break;
+	}
+
+	return false;
 }

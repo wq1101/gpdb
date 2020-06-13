@@ -105,13 +105,13 @@
 #include "access/tuptoaster.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_amop.h"
+#include "catalog/pg_collation.h"
 #include "catalog/pg_operator.h"
 #include "executor/instrument.h"	/* Instrumentation */
 #include "lib/stringinfo.h"		/* StringInfo */
-#include "executor/nodeSort.h"	/* gpmon */
 #include "miscadmin.h"
+#include "pg_trace.h"
 #include "utils/datum.h"
-#include "executor/execWorkfile.h"
 #include "utils/logtape.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -158,7 +158,7 @@ typedef enum
 
 // #define PRINT_SPILL_AND_MEMORY_MESSAGES
 
-/* 
+/*
  * Current position of Tuplesort operation.
  */
 struct TuplesortPos_mk
@@ -203,6 +203,9 @@ typedef struct TupsortMergeReadCtxt
  */
 struct Tuplesortstate_mk
 {
+	/* MUST BE FIRST, to match switcheroo_Tuplesortstate */
+	bool		is_mk_tuplesortstate;
+
 	TupSortStatus status;		/* enumerated value as shown above */
 	int			nKeys;			/* number of columns in sort key */
 	bool		randomAccess;	/* did caller request random access? */
@@ -216,7 +219,7 @@ struct Tuplesortstate_mk
 
 	ScanState  *ss;
 
-	/* Representation of all spill file names, for spill file reuse */
+	/* set holding the temporary files, if this is a shared sort */
 	workfile_set *work_set;
 
 	/*
@@ -336,7 +339,8 @@ struct Tuplesortstate_mk
 	 * These variables are specific to the IndexTuple case; they are set by
 	 * tuplesort_begin_index and used only by the IndexTuple routines.
 	 */
-	Relation	indexRel;
+	Relation	heapRel;		/* table the index is being built on */
+	Relation	indexRel;		/* index being built */
 
 	/*
 	 * These variables are specific to the Datum case; they are set by
@@ -372,11 +376,7 @@ struct Tuplesortstate_mk
 	 * State file used to load a logical tape set. Used by sharing sort across
 	 * slice
 	 */
-	ExecWorkFile *tapeset_state_file;
-
-	/* Gpmon */
-	gpmon_packet_t *gpmon_pkt;
-	int		   *gpmon_sort_tick;
+	BufFile	   *tapeset_state_file;
 };
 
 static void tuplesort_get_stats_mk(Tuplesortstate_mk* state, const char **sortMethod, const char **spaceType, long *spaceUsed);
@@ -560,6 +560,7 @@ tuplesort_begin_common(ScanState *ss, int workMem, bool randomAccess, bool alloc
 										ALLOCSET_DEFAULT_MINSIZE,
 										ALLOCSET_DEFAULT_INITSIZE,
 										ALLOCSET_DEFAULT_MAXSIZE);
+	MemoryContextDeclareAccountingRoot(sortcontext);
 
 	/*
 	 * Make the Tuplesortstate_mk within the per-sort context.  This way, we
@@ -627,37 +628,10 @@ cdb_tuplesort_init_mk(Tuplesortstate_mk *state, int unique, int sort_flags,
 		state->mkctxt.unique = true;
 }
 
-/* make a copy of current state pos */
 void
-tuplesort_begin_pos_mk(Tuplesortstate_mk *st, TuplesortPos_mk ** pos)
-{
-	TuplesortPos_mk *st_pos;
-
-	Assert(st);
-
-	st_pos = (TuplesortPos_mk *) palloc(sizeof(TuplesortPos_mk));
-	memcpy(st_pos, &(st->pos), sizeof(TuplesortPos_mk));
-
-	if (st->result_tape)
-	{
-		st_pos->cur_work_tape = LogicalTapeSetDuplicateTape(st->tapeset, st->result_tape);
-	}
-	else
-	{
-		/*
-		 * sort did not finish completely due to QueryFinishPending so pretend
-		 * that there are no tuples
-		 */
-		st_pos->eof_reached = true;
-	}
-	*pos = st_pos;
-}
-
-void
-create_mksort_context(
-					  MKContext *mkctxt,
+create_mksort_context(MKContext *mkctxt,
 					  int nkeys, AttrNumber *attNums,
-					  Oid *sortOperators, bool *nullsFirstFlags,
+					  Oid *sortOperators, Oid *sortCollations, bool *nullsFirstFlags,
 					  ScanKey sk,
 				MKFetchDatumForPrepare fetchForPrep, MKFreeTuple freeTupleFn,
 					  TupleDesc tupdesc, bool tbyv, int tlen)
@@ -686,6 +660,7 @@ create_mksort_context(
 	{
 		Oid			sortFunction;
 		bool		reverse;
+		int			flags;
 		MKLvContext *sinfo = mkctxt->lvctxt + i;
 
 		if (sortOperators)
@@ -698,21 +673,25 @@ create_mksort_context(
 				elog(ERROR, "operator %u is not a valid ordering operator",
 					 sortOperators[i]);
 
+			/* We use btree's conventions for encoding directionality */
+			flags = 0;
+			if (reverse)
+				flags |= SK_BT_DESC;
+			if (nullsFirstFlags[i])
+				flags |= SK_BT_NULLS_FIRST;
+
 			/*
 			 * We needn't fill in sk_strategy or sk_subtype since these
 			 * scankeys will never be passed to an index.
 			 */
-			ScanKeyInit(&sinfo->scanKey,
-						attNums ? attNums[i] : i + 1,
-						InvalidStrategy,
-						sortFunction,
-						(Datum) 0);
-
-			/* However, we use btree's conventions for encoding directionality */
-			if (reverse)
-				sinfo->scanKey.sk_flags |= SK_BT_DESC;
-			if (nullsFirstFlags[i])
-				sinfo->scanKey.sk_flags |= SK_BT_NULLS_FIRST;
+			ScanKeyEntryInitialize(&sinfo->scanKey,
+								   flags,
+								   attNums ? attNums[i] : i + 1,
+								   InvalidStrategy,
+								   InvalidOid,
+								   sortCollations[i],
+								   sortFunction,
+								   (Datum) 0);
 		}
 		else
 		{
@@ -732,7 +711,12 @@ create_mksort_context(
 
 			if (sinfo->scanKey.sk_func.fn_addr == btint4cmp)
 				sinfo->lvtype = MKLV_TYPE_INT32;
-			if (!lc_collate_is_c())
+
+			/* GPDB_91_MERGE_FIXME: these MKLV_TYPE_CHAR and MKLV_TYPE_TEXT
+			 * fastpaths only work with the default collation of the database.
+			 */
+			if (!lc_collate_is_c(sinfo->scanKey.sk_collation) &&
+				sinfo->scanKey.sk_collation == DEFAULT_COLLATION_OID)
 			{
 				if (sinfo->scanKey.sk_func.fn_addr == bpcharcmp)
 					sinfo->lvtype = MKLV_TYPE_CHAR;
@@ -753,7 +737,7 @@ Tuplesortstate_mk *
 tuplesort_begin_heap_mk(ScanState *ss,
 						TupleDesc tupDesc,
 						int nkeys, AttrNumber *attNums,
-						Oid *sortOperators, bool *nullsFirstFlags,
+						Oid *sortOperators, Oid *sortCollations, bool *nullsFirstFlags,
 						int workMem, bool randomAccess)
 {
 	Tuplesortstate_mk *state = tuplesort_begin_common(ss, workMem, randomAccess, true);
@@ -763,8 +747,7 @@ tuplesort_begin_heap_mk(ScanState *ss,
 
 	AssertArg(nkeys > 0);
 
-	if (trace_sort)
-		PG_TRACE3(tuplesort__begin, nkeys, workMem, randomAccess);
+	TRACE_POSTGRESQL_TUPLESORT_BEGIN(nkeys, workMem, randomAccess);
 
 	state->nKeys = nkeys;
 	state->copytup = copytup_heap;
@@ -778,7 +761,9 @@ tuplesort_begin_heap_mk(ScanState *ss,
 	create_mksort_context(
 						  &state->mkctxt,
 						  nkeys, attNums,
-						  sortOperators, nullsFirstFlags,
+						  sortOperators,
+						  sortCollations,
+						  nullsFirstFlags,
 						  NULL,
 						  tupsort_fetch_datum_mtup,
 						  freetup_heap,
@@ -790,98 +775,16 @@ tuplesort_begin_heap_mk(ScanState *ss,
 }
 
 Tuplesortstate_mk *
-tuplesort_begin_heap_file_readerwriter_mk(ScanState *ss,
-									const char *rwfile_prefix, bool isWriter,
-										  TupleDesc tupDesc,
-										  int nkeys, AttrNumber *attNums,
-								   Oid *sortOperators, bool *nullsFirstFlags,
-										  int workMem, bool randomAccess)
+tuplesort_begin_cluster_mk(TupleDesc tupDesc,
+						   Relation indexRel,
+						   int workMem, bool randomAccess)
 {
-	Tuplesortstate_mk *state;
-	char		statedump[MAXPGPATH];
-	char		full_prefix[MAXPGPATH];
-
-	Assert(randomAccess);
-
-	int			len = snprintf(statedump, sizeof(statedump), "%s/%s_sortstate",
-							   PG_TEMP_FILES_DIR,
-							   rwfile_prefix);
-
-	insist_log(len <= MAXPGPATH - 1, "could not generate temporary file name");
-
-	len = snprintf(full_prefix, sizeof(full_prefix), "%s/%s",
-				   PG_TEMP_FILES_DIR,
-				   rwfile_prefix);
-	insist_log(len <= MAXPGPATH - 1, "could not generate temporary file name");
-
-
-	if (isWriter)
-	{
-		/*
-		 * Writer is a ordinary tuplesort, except the underlying buf file are
-		 * named by rwfile_prefix.
-		 */
-		state = tuplesort_begin_heap_mk(ss, tupDesc, nkeys, attNums,
-										sortOperators, nullsFirstFlags,
-										workMem, randomAccess);
-
-		state->tapeset_file_prefix = MemoryContextStrdup(state->sortcontext, full_prefix);
-
-		state->tapeset_state_file = ExecWorkFile_Create(statedump,
-														BUFFILE,
-													  true /* delOnClose */ ,
-													  0 /* compressType */ );
-		Assert(state->tapeset_state_file != NULL);
-
-		return state;
-	}
-	else
-	{
-		/*
-		 * For reader, we really don't know anything about sort op, attNums,
-		 * etc. All the readers cares are the data on the logical tape set.
-		 * The state of the logical tape set has been dumped, so we load it
-		 * back and that is it.
-		 */
-		MemoryContext oldctxt;
-
-		state = tuplesort_begin_common(ss, workMem, randomAccess, false);
-		state->status = TSS_SORTEDONTAPE;
-		state->randomAccess = true;
-
-		state->readtup = readtup_heap;
-
-		oldctxt = MemoryContextSwitchTo(state->sortcontext);
-
-		state->tapeset_file_prefix = MemoryContextStrdup(state->sortcontext, full_prefix);
-
-		state->tapeset_state_file = ExecWorkFile_Open(statedump,
-													  BUFFILE,
-													  false /* delOnClose */ ,
-													  0 /* compressType */ );
-		ExecWorkFile *tapefile = ExecWorkFile_Open(full_prefix,
-												   BUFFILE,
-												   false /* delOnClose */ ,
-												   0 /* compressType */ );
-
-		state->tapeset = LoadLogicalTapeSetState(state->tapeset_state_file, tapefile);
-		state->currentRun = 0;
-		state->result_tape = LogicalTapeSetGetTape(state->tapeset, 0);
-
-		state->pos.eof_reached = false;
-		state->pos.markpos.tapepos.blkNum = 0;
-		state->pos.markpos.tapepos.offset = 0;
-		state->pos.markpos.mempos = 0;
-		state->pos.markpos_eof = false;
-		state->pos.cur_work_tape = NULL;
-
-		MemoryContextSwitchTo(oldctxt);
-		return state;
-	}
+	elog(ERROR, "GPDB_91_MERGE_FIXME: tuplesort_begin_cluster_mk() not implemented yet");
 }
 
 Tuplesortstate_mk *
-tuplesort_begin_index_mk(Relation indexRel,
+tuplesort_begin_index_mk(Relation heapRel,
+						 Relation indexRel,
 						 bool enforceUnique,
 						 int workMem, bool randomAccess)
 {
@@ -891,8 +794,7 @@ tuplesort_begin_index_mk(Relation indexRel,
 
 	oldcontext = MemoryContextSwitchTo(state->sortcontext);
 
-	if (trace_sort)
-		PG_TRACE3(tuplesort__begin, enforceUnique, workMem, randomAccess);
+	TRACE_POSTGRESQL_TUPLESORT_BEGIN(enforceUnique, workMem, randomAccess);
 
 	state->nKeys = RelationGetNumberOfAttributes(indexRel);
 	tupdesc = RelationGetDescr(indexRel);
@@ -901,13 +803,14 @@ tuplesort_begin_index_mk(Relation indexRel,
 	state->writetup = writetup_index;
 	state->readtup = readtup_index;
 
+	state->heapRel = heapRel;
 	state->indexRel = indexRel;
 	state->cmpScanKey = _bt_mkscankey_nodata(indexRel);
 
 	create_mksort_context(
 						  &state->mkctxt,
 						  state->nKeys, NULL,
-						  NULL, NULL,
+						  NULL, NULL, NULL,
 						  state->cmpScanKey,
 						  tupsort_fetch_datum_itup,
 						  freetup_index,
@@ -915,6 +818,7 @@ tuplesort_begin_index_mk(Relation indexRel,
 
 	state->mkctxt.enforceUnique = enforceUnique;
 	state->mkctxt.indexname = RelationGetRelationName(indexRel);
+	state->mkctxt.heapRel = heapRel;
 	state->mkctxt.indexRel = indexRel;
 	MemoryContextSwitchTo(oldcontext);
 
@@ -924,7 +828,7 @@ tuplesort_begin_index_mk(Relation indexRel,
 Tuplesortstate_mk *
 tuplesort_begin_datum_mk(ScanState *ss,
 						 Oid datumType,
-						 Oid sortOperator, bool nullsFirstFlag,
+						 Oid sortOperator, Oid sortCollation, bool nullsFirstFlag,
 						 int workMem, bool randomAccess)
 {
 	Tuplesortstate_mk *state = tuplesort_begin_common(ss, workMem, randomAccess, true);
@@ -934,8 +838,7 @@ tuplesort_begin_datum_mk(ScanState *ss,
 
 	oldcontext = MemoryContextSwitchTo(state->sortcontext);
 
-	if (trace_sort)
-		PG_TRACE3(tuplesort__begin, datumType, workMem, randomAccess);
+	TRACE_POSTGRESQL_TUPLESORT_BEGIN(datumType, workMem, randomAccess);
 
 	state->nKeys = 1;			/* always a one-column sort */
 
@@ -952,10 +855,11 @@ tuplesort_begin_datum_mk(ScanState *ss,
 
 	state->sortOperator = sortOperator;
 	state->cmpScanKey = NULL;
+	state->nullfirst = nullsFirstFlag;
 	create_mksort_context(
 						  &state->mkctxt,
 						  1, NULL,
-						  &sortOperator, &nullsFirstFlag,
+						  &sortOperator, &sortCollation, &nullsFirstFlag,
 						  NULL,
 						  NULL, /* tupsort_prepare_datum, */
 						  typbyval ? freetup_noop : freetup_datum,
@@ -1035,7 +939,7 @@ tuplesort_end_mk(Tuplesortstate_mk *state)
 
 		if (state->tapeset_state_file)
 		{
-			workfile_mgr_close_file(state->work_set, state->tapeset_state_file);
+			BufFileClose(state->tapeset_state_file);
 		}
 	}
 
@@ -1045,8 +949,7 @@ tuplesort_end_mk(Tuplesortstate_mk *state)
 	}
 
 
-	if (trace_sort)
-		PG_TRACE2(tuplesort__end, state->tapeset ? 1 : 0, spaceUsed);
+	TRACE_POSTGRESQL_TUPLESORT_END(state->tapeset ? 1 : 0, spaceUsed);
 
 	/*
 	 * Free the per-sort memory context, thereby releasing all working memory,
@@ -1063,12 +966,9 @@ tuplesort_end_mk(Tuplesortstate_mk *state)
 void
 tuplesort_finalize_stats_mk(Tuplesortstate_mk *state)
 {
-	if (state->instrument && !state->statsFinalized)
+	if (state->instrument && state->instrument->need_cdb && !state->statsFinalized)
 	{
 		Size		maxSpaceUsedOnSort = MemoryContextGetPeakSpace(state->sortcontext);
-
-		/* Report executor memory used by our memory context. */
-		state->instrument->execmemused += (double) maxSpaceUsedOnSort;
 
 		if (state->instrument->workmemused < maxSpaceUsedOnSort)
 		{
@@ -1147,20 +1047,46 @@ tuplesort_puttupleslot_mk(Tuplesortstate_mk *state, TupleTableSlot *slot)
 }
 
 /*
- * Accept one index tuple while collecting input data for sort.
+ * Accept one tuple while collecting input data for sort.
  *
- * Note that the input tuple is always copied; the caller need not save it.
+ * Note that the input data is always copied; the caller need not save it.
  */
 void
-tuplesort_putindextuple_mk(Tuplesortstate_mk *state, IndexTuple tuple)
+tuplesort_putheaptuple_mk(Tuplesortstate_mk *state, HeapTuple tup)
 {
 	MemoryContext oldcontext = MemoryContextSwitchTo(state->sortcontext);
 	MKEntry		e;
 
 	mke_blank(&e);
 
+	COPYTUP(state, &e, (void *) tup);
+	puttuple_common(state, &e);
+
+	MemoryContextSwitchTo(oldcontext);
+}
+
+/*
+ * Accept one index tuple while collecting input data for sort.
+ *
+ * Note that the input tuple is always copied; the caller need not save it.
+ */
+void
+tuplesort_putindextuplevalues_mk(Tuplesortstate_mk *state, Relation rel,
+								 ItemPointer self, Datum *values, bool *isnull)
+{
+	MemoryContext oldcontext = MemoryContextSwitchTo(state->sortcontext);
+	MKEntry		e;
+	IndexTuple tuple;
+
+	mke_blank(&e);
+
+	tuple = index_form_tuple(RelationGetDescr(rel), values, isnull);
+	tuple->t_tid = *self;
+
 	COPYTUP(state, &e, (void *) tuple);
 	puttuple_common(state, &e);
+	
+	pfree(tuple);
 
 	MemoryContextSwitchTo(oldcontext);
 }
@@ -1194,7 +1120,11 @@ tuplesort_putdatum_mk(Tuplesortstate_mk *state, Datum val, bool isNull)
 	{
 		mke_set_not_null(&e);
 		e.d = datumCopy(val, false, state->datumTypeLen);
-		state->totalTupleBytes += state->datumTypeLen;
+
+		if (state->datumTypeLen > 0)
+			state->totalTupleBytes += state->datumTypeLen;
+		else
+			state->totalTupleBytes += datumGetSize(val, state->datumTypeByVal, state->datumTypeLen);
 	}
 
 	puttuple_common(state, &e);
@@ -1229,14 +1159,18 @@ grow_unsorted_array(Tuplesortstate_mk *state)
 	if ((availMem / (sizeof(MKEntry) + avgTupSize + avgExtraForPrep)) == 0)
 		return false;
 
-	int			maxNumEntries = state->entry_allocsize + (availMem / (sizeof(MKEntry) + avgTupSize + avgExtraForPrep));
-	int			newNumEntries = Min(maxNumEntries, state->entry_allocsize * 2);
+	uint64		maxNumEntries = state->entry_allocsize + (availMem / (sizeof(MKEntry) + avgTupSize + avgExtraForPrep));
+	uint64		newNumEntries = Min(maxNumEntries, state->entry_allocsize * 2);
 
-	state->entries = (MKEntry *) repalloc(state->entries, newNumEntries * sizeof(MKEntry));
-	for (int entryNo = state->entry_allocsize; entryNo < newNumEntries; entryNo++)
+	uint64 allocsize = newNumEntries * sizeof(MKEntry);
+	if (!AllocSizeIsValid(allocsize))
+		return false;
+
+	state->entries = (MKEntry *) repalloc(state->entries, allocsize);
+	for (uint64 entryNo = state->entry_allocsize; entryNo < newNumEntries; entryNo++)
 		mke_blank(state->entries + entryNo);
 
-	state->entry_allocsize = newNumEntries;
+	state->entry_allocsize = (long) newNumEntries;
 
 	return true;
 }
@@ -1250,9 +1184,6 @@ puttuple_common(Tuplesortstate_mk *state, MKEntry *e)
 {
 	Assert(is_under_sort_or_exec_ctxt(state));
 	state->totalNumTuples++;
-
-	if (state->gpmon_pkt)
-		Gpmon_Incr_Rows_In(state->gpmon_pkt);
 
 	bool		growSucceed = true;
 
@@ -1337,8 +1268,7 @@ tuplesort_performsort_mk(Tuplesortstate_mk *state)
 {
 	MemoryContext oldcontext = MemoryContextSwitchTo(state->sortcontext);
 
-	if (trace_sort)
-		PG_TRACE(tuplesort__perform__sort);
+	TRACE_POSTGRESQL_TUPLESORT_PERFORM_SORT();
 
 	switch (state->status)
 	{
@@ -1424,7 +1354,7 @@ tuplesort_flush_mk(Tuplesortstate_mk *state)
 	Assert(state->pos.cur_work_tape == NULL);
 	elog(gp_workfile_caching_loglevel, "tuplesort_mk: writing logical tape state to file");
 	LogicalTapeFlush(state->tapeset, state->result_tape, state->tapeset_state_file);
-	ExecWorkFile_Flush(state->tapeset_state_file);
+	BufFileFlush(state->tapeset_state_file);
 }
 
 /*
@@ -1625,16 +1555,10 @@ tuplesort_gettuple_common_pos(Tuplesortstate_mk *state, TuplesortPos_mk *pos,
  */
 bool
 tuplesort_gettupleslot_mk(Tuplesortstate_mk *state, bool forward,
-						  TupleTableSlot *slot)
+						  TupleTableSlot *slot, Datum *abbrev)
 {
-	return tuplesort_gettupleslot_pos_mk(state, &state->pos, forward, slot, state->sortcontext);
-}
-
-bool
-tuplesort_gettupleslot_pos_mk(Tuplesortstate_mk *state, TuplesortPos_mk *pos,
-				  bool forward, TupleTableSlot *slot, MemoryContext mcontext)
-{
-	MemoryContext oldcontext = MemoryContextSwitchTo(mcontext);
+	TuplesortPos_mk *pos = &state->pos;
+	MemoryContext oldcontext = MemoryContextSwitchTo(state->sortcontext);
 	MKEntry		e;
 
 	bool		should_free = false;
@@ -1659,14 +1583,23 @@ tuplesort_gettupleslot_pos_mk(Tuplesortstate_mk *state, TuplesortPos_mk *pos,
 
 #endif
 
-		if (state->gpmon_pkt)
-			Gpmon_Incr_Rows_Out(state->gpmon_pkt);
-
 		return true;
 	}
 
 	ExecClearTuple(slot);
 	return false;
+}
+
+/*
+ * Fetch the next tuple in either forward or back direction.
+ * Returns NULL if no more tuples.	If *should_free is set, the
+ * caller must pfree the returned tuple when done with it.
+ */
+HeapTuple
+tuplesort_getheaptuple_mk(Tuplesortstate_mk *state, bool forward, bool *should_free)
+{
+	// Need to extract a HeapTuple from here somehow...
+	elog(ERROR, "GPDB_91_MERGE_FIXME: tuplesort_getheaptuple_mk not implemented yet");
 }
 
 /*
@@ -1698,7 +1631,7 @@ tuplesort_getindextuple_mk(Tuplesortstate_mk *state, bool forward,
  */
 bool
 tuplesort_getdatum_mk(Tuplesortstate_mk *state, bool forward,
-					  Datum *val, bool *isNull)
+					  Datum *val, bool *isNull, Datum *abbrev)
 {
 	MemoryContext oldcontext = MemoryContextSwitchTo(state->sortcontext);
 	MKEntry		e;
@@ -1718,6 +1651,65 @@ tuplesort_getdatum_mk(Tuplesortstate_mk *state, bool forward,
 	MemoryContextSwitchTo(oldcontext);
 	return fOK;
 }
+
+/*
+ * Advance over N tuples in either forward or back direction,
+ * without returning any data.  N==0 is a no-op.
+ * Returns TRUE if successful, FALSE if ran out of tuples.
+ */
+bool
+tuplesort_skiptuples_mk(Tuplesortstate_mk *state, int64 ntuples, bool forward)
+{
+	MemoryContext	oldcontext;
+	bool			fOK;
+
+	/*
+	 * We don't actually support backwards skip yet, because no callers need
+	 * it.	The API is designed to allow for that later, though.
+	 */
+	Assert(forward);
+	Assert(ntuples >= 0);
+
+	/*
+	 * Optimize skip strategy only for in memory non unique store. But for unique store, we
+	 * use normal one by one logic because we need to check the emptiness of entries.
+	 */
+	if (state->status == TSS_SORTEDINMEM && !state->mkctxt.unique)
+	{
+		TuplesortPos_mk	*pos = &state->pos;
+		if (pos->current + ntuples <= state->entry_count)
+		{
+			pos->current += ntuples;
+			return true;
+		}
+		pos->eof_reached = true;
+		return false;
+	}
+	else
+	{
+		oldcontext = MemoryContextSwitchTo(state->sortcontext);
+		fOK = true;
+		while (ntuples-- > 0)
+		{
+			MKEntry		e;
+			bool		should_free;
+
+			if (!tuplesort_gettuple_common_pos(state, &state->pos, forward,
+											   &e, &should_free))
+			{
+				fOK = false;
+				break;
+			}
+			if (should_free && e.ptr)
+				pfree(e.ptr);
+			CHECK_FOR_INTERRUPTS();
+		}
+
+		MemoryContextSwitchTo(oldcontext);
+		return fOK;
+	}
+}
+
 
 /*
  * inittapes - initialize for tape sorting.
@@ -1760,8 +1752,7 @@ inittapes_mk(Tuplesortstate_mk *state, const char *rwfile_prefix)
 	state->maxTapes = maxTapes;
 	state->tapeRange = maxTapes - 1;
 
-	if (trace_sort)
-		PG_TRACE1(tuplesort__switch__external, maxTapes);
+	TRACE_POSTGRESQL_TUPLESORT_SWITCH_EXTERNAL(maxTapes);
 
 	/*
 	 * Decrease availMem to reflect the space needed for tape buffers; but
@@ -1773,30 +1764,26 @@ inittapes_mk(Tuplesortstate_mk *state, const char *rwfile_prefix)
 	 * inaccurate.)
 	 */
 	tapeSpace = maxTapes * TAPE_BUFFER_OVERHEAD;
-	Assert(state->work_set == NULL);
 
 	/*
 	 * Create the tape set and allocate the per-tape data arrays.
 	 */
 	if (!rwfile_prefix)
 	{
-		state->work_set = workfile_mgr_create_set(BUFFILE, false /* can_be_reused */ , NULL /* ps */ );
-		state->tapeset_state_file = workfile_mgr_create_fileno(state->work_set, WORKFILE_NUM_MKSORT_METADATA);
-
-		ExecWorkFile *tape_file = workfile_mgr_create_fileno(state->work_set, WORKFILE_NUM_MKSORT_TAPESET);
-
-		state->tapeset = LogicalTapeSetCreate_File(tape_file, maxTapes);
+		Assert(state->work_set == NULL);
+		state->tapeset = LogicalTapeSetCreate(maxTapes);
 	}
 	else
 	{
 		/*
 		 * We are shared XSLICE, use given prefix to create files so that
-		 * consumers can find them
+		 * consumers can find them. (The work set and the "state" were created
+		 * earlier alerady.)
 		 */
-		ExecWorkFile *tape_file = ExecWorkFile_Create(rwfile_prefix,
-													  BUFFILE,
-													  true /* delOnClose */ ,
-													  0 /* compressType */ );
+		Assert(state->work_set != NULL);
+		BufFile *tape_file = BufFileCreateNamedTemp(rwfile_prefix,
+													false /* interXact */,
+													state->work_set /* work_set */);
 
 		state->tapeset = LogicalTapeSetCreate_File(tape_file, maxTapes);
 	}
@@ -1932,7 +1919,7 @@ mergeruns(Tuplesortstate_mk *state)
 	 */
 	HOLD_INTERRUPTS();
 	FaultInjector_InjectFaultIfSet(
-								   ExecSortMKSortMergeRuns,
+								   "execsort_mksort_mergeruns",
 								   DDLNotSpecified,
 								   "", //databaseName
 								   "");
@@ -2122,8 +2109,7 @@ mergeonerun_mk(Tuplesortstate_mk *state)
 	markrunend(state, destTape);
 	state->tp_runs[state->tapeRange]++;
 
-	if (trace_sort)
-		PG_TRACE1(tuplesort__mergeonerun, state->activeTapes);
+	TRACE_POSTGRESQL_TUPLESORT_MERGEONERUN(state->activeTapes);
 }
 
 static bool
@@ -2428,8 +2414,7 @@ dumptuples_mk(Tuplesortstate_mk *state, bool alltuples)
 			state->tp_runs[state->destTape]++;
 			state->tp_dummy[state->destTape]--; /* per Alg D step D2 */
 
-			if (trace_sort)
-				PG_TRACE3(tuplesort__dumptuples, state->entry_count, state->currentRun, state->destTape);
+			TRACE_POSTGRESQL_TUPLESORT_DUMPTUPLES(state->entry_count, state->currentRun, state->destTape);
 
 			/*
 			 * Done if heap is empty, else prepare for new run.
@@ -2441,17 +2426,17 @@ dumptuples_mk(Tuplesortstate_mk *state, bool alltuples)
 			selectnewtape_mk(state);
 		}
 	}
-
-	if (state->gpmon_pkt)
-		tuplesort_checksend_gpmonpkt(state->gpmon_pkt, state->gpmon_sort_tick);
 }
 
+
 /*
- * Put pos at the begining of the tuplesort.  Create pos->work_tape if necessary
+ * tuplesort_rescan		- rewind and replay the scan
  */
+
 void
-tuplesort_rescan_pos_mk(Tuplesortstate_mk *state, TuplesortPos_mk *pos)
+tuplesort_rescan_mk(Tuplesortstate_mk *state)
 {
+	TuplesortPos_mk *pos = &state->pos;
 	MemoryContext oldcontext = MemoryContextSwitchTo(state->sortcontext);
 
 	Assert(state->randomAccess);
@@ -2503,21 +2488,12 @@ tuplesort_rescan_pos_mk(Tuplesortstate_mk *state, TuplesortPos_mk *pos)
 }
 
 /*
- * tuplesort_rescan		- rewind and replay the scan
- */
-
-void
-tuplesort_rescan_mk(Tuplesortstate_mk *state)
-{
-	tuplesort_rescan_pos_mk(state, &state->pos);
-}
-
-/*
  * tuplesort_markpos	- saves current position in the merged sort file
  */
 void
-tuplesort_markpos_pos_mk(Tuplesortstate_mk *state, TuplesortPos_mk *pos)
+tuplesort_markpos_mk(Tuplesortstate_mk *state)
 {
+	TuplesortPos_mk *pos = &state->pos;
 	LogicalTape *work_tape = NULL;
 	MemoryContext oldcontext = MemoryContextSwitchTo(state->sortcontext);
 
@@ -2543,19 +2519,14 @@ tuplesort_markpos_pos_mk(Tuplesortstate_mk *state, TuplesortPos_mk *pos)
 	MemoryContextSwitchTo(oldcontext);
 }
 
-void
-tuplesort_markpos_mk(Tuplesortstate_mk *state)
-{
-	tuplesort_markpos_pos_mk(state, &state->pos);
-}
-
 /*
  * tuplesort_restorepos - restores current position in merged sort file to
  *						  last saved position
  */
 void
-tuplesort_restorepos_pos_mk(Tuplesortstate_mk *state, TuplesortPos_mk *pos)
+tuplesort_restorepos_mk(Tuplesortstate_mk *state)
 {
+	TuplesortPos_mk *pos = &state->pos;
 	MemoryContext oldcontext = MemoryContextSwitchTo(state->sortcontext);
 
 	Assert(state->randomAccess);
@@ -2583,12 +2554,6 @@ tuplesort_restorepos_pos_mk(Tuplesortstate_mk *state, TuplesortPos_mk *pos)
 	}
 
 	MemoryContextSwitchTo(oldcontext);
-}
-
-void
-tuplesort_restorepos_mk(Tuplesortstate_mk *state)
-{
-	tuplesort_restorepos_pos_mk(state, &state->pos);
 }
 
 
@@ -2679,15 +2644,15 @@ markrunend(Tuplesortstate_mk *state, int tapenum)
 
 
 /*
- * Inline-able copy of FunctionCall2() to save some cycles in sorting.
+ * Inline-able copy of FunctionCall2Coll() to save some cycles in sorting.
  */
 static inline Datum
-myFunctionCall2(FmgrInfo *flinfo, Datum arg1, Datum arg2)
+myFunctionCall2Coll(FmgrInfo *flinfo, Oid collation, Datum arg1, Datum arg2)
 {
 	FunctionCallInfoData fcinfo;
 	Datum		result;
 
-	InitFunctionCallInfoData(fcinfo, flinfo, 2, NULL, NULL);
+	InitFunctionCallInfoData(fcinfo, flinfo, 2, collation, NULL, NULL);
 
 	fcinfo.arg[0] = arg1;
 	fcinfo.arg[1] = arg2;
@@ -2710,7 +2675,7 @@ myFunctionCall2(FmgrInfo *flinfo, Datum arg1, Datum arg2)
  * NULLS_FIRST options are encoded in sk_flags the same way btree does it.
  */
 static inline int32
-inlineApplySortFunction(FmgrInfo *sortFunction, int sk_flags,
+inlineApplySortFunction(FmgrInfo *sortFunction, int sk_flags, Oid collation,
 						Datum datum1, bool isNull1,
 						Datum datum2, bool isNull2)
 {
@@ -2734,8 +2699,8 @@ inlineApplySortFunction(FmgrInfo *sortFunction, int sk_flags,
 	}
 	else
 	{
-		compare = DatumGetInt32(myFunctionCall2(sortFunction,
-												datum1, datum2));
+		compare = DatumGetInt32(myFunctionCall2Coll(sortFunction, collation,
+													datum1, datum2));
 
 		if (sk_flags & SK_BT_DESC)
 			compare = -compare;
@@ -2754,11 +2719,9 @@ copytup_heap(Tuplesortstate_mk *state, MKEntry *e, void *tup)
 	TupleTableSlot *slot = (TupleTableSlot *) tup;
 
 	slot_getallattrs(slot);
-	e->ptr = (void *) memtuple_form_to(state->mt_bind,
-									   slot_get_values(slot),
-									   slot_get_isnull(slot),
-									   NULL, NULL, false
-		);
+	e->ptr = (void *) memtuple_form(state->mt_bind,
+									slot_get_values(slot),
+									slot_get_isnull(slot));
 
 	state->totalTupleBytes += memtuple_get_size((MemTuple) e->ptr);
 
@@ -3049,7 +3012,9 @@ tupsort_compare_datum(MKEntry *v1, MKEntry *v2, MKLvContext *lvctxt, MKContext *
 	switch (lvctxt->lvtype)
 	{
 		case MKLV_TYPE_NONE:
-			return inlineApplySortFunction(&lvctxt->scanKey.sk_func, lvctxt->scanKey.sk_flags,
+			return inlineApplySortFunction(&lvctxt->scanKey.sk_func,
+										   lvctxt->scanKey.sk_flags,
+										   lvctxt->scanKey.sk_collation,
 										   v1->d, false,
 										   v2->d, false
 				);
@@ -3134,7 +3099,7 @@ tupsort_compare_char(MKEntry *v1, MKEntry *v2, MKLvContext *lvctxt, MKContext *m
 	Assert(!mke_is_null(v1));
 	Assert(!mke_is_null(v2));
 
-	Assert(!lc_collate_is_c());
+	Assert(!lc_collate_is_c(lvctxt->scanKey.sk_collation));
 	Assert(mkContext->fetchForPrep);
 
 	Assert(p1->ref > 0 && p2->ref > 0);
@@ -3171,8 +3136,11 @@ tupsort_compare_char(MKEntry *v1, MKEntry *v2, MKLvContext *lvctxt, MKContext *m
 										 * null */
 				Assert(!p2IsNull);
 
-				result = inlineApplySortFunction(&lvctxt->scanKey.sk_func, lvctxt->scanKey.sk_flags,
-									   p1Original, false, p2Original, false);
+				result = inlineApplySortFunction(&lvctxt->scanKey.sk_func,
+												 lvctxt->scanKey.sk_flags,
+												 lvctxt->scanKey.sk_collation,
+												 p1Original, false,
+												 p2Original, false);
 			}
 			else
 			{
@@ -3373,8 +3341,6 @@ tupsort_prepare_char(MKEntry *a, bool isCHAR)
 	refcnt_locale_str_k kstr;
 	int			avail = sizeof(kstr.data);
 	bool		storePrefixOnly;
-
-	Assert(!lc_collate_is_c());
 
 	if (mke_is_null(a))
 		return;
@@ -3674,13 +3640,6 @@ tuplesort_limit_sort(Tuplesortstate_mk *state)
 
 	mkheap_destroy(state->mkheap);
 	state->mkheap = NULL;
-}
-
-void
-tuplesort_set_gpmon_mk(Tuplesortstate_mk *state, gpmon_packet_t *gpmon_pkt, int *gpmon_tick)
-{
-	state->gpmon_pkt = gpmon_pkt;
-	state->gpmon_sort_tick = gpmon_tick;
 }
 
 /* EOF */

@@ -5472,14 +5472,12 @@ end $$ language plpgsql volatile;
 --ctas with sirv in select list
 create table sirv_test1_result1 as select sirv_test1() as res distributed by (res);
 
---workaround
+--workaround, should return the same result
 create table sirv_test1_result2 as select (select sirv_test1()) as res distributed by (res);
 
---start_equiv
 select * from sirv_test1_result1;
 
 select * from sirv_test1_result2;
---end_equiv
 
 -- ----------------------------------------------------------------------
 -- Test: test2_ctas_from_clause.sql
@@ -5530,14 +5528,11 @@ $$
 
 create table sirv_test2_result1 as select * from sirv_test2(2,1000,1000) as res distributed by(res);
 
---workaround
+--workaround, should return the same result
 create table sirv_test2_result2 as select * from (select (select sirv_test2(2,1000,1000)) as res) as foo distributed by(res);
 
---start_equiv
 select * from sirv_test2_result1;
-
 select * from sirv_test2_result2;
---end_equiv
 
 -- ----------------------------------------------------------------------
 -- Test: test3_insert_select_list.sql
@@ -5591,14 +5586,11 @@ create table sirv_test3_result2(id int, country_index text) distributed by(id);
 --insert with sirv in the select list
 insert into sirv_test3_result1 select 1,sirv_test3(2,1000,1000);
 
---workaround
+--workaround, should return the same result
 insert into sirv_test3_result2 select 1,(select sirv_test3(2,1000,1000));
 
---start_equiv
 select * from sirv_test3_result1;
-
 select * from sirv_test3_result2;
---end_equiv
 
 -- ----------------------------------------------------------------------
 -- Test: test4_insert_from_clause.sql
@@ -5667,17 +5659,14 @@ insert into sirv_test4_result1 select * from sirv_test4(30000,0);
 insert into sirv_test4_result1 select * from sirv_test4(35000,1);
 
 
---workaround
+--workaround, should return the same result
 insert into sirv_test4_result2 select * from (select (select sirv_test4(20000,0))) AS FOO;
 insert into sirv_test4_result2 select * from (select (select sirv_test4(25000,1))) AS FOO;
 insert into sirv_test4_result2 select * from (select (select sirv_test4(30000,0))) AS FOO;
 insert into sirv_test4_result2 select * from (select (select sirv_test4(35000,1))) AS FOO;
 
---start_equiv
 select * from sirv_test4_result1 order by res;
-
 select * from sirv_test4_result2 order by res;
---end_equiv
 
 -- ----------------------------------------------------------------------
 -- Test: test5_ctas_multiple_sirv.sql
@@ -6786,9 +6775,8 @@ drop language if exists plpythonu cascade;
 drop table if exists sirv_test13_result1;
 drop table if exists sirv_test13_result2;
 
---end_ignore
-
 CREATE LANGUAGE plpythonu;
+--end_ignore
 
 CREATE or replace FUNCTION sirv_test13_fun1 ()
   RETURNS text
@@ -6874,9 +6862,8 @@ drop language if exists plpythonu cascade;
 
 drop table if exists sirv_test14_result1;
 
---end_ignore
-
 CREATE LANGUAGE plpythonu;
+--end_ignore
 
 CREATE or replace FUNCTION sirv_test14_fun1 ()
   RETURNS text
@@ -7274,6 +7261,37 @@ $$
 --ctas with a function returning record
 
 DROP TABLE countries_results;
+
+
+--
+-- SIRV that returns a composite type. Test referencing the individual
+-- fields in WHERE clause.
+--
+CREATE TYPE address AS (street text, name text);
+
+CREATE TABLE inserted_addresses OF address;
+
+CREATE TABLE testfunc_seen_streets (street text);
+
+CREATE OR REPLACE FUNCTION testfunc(street text) RETURNS address AS
+$$
+declare
+  r address;
+begin
+  INSERT INTO testfunc_seen_streets VALUES (street);
+
+  r.street = street;
+  r.name = NULL;
+  return r;
+end;
+$$ LANGUAGE plpgsql VOLATILE;
+
+INSERT INTO inserted_addresses SELECT street, name FROM testfunc('Wall Street') WHERE name IS NOT NULL;
+INSERT INTO inserted_addresses SELECT street, name FROM testfunc('Abbey Road') WHERE street IS NOT NULL;
+
+SELECT * FROM inserted_addresses;
+SELECT * FROM testfunc_seen_streets;
+
 -- ----------------------------------------------------------------------
 -- Test: teardown.sql
 -- ----------------------------------------------------------------------

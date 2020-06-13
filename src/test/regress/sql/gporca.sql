@@ -18,9 +18,13 @@ set optimizer_enable_master_only_queries = on;
 -- master only tables
 
 create schema orca;
+-- start_ignore
+GRANT ALL ON SCHEMA orca TO PUBLIC;
+SET search_path to orca, public;
+-- end_ignore
 
 create table orca.r();
-set allow_system_table_mods='DML';
+set allow_system_table_mods=true;
 delete from gp_distribution_policy where localoid='orca.r'::regclass;
 reset allow_system_table_mods;
 
@@ -30,7 +34,7 @@ alter table orca.r add column b int;
 insert into orca.r select i, i/3 from generate_series(1,20) i;
 
 create table orca.s();
-set allow_system_table_mods='DML';
+set allow_system_table_mods=true;
 delete from gp_distribution_policy where localoid='orca.s'::regclass;
 reset allow_system_table_mods;
 alter table orca.s add column c int;
@@ -100,7 +104,7 @@ SELECT x1 AS one FROM orca.foo having 1 < 2;
 select distinct 1, null;
 select distinct 1, null from orca.foo;
 select distinct 1, sum(x1) from orca.foo;
-select distinct x1, rank() over(order by x1) from (select x1 from orca.foo order by x1) x;
+select distinct x1, rank() over(order by x1) from (select x1 from orca.foo order by x1) x; --order none
 select distinct x1, sum(x3) from orca.foo group by x1,x2;
 select distinct s from (select sum(x2) s from orca.foo group by x1) x;
 select * from orca.foo a where a.x1 = (select distinct sum(b.x1)+avg(b.x1) sa from orca.bar1 b group by b.x3 order by sa limit 1);
@@ -122,6 +126,12 @@ with x as (select * from orca.foo) select count(*) from (select * from x) y wher
 select count(*)+1 from orca.foo x where x.x1 > (select count(*)+1 from orca.bar1 y where y.x1 = x.x2);
 select count(*)+1 from orca.foo x where x.x1 > (select count(*) from orca.bar1 y where y.x1 = x.x2);
 select count(*) from orca.foo x where x.x1 > (select count(*)+1 from orca.bar1 y where y.x1 = x.x2);
+
+-- result node with one time filter and filter
+explain select case when bar1.x2 = bar2.x2 then coalesce((select 1 from orca.foo where bar1.x2 = bar2.x2 and bar1.x2 = random() and foo.x2 = bar2.x2),0) else 1 end as col1, bar1.x1
+from orca.bar1 inner join orca.bar2 on (bar1.x2 = bar2.x2) order by bar1.x1; 
+select case when bar1.x2 = bar2.x2 then coalesce((select 1 from orca.foo where bar1.x2 = bar2.x2 and bar1.x2 = random() and foo.x2 = bar2.x2),0) else 1 end as col1, bar1.x1
+from orca.bar1 inner join orca.bar2 on (bar1.x2 = bar2.x2) order by bar1.x1; 
 
 drop table orca.r cascade;
 create table orca.r(a int, b int) distributed by (a);
@@ -271,7 +281,44 @@ select lead(a) over(order by a) from orca.r order by 1;
 select lag(c,d) over(order by c,d) from orca.s order by 1;
 select lead(c,c+d,1000) over(order by c,d) from orca.s order by 1;
 
--- cte 
+-- test normalization of window functions
+create table orca_w1(a int, b int);
+create table orca_w2(a int, b int);
+create table orca_w3(a int, b text);
+
+insert into orca_w1 select i, i from generate_series(1, 3) i;
+insert into orca_w2 select i, i from generate_series(2, 4) i;
+insert into orca_w3 select i, i from generate_series(3, 5) i;
+
+-- outer ref in subquery in target list and window func in target list
+select (select b from orca_w3 where a = orca_w1.a) as one, row_number() over(partition by orca_w1.a) as two from orca_w2, orca_w1;
+
+-- aggref in subquery with window func in target list
+select orca_w1.a, (select sum(orca_w2.a) from orca_w2 where orca_w1.b = orca_w2.b), count(*), rank() over (order by orca_w1.b) from orca_w1 group by orca_w1.a, orca_w1.b order by orca_w1.a;
+
+-- window function inside subquery inside target list with outer ref
+select orca_w1.a, (select rank() over (order by orca_w1.b) from orca_w2 where orca_w1.b = orca_w2.b), count(*) from orca_w1 group by orca_w1.a, orca_w1.b order by orca_w1.a;
+
+-- window function with empty partition clause inside subquery inside target list with outer ref
+select (select rank() over() from orca_w3 where a = orca_w1.a) as one, row_number() over(partition by orca_w1.a) as two from orca_w1, orca_w2;
+
+-- window function in IN clause
+select (select a from orca_w3 where a = orca_w1.a) as one from orca_w1 where orca_w1.a IN (select rank() over(partition by orca_w1.a) + 1 from orca_w1, orca_w2);
+
+-- window function in subquery inside target list with outer ref in partition clause
+select (select rank() over(partition by orca_w2.a) from orca_w3 where a = orca_w1.a) as one, row_number() over(partition by orca_w1.a) as two from orca_w1, orca_w2 order by orca_w1.a;
+
+-- window function in subquery inside target list with outer ref in order clause
+select (select rank() over(order by orca_w2.a) from orca_w3 where a = orca_w1.a) as one, row_number() over(partition by orca_w1.a) as two from orca_w1, orca_w2 order by orca_w1.a;
+
+-- window function with outer ref in arguments
+select (select sum(orca_w1.a + a) over(order by b) + 1 from orca_w2 where orca_w1.a = orca_w2.a) from orca_w1 order by orca_w1.a;
+
+-- window function with outer ref in window clause and arguments 
+select (select sum(orca_w1.a + a) over(order by b + orca_w1.a) + 1 from orca_w2 where orca_w1.a = orca_w2.a) from orca_w1 order by orca_w1.a;
+
+
+-- cte
 with x as (select a, b from orca.r)
 select rank() over(partition by a, case when b = 0 then a+b end order by b asc) as rank_within_parent from x order by a desc ,case when a+b = 0 then a end ,b;
 
@@ -341,24 +388,24 @@ insert into orca.onek values (670,6,0,2,0,10,0,70,70,170,670,0,1,'UZAAAA','GAAAA
 insert into orca.onek values (543,7,1,3,3,3,3,43,143,43,543,6,7,'XUAAAA','HAAAAA','VVVVxx');
 
 select ten, sum(distinct four) from orca.onek a
-group by ten 
+group by ten
 having exists (select 1 from orca.onek b where sum(distinct a.four) = b.four);
 
 -- indexes on partitioned tables
 create table orca.pp(a int) partition by range(a)(partition pp1 start(1) end(10));
 create index pp_a on orca.pp(a);
 
--- list partition tests 
+-- list partition tests
 
--- test homogeneous partitions 
+-- test homogeneous partitions
 drop table if exists orca.t;
 
 create table orca.t ( a int, b char(2), to_be_drop int, c int, d char(2), e int)
-distributed by (a) 
+distributed by (a)
 partition by list(d) (partition part1 values('a'), partition part2 values('b'));
 
-insert into orca.t 
-	select i, i::char(2), i, i, case when i%2 = 0 then 'a' else 'b' end, i 
+insert into orca.t
+	select i, i::char(2), i, i, case when i%2 = 0 then 'a' else 'b' end, i
 	from generate_series(1,100) i;
 
 select * from orca.t order by 1, 2, 3, 4, 5, 6 limit 4;
@@ -391,11 +438,11 @@ select * from orca.multilevel_p;
 drop table if exists orca.t;
 
 create table orca.t ( a int, b char(2), to_be_drop int, c int, d char(2), e int)
-distributed by (a) 
+distributed by (a)
 partition by list(d) (partition part1 values('a') with (appendonly=true, compresslevel=5, orientation=column), partition part2 values('b') with (appendonly=true, compresslevel=5, orientation=column));
 
-insert into orca.t 
-	select i, i::char(2), i, i, case when i%2 = 0 then 'a' else 'b' end, i 
+insert into orca.t
+	select i, i::char(2), i, i, case when i%2 = 0 then 'a' else 'b' end, i
 	from generate_series(1,100) i;
 
 select * from orca.t order by 1, 2, 3, 4, 5, 6 limit 4;
@@ -404,8 +451,8 @@ alter table orca.t drop column to_be_drop;
 
 select * from orca.t order by 1, 2, 3, 4, 5 limit 4;
 
-insert into orca.t 
-	select i, i::char(2), i, case when i%2 = 0 then 'a' else 'b' end, i 
+insert into orca.t
+	select i, i::char(2), i, case when i%2 = 0 then 'a' else 'b' end, i
 	from generate_series(1,100) i;
 
 select * from orca.t order by 1, 2, 3, 4, 5 limit 4;
@@ -414,8 +461,8 @@ select * from orca.t order by 1, 2, 3, 4, 5 limit 4;
 -- test heterogeneous partitions
 drop table if exists orca.t;
 
-create table orca.t ( timest character varying(6), user_id numeric(16,0) not null, to_be_drop char(5), tag1 char(5), tag2 char(5)) 
-distributed by (user_id) 
+create table orca.t ( timest character varying(6), user_id numeric(16,0) not null, to_be_drop char(5), tag1 char(5), tag2 char(5))
+distributed by (user_id)
 partition by list (timest) (partition part201203 values('201203') with (appendonly=true, compresslevel=5, orientation=column), partition part201204 values('201204') with (appendonly=true, compresslevel=5, orientation=row), partition part201205 values('201205'));
 
 insert into orca.t values('201203',0,'drop', 'tag1','tag2');
@@ -481,6 +528,9 @@ set optimizer_enable_space_pruning=off;
 set optimizer_enable_constant_expression_evaluation=on;
 set optimizer_enumerate_plans=on;
 set optimizer_plan_id = 2;
+-- start_ignore
+analyze orca.t_date;
+-- end_ignore
 explain select * from orca.t_date where user_id=9;
 select * from orca.t_date where user_id=9;
 
@@ -517,56 +567,14 @@ set optimizer_enable_space_pruning=off;
 set optimizer_enable_constant_expression_evaluation=on;
 set optimizer_enumerate_plans=on;
 set optimizer_plan_id = 2;
-
+-- start_ignore
+analyze orca.t_text;
+-- end_ignore
 explain select * from orca.t_text where user_id=9;
 select * from orca.t_text where user_id=9;
 
 reset optimizer_enable_space_pruning;
 set optimizer_enumerate_plans=off;
-set optimizer_enable_constant_expression_evaluation=off;
-
--- create a user defined type and only define equality on it
--- the type can be used in the partitioning list, but Orca is not able to pick a heterogenous index
--- because constraint derivation needs all comparison operators
-drop type if exists orca.employee cascade;
-create type orca.employee as (empid int, empname text);
-
-create function orca.emp_equal(orca.employee, orca.employee) returns boolean
-  as 'select $1.empid = $2.empid;'
-  language sql
-  immutable
-  returns null on null input;
-create operator pg_catalog.= (
-        leftarg = orca.employee,
-        rightarg = orca.employee,
-        procedure = orca.emp_equal
-);
-create operator class orca.employee_op_class default for type orca.employee
-  using btree as
-  operator 3 =;
-
-drop table if exists orca.t_employee;
-create table orca.t_employee(timest date, user_id numeric(16,0) not null, tag1 char(5), emp orca.employee)
-  distributed by (user_id)
-  partition by list(emp)
-  (partition part1 values('(1, ''foo'')'::orca.employee), partition part2 values('(2, ''foo'')'::orca.employee));
-create index user_id_idx1 on orca.t_employee_1_prt_part1(user_id);
-create index user_id_idx2 on orca.t_employee_1_prt_part2(user_id);
-
-insert into orca.t_employee values('01-03-2012'::date,0,'tag1','(1, ''foo'')'::orca.employee);
-insert into orca.t_employee values('01-03-2012'::date,1,'tag1','(1, ''foo'')'::orca.employee);
-insert into orca.t_employee values('01-04-2012'::date,2,'tag1','(2, ''foo'')'::orca.employee);
-insert into orca.t_employee values('01-05-2012'::date,1,'tag1','(1, ''foo'')'::orca.employee);
-insert into orca.t_employee values('01-06-2012'::date,2,'tag1','(2, ''foo'')'::orca.employee);
-insert into orca.t_employee values('01-07-2012'::date,1,'tag1','(1, ''foo'')'::orca.employee);
-insert into orca.t_employee values('01-08-2012'::date,2,'tag1','(2, ''foo'')'::orca.employee);
-
-set optimizer_enable_constant_expression_evaluation=on;
-set optimizer_enable_dynamictablescan = off;
-explain select * from orca.t_employee where user_id = 2;
-select * from orca.t_employee where user_id = 2;
-reset optimizer_enable_dynamictablescan;
-
 reset optimizer_enable_constant_expression_evaluation;
 reset optimizer_enable_partial_index;
 
@@ -574,13 +582,13 @@ reset optimizer_enable_partial_index;
 drop table if exists orca.t_ceeval_ints;
 
 create table orca.t_ceeval_ints(user_id numeric(16,0), category_id int, tag1 char(5), tag2 char(5))
-distributed by (user_id) 
+distributed by (user_id)
 partition by list (category_id)
 	(partition part100 values('100') , partition part101 values('101'), partition part103 values('102'));
 create index user_id_ceeval_ints on orca.t_ceeval_ints_1_prt_part101(user_id);
 
 insert into orca.t_ceeval_ints values(1, 100, 'tag1', 'tag2');
-insert into orca.t_ceeval_ints values(2, 100, 'tag1', 'tag2');	
+insert into orca.t_ceeval_ints values(2, 100, 'tag1', 'tag2');
 insert into orca.t_ceeval_ints values(3, 100, 'tag1', 'tag2');
 insert into orca.t_ceeval_ints values(4, 101, 'tag1', 'tag2');
 insert into orca.t_ceeval_ints values(5, 102, 'tag1', 'tag2');
@@ -591,7 +599,9 @@ set optimizer_enable_constant_expression_evaluation=on;
 set optimizer_use_external_constant_expression_evaluation_for_ints = on;
 set optimizer_enumerate_plans=on;
 set optimizer_plan_id = 2;
-
+-- start_ignore
+analyze orca.t_ceeval_ints;
+-- end_ignore
 explain select * from orca.t_ceeval_ints where user_id=4;
 select * from orca.t_ceeval_ints where user_id=4;
 
@@ -627,6 +637,7 @@ insert into orca.fooh1 select i%4, i%3, i from generate_series(1,20) i;
 insert into orca.fooh2 select i%3, i%2, i from generate_series(1,20) i;
 
 select sum(f1.b) from orca.fooh1 f1 group by f1.a;
+select f1.a + 1 from fooh1 f1 group by f1.a+1 having sum(f1.a+1) + 1 > 20;
 select 1 as one, f1.a from orca.fooh1 f1 group by f1.a having sum(f1.b) > 4;
 select f1.a, 1 as one from orca.fooh1 f1 group by f1.a having 10 > (select f2.a from orca.fooh2 f2 group by f2.a having sum(f1.a) > count(*) order by f2.a limit 1) order by f1.a;
 select 1 from orca.fooh1 f1 group by f1.a having 10 > (select f2.a from orca.fooh2 f2 group by f2.a having sum(f1.a) > count(*) order by f2.a limit 1) order by f1.a;
@@ -645,6 +656,78 @@ select f1.a, 1 as one from orca.fooh1 f1 group by f1.a having f1.a = (select f2.
 select sum(f1.a+1)+1 from orca.fooh1 f1 group by f1.a+1;
 select sum(f1.a+1)+sum(f1.a+1) from orca.fooh1 f1 group by f1.a+1;
 select sum(f1.a+1)+avg(f1.a+1), sum(f1.a), sum(f1.a+1) from orca.fooh1 f1 group by f1.a+1;
+
+--
+-- test algebrization of group by clause with subqueries
+--
+drop table if exists foo, bar, jazz;
+create table foo (a int, b int, c int);
+create table bar (d int, e int, f int);
+create table jazz (g int, h int, j int);
+
+insert into foo values (1, 1, 1), (2, 2, 2), (3, 3, 3);
+insert into bar values (1, 1, 1), (2, 2, 2), (3, 3, 3);
+insert into jazz values (2, 2, 2);
+
+-- subquery with outer reference with aggfunc in target list
+select a, (select sum(e) from bar where foo.b = bar.f), b, count(*) from foo, jazz where foo.c = jazz.g group by b, a, h;
+
+-- complex agg expr in subquery
+select foo.a, (select (foo.a + foo.b) * count(bar.e) from bar), b, count(*) from foo group by foo.a, foo.b, foo.a + foo.b;
+
+-- aggfunc over an outer reference in a subquery
+select (select sum(foo.a + bar.d) from bar) from foo group by a, b;
+
+-- complex expression of aggfunc over an outer reference in a subquery
+select (select sum(foo.a + bar.d) + 1 from bar) from foo group by a, b;
+
+-- aggrefs with multiple agglevelsup
+select (select (select sum(foo.a + bar.d) from jazz) from bar) from foo group by a, b;
+
+-- aggrefs with multiple agglevelsup in an expression
+select (select (select sum(foo.a + bar.d) * 2 from jazz) from bar) from foo group by a, b;
+
+-- nested group by
+select (select max(f) from bar where d = 1 group by a, e) from foo group by a;
+
+-- cte with an aggfunc of outer ref
+select a, count(*), (with cte as (select min(d) dd from bar group by e) select max(a * dd) from cte) from foo group by a;
+
+-- cte with an aggfunc of outer ref in an complex expression
+select a, count(*), (with cte as (select e, min(d) as dd from bar group by e) select max(a) * sum(dd) from cte) from foo group by a;
+
+-- subquery in group by
+select max(a) from foo group by (select e from bar where bar.e = foo.a);
+
+-- nested subquery in group by
+select max(a) from foo group by (select g from jazz where foo.a = (select max(a) from foo where c = 1 group by b));
+
+-- group by inside groupby inside group by ;S
+select max(a) from foo group by (select min(g) from jazz where foo.a = (select max(g) from jazz group by h) group by h);
+
+-- cte subquery in group by
+select max(a) from foo group by b, (with cte as (select min(g) from jazz group by h) select a from cte);
+
+-- group by subquery in order by
+select * from foo order by ((select min(bar.e + 1) * 2 from bar group by foo.a) - foo.a);
+
+-- everything in the kitchen sink
+select max(b), (select foo.a * count(bar.e) from bar), (with cte as (select e, min(d) as dd from bar group by e) select max(a) * sum(dd) from cte), count(*) from foo group by foo.a, (select min(g) from jazz where foo.a = (select max(g) from jazz group by h) group by h), (with cte as (select min(g) from jazz group by h) select a from cte) order by ((select min(bar.e + 1) * 2 from bar group by foo.a) - foo.a);
+
+-- complex expression in group by & targetlist
+select b + (a+1) from foo group by b, a+1;
+
+-- subselects inside aggs
+SELECT  foo.b+1, avg (( SELECT bar.f FROM bar WHERE bar.d = foo.b)) AS t FROM foo GROUP BY foo.b;
+
+SELECT foo.b+1, sum( 1 + (SELECT bar.f FROM bar WHERE bar.d = ANY (SELECT jazz.g FROM jazz WHERE jazz.h = foo.b))) AS t FROM foo GROUP BY foo.b;
+
+select foo.b+1, sum((with cte as (select * from jazz) select 1 from cte where cte.h = foo.b)) as t FROM foo GROUP BY foo.b;
+
+-- ctes inside aggs
+select foo.b+1, sum((with cte as (select * from jazz) select 1 from cte cte1, cte cte2 where cte1.h = foo.b)) as t FROM foo GROUP BY foo.b;
+
+drop table foo, bar, jazz;
 
 create table orca.t77(C952 text) WITH (compresstype=zlib,compresslevel=2,appendonly=true,blocksize=393216,checksum=true);
 insert into orca.t77 select 'text'::text;
@@ -669,7 +752,7 @@ insert into orca.toanalyze values (1,1), (2,2), (3,3);
 alter table orca.toanalyze drop column a;
 analyze orca.toanalyze;
 
--- union 
+-- union
 
 create table orca.ur (a int, b int);
 create table orca.us (c int, d int);
@@ -728,8 +811,8 @@ select 1 where 22 not in (SELECT generate_series(1,10));
 
 -- UDAs
 CREATE FUNCTION sum_sfunc(anyelement,anyelement) returns anyelement AS 'select $1+$2' LANGUAGE SQL STRICT;
-CREATE FUNCTION sum_prefunc(anyelement,anyelement) returns anyelement AS 'select $1+$2' LANGUAGE SQL STRICT;
-CREATE AGGREGATE myagg1(anyelement) (SFUNC = sum_sfunc, PREFUNC = sum_prefunc, STYPE = anyelement, INITCOND = '0');
+CREATE FUNCTION sum_combinefunc(anyelement,anyelement) returns anyelement AS 'select $1+$2' LANGUAGE SQL STRICT;
+CREATE AGGREGATE myagg1(anyelement) (SFUNC = sum_sfunc, COMBINEFUNC = sum_combinefunc, STYPE = anyelement, INITCOND = '0');
 SELECT myagg1(i) FROM orca.tab1;
 
 CREATE FUNCTION sum_sfunc2(anyelement,anyelement,anyelement) returns anyelement AS 'select $1+$2+$3' LANGUAGE SQL STRICT;
@@ -762,7 +845,7 @@ reset optimizer_enable_tablescan;
 -- MPP-22791: SIGSEGV when querying a table with default partition only
 create table mpp22791(a int, b int) partition by range(b) (default partition d);
 insert into mpp22791 values (1, 1), (2, 2), (3, 3);
-select * from mpp22791 where b > 1; 
+select * from mpp22791 where b > 1;
 select * from mpp22791 where b <= 3;
 
 -- MPP-20713, MPP-20714, MPP-20738: Const table get with a filter
@@ -793,27 +876,432 @@ CREATE TABLE orca.tmp_verd_s_pp_provtabs_agt_0015_extract1 (
 )
 WITH (appendonly=true, compresstype=zlib) DISTRIBUTED BY (uid136);
 
- set allow_system_table_mods="DML";
+ set allow_system_table_mods=true;
 
- UPDATE pg_class                                                                                                                                                                                     
- SET                                                                                                                                                                                                 
+ UPDATE pg_class
+ SET
          relpages = 30915::int, reltuples = 7.28661e+07::real WHERE relname = 'tmp_verd_s_pp_provtabs_agt_0015_extract1' AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'xvclin');
-
- insert into pg_statistic values ('orca.tmp_verd_s_pp_provtabs_agt_0015_extract1'::regclass,1::smallint,0::real,17::integer,264682::real,1::smallint,2::smallint,0::smallint,0::smallint,1054::oid,1058::oid,0::oid,0::oid,'{0.000161451,0.000107634,0.000107634,0.000107634,0.000107634,0.000107634,0.000107634,0.000107634,0.000107634,0.000107634,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05}'::real[],NULL::real[],NULL::real[],NULL::real[],'{8X8#1F8V92A2025G,YFAXQ§UBF210PA0P,2IIVIE8V92A2025G,9§BP8F8V92A2025G,35A9EE8V92A2025G,§AJ2Z§9MA210PA0P,3NUQ3E8V92A2025G,F7ZD4F8V92A2025G,$WHHEO§§E210PA0P,Z6EATH2BE210PA0P,N7I28E8V92A2025G,YU0K$E$§9210PA0P,3TAI1ANIF210PA0P,P#H8BF8V92A2025G,VTQ$N$D§92A201SC,N7ZD4F8V92A2025G,77BP8F8V92A2025G,39XOXY78H210PA01,#2#OX6NHH210PA01,2DG1J#XZH210PA01,MFEG$E8V92A2025G,M0HKWNGND210PA0P,FSXI67NSA210PA0P,C1L77E8V92A2025G,01#21E8V92A2025G}'::bpchar[],'{§00§1HKZC210PA0P,1D90GE8V92A2025G,2ULZI6L0O210PA01,489G7L8$I210PA01,5RE8FF8V92A2025G,76NIRFNIF210PA0P,8KOMKE8V92A2025G,#9Y#GPSHB210PA0P,BDAJ#D8V92A2025G,CV9Z7IYVK210PA01,#EC5FE8V92A2025G,FQWY§O1XC210PA0P,H8HL4E8V92A2025G,INC5FE8V92A2025G,K4MX0XHCF210PA0P,LKE8FF8V92A2025G,N03G9UM2F210PA0P,OHJ$#GFZ9210PA0P,PXU3T1OTB210PA0P,RCUA45F1H210PA01,SU§FRY#QI210PA01,UABHMLSLK210PA01,VRBP8F8V92A2025G,X65#KZIDC210PA0P,YLFG§#A2G210PA0P,ZZG8H29OC210PA0P,ZZZDBCEVA210PA0P}'::bpchar[],NULL::bpchar[],NULL::bpchar[]);
- insert into pg_statistic values ('orca.tmp_verd_s_pp_provtabs_agt_0015_extract1'::regclass,2::smallint,0::real,2::integer,205.116::real,1::smallint,2::smallint,0::smallint,0::smallint,94::oid,95::oid,0::oid,0::oid,'{0.278637,0.272448,0.0303797,0.0301106,0.0249442,0.0234373,0.0231682,0.0191319,0.0169793,0.0162527,0.0142884,0.0141539,0.0125394,0.0103329,0.0098216,0.00944488,0.00850308,0.00715766,0.0066464,0.00656567,0.00591987,0.0050588,0.00454753,0.00449372,0.0044399}'::real[],NULL::real[],NULL::real[],NULL::real[],'{199,12,14,5,197,11,198,8,152,299,201,153,9,13,74,179,24,202,2,213,17,195,215,16,200}'::int2[],'{1,5,9,12,14,24,58,80,152,195,198,199,207,302,402}'::int2[],NULL::int2[],NULL::int2[]);
- insert into pg_statistic values ('orca.tmp_verd_s_pp_provtabs_agt_0015_extract1'::regclass,3::smallint,0::real,6::integer,201.005::real,1::smallint,2::smallint,0::smallint,0::smallint,1054::oid,1058::oid,0::oid,0::oid,'{0.0478164,0.0439146,0.0406856,0.0239755,0.0154186,0.0149073,0.0148804,0.0143422,0.0141808,0.0139386,0.0138848,0.0138848,0.0137502,0.0134812,0.0134004,0.0133197,0.0133197,0.013239,0.0131852,0.0130775,0.0130775,0.0130237,0.0129699,0.0129699,0.012943}'::real[],NULL::real[],NULL::real[],NULL::real[],'{AG023,AG032,AG999,AG022,AG--B,AG-VB,AG--C,AG-VC,AG014,AG-VA,AG036,AGT4C,AG--A,AG037,AG009,AG015,AG003,AG002,AGT3C,AG025,AG019,AGT2C,AGT1C,AG005,AG031}'::bpchar[],'{AG001,AG004,AG007,AG010,AG013,AG017,AG020,AG022,AG023,AG026,AG030,AG032,AG034,AG037,AG040,AG045,AG122,AG999,AG--B,AGT1C,AGT4C,AG-VB,MA017,MA--A,MK081,MKRKV}'::bpchar[],NULL::bpchar[],NULL::bpchar[]);
- insert into pg_statistic values ('orca.tmp_verd_s_pp_provtabs_agt_0015_extract1'::regclass,4::smallint,0::real,2::integer,34::real,1::smallint,2::smallint,0::smallint,0::smallint,94::oid,95::oid,0::oid,0::oid,'{0.1135,0.112881,0.111778,0.100288,0.0895245,0.0851384,0.0821785,0.0723569,0.0565616,0.0368646,0.0309986,0.0160375,0.00621586,0.00594677,0.0050588,0.00489734,0.00487044,0.00487044,0.00468208,0.00462826,0.00460135,0.00441299,0.00438608,0.00417081,0.00414391}'::real[],NULL::real[],NULL::real[],NULL::real[],'{1,3,2,7,9,4,5,16,10,6,8,77,12,11,14,13,22,23,64,61,24,51,53,15,54}'::int2[],'{1,2,3,4,5,6,7,9,10,14,16,17,53,98}'::int2[],NULL::int2[],NULL::int2[]);
- insert into pg_statistic values ('orca.tmp_verd_s_pp_provtabs_agt_0015_extract1'::regclass,5::smallint,0::real,2::integer,1::real,1::smallint,2::smallint,0::smallint,0::smallint,94::oid,95::oid,0::oid,0::oid,'{1}'::real[],NULL::real[],NULL::real[],NULL::real[],'{1}'::int2[],'{1}'::int2[],NULL::int2[],NULL::int2[]);
- insert into pg_statistic values ('orca.tmp_verd_s_pp_provtabs_agt_0015_extract1'::regclass,6::smallint,0::real,2::integer,2::real,1::smallint,2::smallint,0::smallint,0::smallint,94::oid,95::oid,0::oid,0::oid,'{0.850227,0.149773}'::real[],NULL::real[],NULL::real[],NULL::real[],'{1,2}'::int2[],'{1,2}'::int2[],NULL::int2[],NULL::int2[]);
- insert into pg_statistic values ('orca.tmp_verd_s_pp_provtabs_agt_0015_extract1'::regclass,7::smallint,0::real,4::integer,591.134::real,1::smallint,2::smallint,0::smallint,0::smallint,1093::oid,1095::oid,0::oid,0::oid,'{0.26042,0.0859995,0.0709308,0.0616473,0.0567231,0.0303797,0.0109787,0.0106289,0.00990232,0.00987541,0.00979469,0.00944488,0.00820709,0.00718457,0.00626968,0.00621586,0.00616204,0.00600059,0.00586605,0.00557006,0.00516643,0.00511261,0.0050857,0.0050857,0.0047628}'::real[],NULL::real[],NULL::real[],NULL::real[],'{1994-01-01,1997-01-01,2005-07-01,1999-01-01,2003-09-01,2000-01-01,2001-01-01,1998-10-01,2001-05-01,1999-03-01,2013-01-01,2003-01-01,2008-01-01,2004-01-01,2009-01-01,2003-02-01,1998-09-01,2000-12-01,2007-04-01,1998-08-01,1998-01-01,2003-07-01,1998-11-01,2005-02-01,1999-04-01}'::date[],'{1900-01-01,1994-01-01,1997-01-01,1998-05-07,1999-01-01,1999-05-01,2000-01-01,2001-03-22,2002-10-01,2003-09-01,2004-08-01,2005-07-01,2007-01-01,2008-06-01,2010-04-01,2012-07-01,2014-12-01,2015-01-01}'::date[],NULL::date[],NULL::date[]);
- insert into pg_statistic values ('orca.tmp_verd_s_pp_provtabs_agt_0015_extract1'::regclass,8::smallint,0::real,4::integer,474.232::real,1::smallint,2::smallint,0::smallint,0::smallint,1093::oid,1095::oid,0::oid,0::oid,'{0.52111,0.0709308,0.0591987,0.0587412,0.0148804,0.010279,0.00990232,0.00931034,0.00791109,0.00718457,0.00688857,0.00608132,0.00557006,0.0053817,0.00503189,0.00500498,0.00457444,0.004117,0.00395555,0.00390173,0.00357883,0.00352501,0.00352501,0.00344429,0.00333665}'::real[],NULL::real[],NULL::real[],NULL::real[],'{9999-12-31,2005-07-01,1999-01-01,2003-09-01,2004-02-01,2001-05-01,2005-02-01,1999-03-01,1998-10-01,2000-01-01,2003-01-01,1998-09-01,1998-08-01,2008-01-01,2007-04-01,2000-12-01,1999-04-01,1998-11-01,2003-02-01,1994-01-01,2002-09-01,1999-02-01,2004-01-01,1998-07-01,2003-07-01}'::date[],'{1994-01-01,1998-11-01,1999-01-01,1999-04-01,2001-05-01,2003-07-01,2003-09-01,2004-02-01,2005-07-01,2007-02-01,2010-03-01,9999-12-31}'::date[],NULL::date[],NULL::date[]);
- insert into pg_statistic values ('orca.tmp_verd_s_pp_provtabs_agt_0015_extract1'::regclass,9::smallint,0::real,2::integer,1::real,1::smallint,2::smallint,0::smallint,0::smallint,98::oid,664::oid,0::oid,0::oid,'{1}'::real[],NULL::real[],NULL::real[],NULL::real[],'{H}'::text[],'{H}'::text[],NULL::text[],NULL::text[]);
- insert into pg_statistic values ('orca.tmp_verd_s_pp_provtabs_agt_0015_extract1'::regclass,10::smallint,0::real,8::integer,1::real,1::smallint,2::smallint,0::smallint,0::smallint,2060::oid,2062::oid,0::oid,0::oid,'{1}'::real[],NULL::real[],NULL::real[],NULL::real[],'{1900-01-01 00:00:00}'::timestamp[],'{1900-01-01 00:00:00}'::timestamp[],NULL::timestamp[],NULL::timestamp[]);
- insert into pg_statistic values ('orca.tmp_verd_s_pp_provtabs_agt_0015_extract1'::regclass,11::smallint,1::real,0::integer,-1::real,0::smallint,0::smallint,0::smallint,0::smallint,0::oid,0::oid,0::oid,0::oid,NULL::real[],NULL::real[],NULL::real[],NULL::real[],NULL::int4[],NULL::int4[],NULL::int4[],NULL::int4[]);
- insert into pg_statistic values ('orca.tmp_verd_s_pp_provtabs_agt_0015_extract1'::regclass,12::smallint,0::real,4::integer,1::real,1::smallint,2::smallint,0::smallint,0::smallint,96::oid,97::oid,0::oid,0::oid,'{1}'::real[],NULL::real[],NULL::real[],NULL::real[],'{1}'::int4[],'{1}'::int4[],NULL::int4[],NULL::int4[]);
- insert into pg_statistic values ('orca.tmp_verd_s_pp_provtabs_agt_0015_extract1'::regclass,13::smallint,0.991927::real,8::integer,301.416::real,1::smallint,2::smallint,0::smallint,0::smallint,2060::oid,2062::oid,0::oid,0::oid,'{8.07255e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05}'::real[],NULL::real[],NULL::real[],NULL::real[],'{2004-01-05 13:45:06.18894,2007-03-20 12:02:33.73888,2009-12-15 12:33:55.32684,2012-09-21 09:58:09.70321,2012-02-13 14:56:03.11625,2000-10-02 09:56:01.24836,1998-01-14 10:11:29.43055,2014-01-08 14:41:44.85935,2012-06-21 12:46:37.48899,2013-07-23 14:27:52.27322,2011-10-27 16:17:10.01694,2005-07-13 16:55:30.7964,2003-06-05 14:53:13.71932,2002-07-22 10:22:31.0967,2011-12-27 16:12:54.85765,2001-01-12 11:40:09.16207,2005-12-30 08:46:31.30943,2007-03-01 08:29:36.765,2011-06-16 09:09:43.8651,2000-12-15 14:33:29.20083,2006-04-25 13:46:46.09684,2011-06-20 16:26:23.65135,2004-01-23 12:37:06.92535,2002-03-04 10:02:08.92547,2003-08-01 10:33:57.33683}'::timestamp[],'{1997-12-05 10:59:43.94611,2014-11-18 08:48:18.32773}'::timestamp[],NULL::timestamp[],NULL::timestamp[]);
- insert into pg_statistic values ('orca.tmp_verd_s_pp_provtabs_agt_0015_extract1'::regclass,14::smallint,0.329817::real,8::integer,38109.5::real,1::smallint,2::smallint,0::smallint,0::smallint,2060::oid,2062::oid,0::oid,0::oid,'{0.0715766,0.0621317,0.00546242,0.0044399,0.000134542,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05}'::real[],NULL::real[],NULL::real[],NULL::real[],'{1997-11-25 19:05:00.83798,1998-12-29 16:19:18.50226,1998-01-28 23:01:18.41289,2000-12-21 18:03:30.34549,2003-08-28 11:14:33.26306,2003-08-28 11:14:33.2622,1999-03-20 13:04:33.24015,2003-08-28 11:14:33.22312,2003-08-28 11:14:33.21933,2003-08-28 11:14:33.22082,2003-08-28 11:14:33.21425,2003-08-28 11:14:33.22336,2003-08-28 11:14:33.2092,2003-08-28 11:14:33.20251,2003-08-28 11:14:33.22145,2003-08-28 11:14:33.26235,2003-08-28 11:14:33.26525,2003-08-28 11:14:33.23714,2003-08-28 11:14:33.26667,2003-08-28 11:14:33.23978,2003-08-28 11:14:33.21527,2003-08-28 11:14:33.2227,1999-04-16 09:01:42.92689,2003-08-28 11:14:33.21846,2003-08-28 11:14:33.24725}'::timestamp[],'{1997-11-25 19:05:00.83798,1998-01-05 11:57:12.19545,1998-10-14 09:06:01.87217,1998-12-29 16:19:18.50226,1999-01-18 15:01:52.77062,1999-12-28 07:57:37.93632,2001-05-16 10:55:44.78317,2003-05-23 10:32:40.1846,2003-08-28 11:14:33.23985,2004-02-04 14:01:57.60942,2005-07-26 17:01:10.98951,2005-07-26 18:41:33.09864,2006-04-25 16:52:03.49003,2008-02-18 14:17:08.58924,2010-04-19 10:16:19.03194,2012-07-23 10:47:40.65789,2014-12-05 10:59:02.25493}'::timestamp[],NULL::timestamp[],NULL::timestamp[]);
- insert into pg_statistic values ('orca.tmp_verd_s_pp_provtabs_agt_0015_extract1'::regclass,15::smallint,0.678255::real,8::integer,7167.15::real,1::smallint,2::smallint,0::smallint,0::smallint,2060::oid,2062::oid,0::oid,0::oid,'{0.000376719,0.00034981,0.00034981,0.00034981,0.00034981,0.00034981,0.00034981,0.000322902,0.000322902,0.000322902,0.000295993,0.000295993,0.000295993,0.000295993,0.000295993,0.000295993,0.000295993,0.000295993,0.000295993,0.000295993,0.000295993,0.000295993,0.000295993,0.000269085,0.000269085}'::real[],NULL::real[],NULL::real[],NULL::real[],'{2012-09-07 14:14:23.95552,2012-09-07 14:14:36.8171,2008-12-02 09:02:19.06415,2012-03-16 15:57:15.10939,1999-06-08 13:59:56.59862,1998-10-29 14:57:47.93588,1997-07-10 09:55:34.68999,2003-03-26 11:18:44.43314,2002-02-27 15:07:42.12004,2002-02-27 15:07:13.65666,2003-03-26 11:22:07.7484,2013-11-29 13:16:25.79261,2007-09-06 09:14:10.7907,1998-10-29 14:54:04.23854,2003-04-11 07:54:56.90542,2006-03-09 15:42:27.40086,2000-05-31 10:27:52.92485,2006-01-23 17:12:44.80256,2003-01-28 10:44:17.44046,2007-11-01 15:11:21.99194,2006-03-09 15:42:56.14013,2004-03-31 10:58:47.12524,1999-06-08 14:02:11.91465,1997-07-11 14:52:47.95918,1999-06-08 13:58:15.07927}'::timestamp[],'{1997-07-09 10:42:54.69421,1997-09-16 10:30:42.71499,1999-06-08 14:32:08.31914,2002-02-27 15:07:13.67355,2003-04-08 16:31:58.80724,2004-05-05 10:18:01.33179,2006-03-13 16:19:59.61215,2007-09-06 09:13:41.71774,2013-11-29 13:16:37.17591,2014-12-03 09:24:25.20945}'::timestamp[],NULL::timestamp[],NULL::timestamp[]);
+insert into pg_statistic
+values (
+  'orca.tmp_verd_s_pp_provtabs_agt_0015_extract1'::regclass,
+  1::smallint,
+  'f',
+  0::real,
+  17::integer,
+  264682::real,
+  1::smallint,
+  2::smallint,
+  0::smallint,
+  0::smallint,
+  0::smallint,
+  1054::oid,
+  1058::oid,
+  0::oid,
+  0::oid,
+  0::oid,
+  '{0.000161451,0.000107634,0.000107634,0.000107634,0.000107634,0.000107634,0.000107634,0.000107634,0.000107634,0.000107634,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05}'::real[],
+  NULL::real[],
+  NULL::real[],
+  NULL::real[],
+  NULL::real[],
+  '{8X8#1F8V92A2025G,YFAXQ§UBF210PA0P,2IIVIE8V92A2025G,9§BP8F8V92A2025G,35A9EE8V92A2025G,§AJ2Z§9MA210PA0P,3NUQ3E8V92A2025G,F7ZD4F8V92A2025G,$WHHEO§§E210PA0P,Z6EATH2BE210PA0P,N7I28E8V92A2025G,YU0K$E$§9210PA0P,3TAI1ANIF210PA0P,P#H8BF8V92A2025G,VTQ$N$D§92A201SC,N7ZD4F8V92A2025G,77BP8F8V92A2025G,39XOXY78H210PA01,#2#OX6NHH210PA01,2DG1J#XZH210PA01,MFEG$E8V92A2025G,M0HKWNGND210PA0P,FSXI67NSA210PA0P,C1L77E8V92A2025G,01#21E8V92A2025G}'::bpchar[],
+  '{§00§1HKZC210PA0P,1D90GE8V92A2025G,2ULZI6L0O210PA01,489G7L8$I210PA01,5RE8FF8V92A2025G,76NIRFNIF210PA0P,8KOMKE8V92A2025G,#9Y#GPSHB210PA0P,BDAJ#D8V92A2025G,CV9Z7IYVK210PA01,#EC5FE8V92A2025G,FQWY§O1XC210PA0P,H8HL4E8V92A2025G,INC5FE8V92A2025G,K4MX0XHCF210PA0P,LKE8FF8V92A2025G,N03G9UM2F210PA0P,OHJ$#GFZ9210PA0P,PXU3T1OTB210PA0P,RCUA45F1H210PA01,SU§FRY#QI210PA01,UABHMLSLK210PA01,VRBP8F8V92A2025G,X65#KZIDC210PA0P,YLFG§#A2G210PA0P,ZZG8H29OC210PA0P,ZZZDBCEVA210PA0P}'::bpchar[],
+  NULL::bpchar[],
+  NULL::bpchar[],
+  NULL::bpchar[]
+),
+(
+  'orca.tmp_verd_s_pp_provtabs_agt_0015_extract1'::regclass,
+  2::smallint,
+  'f',
+  0::real,
+  2::integer,
+  205.116::real,
+  1::smallint,
+  2::smallint,
+  0::smallint,
+  0::smallint,
+  0::smallint,
+  94::oid,
+  95::oid,
+  0::oid,
+  0::oid,
+  0::oid,
+  '{0.278637,0.272448,0.0303797,0.0301106,0.0249442,0.0234373,0.0231682,0.0191319,0.0169793,0.0162527,0.0142884,0.0141539,0.0125394,0.0103329,0.0098216,0.00944488,0.00850308,0.00715766,0.0066464,0.00656567,0.00591987,0.0050588,0.00454753,0.00449372,0.0044399}'::real[],
+  NULL::real[],
+  NULL::real[],
+  NULL::real[],
+  NULL::real[],
+  '{199,12,14,5,197,11,198,8,152,299,201,153,9,13,74,179,24,202,2,213,17,195,215,16,200}'::int2[],
+  '{1,5,9,12,14,24,58,80,152,195,198,199,207,302,402}'::int2[],
+  NULL::int2[],
+  NULL::int2[],
+  NULL::int2[]
+),
+(
+  'orca.tmp_verd_s_pp_provtabs_agt_0015_extract1'::regclass,
+  3::smallint,
+  'f',
+  0::real,
+  6::integer,
+  201.005::real,
+  1::smallint,
+  2::smallint,
+  0::smallint,
+  0::smallint,
+  0::smallint,
+  1054::oid,
+  1058::oid,
+  0::oid,
+  0::oid,
+  0::oid,
+  '{0.0478164,0.0439146,0.0406856,0.0239755,0.0154186,0.0149073,0.0148804,0.0143422,0.0141808,0.0139386,0.0138848,0.0138848,0.0137502,0.0134812,0.0134004,0.0133197,0.0133197,0.013239,0.0131852,0.0130775,0.0130775,0.0130237,0.0129699,0.0129699,0.012943}'::real[],
+  NULL::real[],
+  NULL::real[],
+  NULL::real[],
+  NULL::real[],
+  '{AG023,AG032,AG999,AG022,AG--B,AG-VB,AG--C,AG-VC,AG014,AG-VA,AG036,AGT4C,AG--A,AG037,AG009,AG015,AG003,AG002,AGT3C,AG025,AG019,AGT2C,AGT1C,AG005,AG031}'::bpchar[],
+  '{AG001,AG004,AG007,AG010,AG013,AG017,AG020,AG022,AG023,AG026,AG030,AG032,AG034,AG037,AG040,AG045,AG122,AG999,AG--B,AGT1C,AGT4C,AG-VB,MA017,MA--A,MK081,MKRKV}'::bpchar[],
+  NULL::bpchar[],
+  NULL::bpchar[],
+  NULL::bpchar[]
+),
+(
+  'orca.tmp_verd_s_pp_provtabs_agt_0015_extract1'::regclass,
+  4::smallint,
+  'f',
+  0::real,
+  2::integer,
+  34::real,
+  1::smallint,
+  2::smallint,
+  0::smallint,
+  0::smallint,
+  0::smallint,
+  94::oid,
+  95::oid,
+  0::oid,
+  0::oid,
+  0::oid,
+  '{0.1135,0.112881,0.111778,0.100288,0.0895245,0.0851384,0.0821785,0.0723569,0.0565616,0.0368646,0.0309986,0.0160375,0.00621586,0.00594677,0.0050588,0.00489734,0.00487044,0.00487044,0.00468208,0.00462826,0.00460135,0.00441299,0.00438608,0.00417081,0.00414391}'::real[],
+  NULL::real[],
+  NULL::real[],
+  NULL::real[],
+  NULL::real[],
+  '{1,3,2,7,9,4,5,16,10,6,8,77,12,11,14,13,22,23,64,61,24,51,53,15,54}'::int2[],
+  '{1,2,3,4,5,6,7,9,10,14,16,17,53,98}'::int2[],
+  NULL::int2[],
+  NULL::int2[],
+  NULL::int2[]
+),
+(
+  'orca.tmp_verd_s_pp_provtabs_agt_0015_extract1'::regclass,
+  5::smallint,
+  'f',
+  0::real,
+  2::integer,
+  1::real,
+  1::smallint,
+  2::smallint,
+  0::smallint,
+  0::smallint,
+  0::smallint,
+  94::oid,
+  95::oid,
+  0::oid,
+  0::oid,
+  0::oid,
+  '{1}'::real[],
+  NULL::real[],
+  NULL::real[],
+  NULL::real[],
+  NULL::real[],
+  '{1}'::int2[],
+  '{1}'::int2[],
+  NULL::int2[],
+  NULL::int2[],
+  NULL::int2[]
+),
+(
+  'orca.tmp_verd_s_pp_provtabs_agt_0015_extract1'::regclass,
+  6::smallint,
+  'f',
+  0::real,
+  2::integer,
+  2::real,
+  1::smallint,
+  2::smallint,
+  0::smallint,
+  0::smallint,
+  0::smallint,
+  94::oid,
+  95::oid,
+  0::oid,
+  0::oid,
+  0::oid,
+  '{0.850227,0.149773}'::real[],
+  NULL::real[],
+  NULL::real[],
+  NULL::real[],
+  NULL::real[],
+  '{1,2}'::int2[],
+  '{1,2}'::int2[],
+  NULL::int2[],
+  NULL::int2[],
+  NULL::int2[]
+),
+(
+  'orca.tmp_verd_s_pp_provtabs_agt_0015_extract1'::regclass,
+  7::smallint,
+  'f',
+  0::real,
+  4::integer,
+  591.134::real,
+  1::smallint,
+  2::smallint,
+  0::smallint,
+  0::smallint,
+  0::smallint,
+  1093::oid,
+  1095::oid,
+  0::oid,
+  0::oid,
+  0::oid,
+  '{0.26042,0.0859995,0.0709308,0.0616473,0.0567231,0.0303797,0.0109787,0.0106289,0.00990232,0.00987541,0.00979469,0.00944488,0.00820709,0.00718457,0.00626968,0.00621586,0.00616204,0.00600059,0.00586605,0.00557006,0.00516643,0.00511261,0.0050857,0.0050857,0.0047628}'::real[],
+  NULL::real[],
+  NULL::real[],
+  NULL::real[],
+  NULL::real[],
+  '{1994-01-01,1997-01-01,2005-07-01,1999-01-01,2003-09-01,2000-01-01,2001-01-01,1998-10-01,2001-05-01,1999-03-01,2013-01-01,2003-01-01,2008-01-01,2004-01-01,2009-01-01,2003-02-01,1998-09-01,2000-12-01,2007-04-01,1998-08-01,1998-01-01,2003-07-01,1998-11-01,2005-02-01,1999-04-01}'::date[],
+  '{1900-01-01,1994-01-01,1997-01-01,1998-05-07,1999-01-01,1999-05-01,2000-01-01,2001-03-22,2002-10-01,2003-09-01,2004-08-01,2005-07-01,2007-01-01,2008-06-01,2010-04-01,2012-07-01,2014-12-01,2015-01-01}'::date[],
+  NULL::date[],
+  NULL::date[],
+  NULL::date[]
+),
+(
+  'orca.tmp_verd_s_pp_provtabs_agt_0015_extract1'::regclass,
+  8::smallint,
+  'f',
+  0::real,
+  4::integer,
+  474.232::real,
+  1::smallint,
+  2::smallint,
+  0::smallint,
+  0::smallint,
+  0::smallint,
+  1093::oid,
+  1095::oid,
+  0::oid,
+  0::oid,
+  0::oid,
+  '{0.52111,0.0709308,0.0591987,0.0587412,0.0148804,0.010279,0.00990232,0.00931034,0.00791109,0.00718457,0.00688857,0.00608132,0.00557006,0.0053817,0.00503189,0.00500498,0.00457444,0.004117,0.00395555,0.00390173,0.00357883,0.00352501,0.00352501,0.00344429,0.00333665}'::real[],
+  NULL::real[],
+  NULL::real[],
+  NULL::real[],
+  NULL::real[],
+  '{9999-12-31,2005-07-01,1999-01-01,2003-09-01,2004-02-01,2001-05-01,2005-02-01,1999-03-01,1998-10-01,2000-01-01,2003-01-01,1998-09-01,1998-08-01,2008-01-01,2007-04-01,2000-12-01,1999-04-01,1998-11-01,2003-02-01,1994-01-01,2002-09-01,1999-02-01,2004-01-01,1998-07-01,2003-07-01}'::date[],
+  '{1994-01-01,1998-11-01,1999-01-01,1999-04-01,2001-05-01,2003-07-01,2003-09-01,2004-02-01,2005-07-01,2007-02-01,2010-03-01,9999-12-31}'::date[],
+  NULL::date[],
+  NULL::date[],
+  NULL::date[]
+),
+(
+  'orca.tmp_verd_s_pp_provtabs_agt_0015_extract1'::regclass,
+  9::smallint,
+  'f',
+  0::real,
+  2::integer,
+  1::real,
+  1::smallint,
+  2::smallint,
+  0::smallint,
+  0::smallint,
+  0::smallint,
+  98::oid,
+  664::oid,
+  0::oid,
+  0::oid,
+  0::oid,
+  '{1}'::real[],
+  NULL::real[],
+  NULL::real[],
+  NULL::real[],
+  NULL::real[],
+  '{H}'::text[],
+  '{H}'::text[],
+  NULL::text[],
+  NULL::text[],
+  NULL::text[]
+),
+(
+  'orca.tmp_verd_s_pp_provtabs_agt_0015_extract1'::regclass,
+  10::smallint,
+  'f',
+  0::real,
+  8::integer,
+  1::real,
+  1::smallint,
+  2::smallint,
+  0::smallint,
+  0::smallint,
+  0::smallint,
+  2060::oid,
+  2062::oid,
+  0::oid,
+  0::oid,
+  0::oid,
+  '{1}'::real[],
+  NULL::real[],
+  NULL::real[],
+  NULL::real[],
+  NULL::real[],
+  '{1900-01-01 00:00:00}'::timestamp[],
+  '{1900-01-01 00:00:00}'::timestamp[],
+  NULL::timestamp[],
+  NULL::timestamp[],
+  NULL::timestamp[]
+),
+(
+  'orca.tmp_verd_s_pp_provtabs_agt_0015_extract1'::regclass,
+  11::smallint,
+  'f',
+  1::real,
+  0::integer,
+  -1::real,
+  0::smallint,
+  0::smallint,
+  0::smallint,
+  0::smallint,
+  0::smallint,
+  0::oid,
+  0::oid,
+  0::oid,
+  0::oid,
+  0::oid,
+  NULL::real[],
+  NULL::real[],
+  NULL::real[],
+  NULL::real[],
+  NULL::real[],
+  NULL::int4[],
+  NULL::int4[],
+  NULL::int4[],
+  NULL::int4[],
+  NULL::int4[]
+),
+(
+  'orca.tmp_verd_s_pp_provtabs_agt_0015_extract1'::regclass,
+  12::smallint,
+  'f',
+  0::real,
+  4::integer,
+  1::real,
+  1::smallint,
+  2::smallint,
+  0::smallint,
+  0::smallint,
+  0::smallint,
+  96::oid,
+  97::oid,
+  0::oid,
+  0::oid,
+  0::oid,
+  '{1}'::real[],
+  NULL::real[],
+  NULL::real[],
+  NULL::real[],
+  NULL::real[],
+  '{1}'::int4[],
+  '{1}'::int4[],
+  NULL::int4[],
+  NULL::int4[],
+  NULL::int4[]
+),
+(
+  'orca.tmp_verd_s_pp_provtabs_agt_0015_extract1'::regclass,
+  13::smallint,
+  'f',
+  0.991927::real,
+  8::integer,
+  301.416::real,
+  1::smallint,
+  2::smallint,
+  0::smallint,
+  0::smallint,
+  0::smallint,
+  2060::oid,
+  2062::oid,
+  0::oid,
+  0::oid,
+  0::oid,
+  '{8.07255e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05,2.69085e-05}'::real[],
+  NULL::real[],
+  NULL::real[],
+  NULL::real[],
+  NULL::real[],
+  '{2004-01-05 13:45:06.18894,2007-03-20 12:02:33.73888,2009-12-15 12:33:55.32684,2012-09-21 09:58:09.70321,2012-02-13 14:56:03.11625,2000-10-02 09:56:01.24836,1998-01-14 10:11:29.43055,2014-01-08 14:41:44.85935,2012-06-21 12:46:37.48899,2013-07-23 14:27:52.27322,2011-10-27 16:17:10.01694,2005-07-13 16:55:30.7964,2003-06-05 14:53:13.71932,2002-07-22 10:22:31.0967,2011-12-27 16:12:54.85765,2001-01-12 11:40:09.16207,2005-12-30 08:46:31.30943,2007-03-01 08:29:36.765,2011-06-16 09:09:43.8651,2000-12-15 14:33:29.20083,2006-04-25 13:46:46.09684,2011-06-20 16:26:23.65135,2004-01-23 12:37:06.92535,2002-03-04 10:02:08.92547,2003-08-01 10:33:57.33683}'::timestamp[],
+  '{1997-12-05 10:59:43.94611,2014-11-18 08:48:18.32773}'::timestamp[],
+  NULL::timestamp[],
+  NULL::timestamp[],
+  NULL::timestamp[]
+),
+(
+  'orca.tmp_verd_s_pp_provtabs_agt_0015_extract1'::regclass,
+  14::smallint,
+  'f',
+  0.329817::real,
+  8::integer,
+  38109.5::real,
+  1::smallint,
+  2::smallint,
+  0::smallint,
+  0::smallint,
+  0::smallint,
+  2060::oid,
+  2062::oid,
+  0::oid,
+  0::oid,
+  0::oid,
+  '{0.0715766,0.0621317,0.00546242,0.0044399,0.000134542,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05,8.07255e-05}'::real[],
+  NULL::real[],
+  NULL::real[],
+  NULL::real[],
+  NULL::real[],
+  '{1997-11-25 19:05:00.83798,1998-12-29 16:19:18.50226,1998-01-28 23:01:18.41289,2000-12-21 18:03:30.34549,2003-08-28 11:14:33.26306,2003-08-28 11:14:33.2622,1999-03-20 13:04:33.24015,2003-08-28 11:14:33.22312,2003-08-28 11:14:33.21933,2003-08-28 11:14:33.22082,2003-08-28 11:14:33.21425,2003-08-28 11:14:33.22336,2003-08-28 11:14:33.2092,2003-08-28 11:14:33.20251,2003-08-28 11:14:33.22145,2003-08-28 11:14:33.26235,2003-08-28 11:14:33.26525,2003-08-28 11:14:33.23714,2003-08-28 11:14:33.26667,2003-08-28 11:14:33.23978,2003-08-28 11:14:33.21527,2003-08-28 11:14:33.2227,1999-04-16 09:01:42.92689,2003-08-28 11:14:33.21846,2003-08-28 11:14:33.24725}'::timestamp[],
+  '{1997-11-25 19:05:00.83798,1998-01-05 11:57:12.19545,1998-10-14 09:06:01.87217,1998-12-29 16:19:18.50226,1999-01-18 15:01:52.77062,1999-12-28 07:57:37.93632,2001-05-16 10:55:44.78317,2003-05-23 10:32:40.1846,2003-08-28 11:14:33.23985,2004-02-04 14:01:57.60942,2005-07-26 17:01:10.98951,2005-07-26 18:41:33.09864,2006-04-25 16:52:03.49003,2008-02-18 14:17:08.58924,2010-04-19 10:16:19.03194,2012-07-23 10:47:40.65789,2014-12-05 10:59:02.25493}'::timestamp[],
+  NULL::timestamp[],
+  NULL::timestamp[],
+  NULL::timestamp[]
+),
+(
+  'orca.tmp_verd_s_pp_provtabs_agt_0015_extract1'::regclass,
+  15::smallint,
+  'f',
+  0.678255::real,
+  8::integer,
+  7167.15::real,
+  1::smallint,
+  2::smallint,
+  0::smallint,
+  0::smallint,
+  0::smallint,
+  2060::oid,
+  2062::oid,
+  0::oid,
+  0::oid,
+  0::oid,
+  '{0.000376719,0.00034981,0.00034981,0.00034981,0.00034981,0.00034981,0.00034981,0.000322902,0.000322902,0.000322902,0.000295993,0.000295993,0.000295993,0.000295993,0.000295993,0.000295993,0.000295993,0.000295993,0.000295993,0.000295993,0.000295993,0.000295993,0.000295993,0.000269085,0.000269085}'::real[],
+  NULL::real[],
+  NULL::real[],
+  NULL::real[],
+  NULL::real[],
+  '{2012-09-07 14:14:23.95552,2012-09-07 14:14:36.8171,2008-12-02 09:02:19.06415,2012-03-16 15:57:15.10939,1999-06-08 13:59:56.59862,1998-10-29 14:57:47.93588,1997-07-10 09:55:34.68999,2003-03-26 11:18:44.43314,2002-02-27 15:07:42.12004,2002-02-27 15:07:13.65666,2003-03-26 11:22:07.7484,2013-11-29 13:16:25.79261,2007-09-06 09:14:10.7907,1998-10-29 14:54:04.23854,2003-04-11 07:54:56.90542,2006-03-09 15:42:27.40086,2000-05-31 10:27:52.92485,2006-01-23 17:12:44.80256,2003-01-28 10:44:17.44046,2007-11-01 15:11:21.99194,2006-03-09 15:42:56.14013,2004-03-31 10:58:47.12524,1999-06-08 14:02:11.91465,1997-07-11 14:52:47.95918,1999-06-08 13:58:15.07927}'::timestamp[],
+  '{1997-07-09 10:42:54.69421,1997-09-16 10:30:42.71499,1999-06-08 14:32:08.31914,2002-02-27 15:07:13.67355,2003-04-08 16:31:58.80724,2004-05-05 10:18:01.33179,2006-03-13 16:19:59.61215,2007-09-06 09:13:41.71774,2013-11-29 13:16:37.17591,2014-12-03 09:24:25.20945}'::timestamp[],
+  NULL::timestamp[],
+  NULL::timestamp[],
+  NULL::timestamp[]
+);
 
 set optimizer_segments = 256;
 select a.*,  b.guelt_ab as guelt_ab_b, b.guelt_bis as guelt_bis_b
@@ -824,7 +1312,7 @@ AND a.guelt_ab <= b.guelt_ab AND a.guelt_bis > b.guelt_ab
 ;
 
 set optimizer_segments = 3;
-set allow_system_table_mods="NONE";
+set allow_system_table_mods=false;
 -- Arrayref
 drop table if exists orca.arrtest;
 create table orca.arrtest (
@@ -864,7 +1352,7 @@ select count(*) from foo_missing_stats where a = 10;
 with x as (select * from foo_missing_stats) select count(*) from x x1, x x2 where x1.a = x2.a;
 with x as (select * from foo_missing_stats) select count(*) from x x1, x x2 where x1.a = x2.b;
 
-set allow_system_table_mods="DML";
+set allow_system_table_mods=true;
 delete from pg_statistic where starelid='foo_missing_stats'::regclass;
 delete from pg_statistic where starelid='bar_missing_stats'::regclass;
 
@@ -923,6 +1411,9 @@ alter table orca.bm_dyn_test add partition part5 values(5);
 insert into orca.bm_dyn_test values(2, 5, '2');
 
 set optimizer_enable_bitmapscan=on;
+-- start_ignore
+analyze orca.bm_dyn_test;
+-- end_ignore
 -- gather on 1 segment because of direct dispatch
 explain select * from orca.bm_dyn_test where i=2 and t='2';
 select * from orca.bm_dyn_test where i=2 and t='2';
@@ -946,12 +1437,33 @@ insert into orca.bm_dyn_test_onepart values(2, 5, '2');
 
 set optimizer_enable_bitmapscan=on;
 set optimizer_enable_dynamictablescan = off;
+-- start_ignore
+analyze orca.bm_dyn_test_onepart;
+-- end_ignore
 -- gather on 1 segment because of direct dispatch
 explain select * from orca.bm_dyn_test_onepart where i=2 and t='2';
 select * from orca.bm_dyn_test_onepart where i=2 and t='2';
 
 reset optimizer_enable_dynamictablescan;
 reset optimizer_enable_bitmapscan;
+
+-- Multi-level partition with dynamic bitmap indexes
+create table orca.bm_dyn_test_multilvl_part (id int, year int, quarter int, region text)
+distributed by (id) partition by range (year)
+  subpartition by range (quarter)
+    subpartition template (
+      start (1) end (3) every (1) )
+      subpartition by list (region)
+      subpartition template (
+      subpartition usa values ('usa'),
+      default subpartition other_regions )
+  ( start (2018) end (2020) every (1) );
+insert into orca.bm_dyn_test_multilvl_part select i, 2018 + (i%2), i%2 + 1, 'usa' from generate_series(1,100)i;
+create index bm_multi_test_idx_part on orca.bm_dyn_test_multilvl_part using bitmap(year);
+analyze orca.bm_dyn_test_multilvl_part;
+-- print name of parent index
+explain select * from orca.bm_dyn_test_multilvl_part where year = 2019;
+select count(*) from orca.bm_dyn_test_multilvl_part where year = 2019;
 
 -- More BitmapTableScan & BitmapIndexScan tests
 
@@ -979,7 +1491,7 @@ create table bm.hom_bm_heap (i int, to_be_dropped char(5), j int, t text) distri
   (partition part0 values(0),
    partition part1 values(1),
    partition part2 values(2),
-   partition part3 values(3), 
+   partition part3 values(3),
    partition part4 values(4));
 insert into bm.hom_bm_heap select i % 10, 'drop', i % 5, (i % 10)::text  from generate_series(1, 100) i;
 create index hom_bm_heap_idx on bm.hom_bm_heap using bitmap (i);
@@ -992,13 +1504,13 @@ select sum(i) i_sum, sum(j) j_sum, sum(t::integer) t_sum from bm.hom_bm_heap whe
 
 -- Bitmap index scan on AO parts with dropped columns
 drop table if exists bm.hom_bm_ao;
-create table bm.hom_bm_ao (i int, to_be_dropped char(5), j int, t text) 
+create table bm.hom_bm_ao (i int, to_be_dropped char(5), j int, t text)
 with (appendonly=true, compresslevel=5, orientation=row)
 distributed by (i) partition by list(j)
   (partition part0 values(0),
    partition part1 values(1),
    partition part2 values(2),
-   partition part3 values(3), 
+   partition part3 values(3),
    partition part4 values(4));
 insert into bm.hom_bm_ao select i % 10, 'drop', i % 5, (i % 10)::text  from generate_series(1, 100) i;
 create index hom_bm_ao_idx on bm.hom_bm_ao using bitmap (i);
@@ -1011,13 +1523,13 @@ select sum(i) i_sum, sum(j) j_sum, sum(t::integer) t_sum from bm.hom_bm_ao where
 
 -- Bitmap index scan on AOCO parts with dropped columns
 drop table if exists bm.hom_bm_aoco;
-create table bm.hom_bm_aoco (i int, to_be_dropped char(5), j int, t text) 
+create table bm.hom_bm_aoco (i int, to_be_dropped char(5), j int, t text)
 with (appendonly=true, compresslevel=5, orientation=column)
 distributed by (i) partition by list(j)
   (partition part0 values(0),
    partition part1 values(1),
    partition part2 values(2),
-   partition part3 values(3), 
+   partition part3 values(3),
    partition part4 values(4));
 insert into bm.hom_bm_aoco select i % 10, 'drop', i % 5, (i % 10)::text  from generate_series(1, 100) i;
 create index hom_bm_aoco_idx on bm.hom_bm_aoco using bitmap (i);
@@ -1138,7 +1650,7 @@ set optimizer_enable_indexjoin=on;
 
 -- force_explain
 set optimizer_segments = 3;
-EXPLAIN 
+EXPLAIN
 SELECT (tt.event_ts / 100000) / 5 * 5 as fivemin, COUNT(*)
 FROM my_tt_agg_opt tt, my_tq_agg_opt_part tq
 WHERE tq.sym = tt.symbol AND
@@ -1295,7 +1807,7 @@ insert into canSetTag_input_data values(1, 1, 'A', 1);
 insert into canSetTag_input_data values(2, 1, 'A', 0);
 insert into canSetTag_input_data values(3, 0, 'B', 1);
 
-create table canSetTag_bug_table as 
+create table canSetTag_bug_table as
 SELECT attr, class, (select canSetTag_Func(count(distinct class)::int) from canSetTag_input_data)
    as dclass FROM canSetTag_input_data GROUP BY attr, class distributed by (attr);
 
@@ -1304,17 +1816,29 @@ drop table canSetTag_bug_table;
 drop table canSetTag_input_data;
 
 -- Test B-Tree index scan with in list
-CREATE TABLE btree_test as SELECT * FROM generate_series(1,100) as a distributed randomly;
+CREATE TABLE btree_test as SELECT i a, i b FROM generate_series(1,100) i distributed randomly;
 CREATE INDEX btree_test_index ON btree_test(a);
+set optimizer_enable_tablescan = off;
+-- start_ignore
+select disable_xform('CXformSelect2IndexGet');
+-- end_ignore
 EXPLAIN SELECT * FROM btree_test WHERE a in (1, 47);
 EXPLAIN SELECT * FROM btree_test WHERE a in ('2', 47);
 EXPLAIN SELECT * FROM btree_test WHERE a in ('1', '2');
 EXPLAIN SELECT * FROM btree_test WHERE a in ('1', '2', 47);
+SELECT * FROM btree_test WHERE a in ('1', '2', 47);
+CREATE INDEX btree_test_index_ab ON btree_test using btree(a,b);
+EXPLAIN SELECT * FROM btree_test WHERE a in (1, 2, 47) AND b > 1;
+SELECT * FROM btree_test WHERE a in (1, 2, 47) AND b > 1;
+-- start_ignore
+select enable_xform('CXformSelect2IndexGet');
+-- end_ignore
+reset optimizer_enable_tablescan;
 
 -- Test Bitmap index scan with in list
 CREATE TABLE bitmap_test as SELECT * FROM generate_series(1,100) as a distributed randomly;
 CREATE INDEX bitmap_index ON bitmap_test USING BITMAP(a);
-EXPLAIN SELECT * FROM bitmap_test WHERE a in (select 1);
+EXPLAIN SELECT * FROM bitmap_test WHERE a in (1);
 EXPLAIN SELECT * FROM bitmap_test WHERE a in (1, 47);
 EXPLAIN SELECT * FROM bitmap_test WHERE a in ('2', 47);
 EXPLAIN SELECT * FROM bitmap_test WHERE a in ('1', '2');
@@ -1333,7 +1857,7 @@ create table foo(a int, b int) distributed by (a);
 set log_statement='none';
 set log_min_duration_statement=-1;
 set client_min_messages='log';
-select count(*) from foo group by cube(a,b);
+explain select count(*) from foo group by cube(a,b);
 reset client_min_messages;
 reset log_statement;
 reset log_min_duration_statement;
@@ -1399,10 +1923,173 @@ create table foo (a int, b character varying(10));
 explain select * from foo where b in ('1', '2');
 
 set optimizer_enable_ctas = off;
+set log_statement='none';
+set log_min_duration_statement=-1;
 set client_min_messages='log';
 create table foo_ctas(a) as (select generate_series(1,10)) distributed by (a);
 reset client_min_messages;
+reset log_min_duration_statement;
+reset log_statement;
 reset optimizer_enable_ctas;
+
+-- Test to ensure that ORCA produces correct results for a query with an Agg on top of LOJ
+-- start_ignore
+create table input_tab1 (a int, b int);
+create table input_tab2 (c int, d int);
+insert into input_tab1 values (1, 1);
+insert into input_tab1 values (NULL, NULL);
+set optimizer_force_multistage_agg = off;
+set optimizer_force_three_stage_scalar_dqa = off;
+-- end_ignore
+explain (costs off) select count(*), t2.c from input_tab1 t1 left join input_tab2 t2 on t1.a = t2.c group by t2.c;
+select count(*), t2.c from input_tab1 t1 left join input_tab2 t2 on t1.a = t2.c group by t2.c;
+
+-- start_ignore
+reset optimizer_force_multistage_agg;
+reset optimizer_force_three_stage_scalar_dqa;
+-- end_ignore
+
+--
+-- Test to ensure orca produces correct equivalence class for an alias projected by a LOJ and thus producing correct results.
+-- Previously, orca produced an incorrect filter (cd2 = cd) on top of LOJ which led to incorrect results as column 'cd' is
+-- produced by a nullable side of LOJ (tab2).
+--
+-- start_ignore
+CREATE TABLE tab_1 (id VARCHAR(32)) DISTRIBUTED RANDOMLY;
+INSERT INTO tab_1 VALUES('qwert'), ('vbn');
+
+CREATE TABLE tab_2(key VARCHAR(200) NOT NULL, id VARCHAR(32) NOT NULL, cd VARCHAR(2) NOT NULL) DISTRIBUTED BY(key);
+INSERT INTO tab_2 VALUES('abc', 'rew', 'dr');
+INSERT INTO tab_2 VALUES('tyu', 'rer', 'fd');
+
+CREATE TABLE tab_3 (region TEXT, code TEXT) DISTRIBUTED RANDOMLY;
+INSERT INTO tab_3 VALUES('cvb' ,'tyu');
+INSERT INTO tab_3 VALUES('hjj' ,'xyz');
+-- end_ignore
+
+EXPLAIN SELECT Count(*)
+FROM   (SELECT *
+        FROM   (SELECT tab_2.cd AS CD1,
+                       tab_2.cd AS CD2
+                FROM   tab_1
+                       LEFT JOIN tab_2
+                              ON tab_1.id = tab_2.id) f
+        UNION ALL
+        SELECT region,
+               code
+        FROM   tab_3)a;
+
+SELECT Count(*)
+FROM   (SELECT *
+        FROM   (SELECT tab_2.cd AS CD1,
+                       tab_2.cd AS CD2
+                FROM   tab_1
+                       LEFT JOIN tab_2
+                              ON tab_1.id = tab_2.id) f
+        UNION ALL
+        SELECT region,
+               code
+        FROM   tab_3)a;
+
+--
+-- Test to ensure that ORCA produces correct results with both blocking and
+-- streaming materialze as controlled by optimizer_enable_streaming_material
+-- GUC.
+--
+-- start_ignore
+create table t_outer (c1 integer);
+create table t_inner (c2 integer);
+insert into t_outer values (generate_series (1,10));
+insert into t_inner values (generate_series (1,300));
+-- end_ignore
+
+set optimizer_enable_streaming_material = on;
+select c1 from t_outer where not c1 =all (select c2 from t_inner);
+set optimizer_enable_streaming_material = off;
+select c1 from t_outer where not c1 =all (select c2 from t_inner);
+reset optimizer_enable_streaming_material;
+
+-- Ensure that ORCA rescans the subquery in case of skip-level correlation with
+-- materialization
+drop table if exists wst0, wst1, wst2;
+
+create table wst0(a0 int, b0 int);
+create table wst1(a1 int, b1 int);
+create table wst2(a2 int, b2 int);
+
+insert into wst0 select i, i from generate_series(1,10) i;
+insert into wst1 select i, i from generate_series(1,10) i;
+insert into wst2 select i, i from generate_series(1,10) i;
+
+-- NB: the rank() is need to force materialization (via Sort) in the subplan
+select count(*) from wst0 where exists (select 1, rank() over (order by wst1.a1) from wst1 where a1 = (select b2 from wst2 where a0=a2+5));
+
+
+--
+-- Test to ensure sane behavior when DML queries are optimized by ORCA by
+-- enforcing a non-master gather motion, controlled by
+-- optimizer_enable_gather_on_segment_for_DML GUC
+--
+
+--
+-- CTAS with global-local aggregation
+--
+-- start_ignore
+create table test1 (a int, b int);
+insert into test1 select generate_series(1,100),generate_series(1,100);
+-- end_ignore
+create table t_new as select avg(a) from test1 join (select i from unnest(array[1,2,3]) i) t on (test1.a = t.i);
+select * from t_new;
+
+-- start_ignore
+drop table t_new;
+set optimizer_enable_gather_on_segment_for_DML=off;
+-- end_ignore
+create table t_new as select avg(a) from test1 join (select i from unnest(array[1,2,3]) i) t on (test1.a = t.i);
+select * from t_new;
+
+-- start_ignore
+reset optimizer_enable_gather_on_segment_for_DML;
+-- end_ignore
+
+--
+-- Insert with outer references in the subquery
+--
+-- start_ignore
+create table x_tab(a int);
+create table y_tab(a int);
+create table z_tab(a int);
+
+insert into x_tab values(1);
+insert into y_tab values(0);
+insert into z_tab values(1);
+-- end_ignore
+
+insert into x_tab select * from x_tab where exists (select * from x_tab where x_tab.a = (select x_tab.a + y_tab.a from y_tab));
+select * from x_tab;
+
+--
+-- Insert with Union All with an universal child
+--
+insert into y_tab select 1 union all select a from x_tab limit 10;
+select * from y_tab;
+
+--
+-- Insert with a function containing a SQL
+--
+create or replace function test_func_pg_stats()
+returns integer
+as $$ declare cnt int; begin execute 'select count(*) from pg_statistic' into cnt; return cnt; end $$
+language plpgsql volatile READS SQL DATA;
+
+insert into y_tab select test_func_pg_stats() from x_tab limit 2;
+select count(*) from y_tab;
+
+--
+-- Delete with Hash Join with a universal child
+--
+delete from x_tab where exists (select z_tab.a from z_tab join (select 1 as g) as tab on z_tab.a = tab.g);
+select * from x_tab;
 
 -- start_ignore
 drop table bar;
@@ -1412,6 +2099,358 @@ create table bar(name text);
 insert into bar values('person');
 select * from unnest((select string_to_array(name, ',') from bar)) as a;
 
--- clean up
-drop schema orca cascade;
-reset optimizer_segments;
+-- Query should not fall back to planner and handle implicit cast properly
+
+CREATE TYPE myint;
+
+CREATE FUNCTION myintout(myint) RETURNS cstring AS 'int4out' LANGUAGE INTERNAL STRICT IMMUTABLE;
+CREATE FUNCTION myintin(cstring) RETURNS myint AS 'int4in' LANGUAGE INTERNAL STRICT IMMUTABLE;
+
+CREATE TYPE myint
+(
+	INPUT=myintin,
+	OUTPUT=myintout,
+	INTERNALLENGTH=4,
+	PASSEDBYVALUE
+);
+
+CREATE FUNCTION myint_int8(myint) RETURNS int8 AS 'int48' LANGUAGE INTERNAL STRICT IMMUTABLE;
+
+CREATE CAST (myint AS int8) WITH FUNCTION myint_int8(myint) AS IMPLICIT;
+
+CREATE TABLE csq_cast_param_outer (a int, b myint);
+INSERT INTO csq_cast_param_outer VALUES
+	(1, '42'),
+	(2, '12');
+
+CREATE TABLE csq_cast_param_inner (c int, d myint);
+INSERT INTO csq_cast_param_inner VALUES
+	(11, '11'),
+	(101, '12');
+
+EXPLAIN SELECT a FROM csq_cast_param_outer WHERE b in (SELECT CASE WHEN a > 1 THEN d ELSE '42' END FROM csq_cast_param_inner);
+SELECT a FROM csq_cast_param_outer WHERE b in (SELECT CASE WHEN a > 1 THEN d ELSE '42' END FROM csq_cast_param_inner);
+
+DROP CAST (myint as int8);
+
+CREATE FUNCTION myint_numeric(myint) RETURNS numeric AS 'int4_numeric' LANGUAGE INTERNAL STRICT IMMUTABLE;
+CREATE CAST (myint AS numeric) WITH FUNCTION myint_numeric(myint) AS IMPLICIT;
+
+EXPLAIN SELECT a FROM csq_cast_param_outer WHERE b in (SELECT CASE WHEN a > 1 THEN d ELSE '42' END FROM csq_cast_param_inner);
+SELECT a FROM csq_cast_param_outer WHERE b in (SELECT CASE WHEN a > 1 THEN d ELSE '42' END FROM csq_cast_param_inner);
+
+SELECT a FROM ggg WHERE a IN (NULL, 'x');
+
+EXPLAIN SELECT a FROM ggg WHERE a NOT IN (NULL, '');
+
+EXPLAIN SELECT a FROM ggg WHERE a IN (NULL, 'x');
+
+
+-- result node with one time filter and filter
+CREATE TABLE onetimefilter1 (a int, b int);
+CREATE TABLE onetimefilter2 (a int, b int);
+INSERT INTO onetimefilter1 SELECT i, i FROM generate_series(1,10)i;
+INSERT INTO onetimefilter2 SELECT i, i FROM generate_series(1,10)i;
+ANALYZE onetimefilter1;
+ANALYZE onetimefilter2;
+EXPLAIN WITH abc AS (SELECT onetimefilter1.a, onetimefilter1.b FROM onetimefilter1, onetimefilter2 WHERE onetimefilter1.a=onetimefilter2.a) SELECT (SELECT 1 FROM abc WHERE f1.b = f2.b LIMIT 1), COALESCE((SELECT 2 FROM abc WHERE f1.a=random() AND f1.a=2), 0), (SELECT b FROM abc WHERE b=f1.b) FROM onetimefilter1 f1, onetimefilter2 f2 WHERE f1.b = f2.b;
+WITH abc AS (SELECT onetimefilter1.a, onetimefilter1.b FROM onetimefilter1, onetimefilter2 WHERE onetimefilter1.a=onetimefilter2.a) SELECT (SELECT 1 FROM abc WHERE f1.b = f2.b LIMIT 1), COALESCE((SELECT 2 FROM abc WHERE f1.a=random() AND f1.a=2), 0), (SELECT b FROM abc WHERE b=f1.b) FROM onetimefilter1 f1, onetimefilter2 f2 WHERE f1.b = f2.b;
+
+
+-- full joins with predicates
+DROP TABLE IF EXISTS ffoo, fbar;
+CREATE TABLE ffoo (a, b) AS (VALUES (1, 2), (2, 3), (4, 5), (5, 6), (6, 7)) DISTRIBUTED BY (a);
+CREATE TABLE fbar (c, d) AS (VALUES (1, 42), (2, 43), (4, 45), (5, 46)) DISTRIBUTED BY (c);
+
+SELECT d FROM ffoo FULL OUTER JOIN fbar ON a = c WHERE b BETWEEN 5 and 9;
+
+-- test index left outer joins on bitmap and btree indexes on partitioned tables with and without select clause
+DROP TABLE IF EXISTS touter, tinner;
+CREATE TABLE touter(a int, b int) DISTRIBUTED BY (a);
+CREATE TABLE tinnerbitmap(a int, b int) DISTRIBUTED BY (a) PARTITION BY range(b) (start (0) end (6) every (3));
+CREATE TABLE tinnerbtree(a int, b int) DISTRIBUTED BY (a) PARTITION BY range(b) (start (0) end (6) every (3));
+
+INSERT INTO touter SELECT i, i%6 FROM generate_series(1,10) i;
+INSERT INTO tinnerbitmap select i, i%6 FROM generate_series(1,1000) i;
+INSERT INTO tinnerbtree select i, i%6 FROM generate_series(1,1000) i;
+CREATE INDEX tinnerbitmap_ix ON tinnerbitmap USING bitmap(a);
+CREATE INDEX tinnerbtree_ix ON tinnerbtree USING btree(a);
+
+SELECT * FROM touter LEFT JOIN tinnerbitmap ON touter.a = tinnerbitmap.a;
+SELECT * FROM touter LEFT JOIN tinnerbitmap ON touter.a = tinnerbitmap.a AND tinnerbitmap.b=10;
+
+SELECT * FROM touter LEFT JOIN tinnerbtree ON touter.a = tinnerbtree.a;
+SELECT * FROM touter LEFT JOIN tinnerbtree ON touter.a = tinnerbtree.a AND tinnerbtree.b=10;
+
+-- test subplan in a qual under dynamic scan
+CREATE TABLE ds_part ( a INT, b INT, c INT) PARTITION BY RANGE(c)( START(1) END (10) EVERY (2), DEFAULT PARTITION deflt);
+CREATE TABLE non_part1 (c INT);
+CREATE TABLE non_part2 (e INT, f INT);
+
+INSERT INTO ds_part SELECT i, i, i FROM generate_series (1, 1000)i; 
+INSERT INTO non_part1 SELECT i FROM generate_series(1, 100)i; 
+INSERT INTO non_part2 SELECT i, i FROM generate_series(1, 100)i;
+
+SET optimizer_enforce_subplans TO ON;
+analyze ds_part;
+analyze non_part1;
+analyze non_part2;
+SELECT * FROM ds_part, non_part2 WHERE ds_part.c = non_part2.e AND non_part2.f = 10 AND a IN ( SELECT b + 1 FROM non_part1);
+explain SELECT * FROM ds_part, non_part2 WHERE ds_part.c = non_part2.e AND non_part2.f = 10 AND a IN ( SELECT b + 1 FROM non_part1);
+
+SELECT *, a IN ( SELECT b + 1 FROM non_part1) FROM ds_part, non_part2 WHERE ds_part.c = non_part2.e AND non_part2.f = 10 AND a IN ( SELECT b FROM non_part1);
+CREATE INDEX ds_idx ON ds_part(a);
+analyze ds_part;
+SELECT *, a IN ( SELECT b + 1 FROM non_part1) FROM ds_part, non_part2 WHERE ds_part.c = non_part2.e AND non_part2.f = 10 AND a IN ( SELECT b FROM non_part1);
+
+RESET optimizer_enforce_subplans;
+-- implied predicate must be generated for the type cast(ident) scalar array cmp const array
+CREATE TABLE varchar_sc_array_cmp(a varchar);
+INSERT INTO varchar_sc_array_cmp VALUES ('a'), ('b'), ('c'), ('d');
+EXPLAIN SELECT * FROM varchar_sc_array_cmp t1, varchar_sc_array_cmp t2 where t1.a = t2.a and t1.a in ('b', 'c');
+SELECT * FROM varchar_sc_array_cmp t1, varchar_sc_array_cmp t2 where t1.a = t2.a and t1.a in ('b', 'c');
+SET optimizer_array_constraints=on;
+EXPLAIN SELECT * FROM varchar_sc_array_cmp t1, varchar_sc_array_cmp t2 where t1.a = t2.a and (t1.a in ('b', 'c') OR t1.a = 'a');
+SELECT * FROM varchar_sc_array_cmp t1, varchar_sc_array_cmp t2 where t1.a = t2.a and (t1.a in ('b', 'c') OR t1.a = 'a');
+DROP TABLE varchar_sc_array_cmp;
+
+-- table constraints on nullable columns
+-- start_ignore
+DROP TABLE IF EXISTS tc0, tc1, tc2, tc3, tc4;
+-- end_ignore
+CREATE TABLE tc0 (a int check (a = 5));
+INSERT INTO tc0 VALUES (NULL);
+-- FIXME: Planner gives wrong result
+SELECT * from tc0 where a IS NULL;
+
+CREATE TABLE tc1 (a int check (a between 1 and 2 or a != 3 and a > 5));
+INSERT INTO tc1 VALUES (NULL);
+SELECT * from tc1 where a IS NULL;
+
+CREATE TABLE tc2 (a int check (a in (1,2)));
+INSERT INTO tc2 VALUES (NULL);
+SELECT * from tc2 where a IS NULL;
+
+set optimizer_array_constraints = on;
+CREATE TABLE tc3 (a int check (a = ANY (ARRAY[1,2])));
+INSERT INTO tc3 VALUES (NULL);
+SELECT * from tc3 where a IS NULL;
+reset optimizer_array_constraints;
+
+CREATE TABLE tc4 (a int, b int, check(a + b > 1 and a = b));
+INSERT INTO tc4 VALUES(NULL, NULL);
+SELECT * from tc4 where a IS NULL;
+
+CREATE EXTENSION IF NOT EXISTS citext;
+drop table if exists tt, tc;
+create table tc (a int, c citext) distributed by (a);
+create table tt (b int, v varchar) distributed by (v);
+
+insert into tc values (1, 'a'), (1, 'A');
+insert into tt values (1, 'a'), (1, 'A');
+
+insert into tc values (1, 'b'), (1, 'B');
+insert into tt values (1, 'b'), (1, 'B');
+
+select * from tc, tt where c = v;
+
+-- test gpexpand phase 1
+-- right now, these will fall back to planner
+
+drop table if exists noexp_hash, gpexp_hash, gpexp_rand, gpexp_repl;
+create table noexp_hash(a int, b int) distributed by (a);
+insert into  noexp_hash select i, i from generate_series(1,50) i;
+
+-- three tables that will be expanded (simulated)
+create table gpexp_hash(a int, b int) distributed by (a);
+create table gpexp_rand(a int, b int) distributed randomly;
+create table gpexp_repl(a int, b int) distributed replicated;
+
+-- simulate a cluster with one segment less than we have now
+set allow_system_table_mods = true;
+update gp_distribution_policy set numsegments = numsegments-1 where localoid = 'gpexp_hash'::regclass and numsegments > 1;
+update gp_distribution_policy set numsegments = numsegments-1 where localoid = 'gpexp_rand'::regclass and numsegments > 1;
+update gp_distribution_policy set numsegments = numsegments-1 where localoid = 'gpexp_repl'::regclass and numsegments > 1;
+reset allow_system_table_mods;
+
+-- populate the tables on this smaller cluster
+explain insert into gpexp_hash select i, i from generate_series(1,50) i;
+
+insert into gpexp_hash select i, i from generate_series(1,50) i;
+insert into gpexp_rand select i, i from generate_series(1,50) i;
+insert into gpexp_repl select i, i from generate_series(1,50) i;
+
+-- the segment ids in the unmodified table should have one extra number
+select max(noexp_hash.gp_segment_id) - max(gpexp_hash.gp_segment_id) as expect_one
+from noexp_hash, gpexp_hash;
+
+-- join should have a redistribute motion for gpexp_hash
+explain select count(*) from noexp_hash n join gpexp_hash x on n.a=x.a;
+select count(*) from noexp_hash n join gpexp_hash x on n.a=x.a;
+delete from gpexp_hash where b between 21 and 50;
+select count(*) from gpexp_hash;
+update gpexp_hash set b=-1 where b between 11 and 100;
+select b, count(*) from gpexp_hash group by b order by b;
+
+explain update gpexp_rand set b=(select b from gpexp_hash where gpexp_rand.a = gpexp_hash.a);
+update gpexp_rand set b=(select b from gpexp_hash where gpexp_rand.a = gpexp_hash.a);
+select b, count(*) from gpexp_rand group by b order by b;
+
+delete from gpexp_repl where b >= 20;
+explain insert into gpexp_repl values (20, 20);
+insert into gpexp_repl values (20, 20);
+
+explain select count(*) from gpexp_hash h join gpexp_repl r on h.a=r.a;
+select count(*) as expect_20 from gpexp_hash h join gpexp_repl r on h.a=r.a;
+explain select count(*) as expect_20 from noexp_hash h join gpexp_repl r on h.a=r.a;
+select count(*) as expect_20 from noexp_hash h join gpexp_repl r on h.a=r.a;
+
+create table part1(a int, b int) partition by range(b) (start(1) end(5) every(1));
+create table part2(a int, b int) partition by range(b) (start(1) end(5) every(1));
+insert into part1 select i, (i % 2) + 1 from generate_series(1, 1000) i;
+insert into part2 select i, (i % 2) + 1 from generate_series(1, 100) i;
+-- make sure some child partitions have not been analyzed. This just means that
+-- stats are missing for some child partition but not necessarily that the relation
+-- is empty. So we should not flag this as an empty relation 
+analyze part1_1_prt_1;
+analyze part1_1_prt_2;
+analyze part2_1_prt_1;
+analyze part2_1_prt_2;
+-- the plan should contain a 2 stage limit. If we incorrectly estimate that the
+-- relation is empty, we would end up choosing a single stage limit. 
+explain select * from part1, part2 where part1.b = part2.b limit 5;
+
+-- test opfamily handling in ORCA
+-- start_ignore
+DROP FUNCTION abseq(int, int) CASCADE;
+DROP FUNCTION abslt(int, int) CASCADE;
+DROP FUNCTION absgt(int, int) CASCADE;
+DROP FUNCTION abscmp(int, int) CASCADE;
+-- end_ignore
+CREATE FUNCTION abseq(int, int) RETURNS BOOL AS
+$$
+  begin return abs($1) = abs($2); end;
+$$ LANGUAGE plpgsql STRICT IMMUTABLE;
+
+CREATE OPERATOR |=| (
+  PROCEDURE = abseq,
+  LEFTARG = int,
+  RIGHTARG = int,
+  COMMUTATOR = |=|,
+  hashes, merges);
+
+CREATE FUNCTION abshashfunc(int) RETURNS int AS
+$$
+  begin return hashint4(abs($1)); end;
+$$ LANGUAGE plpgsql STRICT IMMUTABLE;
+
+CREATE FUNCTION abslt(int, int) RETURNS BOOL AS
+$$
+  begin return abs($1) < abs($2); end;
+$$ LANGUAGE plpgsql STRICT IMMUTABLE;
+
+CREATE OPERATOR |<| (
+  PROCEDURE = abslt,
+  LEFTARG = int,
+  RIGHTARG = int);
+
+CREATE FUNCTION absgt(int, int) RETURNS BOOL AS
+$$
+  begin return abs($1) > abs($2); end;
+$$ LANGUAGE plpgsql STRICT IMMUTABLE;
+
+CREATE OPERATOR |>| (
+  PROCEDURE = absgt,
+  LEFTARG = int,
+  RIGHTARG = int);
+
+CREATE FUNCTION abscmp(int, int) RETURNS int AS
+$$
+  begin return btint4cmp(abs($1),abs($2)); end;
+$$ LANGUAGE plpgsql STRICT IMMUTABLE;
+
+DROP TABLE IF EXISTS atab_old_hash;
+DROP TABLE IF EXISTS btab_old_hash;
+CREATE TABLE atab_old_hash (a int) DISTRIBUTED BY (a);
+CREATE TABLE btab_old_hash (b int) DISTRIBUTED BY (b);
+
+INSERT INTO atab_old_hash VALUES (-1), (0), (1);
+INSERT INTO btab_old_hash VALUES (-1), (0), (1), (2);
+
+-- Test simple join using the new operator(s) before creating the opclass/opfamily
+EXPLAIN SELECT a, b FROM atab_old_hash INNER JOIN btab_old_hash ON a |=| b;
+SELECT a, b FROM atab_old_hash INNER JOIN btab_old_hash ON a |=| b;
+
+CREATE OPERATOR CLASS abs_int_hash_ops FOR TYPE int4
+  USING hash AS
+  OPERATOR 1 |=|,
+  FUNCTION 1 abshashfunc(int);
+
+CREATE OPERATOR CLASS abs_int_btree_ops FOR TYPE int4
+  USING btree AS
+  OPERATOR 1 |<|,
+  OPERATOR 3 |=|,
+  OPERATOR 5 |>|,
+  FUNCTION 1 abscmp(int, int);
+
+-- OK test different kinds of joins
+EXPLAIN SELECT a, b FROM atab_old_hash INNER JOIN btab_old_hash ON a |=| b;
+SELECT a, b FROM atab_old_hash INNER JOIN btab_old_hash ON a |=| b;
+
+EXPLAIN SELECT a, b FROM btab_old_hash LEFT OUTER JOIN atab_old_hash ON a |=| b;
+SELECT a, b FROM btab_old_hash LEFT OUTER JOIN atab_old_hash ON a |=| b;
+
+set optimizer_expand_fulljoin = on;
+EXPLAIN SELECT a, b FROM atab_old_hash FULL JOIN btab_old_hash ON a |=| b;
+SELECT a, b FROM atab_old_hash FULL JOIN btab_old_hash ON a |=| b;
+reset optimizer_expand_fulljoin;
+
+-- Test rescanned materialize that is not directly above a motion
+
+DROP TABLE IF EXISTS foo1 CASCADE;
+DROP TABLE IF EXISTS foo2 CASCADE;
+DROP TABLE IF EXISTS foo3 CASCADE;
+CREATE table foo1(a int);
+CREATE table foo2(a int, b int, c int);
+CREATE table foo3(a int, b int);
+CREATE index f2c on foo2 using bitmap(c);
+INSERT INTO foo1 values (1), (2);
+INSERT INTO foo2 values (1,1,1), (2,2,2);
+INSERT INTO foo3 values (1,1), (2,2);
+
+set optimizer_join_order=query;
+select disable_xform('CXformInnerJoin2HashJoin');
+
+EXPLAIN SELECT 1 FROM foo1, foo2 WHERE foo1.a = foo2.a AND foo2.c = 3 AND foo2.b IN (SELECT b FROM foo3);
+SELECT 1 FROM foo1, foo2 WHERE foo1.a = foo2.a AND foo2.c = 3 AND foo2.b IN (SELECT b FROM foo3);
+
+reset optimizer_join_order;
+select enable_xform('CXformInnerJoin2HashJoin');
+
+drop table if exists t55;
+drop table if exists tp;
+
+create table t55 (c int, lid int);
+insert into t55 select i, i from generate_series(1, 1000) i;
+
+set optimizer_join_order = query;
+
+explain verbose
+CREATE TABLE TP AS
+WITH META AS (SELECT '2020-01-01' AS VALID_DT, '99' AS LOAD_ID)
+SELECT DISTINCT L1.c, L1.lid
+FROM t55 L1 CROSS JOIN META
+WHERE L1.lid = int4in(unknownout(meta.load_id));
+
+CREATE TABLE TP AS
+WITH META AS (SELECT '2020-01-01' AS VALID_DT, '99' AS LOAD_ID)
+SELECT DISTINCT L1.c, L1.lid
+FROM t55 L1 CROSS JOIN META
+WHERE L1.lid = int4in(unknownout(meta.load_id));
+
+reset optimizer_join_order;
+SELECT * from tp;
+
+-- start_ignore
+DROP SCHEMA orca CASCADE;
+-- end_ignore

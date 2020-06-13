@@ -3,11 +3,11 @@
  * quote.c
  *	  Functions for quoting identifiers and literals
  *
- * Portions Copyright (c) 2000-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2000-2016, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/adt/quote.c,v 1.23 2008/01/01 19:45:52 momjian Exp $
+ *	  src/backend/utils/adt/quote.c
  *
  *-------------------------------------------------------------------------
  */
@@ -23,31 +23,18 @@
 Datum
 quote_ident(PG_FUNCTION_ARGS)
 {
-	text	   *t = PG_GETARG_TEXT_P(0);
-	text	   *result;
+	text	   *t = PG_GETARG_TEXT_PP(0);
 	const char *qstr;
 	char	   *str;
-	int			len;
 
-	/* We have to convert to a C string to use quote_identifier */
-	len = VARSIZE(t) - VARHDRSZ;
-	str = (char *) palloc(len + 1);
-	memcpy(str, VARDATA(t), len);
-	str[len] = '\0';
-
+	str = text_to_cstring(t);
 	qstr = quote_identifier(str);
-
-	len = strlen(qstr);
-	result = (text *) palloc(len + VARHDRSZ);
-	SET_VARSIZE(result, len + VARHDRSZ);
-	memcpy(VARDATA(result), qstr, len);
-
-	PG_RETURN_TEXT_P(result);
+	PG_RETURN_TEXT_P(cstring_to_text(qstr));
 }
 
 /*
- * quote_literal -
- *	  returns a properly quoted literal
+ * quote_literal_internal -
+ *	  helper function for quote_literal and quote_literal_cstr
  *
  * NOTE: think not to make this function's behavior change with
  * standard_conforming_strings.  We don't know where the result
@@ -55,29 +42,77 @@ quote_ident(PG_FUNCTION_ARGS)
  * will work with either setting.  Take a look at what dblink
  * uses this for before thinking you know better.
  */
+static size_t
+quote_literal_internal(char *dst, const char *src, size_t len)
+{
+	const char *s;
+	char	   *savedst = dst;
+
+	for (s = src; s < src + len; s++)
+	{
+		if (*s == '\\')
+		{
+			*dst++ = ESCAPE_STRING_SYNTAX;
+			break;
+		}
+	}
+
+	*dst++ = '\'';
+	while (len-- > 0)
+	{
+		if (SQL_STR_DOUBLE(*src, true))
+			*dst++ = *src;
+		*dst++ = *src++;
+	}
+	*dst++ = '\'';
+
+	return dst - savedst;
+}
+
+/*
+ * quote_literal -
+ *	  returns a properly quoted literal
+ */
 Datum
 quote_literal(PG_FUNCTION_ARGS)
 {
 	text	   *t = PG_GETARG_TEXT_P(0);
 	text	   *result;
-	const char *qstr;
-	char	   *str;
+	char	   *cp1;
+	char	   *cp2;
 	int			len;
 
-	/* We have to convert to a C string to use quote_literal_internal */
 	len = VARSIZE(t) - VARHDRSZ;
-	str = (char *) palloc(len + 1);
-	memcpy(str, VARDATA(t), len);
-	str[len] = '\0';
+	/* We make a worst-case result area; wasting a little space is OK */
+	result = (text *) palloc(len * 2 + 3 + VARHDRSZ);
 
-	qstr = quote_literal_internal(str);
+	cp1 = VARDATA(t);
+	cp2 = VARDATA(result);
 
-	len = strlen(qstr);
-	result = (text *) palloc(len + VARHDRSZ);
-	SET_VARSIZE(result, len + VARHDRSZ);
-	memcpy(VARDATA(result), qstr, len);
+	SET_VARSIZE(result, VARHDRSZ + quote_literal_internal(cp2, cp1, len));
 
 	PG_RETURN_TEXT_P(result);
+}
+
+/*
+ * quote_literal_cstr -
+ *	  returns a properly quoted literal
+ */
+char *
+quote_literal_cstr(const char *rawstr)
+{
+	char	   *result;
+	int			len;
+	int			newlen;
+
+	len = strlen(rawstr);
+	/* We make a worst-case result area; wasting a little space is OK */
+	result = palloc(len * 2 + 3 + 1);
+
+	newlen = quote_literal_internal(result, rawstr, len);
+	result[newlen] = '\0';
+
+	return result;
 }
 
 /*

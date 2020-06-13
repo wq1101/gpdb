@@ -1,11 +1,16 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/alter_trigger.sgml,v 1.10 2006/09/16 00:30:16 momjian Exp $
+doc/src/sgml/ref/alter_trigger.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-ALTERTRIGGER">
+ <indexterm zone="sql-altertrigger">
+  <primary>ALTER TRIGGER</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="sql-altertrigger-title">ALTER TRIGGER</refentrytitle>
+  <refentrytitle>ALTER TRIGGER</refentrytitle>
+  <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
 
@@ -14,13 +19,10 @@ PostgreSQL documentation
   <refpurpose>change the definition of a trigger</refpurpose>
  </refnamediv>
 
- <indexterm zone="sql-altertrigger">
-  <primary>ALTER TRIGGER</primary>
- </indexterm>
-
  <refsynopsisdiv>
 <synopsis>
-ALTER TRIGGER <replaceable class="PARAMETER">name</replaceable> ON <replaceable class="PARAMETER">table</replaceable> RENAME TO <replaceable class="PARAMETER">newname</replaceable>
+ALTER TRIGGER <replaceable class="PARAMETER">name</replaceable> ON <replaceable class="PARAMETER">table_name</replaceable> RENAME TO <replaceable class="PARAMETER">new_name</replaceable>
+ALTER TRIGGER <replaceable class="PARAMETER">name</replaceable> ON <replaceable class="PARAMETER">table_name</replaceable> DEPENDS ON EXTENSION <replaceable class="PARAMETER">extension_name</replaceable>
 </synopsis>
  </refsynopsisdiv>
 
@@ -31,7 +33,9 @@ ALTER TRIGGER <replaceable class="PARAMETER">name</replaceable> ON <replaceable 
    <command>ALTER TRIGGER</command> changes properties of an existing
    trigger.  The <literal>RENAME</literal> clause changes the name of
    the given trigger without otherwise changing the trigger
-   definition.
+   definition.  The <literal>DEPENDS ON EXTENSION</literal> clause marks
+   the trigger as dependent on an extension, such that if the extension is
+   dropped, the trigger will automatically be dropped as well.
   </para>
 
   <para>
@@ -53,7 +57,7 @@ ALTER TRIGGER <replaceable class="PARAMETER">name</replaceable> ON <replaceable 
    </varlistentry>
 
    <varlistentry>
-    <term><replaceable class="PARAMETER">table</replaceable></term>
+    <term><replaceable class="PARAMETER">table_name</replaceable></term>
     <listitem>
      <para>
       The name of the table on which this trigger acts.
@@ -62,10 +66,19 @@ ALTER TRIGGER <replaceable class="PARAMETER">name</replaceable> ON <replaceable 
    </varlistentry>
 
    <varlistentry>
-    <term><replaceable class="PARAMETER">newname</replaceable></term>
+    <term><replaceable class="PARAMETER">new_name</replaceable></term>
     <listitem>
      <para>
       The new name for the trigger.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><replaceable class="PARAMETER">extension_name</replaceable></term>
+    <listitem>
+     <para>
+      The name of the extension that the trigger is to depend on.
      </para>
     </listitem>
    </varlistentry>
@@ -77,7 +90,7 @@ ALTER TRIGGER <replaceable class="PARAMETER">name</replaceable> ON <replaceable 
 
    <para>
     The ability to temporarily enable or disable a trigger is provided by
-    <xref linkend="SQL-ALTERTABLE" endterm="SQL-ALTERTABLE-TITLE">, not by
+    <xref linkend="SQL-ALTERTABLE">, not by
     <command>ALTER TRIGGER</>, because <command>ALTER TRIGGER</> has no
     convenient way to express the option of enabling or disabling all of
     a table's triggers at once.
@@ -91,8 +104,13 @@ ALTER TRIGGER <replaceable class="PARAMETER">name</replaceable> ON <replaceable 
    To rename an existing trigger:
 <programlisting>
 ALTER TRIGGER emp_stamp ON emp RENAME TO emp_track_chgs;
-</programlisting>
-  </para>
+</programlisting></para>
+
+  <para>
+   To mark a trigger as being dependent on an extension:
+<programlisting>
+ALTER TRIGGER emp_stamp ON emp DEPENDS ON EXTENSION emplib;
+</programlisting></para>
  </refsect1>
 
  <refsect1>
@@ -108,7 +126,7 @@ ALTER TRIGGER emp_stamp ON emp RENAME TO emp_track_chgs;
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-altertable" endterm="sql-altertable-title"></member>
+   <member><xref linkend="sql-altertable"></member>
   </simplelist>
  </refsect1>
 </refentry>

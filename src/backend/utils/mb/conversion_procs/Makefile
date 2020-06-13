@@ -4,7 +4,7 @@
 #    Makefile for utils/mb/conversion_procs
 #
 # IDENTIFICATION
-#    $PostgreSQL: pgsql/src/backend/utils/mb/conversion_procs/Makefile,v 1.21 2009/02/10 19:29:39 petere Exp $
+#    src/backend/utils/mb/conversion_procs/Makefile
 #
 #-------------------------------------------------------------------------
 
@@ -14,17 +14,16 @@ include $(top_builddir)/src/Makefile.global
 
 SQLSCRIPT = conversion_create.sql
 
-# This file can be placed as src/test/regress/conversion.sql
-REGRESSION_SCRIPT = conversion.sql
-
-DIRS = \
+SUBDIRS = \
 	ascii_and_mic cyrillic_and_mic euc_cn_and_mic euc_jp_and_sjis \
 	euc_kr_and_mic euc_tw_and_big5 latin2_and_win1250 latin_and_mic \
 	utf8_and_ascii utf8_and_big5 utf8_and_cyrillic utf8_and_euc_cn \
 	utf8_and_euc_jp utf8_and_euc_kr utf8_and_euc_tw utf8_and_gb18030 \
 	utf8_and_gbk utf8_and_iso8859 utf8_and_iso8859_1 utf8_and_johab \
 	utf8_and_sjis utf8_and_win utf8_and_uhc \
-	utf8_and_euc_jis_2004 utf8_and_shift_jis_2004 euc_jis_2004_and_shift_jis_2004
+	utf8_and_euc2004 utf8_and_sjis2004 euc2004_sjis2004
+
+$(recurse)
 
 # conversion_name source_encoding destination_encoding function object
 CONVERSIONS = \
@@ -154,18 +153,16 @@ CONVERSIONS = \
 		utf8_to_sjis UTF8 SJIS utf8_to_sjis utf8_and_sjis \
 		uhc_to_utf8 UHC UTF8 uhc_to_utf8 utf8_and_uhc \
 		utf8_to_uhc UTF8 UHC utf8_to_uhc utf8_and_uhc \
-		euc_jis_2004_to_utf8 EUC_JIS_2004 UTF8 euc_jis_2004_to_utf8 utf8_and_euc_jis_2004 \
-		utf8_to_euc_jis_2004 UTF8 EUC_JIS_2004 utf8_to_euc_jis_2004 utf8_and_euc_jis_2004 \
-		shift_jis_2004_to_utf8 SHIFT_JIS_2004 UTF8 shift_jis_2004_to_utf8 utf8_and_shift_jis_2004 \
-		utf8_to_shift_jis_2004 UTF8 SHIFT_JIS_2004 utf8_to_shift_jis_2004 utf8_and_shift_jis_2004 \
-		euc_jis_2004_to_shift_jis_2004 EUC_JIS_2004 SHIFT_JIS_2004 euc_jis_2004_to_shift_jis_2004 euc_jis_2004_and_shift_jis_2004 \
-		shift_jis_2004_to_euc_jis_2004 SHIFT_JIS_2004 EUC_JIS_2004 shift_jis_2004_to_euc_jis_2004 euc_jis_2004_and_shift_jis_2004
+		euc_jis_2004_to_utf8 EUC_JIS_2004 UTF8 euc_jis_2004_to_utf8 utf8_and_euc2004 \
+		utf8_to_euc_jis_2004 UTF8 EUC_JIS_2004 utf8_to_euc_jis_2004 utf8_and_euc2004 \
+		shift_jis_2004_to_utf8 SHIFT_JIS_2004 UTF8 shift_jis_2004_to_utf8 utf8_and_sjis2004 \
+		utf8_to_shift_jis_2004 UTF8 SHIFT_JIS_2004 utf8_to_shift_jis_2004 utf8_and_sjis2004 \
+		euc_jis_2004_to_shift_jis_2004 EUC_JIS_2004 SHIFT_JIS_2004 euc_jis_2004_to_shift_jis_2004 euc2004_sjis2004 \
+		shift_jis_2004_to_euc_jis_2004 SHIFT_JIS_2004 EUC_JIS_2004 shift_jis_2004_to_euc_jis_2004 euc2004_sjis2004
 
 all: $(SQLSCRIPT)
-	@for dir in $(DIRS); do $(MAKE) -C $$dir $@ || exit; done
 
 $(SQLSCRIPT): Makefile
-ifeq ($(enable_shared), yes)
 	@set -e; \
 	set $(CONVERSIONS) ; \
 	while [ "$$#" -gt 0 ] ; \
@@ -176,45 +173,22 @@ ifeq ($(enable_shared), yes)
 		func=$$1; shift; \
 		obj=$$1; shift; \
 		echo "-- $$se --> $$de"; \
-		echo "CREATE OR REPLACE FUNCTION $$func (INTEGER, INTEGER, CSTRING, INTERNAL, INTEGER) RETURNS VOID AS '$$"libdir"/$$obj', '$$func' LANGUAGE C STRICT;"; \
+		echo "CREATE OR REPLACE FUNCTION $$func (INTEGER, INTEGER, CSTRING, INTERNAL, INTEGER) RETURNS VOID AS '$$"libdir"/$$obj', '$$func' LANGUAGE C STRICT PARALLEL SAFE;"; \
 	        echo "COMMENT ON FUNCTION $$func(INTEGER, INTEGER, CSTRING, INTERNAL, INTEGER) IS 'internal conversion function for $$se to $$de';"; \
 		echo "DROP CONVERSION pg_catalog.$$name;"; \
 		echo "CREATE DEFAULT CONVERSION pg_catalog.$$name FOR '$$se' TO '$$de' FROM $$func;"; \
 	        echo "COMMENT ON CONVERSION pg_catalog.$$name IS 'conversion for $$se to $$de';"; \
+		echo; \
 	done > $@
-else
-	echo "-- No conversion support, for lack of shared library support" > $@
-endif
-
-$(REGRESSION_SCRIPT): Makefile
-	@set -e; \
-	cp regress_prolog $@; \
-	set $(CONVERSIONS) ; \
-	while [ "$$#" -gt 0 ] ; \
-	do \
-		name=$$1;shift; \
-		se=$$1;shift; \
-		de=$$1; shift; \
-		func=$$1; shift; \
-		obj=$$1; shift; \
-		echo "-- $$se --> $$de"; \
-		echo "SELECT CONVERT('foo' USING $$name);"; \
-		echo "SELECT CONVERT('foo', '$$se', '$$de');"; \
-	done >> $@; \
-	cat regress_epilogue >> $@;
 
 install: $(SQLSCRIPT) installdirs
 	$(INSTALL_DATA) $(SQLSCRIPT) '$(DESTDIR)$(datadir)'
-	@for dir in $(DIRS); do $(MAKE) -C $$dir $@ || exit; done
 
 installdirs:
 	$(MKDIR_P) '$(DESTDIR)$(datadir)' '$(DESTDIR)$(pkglibdir)'
 
 uninstall:
 	rm -f '$(DESTDIR)$(datadir)/$(SQLSCRIPT)'
-	@for dir in $(DIRS); do $(MAKE) -C $$dir $@ || exit; done
 
 clean distclean maintainer-clean:
 	rm -f $(SQLSCRIPT)
-	@for dir in $(DIRS); do $(MAKE) -C $$dir $@ || exit; done
-

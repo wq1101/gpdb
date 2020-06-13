@@ -32,28 +32,6 @@ static void LogPartitionSelection(EState *estate, int32 selectorId);
 static void
 partition_propagation(EState *estate, List *partOids, List *scanIds, int32 selectorId);
 
-/* PartitionSelector Slots */
-#define PARTITIONSELECTOR_NSLOTS 1
-
-/* Return number of TupleTableSlots used by nodePartitionSelector.*/
-int
-ExecCountSlotsPartitionSelector(PartitionSelector *node)
-{
-	if (NULL != outerPlan(node))
-	{
-		return ExecCountSlotsNode(outerPlan(node)) + PARTITIONSELECTOR_NSLOTS;
-	}
-	return PARTITIONSELECTOR_NSLOTS;
-}
-
-void
-initGpmonPktForPartitionSelector(Plan *planNode, gpmon_packet_t *gpmon_pkt, EState *estate)
-{
-	Assert(planNode != NULL && gpmon_pkt != NULL && IsA(planNode, PartitionSelector));
-
-	InitPlanNodeGpmonPkt(planNode, gpmon_pkt, estate);
-}
-
 /* ----------------------------------------------------------------
  *		ExecInitPartitionSelector
  *
@@ -102,8 +80,6 @@ ExecInitPartitionSelector(PartitionSelector *node, EState *estate, int eflags)
 													   ExecGetResultType(&psstate->ps));
 	}
 
-	initGpmonPktForPartitionSelector((Plan *)node, &psstate->ps.gpmon_pkt, estate);
-
 	return psstate;
 }
 
@@ -118,7 +94,7 @@ ExecInitPartitionSelector(PartitionSelector *node, EState *estate, int eflags)
  *		Plan structure:
  *			Sequence
  *				|--PartitionSelector
- *				|--DynamicTableScan
+ *				|--DynamicSeqScan
  *		In this case, PartitionSelector evaluates constant partition
  *		constraints to compute and propagate partition table Oids.
  *		It only need to be called once.
@@ -126,12 +102,12 @@ ExecInitPartitionSelector(PartitionSelector *node, EState *estate, int eflags)
  *		2. Join partition elimination
  *		Plan structure:
  *			...:
- *				|--DynamicTableScan
+ *				|--DynamicSeqScan
  *				|--...
  *					|--PartitionSelector
  *						|--...
  *		In this case, PartitionSelector is in the same slice as
- *		DynamicTableScan, DynamicIndexScan or DynamicBitmapHeapScan.
+ *		DynamicSeqScan, DynamicIndexScan or DynamicBitmapHeapScan.
  *		It is executed for each tuple coming from its child node.
  *		It evaluates partition constraints with the input tuple and
  *		propagate matched partition table Oids.
@@ -208,7 +184,6 @@ ExecPartitionSelector(PartitionSelectorState *node)
 
 	/* partition elimination with the given input tuple */
 	ResetExprContext(econtext);
-	node->ps.ps_OuterTupleSlot = inputSlot;
 	econtext->ecxt_outertuple = inputSlot;
 	econtext->ecxt_scantuple = inputSlot;
 
@@ -241,6 +216,7 @@ ExecPartitionSelector(PartitionSelectorState *node)
 		{
 			InsertPidIntoDynamicTableScanInfo(estate, ps->scanId, lfirst_oid(lc), ps->selectorId);
 		}
+		list_free(oids);
 	}
 	else
 	{
@@ -323,7 +299,7 @@ void LogSelectedPartitionsForScan(int32 selectorId, HTAB *pidIndex, const int32 
  * ----------------------------------------------------------------
  */
 void
-ExecReScanPartitionSelector(PartitionSelectorState *node, ExprContext *exprCtxt)
+ExecReScanPartitionSelector(PartitionSelectorState *node)
 {
 	/* reset PartitionSelectorState */
 	PartitionSelector *ps = (PartitionSelector *) node->ps.plan;
@@ -335,16 +311,6 @@ ExecReScanPartitionSelector(PartitionSelectorState *node, ExprContext *exprCtxt)
 
 	/* free result tuple slot */
 	ExecClearTuple(node->ps.ps_ResultTupleSlot);
-
-	/*
-	 * If we are being passed an outer tuple, link it into the "regular"
-	 * per-tuple econtext for possible qual eval.
-	 */
-	if (exprCtxt != NULL)
-	{
-		ExprContext *stdecontext = node->ps.ps_ExprContext;
-		stdecontext->ecxt_outertuple = exprCtxt->ecxt_outertuple;
-	}
 
 	/* If the PartitionSelector is in the inner side of a nest loop join,
 	 * it should be constant partition elimination and thus has no child node.*/
@@ -375,8 +341,6 @@ ExecEndPartitionSelector(PartitionSelectorState *node)
 	{
 		ExecEndNode(outerPlanState(node));
 	}
-
-	EndPlanStateGpmonPkt(&node->ps);
 }
 
 /* ----------------------------------------------------------------

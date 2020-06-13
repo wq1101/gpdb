@@ -1,19 +1,9 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/prepare.sgml,v 1.23 2007/05/15 19:13:55 neilc Exp $
+doc/src/sgml/ref/prepare.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-PREPARE">
- <refmeta>
-  <refentrytitle id="sql-prepare-title">PREPARE</refentrytitle>
-  <refmiscinfo>SQL - Language Statements</refmiscinfo>
- </refmeta>
-
- <refnamediv>
-  <refname>PREPARE</refname>
-  <refpurpose>prepare a statement for execution</refpurpose>
- </refnamediv>
-
  <indexterm zone="sql-prepare">
   <primary>PREPARE</primary>
  </indexterm>
@@ -23,9 +13,20 @@ PostgreSQL documentation
   <secondary>creating</secondary>
  </indexterm>
 
+ <refmeta>
+  <refentrytitle>PREPARE</refentrytitle>
+  <manvolnum>7</manvolnum>
+  <refmiscinfo>SQL - Language Statements</refmiscinfo>
+ </refmeta>
+
+ <refnamediv>
+  <refname>PREPARE</refname>
+  <refpurpose>prepare a statement for execution</refpurpose>
+ </refnamediv>
+
  <refsynopsisdiv>
 <synopsis>
-PREPARE <replaceable class="PARAMETER">name</replaceable> [ ( <replaceable class="PARAMETER">datatype</replaceable> [, ...] ) ] AS <replaceable class="PARAMETER">statement</replaceable>
+PREPARE <replaceable class="PARAMETER">name</replaceable> [ ( <replaceable class="PARAMETER">data_type</replaceable> [, ...] ) ] AS <replaceable class="PARAMETER">statement</replaceable>
 </synopsis>
  </refsynopsisdiv>
 
@@ -33,13 +34,14 @@ PREPARE <replaceable class="PARAMETER">name</replaceable> [ ( <replaceable class
   <title>Description</title>
 
   <para>
-   <command>PREPARE</command> creates a prepared statement, 
-   possibly with unbound parameters. A prepared statement is a 
-   server-side object that can be used to optimize performance. 
-   A prepared statement may be subsequently executed with a 
-   binding for its parameters. Greenplum Database may choose to 
-   replan the query for different executions of the same 
-   prepared statement. 
+   <command>PREPARE</command> creates a prepared statement. A prepared
+   statement is a server-side object that can be used to optimize
+   performance. When the <command>PREPARE</command> statement is
+   executed, the specified statement is parsed, analyzed, and rewritten.
+   When an <command>EXECUTE</command> command is subsequently
+   issued, the prepared statement is planned and executed.  This division
+   of labor avoids repetitive parse analysis work, while allowing
+   the execution plan to depend on the specific parameter values supplied.
   </para>
 
   <para>
@@ -50,30 +52,29 @@ PREPARE <replaceable class="PARAMETER">name</replaceable> [ ( <replaceable class
    parameter data types can optionally be specified. When a
    parameter's data type is not specified or is declared as
    <literal>unknown</literal>, the type is inferred from the context
-   in which the parameter is used (if possible). When executing the
+   in which the parameter is first used (if possible). When executing the
    statement, specify the actual values for these parameters in the
    <command>EXECUTE</command> statement.  Refer to <xref
-   linkend="sql-execute" endterm="sql-execute-title"> for more
+   linkend="sql-execute"> for more
    information about that.
   </para>
 
   <para>
    Prepared statements only last for the duration of the current
    database session. When the session ends, the prepared statement is
-   forgotten, so it must be recreated before being used again. This 
+   forgotten, so it must be recreated before being used again. This
    also means that a single  prepared statement cannot be used by
    multiple simultaneous database clients; however, each client can create
-   their own prepared statement to use.  The prepared statement can be
-   manually cleaned up using the <xref linkend="sql-deallocate"
-   endterm="sql-deallocate-title"> command.
+   their own prepared statement to use.  Prepared statements can be
+   manually cleaned up using the <xref linkend="sql-deallocate"> command.
   </para>
 
   <para>
-   Prepared statements have the largest performance advantage when a
-   single session is being used to execute a large number of similar
+   Prepared statements potentially have the largest performance advantage
+   when a single session is being used to execute a large number of similar
    statements. The performance difference will be particularly
-   significant if the statements are complex to plan or rewrite, for
-   example, if the query involves a join of many tables or requires
+   significant if the statements are complex to plan or rewrite, e.g. 
+   if the query involves a join of many tables or requires
    the application of several rules. If the statement is relatively simple
    to plan and rewrite but relatively expensive to execute, the
    performance advantage of prepared statements will be less noticeable.
@@ -97,13 +98,13 @@ PREPARE <replaceable class="PARAMETER">name</replaceable> [ ( <replaceable class
    </varlistentry>
 
    <varlistentry>
-    <term><replaceable class="PARAMETER">datatype</replaceable></term>
+    <term><replaceable class="PARAMETER">data_type</replaceable></term>
     <listitem>
      <para>
       The data type of a parameter to the prepared statement.  If the
       data type of a particular parameter is unspecified or is
       specified as <literal>unknown</literal>, it will be inferred
-      from the context in which the parameter is used. To refer to the
+      from the context in which the parameter is first used. To refer to the
       parameters in the prepared statement itself, use
       <literal>$1</literal>, <literal>$2</literal>, etc.
      </para>
@@ -122,36 +123,77 @@ PREPARE <replaceable class="PARAMETER">name</replaceable> [ ( <replaceable class
   </variablelist>
  </refsect1>
 
- <refsect1>
+ <refsect1 id="SQL-PREPARE-notes">
   <title>Notes</title>
 
   <para>
-   In some situations, the query plan produced for a prepared
-   statement will be inferior to the query plan that would have been
-   chosen if the statement had been submitted and executed
-   normally. This is because when the statement is planned and the
-   planner attempts to determine the optimal query plan, the actual
-   values of any parameters specified in the statement are
-   unavailable. <productname>PostgreSQL</productname> collects
-   statistics on the distribution of data in the table, and can use
-   constant values in a statement to make guesses about the likely
-   result of executing the statement. Since this data is unavailable
-   when planning prepared statements with parameters, the chosen plan
-   might be suboptimal. To examine the query plan
-   <productname>PostgreSQL</productname> has chosen for a prepared
-   statement, use <xref linkend="sql-explain"
-   endterm="sql-explain-title">.
+   Prepared statements can use generic plans rather than re-planning with
+   each set of supplied <command>EXECUTE</command> values.  This occurs
+   immediately for prepared statements with no parameters; otherwise
+   it occurs only after five or more executions produce plans whose
+   estimated cost average (including planning overhead) is more expensive
+   than the generic plan cost estimate.  Once a generic plan is chosen,
+   it is used for the remaining lifetime of the prepared statement.
+   Using <command>EXECUTE</command> values which are rare in columns with
+   many duplicates can generate custom plans that are so much cheaper
+   than the generic plan, even after adding planning overhead, that the
+   generic plan might never be used.
+  </para>
+
+  <para>
+   A generic plan assumes that each value supplied to
+   <command>EXECUTE</command> is one of the column's distinct values
+   and that column values are uniformly distributed.  For example,
+   if statistics record three distinct column values, a generic plan
+   assumes a column equality comparison will match 33% of processed rows.
+   Column statistics also allow generic plans to accurately compute the
+   selectivity of unique columns.  Comparisons on non-uniformly-distributed
+   columns and specification of non-existent values affects the average
+   plan cost, and hence if and when a generic plan is chosen.
+  </para>
+
+  <para>
+   To examine the query plan <productname>PostgreSQL</productname> is using
+   for a prepared statement, use <xref linkend="sql-explain">, e.g.
+   <command>EXPLAIN EXECUTE</>.
+   If a generic plan is in use, it will contain parameter symbols
+   <literal>$<replaceable>n</></literal>, while a custom plan will have the
+   supplied parameter values substituted into it.
+   The row estimates in the generic plan reflect the selectivity
+   computed for the parameters.
   </para>
 
   <para>
    For more information on query planning and the statistics collected
    by <productname>PostgreSQL</productname> for that purpose, see
-   the <xref linkend="sql-analyze" endterm="sql-analyze-title">
+   the <xref linkend="sql-analyze">
    documentation.
   </para>
 
   <para>
-   You can see all available prepared statements of a session by querying the
+   Although the main point of a prepared statement is to avoid repeated parse
+   analysis and planning of the statement, <productname>PostgreSQL</> will
+   force re-analysis and re-planning of the statement before using it
+   whenever database objects used in the statement have undergone
+   definitional (DDL) changes since the previous use of the prepared
+   statement.  Also, if the value of <xref linkend="guc-search-path"> changes
+   from one use to the next, the statement will be re-parsed using the new
+   <varname>search_path</>.  (This latter behavior is new as of
+   <productname>PostgreSQL</productname> 9.3.)  These rules make use of a
+   prepared statement semantically almost equivalent to re-submitting the
+   same query text over and over, but with a performance benefit if no object
+   definitions are changed, especially if the best plan remains the same
+   across uses.  An example of a case where the semantic equivalence is not
+   perfect is that if the statement refers to a table by an unqualified name,
+   and then a new table of the same name is created in a schema appearing
+   earlier in the <varname>search_path</>, no automatic re-parse will occur
+   since no object used in the statement changed.  However, if some other
+   change forces a re-parse, the new table will be referenced in subsequent
+   uses.
+  </para>
+
+  <para>
+   You can see all prepared statements available in the session by querying the
    <link linkend="view-pg-prepared-statements"><structname>pg_prepared_statements</structname></link>
    system view.
   </para>
@@ -198,8 +240,8 @@ EXECUTE usrrptplan(1, current_date);
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-deallocate" endterm="sql-deallocate-title"></member>
-   <member><xref linkend="sql-execute" endterm="sql-execute-title"></member>
+   <member><xref linkend="sql-deallocate"></member>
+   <member><xref linkend="sql-execute"></member>
   </simplelist>
  </refsect1>
 </refentry>

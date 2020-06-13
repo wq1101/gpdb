@@ -13,7 +13,6 @@
 #ifndef APPENDONLY_COMPACTION_H
 #define APPENDONLY_COMPACTION_H
 
-#include "postgres.h"
 #include "nodes/pg_list.h"
 #include "access/appendonly_visimap.h"
 #include "utils/rel.h"
@@ -22,20 +21,20 @@
 
 #define APPENDONLY_COMPACTION_SEGNO_INVALID (-1)
 
-extern void AppendOnlyDrop(Relation aorel,
-		List *compaction_segno);
-extern void AppendOnlyCompact(Relation aorel, 
-		List *compaction_segno_list,
-		int insert_segno,
-		bool isFull);
+extern void AppendOnlyRecycleDeadSegments(Relation aorel);
+extern void AppendOnlyCompact(Relation aorel,
+							  int compaction_segno,
+							  int *insert_segno,
+							  bool isFull,
+							  List *avoid_segnos);
 extern bool AppendOnlyCompaction_ShouldCompact(
-	Relation aoRelation,
-	int segno,
-	int64 segmentTotalTupcount,
-	bool isFull);
-extern void AppendOnlyThrowAwayTuple(Relation rel, MemTuple tuple,
-		TupleTableSlot	*slot, MemTupleBinding *mt_bind);
+								   Relation aoRelation,
+								   int segno,
+								   int64 segmentTotalTupcount,
+								   bool isFull,
+								   Snapshot appendOnlyMetaDataSnapshot);
+extern void AppendOnlyThrowAwayTuple(Relation rel,
+						 TupleTableSlot *slot, MemTupleBinding *mt_bind);
 extern void AppendOnlyTruncateToEOF(Relation aorel);
-extern bool HasLockForSegmentFileDrop(Relation aorel);
-extern bool AppendOnlyCompaction_IsRelationEmpty(Relation aorel);
+
 #endif

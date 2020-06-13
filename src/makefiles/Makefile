@@ -1,4 +1,4 @@
-# $PostgreSQL: pgsql/src/makefiles/Makefile,v 1.2 2005/12/09 21:19:36 petere Exp $
+# src/makefiles/Makefile
 
 subdir = src/makefiles
 top_builddir = ../..

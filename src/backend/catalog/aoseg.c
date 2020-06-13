@@ -24,16 +24,17 @@
 #include "catalog/aocatalog.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
+#include "utils/syscache.h"
 
 
 void
-AlterTableCreateAoSegTable(Oid relOid, bool is_part_child)
+AlterTableCreateAoSegTable(Oid relOid, bool is_part_child, bool is_part_parent)
 {
 	TupleDesc	tupdesc;
 	Relation	rel;
 	const char *prefix;
-	Oid			classObjectId[1];
-	int16		coloptions[1];
+	Relation	class_rel;
+	HeapTuple	reltup;
 
 	/*
 	 * Grab an exclusive lock on the target table, which we will NOT release
@@ -155,12 +156,38 @@ AlterTableCreateAoSegTable(Oid relOid, bool is_part_child)
 		return;
 	}
 
-	classObjectId[0] = INT4_BTREE_OPS_OID;
-
-	coloptions[0] = 0;
-
 	(void) CreateAOAuxiliaryTable(rel, prefix, RELKIND_AOSEGMENTS,
-								  tupdesc, NULL, classObjectId, coloptions);
+								  tupdesc,
+								  NULL, NIL, NULL, NULL, is_part_parent);
+
+	/*
+	 * Store the toast table's OID in the parent relation's pg_class row
+	 */
+	class_rel = heap_open(RelationRelationId, RowExclusiveLock);
+
+	reltup = SearchSysCacheCopy(RELOID,
+								ObjectIdGetDatum(relOid),
+								0, 0, 0);
+	if (!HeapTupleIsValid(reltup))
+		elog(ERROR, "cache lookup failed for relation %u", relOid);
+
+	if (!IsBootstrapProcessingMode())
+	{
+		/* normal case, use a transactional update */
+		simple_heap_update(class_rel, &reltup->t_self, reltup);
+
+		/* Keep catalog indexes current */
+		CatalogUpdateIndexes(class_rel, reltup);
+	}
+	else
+	{
+		/* While bootstrapping, we cannot UPDATE, so overwrite in-place */
+		heap_inplace_update(class_rel, reltup);
+	}
+
+	heap_freetuple(reltup);
+
+	heap_close(class_rel, RowExclusiveLock);
 
 	heap_close(rel, NoLock);
 }

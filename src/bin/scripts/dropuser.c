@@ -2,17 +2,17 @@
  *
  * dropuser
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/bin/scripts/dropuser.c,v 1.28 2009/02/26 16:20:55 petere Exp $
+ * src/bin/scripts/dropuser.c
  *
  *-------------------------------------------------------------------------
  */
 
 #include "postgres_fe.h"
 #include "common.h"
-#include "dumputils.h"
+#include "fe_utils/string_utils.h"
 
 
 static void help(const char *progname);
@@ -21,6 +21,8 @@ static void help(const char *progname);
 int
 main(int argc, char *argv[])
 {
+	static int	if_exists = 0;
+
 	static struct option long_options[] = {
 		{"host", required_argument, NULL, 'h'},
 		{"port", required_argument, NULL, 'p'},
@@ -29,6 +31,7 @@ main(int argc, char *argv[])
 		{"password", no_argument, NULL, 'W'},
 		{"echo", no_argument, NULL, 'e'},
 		{"interactive", no_argument, NULL, 'i'},
+		{"if-exists", no_argument, &if_exists, 1},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -59,13 +62,13 @@ main(int argc, char *argv[])
 		switch (c)
 		{
 			case 'h':
-				host = optarg;
+				host = pg_strdup(optarg);
 				break;
 			case 'p':
-				port = optarg;
+				port = pg_strdup(optarg);
 				break;
 			case 'U':
-				username = optarg;
+				username = pg_strdup(optarg);
 				break;
 			case 'w':
 				prompt_password = TRI_NO;
@@ -78,6 +81,9 @@ main(int argc, char *argv[])
 				break;
 			case 'i':
 				interactive = true;
+				break;
+			case 0:
+				/* this covers the long options */
 				break;
 			default:
 				fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
@@ -100,7 +106,16 @@ main(int argc, char *argv[])
 	}
 
 	if (dropuser == NULL)
-		dropuser = simple_prompt("Enter name of role to drop: ", 128, true);
+	{
+		if (interactive)
+			dropuser = simple_prompt("Enter name of role to drop: ", 128, true);
+		else
+		{
+			fprintf(stderr, _("%s: missing required argument role name\n"), progname);
+			fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
+			exit(1);
+		}
+	}
 
 	if (interactive)
 	{
@@ -110,12 +125,14 @@ main(int argc, char *argv[])
 	}
 
 	initPQExpBuffer(&sql);
-	appendPQExpBuffer(&sql, "DROP ROLE %s;\n", fmtId(dropuser));
+	appendPQExpBuffer(&sql, "DROP ROLE %s%s;",
+					  (if_exists ? "IF EXISTS " : ""), fmtId(dropuser));
 
-	conn = connectDatabase("postgres", host, port, username, prompt_password, progname);
+	conn = connectDatabase("postgres", host, port, username, prompt_password,
+						   progname, echo, false, false);
 
 	if (echo)
-		printf("%s", sql.data);
+		printf("%s\n", sql.data);
 	result = PQexec(conn, sql.data);
 
 	if (PQresultStatus(result) != PGRES_COMMAND_OK)
@@ -140,9 +157,11 @@ help(const char *progname)
 	printf(_("  %s [OPTION]... [ROLENAME]\n"), progname);
 	printf(_("\nOptions:\n"));
 	printf(_("  -e, --echo                show the commands being sent to the server\n"));
-	printf(_("  -i, --interactive         prompt before deleting anything\n"));
-	printf(_("  --help                    show this help, then exit\n"));
-	printf(_("  --version                 output version information, then exit\n"));
+	printf(_("  -i, --interactive         prompt before deleting anything, and prompt for\n"
+			 "                            role name if not specified\n"));
+	printf(_("  -V, --version             output version information, then exit\n"));
+	printf(_("  --if-exists               don't report error if user doesn't exist\n"));
+	printf(_("  -?, --help                show this help, then exit\n"));
 	printf(_("\nConnection options:\n"));
 	printf(_("  -h, --host=HOSTNAME       database server host or socket directory\n"));
 	printf(_("  -p, --port=PORT           database server port\n"));

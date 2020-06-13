@@ -33,6 +33,13 @@ main (void)
       exit (sqlca.sqlcode);
     }
 
+  EXEC SQL set bytea_output = escape;
+  if (sqlca.sqlcode)
+    {
+      printf ("set bytea_output error = %ld\n", sqlca.sqlcode);
+      exit (sqlca.sqlcode);
+    }
+
   EXEC SQL create table empl
     (idnum integer, name char (20), accs smallint, byte bytea);
   if (sqlca.sqlcode)
@@ -58,6 +65,8 @@ main (void)
     }
 
   printf ("name=%s, accs=%d byte=%s\n", empl.name, empl.accs, empl.byte);
+
+  EXEC SQL CLOSE C;
 
   memset(empl.name, 0, 21L);
   EXEC SQL DECLARE B BINARY CURSOR FOR select name, accs, byte from empl where idnum =:empl.idnum;

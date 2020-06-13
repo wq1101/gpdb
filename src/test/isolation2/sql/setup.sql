@@ -1,11 +1,12 @@
--- Helper function, to call either __gp_aoseg_name, or gp_aocsseg_name,
--- dependingwhether the table is row- or column-oriented. This allows us to
+-- Helper function, to call either __gp_aoseg, or gp_aocsseg, depending
+-- on whether the table is row- or column-oriented. This allows us to
 -- run the same test queries on both.
 --
 -- The Python utility that runs this doesn't know about dollar-quoting,
 -- and thinks that a ';' at end of line ends the command. The /* in func */
 -- comments at the end of each line thwarts that.
-CREATE OR REPLACE FUNCTION gp_ao_or_aocs_seg_name(rel text,
+CREATE OR REPLACE FUNCTION gp_ao_or_aocs_seg(rel regclass,
+  segment_id OUT integer,
   segno OUT integer,
   tupcount OUT bigint,
   modcount OUT bigint,
@@ -15,13 +16,13 @@ RETURNS SETOF record as $$
 declare
   relstorage_var char;	/* in func */
 begin	/* in func */
-  select relstorage into relstorage_var from pg_class where oid = rel::regclass; /* in func */
+  select relstorage into relstorage_var from pg_class where oid = rel; /* in func */
   if relstorage_var = 'c' then	/* in func */
-    for segno, tupcount, modcount, formatversion, state in SELECT DISTINCT x.segno, x.tupcount, x.modcount, x.formatversion, x.state FROM gp_toolkit.__gp_aocsseg_name(rel) x loop	/* in func */
+    for segment_id, segno, tupcount, modcount, formatversion, state in SELECT DISTINCT x.segment_id, x.segno, x.tupcount, x.modcount, x.formatversion, x.state FROM gp_toolkit.__gp_aocsseg(rel) x loop	/* in func */
       return next;	/* in func */
     end loop;	/* in func */
   else	/* in func */
-    for segno, tupcount, modcount, formatversion, state in SELECT x.segno, x.tupcount, x.modcount, x.formatversion, x.state FROM gp_toolkit.__gp_aoseg_name(rel) x loop	/* in func */
+    for segment_id, segno, tupcount, modcount, formatversion, state in SELECT x.segment_id, x.segno, x.tupcount, x.modcount, x.formatversion, x.state FROM gp_toolkit.__gp_aoseg(rel) x loop	/* in func */
       return next;	/* in func */
     end loop;	/* in func */
   end if;	/* in func */
@@ -86,19 +87,23 @@ SELECT coalesce(
   FROM gp_dist_random('locktest_segments_dist')
   group by relname, relation, mode, locktype;
 
--- start_ignore
-create language plpythonu;
--- end_ignore
-
-CREATE OR REPLACE FUNCTION wait_for_trigger_fault(dbname text, fault text, segno int)
-RETURNS bool as $$
-    import subprocess 
-    import time
-    cmd = 'psql %s -c "select gp_inject_fault(\'%s\', \'status\', %d)"' % (dbname, fault, segno)
-    for i in range(100):
-        cmd_output = subprocess.Popen(cmd, stderr=subprocess.STDOUT, stdout=subprocess.PIPE, shell=True)
-        if 'triggered' in cmd_output.stdout.read():
-            return True
-        time.sleep(0.5)
-    return False 
-$$ LANGUAGE plpythonu;
+-- Helper function
+CREATE or REPLACE FUNCTION wait_until_waiting_for_required_lock (rel_name text, lmode text, segment_id integer) /*in func*/
+RETURNS bool AS
+$$
+declare
+retries int; /* in func */
+begin /* in func */
+  retries := 1200; /* in func */
+  loop /* in func */
+    if (select not granted from pg_locks l where granted='f' and l.relation::regclass = rel_name::regclass and l.mode=lmode and l.gp_segment_id=segment_id) then /* in func */
+      return true; /* in func */
+    end if; /* in func */
+    if retries <= 0 then /* in func */
+      return false; /* in func */
+    end if; /* in func */
+    perform pg_sleep(0.1); /* in func */
+    retries := retries - 1; /* in func */
+  end loop; /* in func */
+end; /* in func */
+$$ language plpgsql;

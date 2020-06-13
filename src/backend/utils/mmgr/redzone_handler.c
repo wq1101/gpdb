@@ -22,6 +22,8 @@
 #include "port/atomics.h"
 #include "utils/vmem_tracker.h"
 #include "utils/session_state.h"
+#include "utils/resgroup.h"
+#include "utils/resource_manager.h"
 
 /* External dependencies within the runaway cleanup framework */
 extern bool vmemTrackerInited;
@@ -109,8 +111,11 @@ RedZoneHandler_ShmemInit()
 			redZoneChunks = VmemTracker_ConvertVmemMBToChunks(gp_vmem_protect_limit * (((float) runaway_detector_activation_percent) / 100.0));
 		}
 
-		/* 0 means disable red-zone completely */
-		if (redZoneChunks == 0)
+		/*
+		 * 0 means disable red-zone completely
+		 * we also disable red-zone for resource group
+		 */
+		if (redZoneChunks == 0 || IsResGroupEnabled())
 		{
 			redZoneChunks = INT32_MAX;
 		}
@@ -129,7 +134,10 @@ RedZoneHandler_IsVmemRedZone()
 
 	if (vmemTrackerInited)
 	{
-		return *segmentVmemChunks > redZoneChunks;
+		if (IsResGroupEnabled())
+			return IsGroupInRedZone();
+		else
+			return *segmentVmemChunks > redZoneChunks;
 	}
 
 	return false;
@@ -148,6 +156,7 @@ RedZoneHandler_FlagTopConsumer()
 
 	Assert(NULL != MySessionState);
 
+	Oid resGroupId = InvalidOid;
 	uint32 expected = 0;
 	bool success = pg_atomic_compare_exchange_u32((pg_atomic_uint32 *) isRunawayDetector, &expected, 1);
 
@@ -178,9 +187,53 @@ RedZoneHandler_FlagTopConsumer()
 
 	SessionState *curSessionState = AllSessionStateEntries->usedList;
 
+	/*
+	 * Find the group which used the most of global memory in resgroup mode.
+	 * Since there exists concurrent DDLs to drop resource group and it is
+	 * not safe to acquire resgroup lock in redzone. We access ResGroupData
+	 * in a lock free way, and using SessionStateLock to ensure the groups with
+	 * sessions will not be dropped.
+	 */
+	if (IsResGroupEnabled())
+	{
+		int32	maxGlobalShareMem = 0;
+		Oid		sessionGroupId = InvalidOid;
+		int32	sessionGroupGSMem;
+
+		while (curSessionState != NULL)
+		{
+			Assert(INVALID_SESSION_ID != curSessionState->sessionId);
+
+			sessionGroupGSMem = SessionGetResGroupGlobalShareMemUsage(curSessionState);
+
+			if (sessionGroupGSMem > maxGlobalShareMem)
+			{
+				maxGlobalShareMem = sessionGroupGSMem;
+				sessionGroupId = SessionGetResGroupId(curSessionState);
+
+				Assert(InvalidOid != sessionGroupId);
+				resGroupId = sessionGroupId;
+			}
+
+			curSessionState = curSessionState->next;
+		}
+	}
+
+	curSessionState = AllSessionStateEntries->usedList;
+
 	while (curSessionState != NULL)
 	{
 		Assert(INVALID_SESSION_ID != curSessionState->sessionId);
+
+		/* 
+		 * in resgroup mode, we should only flag top consumer in group which uses
+		 * the most of the global shared memory
+		 */
+		if (IsResGroupEnabled() && SessionGetResGroupId(curSessionState) != resGroupId)
+		{
+			curSessionState = curSessionState->next;	
+			continue;
+		}
 
 		int32 curVmem = curSessionState->sessionVmem;
 
@@ -291,6 +344,7 @@ RedZoneHandler_FlagTopConsumer()
 void
 RedZoneHandler_DetectRunawaySession()
 {
+
 	/*
 	 * InterruptHoldoffCount > 0 indicates we are in a sensitive code path that doesn't
 	 * like a control flow disruption as may happen from a pending die/cancel interrupt.

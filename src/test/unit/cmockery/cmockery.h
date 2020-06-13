@@ -220,7 +220,7 @@
 #define assert_true(c) _assert_true(cast_to_largest_integral_type(c), #c, \
                                     __FILE__, __LINE__)
 // Assert that the given expression is false.
-#define assert_false(c) _assert_true(!(cast_to_largest_integral_type(c)), #c, \
+#define assert_false(c) _assert_false(!(cast_to_largest_integral_type(c)), #c, \
                                      __FILE__, __LINE__)
 
 // Assert that the two given integers are equal, otherwise fail.
@@ -275,6 +275,12 @@
 
 // Forces the test to fail immediately and quit.
 #define fail() _fail(__FILE__, __LINE__)
+
+// Write an error message and forces the test to fail immediately and quit
+#define fail_msg(msg, ...) do { \
+    print_error("ERROR: " msg "\n", ##__VA_ARGS__); \
+    fail(); \
+} while (0)
 
 // Generic method to kick off testing
 #define run_test(f) _run_test(#f, f, NULL, UNIT_TEST_FUNCTION_TYPE_TEST, NULL)
@@ -516,6 +522,9 @@ void _will_be_called(const char * const function_name, const char * const file,
 void _assert_true(const LargestIntegralType result,
                   const char* const expression,
                   const char * const file, const int line);
+void _assert_false(const LargestIntegralType result,
+                  const char* const expression,
+                  const char * const file, const int line);
 void _assert_int_equal(
     const LargestIntegralType a, const LargestIntegralType b,
     const char * const file, const int line);
@@ -558,10 +567,10 @@ int _run_test(
 int _run_tests(const UnitTest * const tests, const size_t number_of_tests);
 
 // Standard output and error print methods.
-void print_message(int color_code, const char* const format, ...);
-void print_error(const char* const format, ...);
-void vprint_message(int color_code, const char* const format, va_list args);
-void vprint_error(const char* const format, va_list args);
+void print_message(int color_code, const char* const format, ...) __attribute__((format(printf, 2, 0)));
+void print_error(const char* const format, ...) __attribute__((format(printf, 1, 0)));
+void vprint_message(int color_code, const char* const format, va_list args) __attribute__((format(printf, 2, 0)));
+void vprint_error(const char* const format, va_list args) __attribute__((format(printf, 1, 0)));
 
 // Parse command line arguments
 void cmockery_parse_arguments(int argc, char** argv);

@@ -10,11 +10,11 @@
  * via functions such as SubTransGetTopmostTransaction().
  *
  *
- *	Copyright (c) 2003-2008, PostgreSQL Global Development Group
+ *	Copyright (c) 2003-2016, PostgreSQL Global Development Group
  *	Author: Jan Wieck, Afilias USA INC.
  *	64-bit txids: Marko Kreen, Skype Technologies
  *
- *	$PostgreSQL: pgsql/src/backend/utils/adt/txid.c,v 1.4 2008/01/01 19:45:53 momjian Exp $
+ *	src/backend/utils/adt/txid.c
  *
  *-------------------------------------------------------------------------
  */
@@ -23,18 +23,18 @@
 
 #include "access/transam.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "funcapi.h"
+#include "miscadmin.h"
 #include "libpq/pqformat.h"
+#include "postmaster/postmaster.h"
 #include "utils/builtins.h"
+#include "utils/memutils.h"
+#include "utils/snapmgr.h"
 
 
-#ifndef INT64_IS_BUSTED
 /* txid will be signed int8 in database, so must limit to 63 bits */
-#define MAX_TXID   UINT64CONST(0x7FFFFFFFFFFFFFFF)
-#else
-/* we only really have 32 bits to work with :-( */
-#define MAX_TXID   UINT64CONST(0x7FFFFFFF)
-#endif
+#define MAX_TXID   ((uint64) PG_INT64_MAX)
 
 /* Use unsigned variant internally */
 typedef uint64 txid;
@@ -64,11 +64,14 @@ typedef struct
 	uint32		nxip;			/* number of txids in xip array */
 	txid		xmin;
 	txid		xmax;
-	txid		xip[1];			/* in-progress txids, xmin <= xip[i] < xmax */
+	/* in-progress txids, xmin <= xip[i] < xmax: */
+	txid		xip[FLEXIBLE_ARRAY_MEMBER];
 } TxidSnapshot;
 
 #define TXID_SNAPSHOT_SIZE(nxip) \
 	(offsetof(TxidSnapshot, xip) + sizeof(txid) * (nxip))
+#define TXID_SNAPSHOT_MAX_NXIP \
+	((MaxAllocSize - offsetof(TxidSnapshot, xip)) / sizeof(txid))
 
 /*
  * Epoch values from xact.c
@@ -95,7 +98,6 @@ load_xid_epoch(TxidEpoch *state)
 static txid
 convert_xid(TransactionId xid, const TxidEpoch *state)
 {
-#ifndef INT64_IS_BUSTED
 	uint64		epoch;
 
 	/* return special xid's as-is */
@@ -112,10 +114,6 @@ convert_xid(TransactionId xid, const TxidEpoch *state)
 		epoch++;
 
 	return (epoch << 32) | xid;
-#else							/* INT64_IS_BUSTED */
-	/* we can't do anything with the epoch, so ignore it */
-	return (txid) xid & MAX_TXID;
-#endif   /* INT64_IS_BUSTED */
 }
 
 /*
@@ -135,7 +133,8 @@ cmp_txid(const void *aa, const void *bb)
 }
 
 /*
- * sort a snapshot's txids, so we can use bsearch() later.
+ * Sort a snapshot's txids, so we can use bsearch() later.  Also remove
+ * any duplicates.
  *
  * For consistency of on-disk representation, we always sort even if bsearch
  * will not be used.
@@ -143,8 +142,27 @@ cmp_txid(const void *aa, const void *bb)
 static void
 sort_snapshot(TxidSnapshot *snap)
 {
+	txid		last = 0;
+	int			nxip,
+				idx1,
+				idx2;
+
 	if (snap->nxip > 1)
+	{
 		qsort(snap->xip, snap->nxip, sizeof(txid), cmp_txid);
+
+		/* remove duplicates */
+		nxip = snap->nxip;
+		idx1 = idx2 = 0;
+		while (idx1 < nxip)
+		{
+			if (snap->xip[idx1] != last)
+				last = snap->xip[idx2++] = snap->xip[idx1];
+			else
+				snap->nxip--;
+			idx1++;
+		}
+	}
 }
 
 /*
@@ -299,10 +317,12 @@ parse_snapshot(const char *str)
 		str = endp;
 
 		/* require the input to be in order */
-		if (val < xmin || val >= xmax || val <= last_val)
+		if (val < xmin || val >= xmax || val < last_val)
 			goto bad_format;
 
-		buf_add_txid(buf, val);
+		/* skip duplicates */
+		if (val != last_val)
+			buf_add_txid(buf, val);
 		last_val = val;
 
 		if (*str == ',')
@@ -316,8 +336,9 @@ parse_snapshot(const char *str)
 bad_format:
 	ereport(ERROR,
 			(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-			 errmsg("invalid input for txid_snapshot: \"%s\"", str_start)));
-	return NULL;
+			 errmsg("invalid input syntax for type txid_snapshot: \"%s\"",
+					str_start)));
+	return NULL;				/* keep compiler quiet */
 }
 
 /*
@@ -331,13 +352,22 @@ bad_format:
 /*
  * txid_current() returns int8
  *
- *		Return the current toplevel transaction ID as TXID
+ *	Return the current toplevel transaction ID as TXID
+ *	If the current transaction does not have one, one is assigned.
  */
 Datum
 txid_current(PG_FUNCTION_ARGS)
 {
 	txid		val;
 	TxidEpoch	state;
+
+	/*
+	 * Must prevent during recovery because if an xid is not assigned we try
+	 * to assign one, which would fail. Programs already rely on this function
+	 * to always return a valid current xid, so we should not change this to
+	 * return NULL or similar invalid xid.
+	 */
+	PreventCommandDuringRecovery("txid_current()");
 
 	load_xid_epoch(&state);
 
@@ -358,22 +388,26 @@ txid_current_snapshot(PG_FUNCTION_ARGS)
 {
 	TxidSnapshot *snap;
 	uint32		nxip,
-				i,
-				size;
+				i;
 	TxidEpoch	state;
 	Snapshot	cur;
 
-	cur = ActiveSnapshot;
+	cur = GetActiveSnapshot();
 	if (cur == NULL)
-		elog(ERROR, "txid_current_snapshot: ActiveSnapshot == NULL");
+		elog(ERROR, "no active snapshot set");
 
 	load_xid_epoch(&state);
 
+	/*
+	 * Compile-time limits on the procarray (MAX_BACKENDS processes plus
+	 * MAX_BACKENDS prepared transactions) guarantee nxip won't be too large.
+	 */
+	StaticAssertStmt(MAX_BACKENDS * 2 <= TXID_SNAPSHOT_MAX_NXIP,
+					 "possible overflow in txid_current_snapshot()");
+
 	/* allocate */
 	nxip = cur->xcnt;
-	size = TXID_SNAPSHOT_SIZE(nxip);
-	snap = palloc(size);
-	SET_VARSIZE(snap, size);
+	snap = palloc(TXID_SNAPSHOT_SIZE(nxip));
 
 	/* fill */
 	snap->xmin = convert_xid(cur->xmin, &state);
@@ -382,8 +416,17 @@ txid_current_snapshot(PG_FUNCTION_ARGS)
 	for (i = 0; i < nxip; i++)
 		snap->xip[i] = convert_xid(cur->xip[i], &state);
 
-	/* we want them guaranteed to be in ascending order */
+	/*
+	 * We want them guaranteed to be in ascending order.  This also removes
+	 * any duplicate xids.  Normally, an XID can only be assigned to one
+	 * backend, but when preparing a transaction for two-phase commit, there
+	 * is a transient state when both the original backend and the dummy
+	 * PGPROC entry reserved for the prepared transaction hold the same XID.
+	 */
 	sort_snapshot(snap);
+
+	/* set size after sorting, because it may have removed duplicate xips */
+	SET_VARSIZE(snap, TXID_SNAPSHOT_SIZE(snap->nxip));
 
 	PG_RETURN_POINTER(snap);
 }
@@ -446,20 +489,12 @@ txid_snapshot_recv(PG_FUNCTION_ARGS)
 	txid		last = 0;
 	int			nxip;
 	int			i;
-	int			avail;
-	int			expect;
 	txid		xmin,
 				xmax;
 
-	/*
-	 * load nxip and check for nonsense.
-	 *
-	 * (nxip > avail) check is against int overflows in 'expect'.
-	 */
+	/* load and validate nxip */
 	nxip = pq_getmsgint(buf, 4);
-	avail = buf->len - buf->cursor;
-	expect = 8 + 8 + nxip * 8;
-	if (nxip < 0 || nxip > avail || expect > avail)
+	if (nxip < 0 || nxip > TXID_SNAPSHOT_MAX_NXIP)
 		goto bad_format;
 
 	xmin = pq_getmsgint64(buf);
@@ -470,23 +505,34 @@ txid_snapshot_recv(PG_FUNCTION_ARGS)
 	snap = palloc(TXID_SNAPSHOT_SIZE(nxip));
 	snap->xmin = xmin;
 	snap->xmax = xmax;
-	snap->nxip = nxip;
-	SET_VARSIZE(snap, TXID_SNAPSHOT_SIZE(nxip));
 
 	for (i = 0; i < nxip; i++)
 	{
 		txid		cur = pq_getmsgint64(buf);
 
-		if (cur <= last || cur < xmin || cur >= xmax)
+		if (cur < last || cur < xmin || cur >= xmax)
 			goto bad_format;
+
+		/* skip duplicate xips */
+		if (cur == last)
+		{
+			i--;
+			nxip--;
+			continue;
+		}
+
 		snap->xip[i] = cur;
 		last = cur;
 	}
+	snap->nxip = nxip;
+	SET_VARSIZE(snap, TXID_SNAPSHOT_SIZE(nxip));
 	PG_RETURN_POINTER(snap);
 
 bad_format:
-	elog(ERROR, "invalid snapshot data");
-	return (Datum) NULL;
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+			 errmsg("invalid external txid_snapshot data")));
+	PG_RETURN_POINTER(NULL);	/* keep compiler quiet */
 }
 
 /*

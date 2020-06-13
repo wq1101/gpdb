@@ -1,60 +1,103 @@
-# $PostgreSQL: pgsql/contrib/Makefile,v 1.82.2.1 2008/05/08 16:49:47 tgl Exp $
+# contrib/Makefile
 
 subdir = contrib
 top_builddir = ..
 include $(top_builddir)/src/Makefile.global
 
-WANTED_DIRS = \
-		xlogdump \
-		pgbench \
-		changetrackingdump \
+# Greenplum specific changes to the targetlist:
+# tsearch2 and postgres_fdw are currently disabled due to test failures.
+# cube and the related earthdistance are disabled since GPDB define CUBE
+# as a keyword. lo is disabled since large objects aren't supported.
+# adminpack is disabled since the functionality has been imported into
+# GPDB.
+
+SUBDIRS = \
+		auth_delay	\
+		auto_explain	\
+		bloom		\
+		btree_gin	\
+		btree_gist	\
+		chkpass		\
+		citext		\
+		dblink		\
+		dict_int	\
+		dict_xsyn	\
+		file_fdw	\
+		fuzzystrmatch	\
+		hstore		\
+		intagg		\
+		intarray	\
+		isn		\
+		ltree		\
+		oid2name	\
+		pageinspect	\
+		passwordcheck	\
+		pg_buffercache	\
+		pg_freespacemap \
+		pg_prewarm	\
+		pg_standby	\
+		pg_stat_statements \
+		pg_trgm		\
+		pgcrypto	\
+		pgrowlocks	\
+		pgstattuple	\
+		pg_visibility	\
+		seg		\
+		spi		\
+		tablefunc	\
+		tcn		\
+		test_decoding	\
+		tsm_system_rows \
+		tsm_system_time \
+		unaccent	\
+		vacuumlo
+
+# Greenplum-specific additions (to ease merge pain).
+SUBDIRS += \
 		formatter \
 		formatter_fixedwidth \
 		extprotocol \
-		gp_distribution_policy \
-		gp_internal_tools \
-		gp_inject_fault \
-		gp_cancel_query \
-		indexscan \
-		dict_int \
-		dict_xsyn \
-		hstore		\
-		intarray \
-		pageinspect \
-		pg_upgrade \
-		pg_upgrade_support \
-		test_parser \
-		pgcrypto
+		indexscan
 
 ifeq ($(with_openssl),yes)
-WANTED_DIRS += sslinfo
+SUBDIRS += sslinfo
+else
+ALWAYS_SUBDIRS += sslinfo
 endif
 
-ifeq ($(with_ossp_uuid),yes)
-WANTED_DIRS += uuid-ossp
+ifneq ($(with_uuid),no)
+SUBDIRS += uuid-ossp
+else
+ALWAYS_SUBDIRS += uuid-ossp
 endif
 
 ifeq ($(with_libxml),yes)
-WANTED_DIRS += xml2
+SUBDIRS += xml2
+else
+ALWAYS_SUBDIRS += xml2
 endif
 
-ifeq ($(enable_orca),yes)
-WANTED_DIRS += orca_debug
+ifeq ($(with_selinux),yes)
+SUBDIRS += sepgsql
+else
+ALWAYS_SUBDIRS += sepgsql
 endif
 
+ifeq ($(with_perl),yes)
+SUBDIRS += hstore_plperl
+else
+ALWAYS_SUBDIRS += hstore_plperl
+endif
+
+ifeq ($(with_python),yes)
+SUBDIRS += hstore_plpython ltree_plpython
+else
+ALWAYS_SUBDIRS += hstore_plpython ltree_plpython
+endif
 
 # Missing:
 #		start-scripts	\ (does not have a makefile)
 
 
-all install installdirs uninstall distprep clean distclean maintainer-clean:
-	@for dir in $(WANTED_DIRS); do \
-		$(MAKE) -C $$dir $@ || exit; \
-	done
-
-# We'd like check operations to run all the subtests before failing.
-check installcheck:
-	@CHECKERR=0; for dir in $(WANTED_DIRS); do \
-		$(MAKE) -C $$dir $@ || CHECKERR=$$?; \
-	done; \
-	exit $$CHECKERR
+$(recurse)
+$(recurse_always)

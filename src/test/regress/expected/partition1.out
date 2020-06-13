@@ -1,187 +1,10 @@
-set enable_partition_rules = false;
-set gp_enable_hash_partitioned_tables = true;
--- missing subpartition by
-create table ggg (a char(1), b char(2), d char(3))
-distributed by (a)
-partition by hash (b)
-(
-partition aa (subpartition cc, subpartition dd),
-partition bb (subpartition cc, subpartition dd)
-);
-ERROR:  missing SUBPARTITION BY clause for subpartition specification
-LINE 5: partition aa (subpartition cc, subpartition dd),
-        ^
--- missing subpartition spec
-create table ggg (a char(1), b char(2), d char(3))
-distributed by (a)
-partition by hash (b)
-subpartition by hash (d) 
-(
-partition aa ,
-partition bb 
-);
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa" for table "ggg"
-ERROR:  hash partition requires PARTITIONS clause or partition specification
-LINE 4: subpartition by hash (d) 
-                        ^
--- subpart spec conflict
-create table ggg (a char(1), b char(2), d char(3))
-distributed by (a)
-partition by hash (b) 
-subpartition by hash (d) subpartition template (subpartition jjj)
-(
-partition aa (subpartition cc, subpartition dd),
-partition bb (subpartition cc, subpartition dd)
-);
-ERROR:  subpartition configuration conflicts with subpartition template
-LINE 4: subpartition by hash (d) subpartition template (subpartition...
-                        ^
--- missing subpartition by
-create table ggg (a char(1), b char(2), d char(3))
-distributed by (a)
-partition by hash (b)
-subpartition by hash (d)
-(
-partition aa (subpartition cc, subpartition dd (subpartition iii)),
-partition bb (subpartition cc, subpartition dd)
-);
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_cc" for table "ggg_1_prt_aa"
-ERROR:  missing SUBPARTITION BY clause for subpartition specification (at depth 2)
-LINE 6: partition aa (subpartition cc, subpartition dd (subpartition...
-                                       ^
--- Test column lookup works
-create table ggg (a char(1), b char(2), d char(3))
-distributed by (a)
-partition by hash(doesnotexist)
-partitions 3;
-ERROR:  column "doesnotexist" does not exist in relation "ggg"
-LINE 3: partition by hash(doesnotexist)
-                     ^
-create table ggg (a char(1), b char(2), d char(3))
-distributed by (a)
-partition by hash(b)
-partitions 3
-subpartition by list(alsodoesntexist)
-subpartition template (
-subpartition aa values(1)
-);
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1" for table "ggg"
-ERROR:  column "alsodoesntexist" does not exist in relation "ggg_1_prt_1"
-LINE 5: subpartition by list(alsodoesntexist)
-                        ^
--- should work
-create table ggg (a char(1), b char(2), d char(3))
-distributed by (a)
-partition by hash (b)
-subpartition by hash (d) 
-(
-partition aa (subpartition cc, subpartition dd),
-partition bb (subpartition cc, subpartition dd)
-);
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_cc" for table "ggg_1_prt_aa"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_dd" for table "ggg_1_prt_aa"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_cc" for table "ggg_1_prt_bb"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_dd" for table "ggg_1_prt_bb"
-drop table ggg cascade;
--- disable hash partitions
-set gp_enable_hash_partitioned_tables = false;
-create table ggg (a char(1), b char(2), d char(3))
-distributed by (a)
-partition by hash (b)
-subpartition by hash (d) 
-(
-partition aa (subpartition cc, subpartition dd),
-partition bb (subpartition cc, subpartition dd)
-);
-ERROR:  PARTITION BY must specify RANGE or LIST
-drop table ggg cascade;
-ERROR:  table "ggg" does not exist
-set gp_enable_hash_partitioned_tables = true;
--- should work
-create table ggg (a char(1), b char(2), d char(3), e int)
-distributed by (a)
-partition by hash (b)
-subpartition by hash (d) 
-subpartition template ( 
-subpartition cc,
-subpartition dd
-), 
-subpartition by hash (e) 
-subpartition template ( 
-subpartition ee,
-subpartition ff
-) 
-(
-partition aa,
-partition bb
-);
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_cc" for table "ggg_1_prt_aa"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_cc_3_prt_ee" for table "ggg_1_prt_aa_2_prt_cc"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_cc_3_prt_ff" for table "ggg_1_prt_aa_2_prt_cc"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_dd" for table "ggg_1_prt_aa"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_dd_3_prt_ee" for table "ggg_1_prt_aa_2_prt_dd"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_dd_3_prt_ff" for table "ggg_1_prt_aa_2_prt_dd"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_cc" for table "ggg_1_prt_bb"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_cc_3_prt_ee" for table "ggg_1_prt_bb_2_prt_cc"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_cc_3_prt_ff" for table "ggg_1_prt_bb_2_prt_cc"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_dd" for table "ggg_1_prt_bb"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_dd_3_prt_ee" for table "ggg_1_prt_bb_2_prt_dd"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_dd_3_prt_ff" for table "ggg_1_prt_bb_2_prt_dd"
-drop table ggg cascade;
--- should work
-create table ggg (a char(1), b char(2), d char(3), e int)
-distributed by (a)
-partition by hash (b)
-subpartition by hash (d),
-subpartition by hash (e)
-subpartition template ( 
-subpartition ee,
-subpartition ff
-) 
-(
-partition aa (subpartition cc, subpartition dd),
-partition bb (subpartition cc, subpartition dd)
-);
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_cc" for table "ggg_1_prt_aa"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_cc_3_prt_ee" for table "ggg_1_prt_aa_2_prt_cc"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_cc_3_prt_ff" for table "ggg_1_prt_aa_2_prt_cc"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_dd" for table "ggg_1_prt_aa"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_dd_3_prt_ee" for table "ggg_1_prt_aa_2_prt_dd"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_dd_3_prt_ff" for table "ggg_1_prt_aa_2_prt_dd"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_cc" for table "ggg_1_prt_bb"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_cc_3_prt_ee" for table "ggg_1_prt_bb_2_prt_cc"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_cc_3_prt_ff" for table "ggg_1_prt_bb_2_prt_cc"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_dd" for table "ggg_1_prt_bb"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_dd_3_prt_ee" for table "ggg_1_prt_bb_2_prt_dd"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_dd_3_prt_ff" for table "ggg_1_prt_bb_2_prt_dd"
-drop table ggg cascade;
--- doesn't work because cannot have nested declaration in template
-create table ggg (a char(1), b char(2), d char(3), e int)
-distributed by (a)
-partition by hash (b)
-subpartition by hash (d) 
-subpartition template ( 
-subpartition cc (subpartition ee, subpartition ff),
-subpartition dd (subpartition ee, subpartition ff)
-), 
-subpartition by hash (e) 
-(
-partition aa,
-partition bb
-);
-ERROR:  template cannot contain specification for child partition
-drop table ggg cascade;
-ERROR:  table "ggg" does not exist
---ERROR: Missing boundary specification in partition 'aa' of type LIST 
+drop table if exists d;
+drop table if exists c;
+drop table if exists b;
+drop table if exists a;
+--ERROR: Missing boundary specification in partition 'aa' of type LIST
 create table fff (a char(1), b char(2), d char(3)) distributed by
-(a) partition by list (b) (partition aa ); 
+(a) partition by list (b) (partition aa );
 ERROR:  missing boundary specification in partition "aa" of type LIST
 LINE 2: (a) partition by list (b) (partition aa );
                                    ^
@@ -197,29 +20,10 @@ create table fff (a char(1), b char(2), d char(3)) distributed by (a)
 partition by list (b) (partition aa values ('2'));
 NOTICE:  CREATE TABLE will create partition "fff_1_prt_aa" for table "fff"
 drop table fff cascade;
--- Invalid use of RANGE boundary specification in partition "cc" of 
--- type HASH (at depth 2)
-create table ggg (a char(1), b char(2), d char(3), e int) distributed by (a)
-partition by hash (b) subpartition by hash (d),
-subpartition by hash (e) 
-subpartition template ( subpartition ee, subpartition ff ) (
-partition aa (subpartition cc, subpartition dd), partition bb
-(subpartition cc start ('a') , subpartition dd) );
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_cc" for table "ggg_1_prt_aa"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_cc_3_prt_ee" for table "ggg_1_prt_aa_2_prt_cc"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_cc_3_prt_ff" for table "ggg_1_prt_aa_2_prt_cc"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_dd" for table "ggg_1_prt_aa"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_dd_3_prt_ee" for table "ggg_1_prt_aa_2_prt_dd"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_dd_3_prt_ff" for table "ggg_1_prt_aa_2_prt_dd"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb" for table "ggg"
-ERROR:  invalid use of RANGE boundary specification in partition "cc" of type HASH (at depth 2)
-LINE 6: (subpartition cc start ('a') , subpartition dd) );
-                         ^
 -- this is subtly wrong -- it defines 4 partitions
 -- the problem is the comma before "end", which causes us to
 -- generate 2 anonymous partitions.
--- This is an error: 
+-- This is an error:
 -- ERROR:  invalid use of mixed named and unnamed RANGE boundary specifications
 create table ggg (a char(1), b int, d char(3))
 distributed by (a)
@@ -271,232 +75,11 @@ partition by range (b,d)
 partition aa start (2007,1) end (2008,2),
 partition bb start (2008,2) end (2009,3)
 );
-ERROR:  too many columns for RANGE partition -- only one column is allowed.
+ERROR:  too many columns for RANGE partition -- only one column is allowed
 LINE 3: partition by range (b,d)
                      ^
 drop table ggg cascade;
 ERROR:  table "ggg" does not exist
--- demo starts here
--- nested subpartitions
-create table ggg
- (a char(1),   b date,
-  d char(3),  e numeric,
-  f numeric,  g numeric,
-  h numeric)
-distributed by (a)
-partition by hash(b)
-partitions 2
-subpartition by hash(d)
-subpartitions 2,
-subpartition by hash(e) subpartitions 2,
-subpartition by hash(f) subpartitions 2,
-subpartition by hash(g) subpartitions 2,
-subpartition by hash(h) subpartitions 2;
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_1" for table "ggg_1_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_1_3_prt_1" for table "ggg_1_prt_1_2_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_1_3_prt_1_4_prt_1" for table "ggg_1_prt_1_2_prt_1_3_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_1_3_prt_1_4_prt_1_5_prt_1" for table "ggg_1_prt_1_2_prt_1_3_prt_1_4_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_1_3_prt_1_4_prt_1_5_prt_1_6_prt_1" for table "ggg_1_prt_1_2_prt_1_3_prt_1_4_prt_1_5_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_1_3_prt_1_4_prt_1_5_prt_1_6_prt_2" for table "ggg_1_prt_1_2_prt_1_3_prt_1_4_prt_1_5_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_1_3_prt_1_4_prt_1_5_prt_2" for table "ggg_1_prt_1_2_prt_1_3_prt_1_4_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_1_3_prt_1_4_prt_1_5_prt_2_6_prt_1" for table "ggg_1_prt_1_2_prt_1_3_prt_1_4_prt_1_5_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_1_3_prt_1_4_prt_1_5_prt_2_6_prt_2" for table "ggg_1_prt_1_2_prt_1_3_prt_1_4_prt_1_5_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_1_3_prt_1_4_prt_2" for table "ggg_1_prt_1_2_prt_1_3_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_1_3_prt_1_4_prt_2_5_prt_1" for table "ggg_1_prt_1_2_prt_1_3_prt_1_4_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_1_3_prt_1_4_prt_2_5_prt_1_6_prt_1" for table "ggg_1_prt_1_2_prt_1_3_prt_1_4_prt_2_5_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_1_3_prt_1_4_prt_2_5_prt_1_6_prt_2" for table "ggg_1_prt_1_2_prt_1_3_prt_1_4_prt_2_5_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_1_3_prt_1_4_prt_2_5_prt_2" for table "ggg_1_prt_1_2_prt_1_3_prt_1_4_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_1_3_prt_1_4_prt_2_5_prt_2_6_prt_1" for table "ggg_1_prt_1_2_prt_1_3_prt_1_4_prt_2_5_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_1_3_prt_1_4_prt_2_5_prt_2_6_prt_2" for table "ggg_1_prt_1_2_prt_1_3_prt_1_4_prt_2_5_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_1_3_prt_2" for table "ggg_1_prt_1_2_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_1_3_prt_2_4_prt_1" for table "ggg_1_prt_1_2_prt_1_3_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_1_3_prt_2_4_prt_1_5_prt_1" for table "ggg_1_prt_1_2_prt_1_3_prt_2_4_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_1_3_prt_2_4_prt_1_5_prt_1_6_prt_1" for table "ggg_1_prt_1_2_prt_1_3_prt_2_4_prt_1_5_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_1_3_prt_2_4_prt_1_5_prt_1_6_prt_2" for table "ggg_1_prt_1_2_prt_1_3_prt_2_4_prt_1_5_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_1_3_prt_2_4_prt_1_5_prt_2" for table "ggg_1_prt_1_2_prt_1_3_prt_2_4_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_1_3_prt_2_4_prt_1_5_prt_2_6_prt_1" for table "ggg_1_prt_1_2_prt_1_3_prt_2_4_prt_1_5_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_1_3_prt_2_4_prt_1_5_prt_2_6_prt_2" for table "ggg_1_prt_1_2_prt_1_3_prt_2_4_prt_1_5_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_1_3_prt_2_4_prt_2" for table "ggg_1_prt_1_2_prt_1_3_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_1_3_prt_2_4_prt_2_5_prt_1" for table "ggg_1_prt_1_2_prt_1_3_prt_2_4_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_1_3_prt_2_4_prt_2_5_prt_1_6_prt_1" for table "ggg_1_prt_1_2_prt_1_3_prt_2_4_prt_2_5_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_1_3_prt_2_4_prt_2_5_prt_1_6_prt_2" for table "ggg_1_prt_1_2_prt_1_3_prt_2_4_prt_2_5_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_1_3_prt_2_4_prt_2_5_prt_2" for table "ggg_1_prt_1_2_prt_1_3_prt_2_4_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_1_3_prt_2_4_prt_2_5_prt_2_6_prt_1" for table "ggg_1_prt_1_2_prt_1_3_prt_2_4_prt_2_5_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_1_3_prt_2_4_prt_2_5_prt_2_6_prt_2" for table "ggg_1_prt_1_2_prt_1_3_prt_2_4_prt_2_5_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_2" for table "ggg_1_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_2_3_prt_1" for table "ggg_1_prt_1_2_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_2_3_prt_1_4_prt_1" for table "ggg_1_prt_1_2_prt_2_3_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_2_3_prt_1_4_prt_1_5_prt_1" for table "ggg_1_prt_1_2_prt_2_3_prt_1_4_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_2_3_prt_1_4_prt_1_5_prt_1_6_prt_1" for table "ggg_1_prt_1_2_prt_2_3_prt_1_4_prt_1_5_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_2_3_prt_1_4_prt_1_5_prt_1_6_prt_2" for table "ggg_1_prt_1_2_prt_2_3_prt_1_4_prt_1_5_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_2_3_prt_1_4_prt_1_5_prt_2" for table "ggg_1_prt_1_2_prt_2_3_prt_1_4_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_2_3_prt_1_4_prt_1_5_prt_2_6_prt_1" for table "ggg_1_prt_1_2_prt_2_3_prt_1_4_prt_1_5_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_2_3_prt_1_4_prt_1_5_prt_2_6_prt_2" for table "ggg_1_prt_1_2_prt_2_3_prt_1_4_prt_1_5_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_2_3_prt_1_4_prt_2" for table "ggg_1_prt_1_2_prt_2_3_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_2_3_prt_1_4_prt_2_5_prt_1" for table "ggg_1_prt_1_2_prt_2_3_prt_1_4_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_2_3_prt_1_4_prt_2_5_prt_1_6_prt_1" for table "ggg_1_prt_1_2_prt_2_3_prt_1_4_prt_2_5_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_2_3_prt_1_4_prt_2_5_prt_1_6_prt_2" for table "ggg_1_prt_1_2_prt_2_3_prt_1_4_prt_2_5_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_2_3_prt_1_4_prt_2_5_prt_2" for table "ggg_1_prt_1_2_prt_2_3_prt_1_4_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_2_3_prt_1_4_prt_2_5_prt_2_6_prt_1" for table "ggg_1_prt_1_2_prt_2_3_prt_1_4_prt_2_5_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_2_3_prt_1_4_prt_2_5_prt_2_6_prt_2" for table "ggg_1_prt_1_2_prt_2_3_prt_1_4_prt_2_5_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_2_3_prt_2" for table "ggg_1_prt_1_2_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_2_3_prt_2_4_prt_1" for table "ggg_1_prt_1_2_prt_2_3_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_2_3_prt_2_4_prt_1_5_prt_1" for table "ggg_1_prt_1_2_prt_2_3_prt_2_4_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_2_3_prt_2_4_prt_1_5_prt_1_6_prt_1" for table "ggg_1_prt_1_2_prt_2_3_prt_2_4_prt_1_5_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_2_3_prt_2_4_prt_1_5_prt_1_6_prt_2" for table "ggg_1_prt_1_2_prt_2_3_prt_2_4_prt_1_5_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_2_3_prt_2_4_prt_1_5_prt_2" for table "ggg_1_prt_1_2_prt_2_3_prt_2_4_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_2_3_prt_2_4_prt_1_5_prt_2_6_prt_1" for table "ggg_1_prt_1_2_prt_2_3_prt_2_4_prt_1_5_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_2_3_prt_2_4_prt_1_5_prt_2_6_prt_2" for table "ggg_1_prt_1_2_prt_2_3_prt_2_4_prt_1_5_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_2_3_prt_2_4_prt_2" for table "ggg_1_prt_1_2_prt_2_3_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_2_3_prt_2_4_prt_2_5_prt_1" for table "ggg_1_prt_1_2_prt_2_3_prt_2_4_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_2_3_prt_2_4_prt_2_5_prt_1_6_prt_1" for table "ggg_1_prt_1_2_prt_2_3_prt_2_4_prt_2_5_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_2_3_prt_2_4_prt_2_5_prt_1_6_prt_2" for table "ggg_1_prt_1_2_prt_2_3_prt_2_4_prt_2_5_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_2_3_prt_2_4_prt_2_5_prt_2" for table "ggg_1_prt_1_2_prt_2_3_prt_2_4_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_2_3_prt_2_4_prt_2_5_prt_2_6_prt_1" for table "ggg_1_prt_1_2_prt_2_3_prt_2_4_prt_2_5_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1_2_prt_2_3_prt_2_4_prt_2_5_prt_2_6_prt_2" for table "ggg_1_prt_1_2_prt_2_3_prt_2_4_prt_2_5_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_1" for table "ggg_1_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_1_3_prt_1" for table "ggg_1_prt_2_2_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_1_3_prt_1_4_prt_1" for table "ggg_1_prt_2_2_prt_1_3_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_1_3_prt_1_4_prt_1_5_prt_1" for table "ggg_1_prt_2_2_prt_1_3_prt_1_4_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_1_3_prt_1_4_prt_1_5_prt_1_6_prt_1" for table "ggg_1_prt_2_2_prt_1_3_prt_1_4_prt_1_5_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_1_3_prt_1_4_prt_1_5_prt_1_6_prt_2" for table "ggg_1_prt_2_2_prt_1_3_prt_1_4_prt_1_5_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_1_3_prt_1_4_prt_1_5_prt_2" for table "ggg_1_prt_2_2_prt_1_3_prt_1_4_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_1_3_prt_1_4_prt_1_5_prt_2_6_prt_1" for table "ggg_1_prt_2_2_prt_1_3_prt_1_4_prt_1_5_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_1_3_prt_1_4_prt_1_5_prt_2_6_prt_2" for table "ggg_1_prt_2_2_prt_1_3_prt_1_4_prt_1_5_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_1_3_prt_1_4_prt_2" for table "ggg_1_prt_2_2_prt_1_3_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_1_3_prt_1_4_prt_2_5_prt_1" for table "ggg_1_prt_2_2_prt_1_3_prt_1_4_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_1_3_prt_1_4_prt_2_5_prt_1_6_prt_1" for table "ggg_1_prt_2_2_prt_1_3_prt_1_4_prt_2_5_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_1_3_prt_1_4_prt_2_5_prt_1_6_prt_2" for table "ggg_1_prt_2_2_prt_1_3_prt_1_4_prt_2_5_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_1_3_prt_1_4_prt_2_5_prt_2" for table "ggg_1_prt_2_2_prt_1_3_prt_1_4_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_1_3_prt_1_4_prt_2_5_prt_2_6_prt_1" for table "ggg_1_prt_2_2_prt_1_3_prt_1_4_prt_2_5_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_1_3_prt_1_4_prt_2_5_prt_2_6_prt_2" for table "ggg_1_prt_2_2_prt_1_3_prt_1_4_prt_2_5_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_1_3_prt_2" for table "ggg_1_prt_2_2_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_1_3_prt_2_4_prt_1" for table "ggg_1_prt_2_2_prt_1_3_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_1_3_prt_2_4_prt_1_5_prt_1" for table "ggg_1_prt_2_2_prt_1_3_prt_2_4_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_1_3_prt_2_4_prt_1_5_prt_1_6_prt_1" for table "ggg_1_prt_2_2_prt_1_3_prt_2_4_prt_1_5_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_1_3_prt_2_4_prt_1_5_prt_1_6_prt_2" for table "ggg_1_prt_2_2_prt_1_3_prt_2_4_prt_1_5_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_1_3_prt_2_4_prt_1_5_prt_2" for table "ggg_1_prt_2_2_prt_1_3_prt_2_4_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_1_3_prt_2_4_prt_1_5_prt_2_6_prt_1" for table "ggg_1_prt_2_2_prt_1_3_prt_2_4_prt_1_5_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_1_3_prt_2_4_prt_1_5_prt_2_6_prt_2" for table "ggg_1_prt_2_2_prt_1_3_prt_2_4_prt_1_5_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_1_3_prt_2_4_prt_2" for table "ggg_1_prt_2_2_prt_1_3_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_1_3_prt_2_4_prt_2_5_prt_1" for table "ggg_1_prt_2_2_prt_1_3_prt_2_4_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_1_3_prt_2_4_prt_2_5_prt_1_6_prt_1" for table "ggg_1_prt_2_2_prt_1_3_prt_2_4_prt_2_5_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_1_3_prt_2_4_prt_2_5_prt_1_6_prt_2" for table "ggg_1_prt_2_2_prt_1_3_prt_2_4_prt_2_5_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_1_3_prt_2_4_prt_2_5_prt_2" for table "ggg_1_prt_2_2_prt_1_3_prt_2_4_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_1_3_prt_2_4_prt_2_5_prt_2_6_prt_1" for table "ggg_1_prt_2_2_prt_1_3_prt_2_4_prt_2_5_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_1_3_prt_2_4_prt_2_5_prt_2_6_prt_2" for table "ggg_1_prt_2_2_prt_1_3_prt_2_4_prt_2_5_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_2" for table "ggg_1_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_2_3_prt_1" for table "ggg_1_prt_2_2_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_2_3_prt_1_4_prt_1" for table "ggg_1_prt_2_2_prt_2_3_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_2_3_prt_1_4_prt_1_5_prt_1" for table "ggg_1_prt_2_2_prt_2_3_prt_1_4_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_2_3_prt_1_4_prt_1_5_prt_1_6_prt_1" for table "ggg_1_prt_2_2_prt_2_3_prt_1_4_prt_1_5_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_2_3_prt_1_4_prt_1_5_prt_1_6_prt_2" for table "ggg_1_prt_2_2_prt_2_3_prt_1_4_prt_1_5_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_2_3_prt_1_4_prt_1_5_prt_2" for table "ggg_1_prt_2_2_prt_2_3_prt_1_4_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_2_3_prt_1_4_prt_1_5_prt_2_6_prt_1" for table "ggg_1_prt_2_2_prt_2_3_prt_1_4_prt_1_5_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_2_3_prt_1_4_prt_1_5_prt_2_6_prt_2" for table "ggg_1_prt_2_2_prt_2_3_prt_1_4_prt_1_5_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_2_3_prt_1_4_prt_2" for table "ggg_1_prt_2_2_prt_2_3_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_2_3_prt_1_4_prt_2_5_prt_1" for table "ggg_1_prt_2_2_prt_2_3_prt_1_4_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_2_3_prt_1_4_prt_2_5_prt_1_6_prt_1" for table "ggg_1_prt_2_2_prt_2_3_prt_1_4_prt_2_5_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_2_3_prt_1_4_prt_2_5_prt_1_6_prt_2" for table "ggg_1_prt_2_2_prt_2_3_prt_1_4_prt_2_5_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_2_3_prt_1_4_prt_2_5_prt_2" for table "ggg_1_prt_2_2_prt_2_3_prt_1_4_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_2_3_prt_1_4_prt_2_5_prt_2_6_prt_1" for table "ggg_1_prt_2_2_prt_2_3_prt_1_4_prt_2_5_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_2_3_prt_1_4_prt_2_5_prt_2_6_prt_2" for table "ggg_1_prt_2_2_prt_2_3_prt_1_4_prt_2_5_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_2_3_prt_2" for table "ggg_1_prt_2_2_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_2_3_prt_2_4_prt_1" for table "ggg_1_prt_2_2_prt_2_3_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_2_3_prt_2_4_prt_1_5_prt_1" for table "ggg_1_prt_2_2_prt_2_3_prt_2_4_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_2_3_prt_2_4_prt_1_5_prt_1_6_prt_1" for table "ggg_1_prt_2_2_prt_2_3_prt_2_4_prt_1_5_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_2_3_prt_2_4_prt_1_5_prt_1_6_prt_2" for table "ggg_1_prt_2_2_prt_2_3_prt_2_4_prt_1_5_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_2_3_prt_2_4_prt_1_5_prt_2" for table "ggg_1_prt_2_2_prt_2_3_prt_2_4_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_2_3_prt_2_4_prt_1_5_prt_2_6_prt_1" for table "ggg_1_prt_2_2_prt_2_3_prt_2_4_prt_1_5_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_2_3_prt_2_4_prt_1_5_prt_2_6_prt_2" for table "ggg_1_prt_2_2_prt_2_3_prt_2_4_prt_1_5_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_2_3_prt_2_4_prt_2" for table "ggg_1_prt_2_2_prt_2_3_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_2_3_prt_2_4_prt_2_5_prt_1" for table "ggg_1_prt_2_2_prt_2_3_prt_2_4_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_2_3_prt_2_4_prt_2_5_prt_1_6_prt_1" for table "ggg_1_prt_2_2_prt_2_3_prt_2_4_prt_2_5_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_2_3_prt_2_4_prt_2_5_prt_1_6_prt_2" for table "ggg_1_prt_2_2_prt_2_3_prt_2_4_prt_2_5_prt_1"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_2_3_prt_2_4_prt_2_5_prt_2" for table "ggg_1_prt_2_2_prt_2_3_prt_2_4_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_2_3_prt_2_4_prt_2_5_prt_2_6_prt_1" for table "ggg_1_prt_2_2_prt_2_3_prt_2_4_prt_2_5_prt_2"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2_2_prt_2_3_prt_2_4_prt_2_5_prt_2_6_prt_2" for table "ggg_1_prt_2_2_prt_2_3_prt_2_4_prt_2_5_prt_2"
-drop table ggg cascade;
--- named, inline subpartitions
-create table ggg (a char(1), b char(2), d char(3))
-distributed by (a)
-partition by hash (b)
-subpartition by hash (d) 
-(
-partition aa (subpartition cc, subpartition dd),
-partition bb (subpartition cc, subpartition dd)
-);
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_cc" for table "ggg_1_prt_aa"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_dd" for table "ggg_1_prt_aa"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_cc" for table "ggg_1_prt_bb"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_dd" for table "ggg_1_prt_bb"
-drop table ggg cascade;
--- subpartitions with templates
-create table ggg (a char(1), b char(2), d char(3), e numeric)
-distributed by (a)
-partition by hash (b)
-subpartition by hash (d) 
-subpartition template ( 
-subpartition cc,
-subpartition dd
-), 
-subpartition by hash (e) 
-subpartition template ( 
-subpartition ee,
-subpartition ff
-) 
-(
-partition aa,
-partition bb
-);
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_cc" for table "ggg_1_prt_aa"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_cc_3_prt_ee" for table "ggg_1_prt_aa_2_prt_cc"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_cc_3_prt_ff" for table "ggg_1_prt_aa_2_prt_cc"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_dd" for table "ggg_1_prt_aa"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_dd_3_prt_ee" for table "ggg_1_prt_aa_2_prt_dd"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_dd_3_prt_ff" for table "ggg_1_prt_aa_2_prt_dd"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_cc" for table "ggg_1_prt_bb"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_cc_3_prt_ee" for table "ggg_1_prt_bb_2_prt_cc"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_cc_3_prt_ff" for table "ggg_1_prt_bb_2_prt_cc"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_dd" for table "ggg_1_prt_bb"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_dd_3_prt_ee" for table "ggg_1_prt_bb_2_prt_dd"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_dd_3_prt_ff" for table "ggg_1_prt_bb_2_prt_dd"
-drop table ggg cascade;
--- mixed inline subpartition declarations with templates
-create table ggg (a char(1), b char(2), d char(3), e numeric)
-distributed by (a)
-partition by hash (b)
-subpartition by hash (d) , 
-subpartition by hash (e) 
-subpartition template ( 
-subpartition ee,
-subpartition ff
-) 
-(
-partition aa (subpartition cc, subpartition dd),
-partition bb (subpartition cc, subpartition dd)
-);
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_cc" for table "ggg_1_prt_aa"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_cc_3_prt_ee" for table "ggg_1_prt_aa_2_prt_cc"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_cc_3_prt_ff" for table "ggg_1_prt_aa_2_prt_cc"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_dd" for table "ggg_1_prt_aa"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_dd_3_prt_ee" for table "ggg_1_prt_aa_2_prt_dd"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_dd_3_prt_ff" for table "ggg_1_prt_aa_2_prt_dd"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_cc" for table "ggg_1_prt_bb"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_cc_3_prt_ee" for table "ggg_1_prt_bb_2_prt_cc"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_cc_3_prt_ff" for table "ggg_1_prt_bb_2_prt_cc"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_dd" for table "ggg_1_prt_bb"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_dd_3_prt_ee" for table "ggg_1_prt_bb_2_prt_dd"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_dd_3_prt_ff" for table "ggg_1_prt_bb_2_prt_dd"
-drop table ggg cascade;
 -- basic list partition
 create table ggg (a char(1), b char(2), d char(3))
 distributed by (a)
@@ -567,7 +150,7 @@ select * from ggg_1_prt_bb order by 1, 2;
 
 drop table ggg cascade;
 -- documentation example - partition by list and range
-CREATE TABLE rank (id int, rank int, year date, gender 
+CREATE TABLE rank (id int, rank int, year date, gender
 char(1)) DISTRIBUTED BY (id, gender, year)
 partition by list (gender)
 subpartition by range (year)
@@ -652,42 +235,29 @@ select * from rank_1_prt_girls_2_prt_2 order by 1, 2, 3, 4;
 (1 row)
 
 drop table rank cascade;
--- range list hash combo
+-- range list combo
 create table ggg (a char(1), b date, d char(3), e numeric)
 distributed by (a)
 partition by range (b)
-subpartition by list(d),
-subpartition by hash(e) subpartitions 3
+subpartition by list(d)
 (
-partition aa 
-start  (date '2007-01-01') 
-end (date '2008-01-01') 
-       (subpartition dd values ('1', '2', '3'), 
+partition aa
+start  (date '2007-01-01')
+end (date '2008-01-01')
+       (subpartition dd values ('1', '2', '3'),
 	    subpartition ee values ('4', '5', '6')),
 partition bb
-start  (date '2008-01-01') 
-end (date '2009-01-01') 
+start  (date '2008-01-01')
+end (date '2009-01-01')
        (subpartition dd values ('1', '2', '3'),
 	    subpartition ee values ('4', '5', '6'))
 );
 NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa" for table "ggg"
 NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_dd" for table "ggg_1_prt_aa"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_dd_3_prt_1" for table "ggg_1_prt_aa_2_prt_dd"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_dd_3_prt_2" for table "ggg_1_prt_aa_2_prt_dd"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_dd_3_prt_3" for table "ggg_1_prt_aa_2_prt_dd"
 NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_ee" for table "ggg_1_prt_aa"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_ee_3_prt_1" for table "ggg_1_prt_aa_2_prt_ee"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_ee_3_prt_2" for table "ggg_1_prt_aa_2_prt_ee"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_ee_3_prt_3" for table "ggg_1_prt_aa_2_prt_ee"
 NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb" for table "ggg"
 NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_dd" for table "ggg_1_prt_bb"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_dd_3_prt_1" for table "ggg_1_prt_bb_2_prt_dd"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_dd_3_prt_2" for table "ggg_1_prt_bb_2_prt_dd"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_dd_3_prt_3" for table "ggg_1_prt_bb_2_prt_dd"
 NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_ee" for table "ggg_1_prt_bb"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_ee_3_prt_1" for table "ggg_1_prt_bb_2_prt_ee"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_ee_3_prt_2" for table "ggg_1_prt_bb_2_prt_ee"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_ee_3_prt_3" for table "ggg_1_prt_bb_2_prt_ee"
 drop table ggg cascade;
 -- demo ends here
 -- LIST validation
@@ -724,12 +294,12 @@ LINE 10:  partition bb values ((1, 'M'))
                        ^
 -- RANGE validation
 -- legal if end of aa not inclusive
-create table ggg (a char(1), b date, d char(3)) 
+create table ggg (a char(1), b date, d char(3))
 distributed by (a)
 partition by range (b)
 (
-partition aa start (date '2007-01-01') end (date '2008-01-01'),
-partition bb start (date '2008-01-01') end (date '2009-01-01') 
+partition aa start (date '2007-08-01') end (date '2008-01-01'),
+partition bb start (date '2008-01-01') end (date '2008-03-01')
 every (interval '10 days'));
 NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa" for table "ggg"
 NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_1" for table "ggg"
@@ -738,45 +308,14 @@ NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_3" for table "ggg"
 NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_4" for table "ggg"
 NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_5" for table "ggg"
 NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_6" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_7" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_8" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_9" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_10" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_11" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_12" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_13" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_14" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_15" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_16" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_17" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_18" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_19" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_20" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_21" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_22" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_23" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_24" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_25" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_26" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_27" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_28" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_29" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_30" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_31" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_32" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_33" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_34" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_35" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_36" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_37" for table "ggg"
 drop table ggg cascade;
 -- bad - legal if end of aa not inclusive
-create table ggg (a char(1), b date, d char(3)) 
+create table ggg (a char(1), b date, d char(3))
 distributed by (a)
 partition by range (b)
 (
 partition aa start (date '2007-01-01') end (date '2008-01-01') inclusive,
-partition bb start (date '2008-01-01') end (date '2009-01-01') 
+partition bb start (date '2008-01-01') end (date '2009-01-01')
 every (interval '10 days'));
 ERROR:  starting value of partition "bb_1" overlaps previous range
 LINE 6: partition bb start (date '2008-01-01') end (date '2009-01-01...
@@ -784,12 +323,12 @@ LINE 6: partition bb start (date '2008-01-01') end (date '2009-01-01...
 drop table ggg cascade;
 ERROR:  table "ggg" does not exist
 -- legal because start of bb not inclusive
-create table ggg (a char(1), b date, d char(3)) 
+create table ggg (a char(1), b date, d char(3))
 distributed by (a)
 partition by range (b)
 (
-partition aa start (date '2007-01-01') end (date '2008-01-01') inclusive,
-partition bb start (date '2008-01-01') exclusive end (date '2009-01-01') 
+partition aa start (date '2007-08-01') end (date '2008-01-01') inclusive,
+partition bb start (date '2008-01-01') exclusive end (date '2008-03-01')
 every (interval '10 days'));
 NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa" for table "ggg"
 NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_1" for table "ggg"
@@ -798,40 +337,9 @@ NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_3" for table "ggg"
 NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_4" for table "ggg"
 NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_5" for table "ggg"
 NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_6" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_7" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_8" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_9" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_10" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_11" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_12" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_13" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_14" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_15" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_16" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_17" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_18" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_19" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_20" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_21" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_22" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_23" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_24" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_25" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_26" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_27" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_28" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_29" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_30" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_31" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_32" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_33" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_34" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_35" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_36" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_37" for table "ggg"
 drop table ggg cascade;
 -- legal if end of aa not inclusive
-create table ggg (a char(1), b date, d char(3)) 
+create table ggg (a char(1), b date, d char(3))
 distributed by (a)
 partition by range (b)
 (
@@ -842,7 +350,7 @@ NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa" for table "ggg"
 NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb" for table "ggg"
 drop table ggg cascade;
 -- bad - legal if end of aa not inclusive
-create table ggg (a char(1), b date, d char(3)) 
+create table ggg (a char(1), b date, d char(3))
 distributed by (a)
 partition by range (b)
 (
@@ -855,7 +363,7 @@ LINE 5: partition bb start (date '2008-01-01') end (date '2009-01-01...
 drop table ggg cascade;
 ERROR:  table "ggg" does not exist
 -- legal because start of bb not inclusive
-create table ggg (a char(1), b date, d char(3)) 
+create table ggg (a char(1), b date, d char(3))
 distributed by (a)
 partition by range (b)
 (
@@ -866,7 +374,7 @@ NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa" for table "ggg"
 NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb" for table "ggg"
 drop table ggg cascade;
 -- validate aa - start greater than end
-create table ggg (a char(1), b date, d char(3)) 
+create table ggg (a char(1), b date, d char(3))
 distributed by (a)
 partition by range (b)
 (
@@ -880,12 +388,12 @@ drop table ggg cascade;
 ERROR:  table "ggg" does not exist
 -- formerly we could not set end of first partition because next is before
 -- but we can sort them now so this is legal.
-create table ggg (a char(1), b date, d char(3)) 
+create table ggg (a char(1), b date, d char(3))
 distributed by (a)
 partition by range (b)
 (
 partition bb start (date '2008-01-01') ,
-partition aa start (date '2007-01-01') 
+partition aa start (date '2007-01-01')
 );
 NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa" for table "ggg"
 NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb" for table "ggg"
@@ -1052,157 +560,8 @@ select * from ggg_1_prt_4 order by 1, 2;
 (1 row)
 
 drop table ggg cascade;
--- hash tests
-create table ggg (a char(1), b varchar(2), d varchar(2))
-distributed by (a)
-partition by hash(b)
-partitions 3
-(partition a, partition b, partition c);
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_a" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_b" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_c" for table "ggg"
-insert into ggg values (1,1,1);
-insert into ggg values (2,2,1);
-insert into ggg values (1,3,1);
-insert into ggg values (2,2,3);
-insert into ggg values (1,4,5);
-insert into ggg values (2,2,4);
-insert into ggg values (1,5,6);
-insert into ggg values (2,7,3);
-insert into ggg values (1,'a','b');
-insert into ggg values (2,'c','c');
-select * from ggg order by 1, 2, 3;
- a | b | d 
----+---+---
- 1 | 1 | 1
- 1 | 3 | 1
- 1 | 4 | 5
- 1 | 5 | 6
- 1 | a | b
- 2 | 2 | 1
- 2 | 2 | 3
- 2 | 2 | 4
- 2 | 7 | 3
- 2 | c | c
-(10 rows)
-
---select * from ggg_1_prt_a order by 1, 2, 3;
---select * from ggg_1_prt_b order by 1, 2, 3;
---select * from ggg_1_prt_c order by 1, 2, 3;
-drop table ggg cascade;
--- use multiple cols
-create table ggg (a char(1), b varchar(2), d varchar(2))
-distributed by (a)
-partition by hash(b,d)
-partitions 3
-(partition a, partition b, partition c);
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_a" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_b" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_c" for table "ggg"
-insert into ggg values (1,1,1);
-insert into ggg values (2,2,1);
-insert into ggg values (1,3,1);
-insert into ggg values (2,2,3);
-insert into ggg values (1,4,5);
-insert into ggg values (2,2,4);
-insert into ggg values (1,5,6);
-insert into ggg values (2,7,3);
-insert into ggg values (1,'a','b');
-insert into ggg values (2,'c','c');
-select * from ggg order by 1, 2, 3;
- a | b | d 
----+---+---
- 1 | 1 | 1
- 1 | 3 | 1
- 1 | 4 | 5
- 1 | 5 | 6
- 1 | a | b
- 2 | 2 | 1
- 2 | 2 | 3
- 2 | 2 | 4
- 2 | 7 | 3
- 2 | c | c
-(10 rows)
-
---select * from ggg_1_prt_a order by 1, 2, 3;
---select * from ggg_1_prt_b order by 1, 2, 3;
---select * from ggg_1_prt_c order by 1, 2, 3;
-drop table ggg cascade;
--- use multiple cols of different types and without a partition spec
-create table ggg (a char(1), b varchar(2), d integer, e date)
-distributed by (a)
-partition by hash(b,d,e)
-partitions 3;
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_3" for table "ggg"
-insert into ggg values (1,1,1,date '2001-01-15');
-insert into ggg values (2,2,1,date '2001-01-15');
-insert into ggg values (1,3,1,date '2001-01-15');
-insert into ggg values (2,2,3,date '2001-01-15');
-insert into ggg values (1,4,5,date '2001-01-15');
-insert into ggg values (2,2,4,date '2001-01-15');
-insert into ggg values (1,5,6,date '2001-01-15');
-insert into ggg values (2,7,3,date '2001-01-15');
-insert into ggg values (1,'a',33,date '2001-01-15');
-insert into ggg values (2,'c',44,date '2001-01-15');
-select * from ggg order by 1, 2, 3, 4;
- a | b | d  |     e      
----+---+----+------------
- 1 | 1 |  1 | 01-15-2001
- 1 | 3 |  1 | 01-15-2001
- 1 | 4 |  5 | 01-15-2001
- 1 | 5 |  6 | 01-15-2001
- 1 | a | 33 | 01-15-2001
- 2 | 2 |  1 | 01-15-2001
- 2 | 2 |  3 | 01-15-2001
- 2 | 2 |  4 | 01-15-2001
- 2 | 7 |  3 | 01-15-2001
- 2 | c | 44 | 01-15-2001
-(10 rows)
-
---select * from ggg_1_prt_1 order by 1, 2, 3, 4;
---select * from ggg_1_prt_2 order by 1, 2, 3, 4;
---select * from ggg_1_prt_3 order by 1, 2, 3, 4;
-drop table ggg cascade;
-create table ggg (a char(1), b char(2), d char(3))
-distributed by (a)
-partItion by hash(b)
-partitions 3;
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_3" for table "ggg"
-drop table ggg cascade;
-create table ggg (a char(1), b char(2), d char(3))
-distributed by (a)
-partition by hash (b)
-(
-partition aa (subpartition cc, subpartition dd),
-partition bb (subpartition cc, subpartition dd)
-);
-ERROR:  missing SUBPARTITION BY clause for subpartition specification
-LINE 5: partition aa (subpartition cc, subpartition dd),
-        ^
-drop table ggg cascade;
-ERROR:  table "ggg" does not exist
-create table ggg (a char(1), b char(2), d char(3))
-distributed by (a)
-partition by hash (b)
-subpartition by hash (d) 
-(
-partition aa (subpartition cc, subpartition dd),
-partition bb (subpartition cc, subpartition dd)
-);
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_cc" for table "ggg_1_prt_aa"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_dd" for table "ggg_1_prt_aa"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_cc" for table "ggg_1_prt_bb"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_dd" for table "ggg_1_prt_bb"
-drop table ggg cascade;
 create table fff (a char(1), b char(2), d char(3)) distributed by (a)
 partition by list (b) (partition aa values ('2'));
-NOTICE:  CREATE TABLE will create partition "fff_1_prt_aa" for table "fff"
 drop table fff cascade;
 create table ggg (a char(1), b numeric, d numeric)
 distributed by (a)
@@ -1211,46 +570,12 @@ partition by range (b,d)
 partition aa start (2007,1) end (2008,2),
 partition bb start (2008,2) end (2009,3)
 );
-ERROR:  too many columns for RANGE partition -- only one column is allowed.
+ERROR:  too many columns for RANGE partition -- only one column is allowed
 LINE 3: partition by range (b,d)
                      ^
 drop table ggg cascade;
 ERROR:  table "ggg" does not exist
-create table ggg (a char(1), b date, d char(3), e numeric)
-distributed by (a)
-partition by range (b)
-subpartition by list(d),
-subpartition by hash(e) subpartitions 3
-(
-partition aa 
-start  (date '2007-01-01') 
-end (date '2008-01-01') 
-       (subpartition dd values (1,2,3), subpartition ee values (4,5,6)),
-partition bb
-start  (date '2008-01-01') 
-end (date '2009-01-01') 
-       (subpartition dd values (1,2,3), subpartition ee values (4,5,6))
-);
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_dd" for table "ggg_1_prt_aa"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_dd_3_prt_1" for table "ggg_1_prt_aa_2_prt_dd"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_dd_3_prt_2" for table "ggg_1_prt_aa_2_prt_dd"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_dd_3_prt_3" for table "ggg_1_prt_aa_2_prt_dd"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_ee" for table "ggg_1_prt_aa"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_ee_3_prt_1" for table "ggg_1_prt_aa_2_prt_ee"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_ee_3_prt_2" for table "ggg_1_prt_aa_2_prt_ee"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_aa_2_prt_ee_3_prt_3" for table "ggg_1_prt_aa_2_prt_ee"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_dd" for table "ggg_1_prt_bb"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_dd_3_prt_1" for table "ggg_1_prt_bb_2_prt_dd"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_dd_3_prt_2" for table "ggg_1_prt_bb_2_prt_dd"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_dd_3_prt_3" for table "ggg_1_prt_bb_2_prt_dd"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_ee" for table "ggg_1_prt_bb"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_ee_3_prt_1" for table "ggg_1_prt_bb_2_prt_ee"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_ee_3_prt_2" for table "ggg_1_prt_bb_2_prt_ee"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_bb_2_prt_ee_3_prt_3" for table "ggg_1_prt_bb_2_prt_ee"
-drop table ggg cascade;
-create table ggg (a char(1), b date, d char(3)) 
+create table ggg (a char(1), b date, d char(3))
 distributed by (a)
 partition by range (b)
 (
@@ -1262,64 +587,6 @@ LINE 6: partition aa start (date '2007-01-01') end (date '2006-01-01...
                      ^
 drop table ggg cascade;
 ERROR:  table "ggg" does not exist
-create table ggg (a char(1), b varchar(2), d varchar(2))
-distributed by (a)
-partition by hash(b)
-partitions 3;
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_1" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_2" for table "ggg"
-NOTICE:  CREATE TABLE will create partition "ggg_1_prt_3" for table "ggg"
-insert into ggg values (1,1,1);
-insert into ggg values (2,2,1);
-insert into ggg values (1,3,1);
-insert into ggg values (2,2,3);
-insert into ggg values (1,4,5);
-insert into ggg values (2,2,4);
-insert into ggg values (1,5,6);
-insert into ggg values (2,7,3);
-insert into ggg values (1,'a','b');
-insert into ggg values (2,'c','c');
-select * from ggg;
- a | b | d 
----+---+---
- 1 | 1 | 1
- 1 | 3 | 1
- 1 | 4 | 5
- 1 | 5 | 6
- 1 | a | b
- 2 | 7 | 3
- 2 | 2 | 1
- 2 | 2 | 3
- 2 | 2 | 4
- 2 | c | c
-(10 rows)
-
-select * from ggg_1_prt_1;
- a | b | d 
----+---+---
- 1 | 1 | 1
- 1 | 3 | 1
- 2 | 7 | 3
-(3 rows)
-
-select * from ggg_1_prt_2;
- a | b | d 
----+---+---
- 1 | 4 | 5
-(1 row)
-
-select * from ggg_1_prt_3;
- a | b | d 
----+---+---
- 1 | 5 | 6
- 1 | a | b
- 2 | 2 | 1
- 2 | 2 | 3
- 2 | 2 | 4
- 2 | c | c
-(6 rows)
-
-drop table ggg cascade;
 -- append only tests
 create table foz (i int, d date) with (appendonly = true) distributed by (i)
 partition by range (d) (start (date '2001-01-01') end (date '2005-01-01')
@@ -1466,8 +733,8 @@ end (date '2006-01-01') every (interval '1 year')) (
 partition boys values ('M'),
 partition girls values ('F')
 );
-ERROR:  Cannot create a partitioned table using CREATE TABLE AS SELECT
-HINT:  Use CREATE TABLE...LIKE (followed by INSERT...SELECT) instead
+ERROR:  cannot create a partitioned table using CREATE TABLE AS SELECT
+HINT:  Use CREATE TABLE...LIKE (followed by INSERT...SELECT) instead.
 -- like is ok
 create table rank2 (like rank1)
 DISTRIBUTED BY (id, gender, year)
@@ -1475,22 +742,16 @@ partition by list (gender)
 subpartition by range (year)
 subpartition template (
 start (date '2001-01-01')
-end (date '2006-01-01') every (interval '1 year')) (
+end (date '2003-01-01') every (interval '1 year')) (
 partition boys values ('M'),
 partition girls values ('F')
 );
 NOTICE:  CREATE TABLE will create partition "rank2_1_prt_boys" for table "rank2"
 NOTICE:  CREATE TABLE will create partition "rank2_1_prt_boys_2_prt_1" for table "rank2_1_prt_boys"
 NOTICE:  CREATE TABLE will create partition "rank2_1_prt_boys_2_prt_2" for table "rank2_1_prt_boys"
-NOTICE:  CREATE TABLE will create partition "rank2_1_prt_boys_2_prt_3" for table "rank2_1_prt_boys"
-NOTICE:  CREATE TABLE will create partition "rank2_1_prt_boys_2_prt_4" for table "rank2_1_prt_boys"
-NOTICE:  CREATE TABLE will create partition "rank2_1_prt_boys_2_prt_5" for table "rank2_1_prt_boys"
 NOTICE:  CREATE TABLE will create partition "rank2_1_prt_girls" for table "rank2"
 NOTICE:  CREATE TABLE will create partition "rank2_1_prt_girls_2_prt_1" for table "rank2_1_prt_girls"
 NOTICE:  CREATE TABLE will create partition "rank2_1_prt_girls_2_prt_2" for table "rank2_1_prt_girls"
-NOTICE:  CREATE TABLE will create partition "rank2_1_prt_girls_2_prt_3" for table "rank2_1_prt_girls"
-NOTICE:  CREATE TABLE will create partition "rank2_1_prt_girls_2_prt_4" for table "rank2_1_prt_girls"
-NOTICE:  CREATE TABLE will create partition "rank2_1_prt_girls_2_prt_5" for table "rank2_1_prt_girls"
 drop table rank1 cascade;
 drop table rank2 cascade;
 -- alter table testing
@@ -1498,7 +759,7 @@ create table hhh (a char(1), b date, d char(3))
 distributed by (a)
 partition by range (b)
 (
-partition aa start (date '2007-01-01') end (date '2008-01-01') 
+partition aa start (date '2007-01-01') end (date '2008-01-01')
     with (appendonly=true),
 partition bb start (date '2008-01-01') end (date '2009-01-01')
     with (appendonly=false)
@@ -1563,7 +824,7 @@ alter table no_start1 add partition baz2 start (5);
 NOTICE:  CREATE TABLE will create partition "no_start1_1_prt_baz2" for table "no_start1"
 select tablename, partitionlevel, parentpartitiontablename,
 partitionname, partitionrank, partitionboundary from pg_partitions
-where tablename = 'no_start1' or tablename = 'no_end1' 
+where tablename = 'no_start1' or tablename = 'no_end1'
 order by tablename, partitionrank;
  tablename | partitionlevel | parentpartitiontablename | partitionname | partitionrank |        partitionboundary        
 -----------+----------------+--------------------------+---------------+---------------+---------------------------------
@@ -1577,23 +838,10 @@ order by tablename, partitionrank;
 
 drop table no_end1;
 drop table no_start1;
--- hash partitions cannot have default partitions
-create table jjj (aa int, bb int) 
-partition by hash(bb) 
-(partition j1, partition j2);
-NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'aa' as the Greenplum Database data distribution key for this table.
-HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
-NOTICE:  CREATE TABLE will create partition "jjj_1_prt_j1" for table "jjj"
-NOTICE:  CREATE TABLE will create partition "jjj_1_prt_j2" for table "jjj"
-alter table jjj add default partition;
-ERROR:  syntax error at or near ";"
-LINE 1: alter table jjj add default partition;
-                                             ^
-drop table jjj cascade;
 -- default partitions cannot have boundary specifications
-create table jjj (aa int, bb date) 
-partition by range(bb) 
-(partition j1 end (date '2008-01-01'), 
+create table jjj (aa int, bb date)
+partition by range(bb)
+(partition j1 end (date '2008-01-01'),
 partition j2 end (date '2009-01-01'));
 NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'aa' as the Greenplum Database data distribution key for this table.
 HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
@@ -1605,15 +853,15 @@ ERROR:  syntax error at or near ";"
 LINE 1: alter table jjj add default partition;
                                              ^
 alter table jjj add default partition for (rank(1));
-ERROR:  Can only ADD a partition by name
+ERROR:  can only ADD a partition by name
 -- cannot have boundary spec
 alter table jjj add default partition j3 end (date '2010-01-01');
 ERROR:  invalid use of boundary specification for DEFAULT partition "j3" of relation "jjj"
 drop table jjj cascade;
 -- only one default partition
-create table jjj (aa int, bb date) 
-partition by range(bb) 
-(partition j1 end (date '2008-01-01'), 
+create table jjj (aa int, bb date)
+partition by range(bb)
+(partition j1 end (date '2008-01-01'),
 partition j2 end (date '2009-01-01'),
 default partition j3);
 NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'aa' as the Greenplum Database data distribution key for this table.
@@ -1634,10 +882,6 @@ alter table hhh alter partition cc set tablespace foo_p;
 ERROR:  tablespace "foo_p" does not exist
 alter table hhh alter partition aa set tablespace foo_p;
 ERROR:  tablespace "foo_p" does not exist
-alter table hhh coalesce partition cc;
-ERROR:  cannot COALESCE PARTITION for relation "hhh"
-alter table hhh coalesce partition aa;
-ERROR:  cannot COALESCE PARTITION for relation "hhh"
 alter table hhh drop partition cc;
 alter table hhh drop partition cc cascade;
 ERROR:  partition "cc" of relation "hhh" does not exist
@@ -1656,7 +900,7 @@ create table hhh_r1 (a char(1), b date, d char(3))
 distributed by (a)
 partition by range (b)
 (
-partition aa start (date '2007-01-01') end (date '2008-01-01') 
+partition aa start (date '2007-01-01') end (date '2008-01-01')
              every (interval '1 month')
 );
 NOTICE:  CREATE TABLE will create partition "hhh_r1_1_prt_aa_1" for table "hhh_r1"
@@ -1677,30 +921,28 @@ partition by list (b)
 (
 partition aa values ('2007-01-01'),
 partition bb values ('2008-01-01'),
-partition cc values ('2009-01-01') 
+partition cc values ('2009-01-01')
 );
 NOTICE:  CREATE TABLE will create partition "hhh_l1_1_prt_aa" for table "hhh_l1"
 NOTICE:  CREATE TABLE will create partition "hhh_l1_1_prt_bb" for table "hhh_l1"
 NOTICE:  CREATE TABLE will create partition "hhh_l1_1_prt_cc" for table "hhh_l1"
--- must have name or value for list partition
+-- must have name or value for partition
 alter table hhh_l1 drop partition;
 ERROR:  missing name or value for DROP for relation "hhh_l1"
 alter table hhh_l1 drop partition aa;
 alter table hhh_l1 drop partition for ('2008-01-01');
 NOTICE:  dropped partition "bb" for relation "hhh_l1"
--- if not specified, drop first range partition...
+-- same with range partitioning
+alter table hhh_r1 drop partition;
+ERROR:  missing name or value for DROP for relation "hhh_r1"
 alter table hhh_r1 drop partition for ('2007-04-01');
 NOTICE:  dropped partition "aa_4" for relation "hhh_r1"
-alter table hhh_r1 drop partition;
+alter table hhh_r1 drop partition for(rank(1));
 NOTICE:  dropped partition "aa_1" for relation "hhh_r1"
-alter table hhh_r1 drop partition;
-NOTICE:  dropped partition "aa_2" for relation "hhh_r1"
-alter table hhh_r1 drop partition;
-NOTICE:  dropped partition "aa_3" for relation "hhh_r1"
-alter table hhh_r1 drop partition;
-NOTICE:  dropped partition "aa_5" for relation "hhh_r1"
-alter table hhh_r1 drop partition;
-NOTICE:  dropped partition "aa_6" for relation "hhh_r1"
+alter table hhh_r1 drop partition aa_2;
+alter table hhh_r1 drop partition aa_3;
+alter table hhh_r1 drop partition aa_5;
+alter table hhh_r1 drop partition aa_6;
 -- more add partition tests
 -- start before first partition (fail because start equal end)
 alter table hhh_r1 add partition zaa start ('2007-07-01');
@@ -1712,7 +954,7 @@ NOTICE:  CREATE TABLE will create partition "hhh_r1_1_prt_zaa" for table "hhh_r1
 alter table hhh_r1 add partition bb start ('2008-01-01') end ('2008-01-01') ;
 ERROR:  START equal to END for partition "bb"
 -- start > last (ok)
-alter table hhh_r1 add partition bb start ('2008-01-01') 
+alter table hhh_r1 add partition bb start ('2008-01-01')
 end ('2008-02-01') inclusive;
 NOTICE:  CREATE TABLE will create partition "hhh_r1_1_prt_bb" for table "hhh_r1"
 -- start > last (fail because start == last end inclusive)
@@ -1734,11 +976,11 @@ ERROR:  new partition overlaps existing partition
 alter table hhh_r1 add partition yaa start ('2007-05-01') end ('2007-07-01');
 ERROR:  new partition overlaps existing partition "aa_7"
 -- start before first partition (fail )
-alter table hhh_r1 add partition yaa start ('2007-05-01') 
+alter table hhh_r1 add partition yaa start ('2007-05-01')
 end ('2007-10-01') inclusive;
 ERROR:  new partition overlaps existing partition "aa_10"
 -- start before first partition (fail because end overlaps)
-alter table hhh_r1 add partition yaa start ('2007-05-01') 
+alter table hhh_r1 add partition yaa start ('2007-05-01')
 end ('2007-10-01') exclusive;
 ERROR:  new partition overlaps existing partition "aa_10"
 drop table hhh_r1 cascade;
@@ -1812,7 +1054,7 @@ select * from rank ;
  10 |    1 | 05-15-2005 | F
 (5 rows)
 
--- MPP-3722: complain if for(value) matches the default partition 
+-- MPP-3722: complain if for(value) matches the default partition
 alter table rank truncate partition for('N');
 ERROR:  FOR expression matches DEFAULT partition "neuter" of relation "rank"
 HINT:  FOR expression may only specify a non-default partition in this context.
@@ -1831,7 +1073,7 @@ HINT:  Use DROP TABLE "rank" to remove the table and the final partition
 -- MPP-4011: make FOR(value) work
 alter table rank alter partition for ('F') add default partition def1;
 NOTICE:  CREATE TABLE will create partition "rank_1_prt_girls_2_prt_def1" for table "rank_1_prt_girls"
-alter table rank alter partition for ('F') 
+alter table rank alter partition for ('F')
 truncate partition for ('2010-10-10');
 ERROR:  FOR expression matches DEFAULT partition "def1" of partition "girls" of relation "rank"
 HINT:  FOR expression may only specify a non-default partition in this context.
@@ -1846,113 +1088,6 @@ alter table hhh exchange partition aa with table nosuchtable with validation;
 ERROR:  relation "nosuchtable" does not exist
 alter table hhh exchange partition aa with table nosuchtable without validation;
 ERROR:  relation "nosuchtable" does not exist
-alter table hhh merge partition cc, partition dd;
-ERROR:  partition "cc" of relation "hhh" does not exist
-alter table hhh merge partition cc, partition dd into partition ee;
-ERROR:  partition "cc" of relation "hhh" does not exist
-alter table hhh merge partition aa, partition dd into partition ee;
-ERROR:  partition "dd" of relation "hhh" does not exist
-alter table hhh modify partition cc add values ('a');
-ERROR:  partition "cc" of relation "hhh" does not exist
-alter table hhh modify partition cc drop values ('a');
-ERROR:  partition "cc" of relation "hhh" does not exist
-alter table hhh modify partition aa add values ('a');
-ERROR:  invalid use of LIST boundary specification in partition "aa" of type RANGE
-alter table hhh modify partition aa drop values ('a');
-ERROR:  invalid use of LIST boundary specification in partition "aa" of type RANGE
-create table mmm_r1 (a char(1), b date, d char(3))
-distributed by (a)
-partition by range (b)
-(
-partition aa start (date '2007-01-01') end (date '2008-01-01')
-             every (interval '1 month')
-);
-NOTICE:  CREATE TABLE will create partition "mmm_r1_1_prt_aa_1" for table "mmm_r1"
-NOTICE:  CREATE TABLE will create partition "mmm_r1_1_prt_aa_2" for table "mmm_r1"
-NOTICE:  CREATE TABLE will create partition "mmm_r1_1_prt_aa_3" for table "mmm_r1"
-NOTICE:  CREATE TABLE will create partition "mmm_r1_1_prt_aa_4" for table "mmm_r1"
-NOTICE:  CREATE TABLE will create partition "mmm_r1_1_prt_aa_5" for table "mmm_r1"
-NOTICE:  CREATE TABLE will create partition "mmm_r1_1_prt_aa_6" for table "mmm_r1"
-NOTICE:  CREATE TABLE will create partition "mmm_r1_1_prt_aa_7" for table "mmm_r1"
-NOTICE:  CREATE TABLE will create partition "mmm_r1_1_prt_aa_8" for table "mmm_r1"
-NOTICE:  CREATE TABLE will create partition "mmm_r1_1_prt_aa_9" for table "mmm_r1"
-NOTICE:  CREATE TABLE will create partition "mmm_r1_1_prt_aa_10" for table "mmm_r1"
-NOTICE:  CREATE TABLE will create partition "mmm_r1_1_prt_aa_11" for table "mmm_r1"
-NOTICE:  CREATE TABLE will create partition "mmm_r1_1_prt_aa_12" for table "mmm_r1"
-create table mmm_l1 (a char(1), b char(1), d char(3))
-distributed by (a)
-partition by list (b)
-(
-partition aa values ('a', 'b', 'c'),
-partition bb values ('d', 'e', 'f'),
-partition cc values ('g', 'h', 'i')
-);
-NOTICE:  CREATE TABLE will create partition "mmm_l1_1_prt_aa" for table "mmm_l1"
-NOTICE:  CREATE TABLE will create partition "mmm_l1_1_prt_bb" for table "mmm_l1"
-NOTICE:  CREATE TABLE will create partition "mmm_l1_1_prt_cc" for table "mmm_l1"
-alter table mmm_r1 drop partition for ('2007-03-01');
-NOTICE:  dropped partition "aa_3" for relation "mmm_r1"
--- ok
-alter table mmm_r1 add partition bb START ('2007-03-03') END ('2007-03-20');
-NOTICE:  CREATE TABLE will create partition "mmm_r1_1_prt_bb" for table "mmm_r1"
--- fail
-alter table mmm_r1 modify partition for (rank(-55)) start ('2007-03-02');
-ERROR:  partition for rank -55 of relation "mmm_r1" does not exist
-alter table mmm_r1 modify partition for ('2001-01-01') start ('2007-03-02');
-ERROR:  partition for value ('2001-01-01') of relation "mmm_r1" does not exist
-alter table mmm_r1 modify partition bb start ('2006-03-02');
-ERROR:  cannot MODIFY RANGE partition "bb" for relation "mmm_r1" -- would overlap existing partition "aa_2"
-alter table mmm_r1 modify partition bb start ('2011-03-02');
-ERROR:  START greater than END for partition "bb"
-alter table mmm_r1 modify partition bb end ('2006-03-02');
-ERROR:  START greater than END for partition "bb"
-alter table mmm_r1 modify partition bb end ('2011-03-02');
-ERROR:  cannot MODIFY RANGE partition "bb" for relation "mmm_r1" -- would overlap existing partition "aa_4"
-alter table mmm_r1 modify partition bb add values ('2011-03-02');
-ERROR:  invalid use of LIST boundary specification in partition "bb" of type RANGE
-alter table mmm_r1 modify partition bb drop values ('2011-03-02');
-ERROR:  invalid use of LIST boundary specification in partition "bb" of type RANGE
---ok
-alter table mmm_r1 modify partition bb START ('2007-03-02') END ('2007-03-22');
-alter table mmm_r1 modify partition bb START ('2007-03-01') END ('2007-03-31');
-alter table mmm_r1 modify partition bb START ('2007-03-02') END ('2007-03-22');
--- with default
-alter table mmm_r1 add default partition def1;
-NOTICE:  CREATE TABLE will create partition "mmm_r1_1_prt_def1" for table "mmm_r1"
--- now fail
-alter table mmm_r1 modify partition bb START ('2007-03-01') END ('2007-03-31');
-ERROR:  cannot MODIFY RANGE partition "bb" for relation "mmm_r1" to extend range -- would overlap DEFAULT partition "def1"
-HINT:  need to SPLIT partition "def1"
--- still ok to reduce range
-alter table mmm_r1 modify partition bb START ('2007-03-09') END ('2007-03-10');
--- fail
-alter table mmm_l1 modify partition for (rank(1)) drop values ('k');
-ERROR:  cannot find partition by RANK -- relation "mmm_l1" is LIST partitioned
-alter table mmm_l1 modify partition for ('j') drop values ('k');
-ERROR:  partition for value ('j') of relation "mmm_l1" does not exist
-alter table mmm_l1 modify partition for ('a') drop values ('k');
-ERROR:  cannot MODIFY LIST partition "aa" for relation "mmm_l1" -- DROP value not found
-alter table mmm_l1 modify partition for ('a') drop values ('e');
-ERROR:  cannot MODIFY LIST partition "aa" for relation "mmm_l1" -- found DROP value in partition "bb"
-alter table mmm_l1 modify partition for ('a') add values ('e');
-ERROR:  cannot MODIFY LIST partition "aa" for relation "mmm_l1" -- would overlap existing partition "bb"
-alter table mmm_l1 modify partition for ('a') START ('2007-03-09') ;
-ERROR:  invalid use of RANGE boundary specification in partition "aa" of type LIST
---ok
-alter table mmm_l1 modify partition for ('a') drop values ('b');
-alter table mmm_l1 modify partition for ('a') add values ('z');
--- with default
-alter table mmm_l1 add default partition def1;
-NOTICE:  CREATE TABLE will create partition "mmm_l1_1_prt_def1" for table "mmm_l1"
--- ok
-alter table mmm_l1 modify partition for ('a') drop values ('c');
--- now fail
-alter table mmm_l1 modify partition for ('a') add values ('y');
-ERROR:  cannot MODIFY LIST partition "aa" for relation "mmm_l1" to ADD values -- would overlap DEFAULT partition "def1"
-HINT:  need to SPLIT partition "def1"
--- XXX XXX: add some data 
-drop table mmm_r1 cascade;
-drop table mmm_l1 cascade;
 alter table hhh rename partition cc to aa;
 ERROR:  partition "cc" of relation "hhh" does not exist
 alter table hhh rename partition bb to aa;
@@ -2116,20 +1251,11 @@ select * from hhh;
 
 drop table hhh cascade;
 -- default partitions
--- hash partitions cannot have default partitions
-create table jjj (aa int, bb int) 
-partition by hash(bb) 
-(partition j1, partition j2, default partition j3);
-NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'aa' as the Greenplum Database data distribution key for this table.
-HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
-ERROR:  invalid use of DEFAULT partition for partition "j3" of type HASH
-LINE 3: (partition j1, partition j2, default partition j3);
-                                     ^
 -- default partitions cannot have boundary specifications
-create table jjj (aa int, bb date) 
-partition by range(bb) 
-(partition j1 end (date '2008-01-01'), 
-partition j2 end (date '2009-01-01'), 
+create table jjj (aa int, bb date)
+partition by range(bb)
+(partition j1 end (date '2008-01-01'),
+partition j2 end (date '2009-01-01'),
 default partition j3 end (date '2010-01-01'));
 NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'aa' as the Greenplum Database data distribution key for this table.
 HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
@@ -2137,10 +1263,10 @@ ERROR:  invalid use of boundary specification for DEFAULT partition "j3"
 LINE 5: default partition j3 end (date '2010-01-01'));
         ^
 -- more than one default partition
-create table jjj (aa int, bb date) 
-partition by range(bb) 
-(partition j1 end (date '2008-01-01'), 
-partition j2 end (date '2009-01-01'), 
+create table jjj (aa int, bb date)
+partition by range(bb)
+(partition j1 end (date '2008-01-01'),
+partition j2 end (date '2009-01-01'),
 default partition j3,
 default partition j4);
 NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'aa' as the Greenplum Database data distribution key for this table.
@@ -2150,7 +1276,7 @@ LINE 6: default partition j4);
         ^
 -- check default
 create table foz (i int, d date) distributed by (i)
-partition by range (d) 
+partition by range (d)
 (
  default partition dsf,
  partition foo start (date '2001-01-01') end (date '2005-01-01')
@@ -2220,17 +1346,6 @@ select * from d_1_prt_3;
 
 drop table d cascade;
 -- check for NULL support
--- hash
-create table d (i int, j int) partition by hash(j) partitions 4;
-NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'i' as the Greenplum Database data distribution key for this table.
-HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
-NOTICE:  CREATE TABLE will create partition "d_1_prt_1" for table "d"
-NOTICE:  CREATE TABLE will create partition "d_1_prt_2" for table "d"
-NOTICE:  CREATE TABLE will create partition "d_1_prt_3" for table "d"
-NOTICE:  CREATE TABLE will create partition "d_1_prt_4" for table "d"
-insert into d values(1, NULL);
-insert into d values(NULL, NULL);
-drop table d cascade;
 -- list
 create table d (i int, j int) partition by list(j)
 (partition a values(1, 2, NULL),
@@ -2294,7 +1409,7 @@ select * from d_1_prt_abc;
 
 drop table  d cascade;
 -- multicolumn list support
-create table d (a int, b int, c int) distributed by (a) 
+create table d (a int, b int, c int) distributed by (a)
 partition by list(b, c)
 (partition a values(('1', '2'), ('3', '4')),
  partition b values(('100', '20')),
@@ -2340,7 +1455,7 @@ partition by range (i, j)
  start(15, '2010-01-01') end (30, '2011-01-01'),
  start(1, '2011-01-01') end (100, '2012-01-01')
 );
-ERROR:  too many columns for RANGE partition -- only one column is allowed.
+ERROR:  too many columns for RANGE partition -- only one column is allowed
 LINE 2: partition by range (i, j)
                      ^
 -- should work
@@ -2369,7 +1484,6 @@ insert into b values(91, '2008-05-05');
 ERROR:  relation "b" does not exist
 LINE 1: insert into b values(91, '2008-05-05');
                     ^
- 
 select * from b_1_prt_1;
 ERROR:  relation "b_1_prt_1" does not exist
 LINE 1: select * from b_1_prt_1;
@@ -2400,7 +1514,7 @@ start(2000.99, '2007-01-01 00:00:00', 'BBB')
 start(4000.95, '2007-01-01 00:00:00', 'AAA')
   end (7000.95, '2007-02-02 15:00:00', 'BBB')
 );
-ERROR:  too many columns for RANGE partition -- only one column is allowed.
+ERROR:  too many columns for RANGE partition -- only one column is allowed
 LINE 3: partition by range(n, t, s)
                      ^
 -- should work
@@ -2424,7 +1538,7 @@ insert into b values(6, 3000, '2007-02-02 15:30:00', 'CC');
 ERROR:  relation "b" does not exist
 LINE 1: insert into b values(6, 3000, '2007-02-02 15:30:00', 'CC');
                     ^
-insert into b values(6, 3000, '2007-02-02 16:00:00'::timestamp - 
+insert into b values(6, 3000, '2007-02-02 16:00:00'::timestamp -
 					'1 second'::interval, 'BBZZZZZZZZZZ');
 ERROR:  relation "b" does not exist
 LINE 1: insert into b values(6, 3000, '2007-02-02 16:00:00'::timesta...
@@ -2469,40 +1583,10 @@ LINE 1: insert into b values(6, 3000, '2007-01-01 12:00:00', NULL);
                     ^
 drop table b;
 ERROR:  table "b" does not exist
--- check that we detect subpartitions partitioning a column that is already
--- a partitioning target
-create table a (i int, b int)
-distributed by (i)
-partition by range (i)
-subpartition by hash(b) subpartitions 3,
-subpartition by hash(b) subpartitions 2
-(start(1) end(100),
- start(100) end(1000)
-);
-NOTICE:  CREATE TABLE will create partition "a_1_prt_1" for table "a"
-NOTICE:  CREATE TABLE will create partition "a_1_prt_1_2_prt_1" for table "a_1_prt_1"
-NOTICE:  CREATE TABLE will create partition "a_1_prt_1_2_prt_1_3_prt_1" for table "a_1_prt_1_2_prt_1"
-NOTICE:  CREATE TABLE will create partition "a_1_prt_1_2_prt_1_3_prt_2" for table "a_1_prt_1_2_prt_1"
-NOTICE:  CREATE TABLE will create partition "a_1_prt_1_2_prt_2" for table "a_1_prt_1"
-NOTICE:  CREATE TABLE will create partition "a_1_prt_1_2_prt_2_3_prt_1" for table "a_1_prt_1_2_prt_2"
-NOTICE:  CREATE TABLE will create partition "a_1_prt_1_2_prt_2_3_prt_2" for table "a_1_prt_1_2_prt_2"
-NOTICE:  CREATE TABLE will create partition "a_1_prt_1_2_prt_3" for table "a_1_prt_1"
-NOTICE:  CREATE TABLE will create partition "a_1_prt_1_2_prt_3_3_prt_1" for table "a_1_prt_1_2_prt_3"
-NOTICE:  CREATE TABLE will create partition "a_1_prt_1_2_prt_3_3_prt_2" for table "a_1_prt_1_2_prt_3"
-NOTICE:  CREATE TABLE will create partition "a_1_prt_2" for table "a"
-NOTICE:  CREATE TABLE will create partition "a_1_prt_2_2_prt_1" for table "a_1_prt_2"
-NOTICE:  CREATE TABLE will create partition "a_1_prt_2_2_prt_1_3_prt_1" for table "a_1_prt_2_2_prt_1"
-NOTICE:  CREATE TABLE will create partition "a_1_prt_2_2_prt_1_3_prt_2" for table "a_1_prt_2_2_prt_1"
-NOTICE:  CREATE TABLE will create partition "a_1_prt_2_2_prt_2" for table "a_1_prt_2"
-NOTICE:  CREATE TABLE will create partition "a_1_prt_2_2_prt_2_3_prt_1" for table "a_1_prt_2_2_prt_2"
-NOTICE:  CREATE TABLE will create partition "a_1_prt_2_2_prt_2_3_prt_2" for table "a_1_prt_2_2_prt_2"
-NOTICE:  CREATE TABLE will create partition "a_1_prt_2_2_prt_3" for table "a_1_prt_2"
-NOTICE:  CREATE TABLE will create partition "a_1_prt_2_2_prt_3_3_prt_1" for table "a_1_prt_2_2_prt_3"
-NOTICE:  CREATE TABLE will create partition "a_1_prt_2_2_prt_3_3_prt_2" for table "a_1_prt_2_2_prt_3"
 -- MPP-3988: allow same column in multiple partitioning keys at
 -- different levels -- so this is legal again...
 drop table if exists a;
--- TEST: make sure GPOPT (aka pivotal query optimizer) fall back to legacy query optimizer 
+-- TEST: make sure GPOPT (aka pivotal query optimizer) fall back to Postgres query optimizer
 --       for queries with partition elimination over FULL OUTER JOIN
 --       between partitioned tables.
 -- SETUP
@@ -2530,7 +1614,7 @@ NOTICE:  CREATE TABLE will create partition "s2_1_prt_1" for table "s2"
 NOTICE:  CREATE TABLE will create partition "s2_1_prt_2" for table "s2"
 -- end_ignore
 -- VERIFY
--- expect GPOPT fall back to legacy query optimizer
+-- expect GPOPT fall back to Postgres query optimizer
 -- since GPOPT don't support partition elimination through full outer joins
 select * from s1 full outer join s2 on s1.d1 = s2.d2 and s1.p1 = s2.p2 where s1.p1 = 1;
  d1 | p1 | d2 | p2 
@@ -2542,11 +1626,49 @@ select * from s1 full outer join s2 on s1.d1 = s2.d2 and s1.p1 = s2.p2 where s1.
 drop table if exists s1;
 drop table if exists s2;
 -- end_ignore
+-- the following case is to test when we have a template
+-- we can correct add new subpartition with relation options.
+create table test_part_relops_tmpl (id int,  p1 text, p2 text, count int)
+distributed by (id)
+partition by list (p1)
+subpartition by list (p2)
+(
+  partition m1 values ('m1')
+  (subpartition l1 values ('l1'),
+   subpartition l2 values ('l2')),
+  partition m2 values ('m2')
+  (subpartition l1 values ('l1'),
+   subpartition l2 values ('l2'))
+);
+NOTICE:  CREATE TABLE will create partition "test_part_relops_tmpl_1_prt_m1" for table "test_part_relops_tmpl"
+NOTICE:  CREATE TABLE will create partition "test_part_relops_tmpl_1_prt_m1_2_prt_l1" for table "test_part_relops_tmpl_1_prt_m1"
+NOTICE:  CREATE TABLE will create partition "test_part_relops_tmpl_1_prt_m1_2_prt_l2" for table "test_part_relops_tmpl_1_prt_m1"
+NOTICE:  CREATE TABLE will create partition "test_part_relops_tmpl_1_prt_m2" for table "test_part_relops_tmpl"
+NOTICE:  CREATE TABLE will create partition "test_part_relops_tmpl_1_prt_m2_2_prt_l1" for table "test_part_relops_tmpl_1_prt_m2"
+NOTICE:  CREATE TABLE will create partition "test_part_relops_tmpl_1_prt_m2_2_prt_l2" for table "test_part_relops_tmpl_1_prt_m2"
+alter table test_part_relops_tmpl
+set subpartition template
+(
+   subpartition l1 values('l1')
+);
+NOTICE:  adding level 1 subpartition template specification for relation "test_part_relops_tmpl"
+NOTICE:  CREATE TABLE will create partition "test_part_relops_tmpl_1_prt_subpartition_template" for table "test_part_relops_tmpl"
+NOTICE:  CREATE TABLE will create partition "test_part_relops_tmpl_1_prt_subpartition_template_2_prt_l1" for table "test_part_relops_tmpl_1_prt_subpartition_template"
+-- previously, we do wrong in the function of `add_partition_rule`
+-- which invokes `transformRelOptions`, and transformRelOptions
+-- may return NULL in some cases. For example, the invokation of
+-- transformRelOptions in add_partition_rule set ignoreOids = true,
+-- so the following statement creates such senario by passing oids options,
+-- then transformRelOptions return NULL and we should correctly handle
+-- null pointers.
+alter table test_part_relops_tmpl alter partition for ('m1') add partition l3 values ('l3')
+with (oids=false);
+NOTICE:  CREATE TABLE will create partition "test_part_relops_tmpl_1_prt_m1_2_prt_l3" for table "test_part_relops_tmpl_1_prt_m1"
 create table mpp_2914A(id int,  buyDate date, kind char(1))
 DISTRIBUTED BY (id)
-partition by list (kind) 
-subpartition by range(buyDate) 
-subpartition template 
+partition by list (kind)
+subpartition by range(buyDate)
+subpartition template
 (
         start (date '2001-01-01'),
         start (date '2002-01-01'),
@@ -2827,7 +1949,7 @@ subpartition by range(buyDate)
                 subpartition y2004 start (date '2004-01-01'),
                 subpartition y2005 start (date '2005-01-01')
         ),
-        default partition catchAll  
+        default partition catchAll
         (
                 subpartition  y2001 start (date '2001-01-01'),
                 subpartition  y2002 start (date '2002-01-01'),
@@ -3097,14 +2219,9 @@ partition aa start(1) end(100) inclusive,
 partition bb start(101) end(200) inclusive,
 partition cc start(201) end (300) inclusive
 );
-NOTICE:  CREATE TABLE will create implicit sequence "mpp10847_pkeyconstraints_pkid_seq" for serial column "mpp10847_pkeyconstraints.pkid"
 NOTICE:  CREATE TABLE will create partition "mpp10847_pkeyconstraints_1_prt_aa" for table "mpp10847_pkeyconstraints"
 NOTICE:  CREATE TABLE will create partition "mpp10847_pkeyconstraints_1_prt_bb" for table "mpp10847_pkeyconstraints"
 NOTICE:  CREATE TABLE will create partition "mpp10847_pkeyconstraints_1_prt_cc" for table "mpp10847_pkeyconstraints"
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "mpp10847_pkeyconstraints_pkey" for table "mpp10847_pkeyconstraints"
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "mpp10847_pkeyconstraints_1_prt_aa_pkey" for table "mpp10847_pkeyconstraints_1_prt_aa"
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "mpp10847_pkeyconstraints_1_prt_bb_pkey" for table "mpp10847_pkeyconstraints_1_prt_bb"
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "mpp10847_pkeyconstraints_1_prt_cc_pkey" for table "mpp10847_pkeyconstraints_1_prt_cc"
 insert into mpp10847_pkeyconstraints values (10000, 50, 50, 102);
 -- This is supposed to fail as you're not supposed to be able to use the same
 -- primary key in the same table. But GPDB cannot currently enforce that.
@@ -3124,15 +2241,6 @@ create table dcl_messaging_test
         message_create_date     timestamp(3) not null,
         trace_socket            varchar(1024) null,
         trace_count             varchar(1024) null,
-        variable_01             varchar(1024) null,
-        variable_02             varchar(1024) null,
-        variable_03             varchar(1024) null,
-        variable_04             varchar(1024) null,
-        variable_05             varchar(1024) null,
-        variable_06             varchar(1024) null,
-        variable_07             varchar(1024) null,
-        variable_08             varchar(1024) null,
-        variable_09             varchar(1024) null,
         variable_10             varchar(1024) null,
         variable_11             varchar(1024) null,
         variable_12             varchar(1024) null,
@@ -3143,52 +2251,12 @@ create table dcl_messaging_test
         variable_17             varchar(1024) null,
         variable_18             varchar(1024) null,
         variable_19             varchar(1024) null,
-        variable_20             varchar(1024) null,
-        variable_21             varchar(1024) null,
-        variable_22             varchar(1024) null,
-        variable_23             varchar(1024) null,
-        variable_24             varchar(1024) null,
-        variable_25             varchar(1024) null,
-        variable_26             varchar(1024) null,
-        variable_27             varchar(1024) null,
-        variable_28             varchar(1024) null,
-        variable_29             varchar(1024) null,
-        variable_30             varchar(1024) null,
-        variable_31             varchar(1024) null,
-        variable_32             varchar(1024) null,
-        variable_33             varchar(1024) null,
-        variable_34             varchar(1024) null,
-        variable_35             varchar(1024) null,
-        variable_36             varchar(1024) null,
-        variable_37             varchar(1024) null,
-        variable_38             varchar(1024) null,
-        variable_39             varchar(1024) null,
-        variable_40             varchar(1024) null,
-        variable_41             varchar(1024) null,
-        variable_42             varchar(1024) null,
-        variable_43             varchar(1024) null,
-        variable_44             varchar(1024) null,
-        variable_45             varchar(1024) null,
-        variable_46             varchar(1024) null,
-        variable_47             varchar(1024) null,
-        variable_48             varchar(1024) null,
-        variable_49             varchar(1024) null,
-        variable_50             varchar(1024) null,
-        variable_51             varchar(1024) null,
-        variable_52             varchar(1024) null,
-        variable_53             varchar(1024) null,
-        variable_54             varchar(1024) null,
-        variable_55             varchar(1024) null,
-        variable_56             varchar(1024) null,
-        variable_57             varchar(1024) null,
-        variable_58             varchar(1024) null,
-        variable_59             varchar(1024) null,
-        variable_60             varchar(1024) null
+        variable_20             varchar(1024) null
 )
 distributed by (message_create_date)
 partition by range (message_create_date)
 (
-    START (timestamp '2011-09-01') END (timestamp '2011-09-15') EVERY (interval '1 day'),
+    START (timestamp '2011-09-01') END (timestamp '2011-09-10') EVERY (interval '1 day'),
     DEFAULT PARTITION outlying_dates
 );
 NOTICE:  CREATE TABLE will create partition "dcl_messaging_test_1_prt_outlying_dates" for table "dcl_messaging_test"
@@ -3201,11 +2269,6 @@ NOTICE:  CREATE TABLE will create partition "dcl_messaging_test_1_prt_7" for tab
 NOTICE:  CREATE TABLE will create partition "dcl_messaging_test_1_prt_8" for table "dcl_messaging_test"
 NOTICE:  CREATE TABLE will create partition "dcl_messaging_test_1_prt_9" for table "dcl_messaging_test"
 NOTICE:  CREATE TABLE will create partition "dcl_messaging_test_1_prt_10" for table "dcl_messaging_test"
-NOTICE:  CREATE TABLE will create partition "dcl_messaging_test_1_prt_11" for table "dcl_messaging_test"
-NOTICE:  CREATE TABLE will create partition "dcl_messaging_test_1_prt_12" for table "dcl_messaging_test"
-NOTICE:  CREATE TABLE will create partition "dcl_messaging_test_1_prt_13" for table "dcl_messaging_test"
-NOTICE:  CREATE TABLE will create partition "dcl_messaging_test_1_prt_14" for table "dcl_messaging_test"
-NOTICE:  CREATE TABLE will create partition "dcl_messaging_test_1_prt_15" for table "dcl_messaging_test"
 -- partial index
 create index dcl_messaging_test_index13 on dcl_messaging_test(variable_13) where message_create_date > '2011-09-02';
 NOTICE:  building index for child partition "dcl_messaging_test_1_prt_outlying_dates"
@@ -3243,11 +2306,11 @@ NOTICE:  building index for child partition "dcl_messaging_test_1_prt_15"
 alter table dcl_messaging_test drop default partition;
 NOTICE:  dropped partition "outlying_dates" for relation "dcl_messaging_test"
 -- ADD case
-alter table dcl_messaging_test add partition start (timestamp '2011-09-15') inclusive end (timestamp '2011-09-16') exclusive;
+alter table dcl_messaging_test add partition start (timestamp '2011-09-10') inclusive end (timestamp '2011-09-11') exclusive;
 NOTICE:  CREATE TABLE will create partition "dcl_messaging_test_1_prt_r1571743545" for table "dcl_messaging_test"
 -- EXCHANGE case
-create table dcl_candidate(like dcl_messaging_test) with (appendonly=true);
-NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, defaulting to distribution columns from LIKE table
+create table dcl_candidate(like dcl_messaging_test including indexes) with (appendonly=true);
+NOTICE:  table doesn't have 'DISTRIBUTED BY' clause, defaulting to distribution columns from LIKE table
 insert into dcl_candidate(message_create_date) values (timestamp '2011-09-06');
 alter table dcl_messaging_test exchange partition for ('2011-09-06') with table dcl_candidate;
 -- SPLIT case
@@ -3438,19 +2501,61 @@ select tablename,partitiontablename, partitionname from pg_partitions where tabl
 
 -- SPLIT partition
 alter table mpp14613_list alter partition others split partition subothers at (10) into (partition b1, partition b2);
-NOTICE:  exchanged partition "subothers" of partition "others" of relation "mpp14613_list" with relation "pg_temp_291985"
-NOTICE:  dropped partition "subothers" for partition "others" of relation "mpp14613_list"
-NOTICE:  CREATE TABLE will create partition "mpp14613_list_1_prt_others_2_prt_b1" for table "mpp14613_list_1_prt_others"
-NOTICE:  CREATE TABLE will create partition "mpp14613_list_1_prt_others_2_prt_b2" for table "mpp14613_list_1_prt_others"
+ERROR:  SPLIT PARTITION is not currently supported when leaf partition is list partitioned in multi level partition table
 alter table mpp14613_range alter partition others split partition subothers at (10) into (partition b1, partition b2);
-NOTICE:  exchanged partition "subothers" of partition "others" of relation "mpp14613_range" with relation "pg_temp_292320"
-NOTICE:  dropped partition "subothers" for partition "others" of relation "mpp14613_range"
-ERROR:  invalid partition range specification.
+ERROR:  AT clause cannot be used when splitting a default RANGE partition
+-- ALTER TABLE ... ALTER PARTITION ... SPLIT DEFAULT PARTITION
+create table foo(
+  a int,
+  b int,
+  c int,
+  d int)
+  partition by range(b)
+  subpartition by list(c)
+  subpartition template
+ (
+    default subpartition subothers,
+    subpartition s1 values(1,2,3),
+    subpartition s2 values(4,5,6)
+ )
+ (
+    default partition others,
+    start(1) end(5) every(1)
+ );
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'a' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+NOTICE:  CREATE TABLE will create partition "foo_1_prt_others" for table "foo"
+NOTICE:  CREATE TABLE will create partition "foo_1_prt_others_2_prt_subothers" for table "foo_1_prt_others"
+NOTICE:  CREATE TABLE will create partition "foo_1_prt_others_2_prt_s1" for table "foo_1_prt_others"
+NOTICE:  CREATE TABLE will create partition "foo_1_prt_others_2_prt_s2" for table "foo_1_prt_others"
+NOTICE:  CREATE TABLE will create partition "foo_1_prt_2" for table "foo"
+NOTICE:  CREATE TABLE will create partition "foo_1_prt_2_2_prt_subothers" for table "foo_1_prt_2"
+NOTICE:  CREATE TABLE will create partition "foo_1_prt_2_2_prt_s1" for table "foo_1_prt_2"
+NOTICE:  CREATE TABLE will create partition "foo_1_prt_2_2_prt_s2" for table "foo_1_prt_2"
+NOTICE:  CREATE TABLE will create partition "foo_1_prt_3" for table "foo"
+NOTICE:  CREATE TABLE will create partition "foo_1_prt_3_2_prt_subothers" for table "foo_1_prt_3"
+NOTICE:  CREATE TABLE will create partition "foo_1_prt_3_2_prt_s1" for table "foo_1_prt_3"
+NOTICE:  CREATE TABLE will create partition "foo_1_prt_3_2_prt_s2" for table "foo_1_prt_3"
+NOTICE:  CREATE TABLE will create partition "foo_1_prt_4" for table "foo"
+NOTICE:  CREATE TABLE will create partition "foo_1_prt_4_2_prt_subothers" for table "foo_1_prt_4"
+NOTICE:  CREATE TABLE will create partition "foo_1_prt_4_2_prt_s1" for table "foo_1_prt_4"
+NOTICE:  CREATE TABLE will create partition "foo_1_prt_4_2_prt_s2" for table "foo_1_prt_4"
+NOTICE:  CREATE TABLE will create partition "foo_1_prt_5" for table "foo"
+NOTICE:  CREATE TABLE will create partition "foo_1_prt_5_2_prt_subothers" for table "foo_1_prt_5"
+NOTICE:  CREATE TABLE will create partition "foo_1_prt_5_2_prt_s1" for table "foo_1_prt_5"
+NOTICE:  CREATE TABLE will create partition "foo_1_prt_5_2_prt_s2" for table "foo_1_prt_5"
+alter table foo alter partition others split partition subothers at (10) into (partition b1, default partition);
+ERROR:  SPLIT PARTITION is not currently supported when leaf partition is list partitioned in multi level partition table
+alter table foo alter partition others split partition subothers at (10) into (partition b1, partition subothers);
+ERROR:  SPLIT PARTITION is not currently supported when leaf partition is list partitioned in multi level partition table
+alter table foo alter partition others split default partition at (10) into (partition b1, default partition);
+ERROR:  SPLIT PARTITION is not currently supported when leaf partition is list partitioned in multi level partition table
+drop table foo;
 -- Drop table as gpcheckcat will complaint of not having constraint for newly
 -- created tables due to split.
 drop table mpp14613_list;
 --
--- Drop index on a partitioned table. The indexes on the partitions remain.
+-- Drop index on a partitioned table. The indexes on the partitions are removed.
 --
 create table pt_indx_tab (c1 integer, c2 int, c3 text) partition by range (c1) (partition A start (integer '0') end (integer '5') every (integer '1'));
 NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'c1' as the Greenplum Database data distribution key for this table.
@@ -3479,8 +2584,6 @@ select count(*) from pg_index where indrelid='pt_indx_tab_1_prt_a_1'::regclass;
 (1 row)
 
 drop index pt_indx_drop;
-WARNING:  Only dropped the index "pt_indx_drop"
-HINT:  To drop other indexes on child partitions, drop each one explicitly.
 select count(*) from pg_index where indrelid='pt_indx_tab'::regclass;
  count 
 -------
@@ -3490,7 +2593,7 @@ select count(*) from pg_index where indrelid='pt_indx_tab'::regclass;
 select count(*) from pg_index where indrelid='pt_indx_tab_1_prt_a_1'::regclass;
  count 
 -------
-     1
+     0
 (1 row)
 
 --
@@ -3593,40 +2696,31 @@ CREATE INDEX mpp7635_ix3 ON mpp7635_aoi_table2 USING BITMAP (id);
 NOTICE:  building index for child partition "mpp7635_aoi_table2_1_prt_1"
 NOTICE:  building index for child partition "mpp7635_aoi_table2_1_prt_2"
 select * from pg_indexes where tablename like 'mpp7635%';
- schemaname |         tablename          |      indexname      | tablespace |                                     indexdef                                     
-------------+----------------------------+---------------------+------------+----------------------------------------------------------------------------------
- public     | mpp7635_aoi_table2         | mpp7635_ix3         |            | CREATE INDEX mpp7635_ix3 ON mpp7635_aoi_table2 USING bitmap (id)
- public     | mpp7635_aoi_table2_1_prt_1 | mpp7635_ix3_1_prt_1 |            | CREATE INDEX mpp7635_ix3_1_prt_1 ON mpp7635_aoi_table2_1_prt_1 USING bitmap (id)
- public     | mpp7635_aoi_table2_1_prt_2 | mpp7635_ix3_1_prt_2 |            | CREATE INDEX mpp7635_ix3_1_prt_2 ON mpp7635_aoi_table2_1_prt_2 USING bitmap (id)
+ schemaname |         tablename          |             indexname             | tablespace |                                               indexdef                                                
+------------+----------------------------+-----------------------------------+------------+-------------------------------------------------------------------------------------------------------
+ public     | mpp7635_aoi_table2         | mpp7635_ix3                       |            | CREATE INDEX mpp7635_ix3 ON public.mpp7635_aoi_table2 USING bitmap (id)
+ public     | mpp7635_aoi_table2_1_prt_1 | mpp7635_aoi_table2_1_prt_1_id_idx |            | CREATE INDEX mpp7635_aoi_table2_1_prt_1_id_idx ON public.mpp7635_aoi_table2_1_prt_1 USING bitmap (id)
+ public     | mpp7635_aoi_table2_1_prt_2 | mpp7635_aoi_table2_1_prt_2_id_idx |            | CREATE INDEX mpp7635_aoi_table2_1_prt_2_id_idx ON public.mpp7635_aoi_table2_1_prt_2 USING bitmap (id)
 (3 rows)
 
--- Drop it. This only drops it from the root table, not the partitions.
+-- Drop it
 DROP INDEX mpp7635_ix3;
-WARNING:  Only dropped the index "mpp7635_ix3"
-HINT:  To drop other indexes on child partitions, drop each one explicitly.
 select * from pg_indexes where tablename like 'mpp7635%';
- schemaname |         tablename          |      indexname      | tablespace |                                     indexdef                                     
-------------+----------------------------+---------------------+------------+----------------------------------------------------------------------------------
- public     | mpp7635_aoi_table2_1_prt_1 | mpp7635_ix3_1_prt_1 |            | CREATE INDEX mpp7635_ix3_1_prt_1 ON mpp7635_aoi_table2_1_prt_1 USING bitmap (id)
- public     | mpp7635_aoi_table2_1_prt_2 | mpp7635_ix3_1_prt_2 |            | CREATE INDEX mpp7635_ix3_1_prt_2 ON mpp7635_aoi_table2_1_prt_2 USING bitmap (id)
-(2 rows)
+ schemaname | tablename | indexname | tablespace | indexdef 
+------------+-----------+-----------+------------+----------
+(0 rows)
 
--- Create it again. This creates the index on the partitions, too, so you
--- end up with duplicate indexes on the partitions. It's a bit silly, but
--- should still work, and not throw a "relation already exists" error, for
--- example.
+-- Create it again.
 CREATE INDEX mpp7635_ix3 ON mpp7635_aoi_table2 (id);
 NOTICE:  building index for child partition "mpp7635_aoi_table2_1_prt_1"
 NOTICE:  building index for child partition "mpp7635_aoi_table2_1_prt_2"
 select * from pg_indexes where tablename like 'mpp7635%';
- schemaname |         tablename          |      indexname       | tablespace |                                     indexdef                                     
-------------+----------------------------+----------------------+------------+----------------------------------------------------------------------------------
- public     | mpp7635_aoi_table2_1_prt_1 | mpp7635_ix3_1_prt_1  |            | CREATE INDEX mpp7635_ix3_1_prt_1 ON mpp7635_aoi_table2_1_prt_1 USING bitmap (id)
- public     | mpp7635_aoi_table2_1_prt_2 | mpp7635_ix3_1_prt_2  |            | CREATE INDEX mpp7635_ix3_1_prt_2 ON mpp7635_aoi_table2_1_prt_2 USING bitmap (id)
- public     | mpp7635_aoi_table2         | mpp7635_ix3          |            | CREATE INDEX mpp7635_ix3 ON mpp7635_aoi_table2 USING btree (id)
- public     | mpp7635_aoi_table2_1_prt_1 | mpp7635_ix3_1_prt_11 |            | CREATE INDEX mpp7635_ix3_1_prt_11 ON mpp7635_aoi_table2_1_prt_1 USING btree (id)
- public     | mpp7635_aoi_table2_1_prt_2 | mpp7635_ix3_1_prt_21 |            | CREATE INDEX mpp7635_ix3_1_prt_21 ON mpp7635_aoi_table2_1_prt_2 USING btree (id)
-(5 rows)
+ schemaname |         tablename          |             indexname             | tablespace |                                               indexdef                                               
+------------+----------------------------+-----------------------------------+------------+------------------------------------------------------------------------------------------------------
+ public     | mpp7635_aoi_table2         | mpp7635_ix3                       |            | CREATE INDEX mpp7635_ix3 ON public.mpp7635_aoi_table2 USING btree (id)
+ public     | mpp7635_aoi_table2_1_prt_1 | mpp7635_aoi_table2_1_prt_1_id_idx |            | CREATE INDEX mpp7635_aoi_table2_1_prt_1_id_idx ON public.mpp7635_aoi_table2_1_prt_1 USING btree (id)
+ public     | mpp7635_aoi_table2_1_prt_2 | mpp7635_aoi_table2_1_prt_2_id_idx |            | CREATE INDEX mpp7635_aoi_table2_1_prt_2_id_idx ON public.mpp7635_aoi_table2_1_prt_2 USING btree (id)
+(3 rows)
 
 --
 -- Test handling of NULL values in SPLIT PARTITION.
@@ -3721,7 +2815,9 @@ NOTICE:  CREATE TABLE will create partition "part_expr_test_list_1_prt_p1" for t
 set session authorization part_expr_role;
 -- This should throw a "not allowed" error.
 select pg_get_expr('bogus', 'pg_class'::regclass);
-ERROR:  argument to pg_get_expr() must come from system catalogs
+ERROR:  cannot accept a value of type pg_node_tree
+LINE 1: select pg_get_expr('bogus', 'pg_class'::regclass);
+                           ^
 -- But this should
 select p.parrelid::regclass, pr.parchildrelid::regclass,
        pg_get_expr(parrangestart, pr.parchildrelid),
@@ -3742,3 +2838,132 @@ reset session authorization;
 DROP TABLE part_expr_test_range;
 DROP TABLE part_expr_test_list;
 DROP ROLE part_expr_role;
+--
+-- Test handling of dropped columns in SPLIT PARTITION. (PR #9386)
+--
+DROP TABLE IF EXISTS users_test;
+NOTICE:  table "users_test" does not exist, skipping
+CREATE TABLE users_test
+(
+  id          INT,
+  dd          TEXT,
+  user_name   VARCHAR(40),
+  user_email  VARCHAR(60),
+  born_time   TIMESTAMP,
+  create_time TIMESTAMP
+)
+DISTRIBUTED BY (id)
+PARTITION BY RANGE (create_time)
+(
+  PARTITION p2019 START ('2019-01-01'::TIMESTAMP) END ('2020-01-01'::TIMESTAMP),
+  DEFAULT PARTITION extra
+);
+NOTICE:  CREATE TABLE will create partition "users_test_1_prt_extra" for table "users_test"
+NOTICE:  CREATE TABLE will create partition "users_test_1_prt_p2019" for table "users_test"
+-- Drop useless column dd for some reason
+ALTER TABLE users_test DROP COLUMN dd;
+-- Assume we forgot/failed to split out new partitions beforehand
+INSERT INTO users_test VALUES(1, 'A', 'A@abc.com', '1970-01-01', '2019-01-01 12:00:00');
+INSERT INTO users_test VALUES(2, 'B', 'B@abc.com', '1980-01-01', '2020-01-01 12:00:00');
+INSERT INTO users_test VALUES(3, 'C', 'C@abc.com', '1990-01-01', '2021-01-01 12:00:00');
+-- New partition arrives late
+ALTER TABLE users_test SPLIT DEFAULT PARTITION START ('2020-01-01'::TIMESTAMP) END ('2021-01-01'::TIMESTAMP)
+ INTO (PARTITION p2020, DEFAULT PARTITION);
+NOTICE:  exchanged partition "extra" of relation "users_test" with relation "pg_temp_114588"
+NOTICE:  dropped partition "extra" for relation "users_test"
+NOTICE:  CREATE TABLE will create partition "users_test_1_prt_p2020" for table "users_test"
+NOTICE:  CREATE TABLE will create partition "users_test_1_prt_extra" for table "users_test"
+-- Expect A
+SELECT user_name FROM users_test_1_prt_p2019;
+ user_name 
+-----------
+ A
+(1 row)
+
+-- Expect B
+SELECT user_name FROM users_test_1_prt_p2020;
+ user_name 
+-----------
+ B
+(1 row)
+
+-- Expect C
+SELECT user_name FROM users_test_1_prt_extra;
+ user_name 
+-----------
+ C
+(1 row)
+
+-- Github issue: https://github.com/greenplum-db/gpdb/issues/9460
+-- When creating unique or primary key index on Partition table,
+-- the cols in index must contain all partition keys.
+CREATE TABLE t_idx_col_contain_partkey(a int, b int) DISTRIBUTED BY (a)
+PARTITION BY list (b)
+(PARTITION t1 values (1),
+ PARTITION t2 values (2));
+NOTICE:  CREATE TABLE will create partition "t_idx_col_contain_partkey_1_prt_t1" for table "t_idx_col_contain_partkey"
+NOTICE:  CREATE TABLE will create partition "t_idx_col_contain_partkey_1_prt_t2" for table "t_idx_col_contain_partkey"
+-- the following statement should fail because index cols does not contain part key
+CREATE UNIQUE INDEX uidx_t_idx_col_contain_partkey on t_idx_col_contain_partkey(a);
+ERROR:  UNIQUE constraint must contain all columns in the partition key of relation "t_idx_col_contain_partkey"
+HINT:  Include the partition key or create a part-wise UNIQUE index instead.
+-- the following statement should work
+CREATE UNIQUE INDEX uidx_t_idx_col_contain_partkey on t_idx_col_contain_partkey(a, b);
+DROP INDEX uidx_t_idx_col_contain_partkey;
+DROP TABLE t_idx_col_contain_partkey;
+-- test unique index for multi level partition table
+CREATE TABLE t_idx_col_contain_partkey
+(
+        r_regionkey integer not null,
+        r_name char(25),
+        r_comment varchar(152)
+)
+DISTRIBUTED BY (r_regionkey)
+PARTITION BY RANGE (r_regionkey)
+SUBPARTITION BY LIST (r_name) SUBPARTITION TEMPLATE
+(
+        SUBPARTITION africa VALUES ('AFRICA'),
+        SUBPARTITION america VALUES ('AMERICA'),
+        SUBPARTITION asia VALUES ('ASIA'),
+        SUBPARTITION europe VALUES ('EUROPE'),
+        SUBPARTITION mideast VALUES ('MIDDLE EAST'),
+        SUBPARTITION australia VALUES ('AUSTRALIA'),
+        SUBPARTITION antarctica VALUES ('ANTARCTICA')
+)
+(
+        PARTITION region1 start (0),
+        PARTITION region2 start (3),
+        PARTITION region3 start (5) end (8)
+);
+NOTICE:  CREATE TABLE will create partition "t_idx_col_contain_partkey_1_prt_region1" for table "t_idx_col_contain_partkey"
+NOTICE:  CREATE TABLE will create partition "t_idx_col_contain_partkey_1_prt_region1_2_prt_africa" for table "t_idx_col_contain_partkey_1_prt_region1"
+NOTICE:  CREATE TABLE will create partition "t_idx_col_contain_partkey_1_prt_region1_2_prt_america" for table "t_idx_col_contain_partkey_1_prt_region1"
+NOTICE:  CREATE TABLE will create partition "t_idx_col_contain_partkey_1_prt_region1_2_prt_asia" for table "t_idx_col_contain_partkey_1_prt_region1"
+NOTICE:  CREATE TABLE will create partition "t_idx_col_contain_partkey_1_prt_region1_2_prt_europe" for table "t_idx_col_contain_partkey_1_prt_region1"
+NOTICE:  CREATE TABLE will create partition "t_idx_col_contain_partkey_1_prt_region1_2_prt_mideast" for table "t_idx_col_contain_partkey_1_prt_region1"
+NOTICE:  CREATE TABLE will create partition "t_idx_col_contain_partkey_1_prt_region1_2_prt_australia" for table "t_idx_col_contain_partkey_1_prt_region1"
+NOTICE:  CREATE TABLE will create partition "t_idx_col_contain_partkey_1_prt_region1_2_prt_antarctica" for table "t_idx_col_contain_partkey_1_prt_region1"
+NOTICE:  CREATE TABLE will create partition "t_idx_col_contain_partkey_1_prt_region2" for table "t_idx_col_contain_partkey"
+NOTICE:  CREATE TABLE will create partition "t_idx_col_contain_partkey_1_prt_region2_2_prt_africa" for table "t_idx_col_contain_partkey_1_prt_region2"
+NOTICE:  CREATE TABLE will create partition "t_idx_col_contain_partkey_1_prt_region2_2_prt_america" for table "t_idx_col_contain_partkey_1_prt_region2"
+NOTICE:  CREATE TABLE will create partition "t_idx_col_contain_partkey_1_prt_region2_2_prt_asia" for table "t_idx_col_contain_partkey_1_prt_region2"
+NOTICE:  CREATE TABLE will create partition "t_idx_col_contain_partkey_1_prt_region2_2_prt_europe" for table "t_idx_col_contain_partkey_1_prt_region2"
+NOTICE:  CREATE TABLE will create partition "t_idx_col_contain_partkey_1_prt_region2_2_prt_mideast" for table "t_idx_col_contain_partkey_1_prt_region2"
+NOTICE:  CREATE TABLE will create partition "t_idx_col_contain_partkey_1_prt_region2_2_prt_australia" for table "t_idx_col_contain_partkey_1_prt_region2"
+NOTICE:  CREATE TABLE will create partition "t_idx_col_contain_partkey_1_prt_region2_2_prt_antarctica" for table "t_idx_col_contain_partkey_1_prt_region2"
+NOTICE:  CREATE TABLE will create partition "t_idx_col_contain_partkey_1_prt_region3" for table "t_idx_col_contain_partkey"
+NOTICE:  CREATE TABLE will create partition "t_idx_col_contain_partkey_1_prt_region3_2_prt_africa" for table "t_idx_col_contain_partkey_1_prt_region3"
+NOTICE:  CREATE TABLE will create partition "t_idx_col_contain_partkey_1_prt_region3_2_prt_america" for table "t_idx_col_contain_partkey_1_prt_region3"
+NOTICE:  CREATE TABLE will create partition "t_idx_col_contain_partkey_1_prt_region3_2_prt_asia" for table "t_idx_col_contain_partkey_1_prt_region3"
+NOTICE:  CREATE TABLE will create partition "t_idx_col_contain_partkey_1_prt_region3_2_prt_europe" for table "t_idx_col_contain_partkey_1_prt_region3"
+NOTICE:  CREATE TABLE will create partition "t_idx_col_contain_partkey_1_prt_region3_2_prt_mideast" for table "t_idx_col_contain_partkey_1_prt_region3"
+NOTICE:  CREATE TABLE will create partition "t_idx_col_contain_partkey_1_prt_region3_2_prt_australia" for table "t_idx_col_contain_partkey_1_prt_region3"
+NOTICE:  CREATE TABLE will create partition "t_idx_col_contain_partkey_1_prt_region3_2_prt_antarctica" for table "t_idx_col_contain_partkey_1_prt_region3"
+-- should fail, must contain all the partition keys of all levels
+CREATE UNIQUE INDEX uidx_t_idx_col_contain_partkey on t_idx_col_contain_partkey(r_regionkey);
+ERROR:  UNIQUE constraint must contain all columns in the partition key of relation "t_idx_col_contain_partkey"
+HINT:  Include the partition key or create a part-wise UNIQUE index instead.
+-- should work
+CREATE UNIQUE INDEX uidx_t_idx_col_contain_partkey on t_idx_col_contain_partkey(r_regionkey, r_name);
+DROP INDEX uidx_t_idx_col_contain_partkey;
+DROP TABLE t_idx_col_contain_partkey;

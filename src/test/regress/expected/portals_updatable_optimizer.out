@@ -388,9 +388,6 @@ DECLARE c CURSOR FOR SELECT * FROM portals_updatable_rank_1_prt_extra WHERE rank
 DELETE FROM portals_updatable_rank WHERE CURRENT OF c;	-- error out on wrong table
 ERROR:  cursor "c" is not a simply updatable scan of table "portals_updatable_rank"
 ROLLBACK;
--- Partitioning, negative, cursor-agnostic: cannot update distribution key
-UPDATE portals_updatable_rank SET id = id + 1 WHERE CURRENT OF c;
-ERROR:  Cannot parallelize an UPDATE statement that updates the distribution columns
 -- Partitioning, negative, cursor-agnostic: cannot move tuple across partitions
 BEGIN;
 DECLARE c CURSOR FOR SELECT * FROM portals_updatable_rank WHERE rank = 1;
@@ -478,6 +475,7 @@ DROP TABLE aopart;
 CREATE TABLE aopart (LIKE portals_updatable_rank) WITH (appendonly=true) DISTRIBUTED BY (id);
 INSERT INTO aopart SELECT * FROM portals_updatable_rank_1_prt_11;
 ALTER TABLE portals_updatable_rank EXCHANGE PARTITION FOR (9) WITH TABLE aopart;
+ANALYZE portals_updatable_rank;
 BEGIN;
 DECLARE c CURSOR FOR SELECT * FROM portals_updatable_rank WHERE rank = 10;    -- isolate the remaining heap part
 FETCH 1 FROM c;
@@ -516,30 +514,30 @@ CREATE TABLE bar (a int, b int, c int, d int)
         )
     ( DEFAULT PARTITION others, START(0) END(6) EVERY(1) );
 NOTICE:  CREATE TABLE will create partition "bar_1_prt_others" for table "bar"
-NOTICE:  CREATE TABLE will create partition "bar_1_prt_2" for table "bar"
-NOTICE:  CREATE TABLE will create partition "bar_1_prt_3" for table "bar"
-NOTICE:  CREATE TABLE will create partition "bar_1_prt_4" for table "bar"
-NOTICE:  CREATE TABLE will create partition "bar_1_prt_5" for table "bar"
-NOTICE:  CREATE TABLE will create partition "bar_1_prt_6" for table "bar"
-NOTICE:  CREATE TABLE will create partition "bar_1_prt_7" for table "bar"
 NOTICE:  CREATE TABLE will create partition "bar_1_prt_others_2_prt_subothers" for table "bar_1_prt_others"
 NOTICE:  CREATE TABLE will create partition "bar_1_prt_others_2_prt_s1" for table "bar_1_prt_others"
 NOTICE:  CREATE TABLE will create partition "bar_1_prt_others_2_prt_s2" for table "bar_1_prt_others"
+NOTICE:  CREATE TABLE will create partition "bar_1_prt_2" for table "bar"
 NOTICE:  CREATE TABLE will create partition "bar_1_prt_2_2_prt_subothers" for table "bar_1_prt_2"
 NOTICE:  CREATE TABLE will create partition "bar_1_prt_2_2_prt_s1" for table "bar_1_prt_2"
 NOTICE:  CREATE TABLE will create partition "bar_1_prt_2_2_prt_s2" for table "bar_1_prt_2"
+NOTICE:  CREATE TABLE will create partition "bar_1_prt_3" for table "bar"
 NOTICE:  CREATE TABLE will create partition "bar_1_prt_3_2_prt_subothers" for table "bar_1_prt_3"
 NOTICE:  CREATE TABLE will create partition "bar_1_prt_3_2_prt_s1" for table "bar_1_prt_3"
 NOTICE:  CREATE TABLE will create partition "bar_1_prt_3_2_prt_s2" for table "bar_1_prt_3"
+NOTICE:  CREATE TABLE will create partition "bar_1_prt_4" for table "bar"
 NOTICE:  CREATE TABLE will create partition "bar_1_prt_4_2_prt_subothers" for table "bar_1_prt_4"
 NOTICE:  CREATE TABLE will create partition "bar_1_prt_4_2_prt_s1" for table "bar_1_prt_4"
 NOTICE:  CREATE TABLE will create partition "bar_1_prt_4_2_prt_s2" for table "bar_1_prt_4"
+NOTICE:  CREATE TABLE will create partition "bar_1_prt_5" for table "bar"
 NOTICE:  CREATE TABLE will create partition "bar_1_prt_5_2_prt_subothers" for table "bar_1_prt_5"
 NOTICE:  CREATE TABLE will create partition "bar_1_prt_5_2_prt_s1" for table "bar_1_prt_5"
 NOTICE:  CREATE TABLE will create partition "bar_1_prt_5_2_prt_s2" for table "bar_1_prt_5"
+NOTICE:  CREATE TABLE will create partition "bar_1_prt_6" for table "bar"
 NOTICE:  CREATE TABLE will create partition "bar_1_prt_6_2_prt_subothers" for table "bar_1_prt_6"
 NOTICE:  CREATE TABLE will create partition "bar_1_prt_6_2_prt_s1" for table "bar_1_prt_6"
 NOTICE:  CREATE TABLE will create partition "bar_1_prt_6_2_prt_s2" for table "bar_1_prt_6"
+NOTICE:  CREATE TABLE will create partition "bar_1_prt_7" for table "bar"
 NOTICE:  CREATE TABLE will create partition "bar_1_prt_7_2_prt_subothers" for table "bar_1_prt_7"
 NOTICE:  CREATE TABLE will create partition "bar_1_prt_7_2_prt_s1" for table "bar_1_prt_7"
 NOTICE:  CREATE TABLE will create partition "bar_1_prt_7_2_prt_s2" for table "bar_1_prt_7"
@@ -570,6 +568,33 @@ SELECT * FROM bar ORDER BY 1, 2, 3, 4;
  10 | 4 | 4 |    10
  11 | 5 | 5 |    11
 (12 rows)
+
+-- Partitioning, update distribution key
+BEGIN;
+DECLARE c CURSOR FOR SELECT * FROM portals_updatable_rank  WHERE rank = 10;
+FETCH 1 FROM c;
+ id | rank | f  
+----+------+----
+ 10 |   10 | 10
+(1 row)
+
+UPDATE portals_updatable_rank SET id = id + 1 WHERE CURRENT OF c;
+COMMIT;
+SELECT * FROM portals_updatable_rank  ORDER BY 1, 2, 3;
+ id | rank | f  
+----+------+----
+  0 |    0 |  0
+  1 |    1 | -1
+  2 |    2 |  2
+  3 |    3 |  3
+  4 |    4 |  4
+  5 |    5 |  5
+  6 |    6 |  6
+  7 |    7 |  7
+  8 |    8 |  8
+  9 |    9 |  9
+ 11 |   10 | 10
+(11 rows)
 
 -- 
 -- Expected Failure
@@ -771,23 +796,20 @@ FETCH 1 FROM c1;
 DELETE FROM ucview WHERE CURRENT OF c1;
 ERROR:  WHERE CURRENT OF on a view is not implemented
 ROLLBACK;
--- Negative, cursor-agnostic: cannot update distribution key
-UPDATE uctest SET f1 = f1 + 10 WHERE CURRENT OF a;
-ERROR:  Cannot parallelize an UPDATE statement that updates the distribution columns
 -- Negative, cursor-agnostic: cannot update external tables
-CREATE EXTERNAL WEB TABLE foo (x text) EXECUTE 'echo "foo";' FORMAT 'TEXT';
+CREATE EXTERNAL WEB TABLE ucexttest (x text) EXECUTE 'echo "foo";' FORMAT 'TEXT';
 BEGIN;
-DECLARE c CURSOR FOR SELECT * FROM foo;
+DECLARE c CURSOR FOR SELECT * FROM ucexttest;
 FETCH 1 from c;
   x  
 -----
  foo
 (1 row)
 
-UPDATE foo SET x = 'bar' WHERE CURRENT OF c;
-ERROR:  cannot update or delete from external relation "foo"
+UPDATE ucexttest SET x = 'bar' WHERE CURRENT OF c;
+ERROR:  "ucexttest" is not simply updatable
 ROLLBACK;
-DROP EXTERNAL TABLE foo;
+DROP EXTERNAL TABLE ucexttest;
 -- Negative, cursor-agnostic: cannot update AO
 CREATE TEMP TABLE aotest (a int, b text)
 	WITH (appendonly=true);
@@ -808,3 +830,36 @@ DECLARE c CURSOR FOR SELECT * FROM aocotest;
 DELETE FROM aocotest WHERE CURRENT OF c;
 ERROR:  "aocotest" is not simply updatable
 ROLLBACK;
+--
+-- PL/pgSQL cursors
+--
+-- Test that cursors opened in PL/pgSQL can also be updated.
+-- (Not supported by ORCA, as of this writing.)
+create temp table uctest3 as
+  select n as i, n as j from generate_series(1, 5) n distributed randomly;
+create or replace function plpgsql_uc_test() returns void as $$
+declare
+  c cursor for select * from uctest3 where i = 3;
+  r record;
+begin
+  open c;
+  fetch c into r;
+  raise notice '%, %', r.i, r.j;
+  update uctest3 set i = i * 100, j = r.j * 2 where current of c;
+end;
+$$ language plpgsql;
+select plpgsql_uc_test();
+NOTICE:  3, 3
+ERROR:  cursor "c" is not a simply updatable scan of table "uctest3"
+CONTEXT:  SQL statement "update uctest3 set i = i * 100, j = r.j * 2 where current of c"
+PL/pgSQL function plpgsql_uc_test() line 9 at SQL statement
+select * from uctest3;
+ i | j 
+---+---
+ 1 | 1
+ 3 | 3
+ 4 | 4
+ 5 | 5
+ 2 | 2
+(5 rows)
+

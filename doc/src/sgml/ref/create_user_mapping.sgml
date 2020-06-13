@@ -1,11 +1,15 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/create_user_mapping.sgml,v 1.7 2009/09/19 10:23:27 petere Exp $
+doc/src/sgml/ref/create_user_mapping.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-CREATEUSERMAPPING">
+ <indexterm zone="sql-createusermapping">
+  <primary>CREATE USER MAPPING</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="sql-createusermapping-title">CREATE USER MAPPING</refentrytitle>
+  <refentrytitle>CREATE USER MAPPING</refentrytitle>
   <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
@@ -14,10 +18,6 @@ PostgreSQL documentation
   <refname>CREATE USER MAPPING</refname>
   <refpurpose>define a new mapping of a user to a foreign server</refpurpose>
  </refnamediv>
-
- <indexterm zone="sql-createusermapping">
-  <primary>CREATE USER MAPPING</primary>
- </indexterm>
 
  <refsynopsisdiv>
 <synopsis>
@@ -34,14 +34,14 @@ CREATE USER MAPPING FOR { <replaceable class="parameter">user_name</replaceable>
    <command>CREATE USER MAPPING</command> defines a mapping of a user
    to a foreign server.  A user mapping typically encapsulates
    connection information that a foreign-data wrapper uses together
-   with the information encapsulated be a foreign server to access an
+   with the information encapsulated by a foreign server to access an
    external data resource.
   </para>
 
   <para>
    The owner of a foreign server can create user mappings for that
    server for any user.  Also, a user can create a user mapping for
-   his own user name if <literal>USAGE</> privilege on the server has
+   their own user name if <literal>USAGE</> privilege on the server has
    been granted to the user.
   </para>
  </refsect1>
@@ -94,8 +94,7 @@ CREATE USER MAPPING FOR { <replaceable class="parameter">user_name</replaceable>
    Create a user mapping for user <literal>bob</>, server <literal>foo</>:
 <programlisting>
 CREATE USER MAPPING FOR bob SERVER foo OPTIONS (user 'bob', password 'secret');
-</programlisting>
-  </para>
+</programlisting></para>
 
  </refsect1>
 
@@ -111,10 +110,10 @@ CREATE USER MAPPING FOR bob SERVER foo OPTIONS (user 'bob', password 'secret');
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-alterusermapping" endterm="sql-alterusermapping-title"></member>
-   <member><xref linkend="sql-dropusermapping" endterm="sql-dropusermapping-title"></member>
-   <member><xref linkend="sql-createforeigndatawrapper" endterm="sql-createforeigndatawrapper-title"></member>
-   <member><xref linkend="sql-createserver" endterm="sql-createserver-title"></member>
+   <member><xref linkend="sql-alterusermapping"></member>
+   <member><xref linkend="sql-dropusermapping"></member>
+   <member><xref linkend="sql-createforeigndatawrapper"></member>
+   <member><xref linkend="sql-createserver"></member>
   </simplelist>
  </refsect1>
 

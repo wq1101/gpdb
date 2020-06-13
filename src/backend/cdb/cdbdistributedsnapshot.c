@@ -12,110 +12,34 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+
 #include "cdb/cdbdistributedsnapshot.h"
 #include "cdb/cdblocaldistribxact.h"
 #include "access/distributedlog.h"
 #include "miscadmin.h"
 #include "access/transam.h"
 #include "cdb/cdbvars.h"
-#include "utils/tqual.h"
-
-/*
- * Purpose of this function is on pretty same lines as
- * HeapTupleSatisfiesVacuum() just more from distributed perspective.
- *
- * Helps to determine the status of tuples for VACUUM, PagePruning and
- * FREEZING purposes. Here, what we mainly want to know is:
- * - if a tuple is potentially visible to *any* running transaction GLOBALLY
- * in cluster. If so, it can't be removed yet by VACUUM.
- * - also, if a tuple is visible to *all* current and future transactions,
- *   then it can be freezed by VACUUM.
- *
- * xminAllDistributedSnapshots is a cutoff XID (obtained from distributed
- * snapshot). Tuples deleted by dxids >= xminAllDistributedSnapshots are
- * deemed "recently dead"; they might still be visible to some open
- * transaction globally, so we can't remove them, even if we see that the
- * deleting transaction has committed and even if locally its lower than
- * OldestXmin.
- *
- * Function is coded with conservative mind-set, to make sure tuples are
- * deleted or freezed only if can be evaluated and guaranteed to be known
- * meeting above mentioned criteria. So, any scenarios in which global
- * snapshot can't be checked it returns to not do anything to the tuple. For
- * example running vacuum in utility mode for particular QE directly, in which
- * case don't have distributed snapshot to check against, it will not allow
- * marking tuples DEAD just based on local information.
- */
-bool
-localXidSatisfiesAnyDistributedSnapshot(TransactionId localXid)
-{
-	DistributedSnapshotCommitted distributedSnapshotCommitted;
-	Assert(TransactionIdIsNormal(localXid));
-
-	/*
-	 * For single user mode operation like initdb time, let the vacuum
-	 * cleanout and freeze tuples.
-	 */
-	if (!IsUnderPostmaster || !IsNormalProcessingMode())
-		return false;
-
-	/*
-	 * If don't have snapshot, can't check the global visibility and hence
-	 * return not to perform clean the tuple.
-	 */
-	if (NULL == SerializableSnapshot)
-		return true;
-
-	/* Only if we have distributed snapshot, evaluate against it */
-	if (SerializableSnapshot->haveDistribSnapshot)
-	{
-		distributedSnapshotCommitted =
-			DistributedSnapshotWithLocalMapping_CommittedTest(
-				&SerializableSnapshot->distribSnapshotWithLocalMapping,
-				localXid,
-				true);
-
-		switch (distributedSnapshotCommitted)
-		{
-			case DISTRIBUTEDSNAPSHOT_COMMITTED_INPROGRESS:
-				return true;
-
-			case DISTRIBUTEDSNAPSHOT_COMMITTED_IGNORE:
-				return false;
-
-			default:
-				elog(ERROR,
-					 "unrecognized distributed committed test result: %d for localXid %u",
-					 (int) distributedSnapshotCommitted, localXid);
-				break;
-		}
-	}
-
-	/*
-	 * If don't have distributed snapshot to check, return it can be seen and
-	 * hence not to be cleaned-up.
-	 */
-	return true;
-}
+#include "utils/guc.h"
+#include "utils/snapmgr.h"
+#include "storage/procarray.h"
 
 /*
  * DistributedSnapshotWithLocalMapping_CommittedTest
  *		Is the given XID still-in-progress according to the
  *      distributed snapshot?  Or, is the transaction strictly local
  *      and needs to be tested with the local snapshot?
- *
- * The caller should've checked that the XID is committed (in clog),
- * otherwise the result of this function is undefined.
  */
-DistributedSnapshotCommitted 
+DistributedSnapshotCommitted
 DistributedSnapshotWithLocalMapping_CommittedTest(
-	DistributedSnapshotWithLocalMapping		*dslm,
-	TransactionId 							localXid,
-	bool isVacuumCheck)
+												  DistributedSnapshotWithLocalMapping *dslm,
+												  TransactionId localXid,
+												  bool isVacuumCheck)
 {
 	DistributedSnapshot *ds = &dslm->ds;
-	uint32							i;
-	DistributedTransactionId		distribXid = InvalidDistributedTransactionId;
+	uint32		i;
+	DistributedTransactionId distribXid = InvalidDistributedTransactionId;
+
+	Assert(!IS_QUERY_DISPATCHER());
 
 	/*
 	 * Return early if local xid is not normal as it cannot have distributed
@@ -129,7 +53,7 @@ DistributedSnapshotWithLocalMapping_CommittedTest(
 	 * through our cache in distributed snapshot looking for a possible
 	 * corresponding local xid only if it has value in checking.
 	 */
-	if (dslm->currentLocalXidsCount)
+	if (dslm->currentLocalXidsCount > 0)
 	{
 		Assert(TransactionIdIsNormal(dslm->minCachedLocalXid));
 		Assert(TransactionIdIsNormal(dslm->maxCachedLocalXid));
@@ -158,12 +82,11 @@ DistributedSnapshotWithLocalMapping_CommittedTest(
 	 * Is this local xid in a process-local cache we maintain?
 	 */
 	if (LocalDistribXactCache_CommittedFind(localXid,
-											ds->distribTransactionTimeStamp,
 											&distribXid))
 	{
 		/*
-		 * We cache local-only committed transactions for better
-		 * performance, too.
+		 * We cache local-only committed transactions for better performance,
+		 * too.
 		 */
 		if (distribXid == InvalidDistributedTransactionId)
 			return DISTRIBUTEDSNAPSHOT_COMMITTED_IGNORE;
@@ -198,40 +121,36 @@ DistributedSnapshotWithLocalMapping_CommittedTest(
 				return DISTRIBUTEDSNAPSHOT_COMMITTED_IGNORE;
 
 			/*
-			 * We have a distributed committed xid that corresponds to the local xid.
+			 * We have a distributed committed xid that corresponds to the
+			 * local xid.
 			 */
 			Assert(distribXid != InvalidDistributedTransactionId);
 
 			/*
 			 * Since we did not find it in our process local cache, add it.
 			 */
-			LocalDistribXactCache_AddCommitted(
-				localXid, 
-				ds->distribTransactionTimeStamp,
-				distribXid);
+			LocalDistribXactCache_AddCommitted(localXid,
+											   distribXid);
 		}
 		else
 		{
 			/*
-			 * Since the local xid is committed (as determined by the
-			 * visibility routine) and distributedlog doesn't know of the
-			 * transaction, it must be local-only.
+			 * The distributedlog doesn't know of the transaction. It can be
+			 * local-only, or still in-progress. The caller will proceed to do
+			 * a local visibility check, which will determine which it is.
 			 */
-			LocalDistribXactCache_AddCommitted(localXid,
-											   ds->distribTransactionTimeStamp,
-											   /* distribXid */ InvalidDistributedTransactionId);
-
-			return DISTRIBUTEDSNAPSHOT_COMMITTED_IGNORE;
+			return DISTRIBUTEDSNAPSHOT_COMMITTED_UNKNOWN;
 		}
 	}
 
 	Assert(ds->xminAllDistributedSnapshots != InvalidDistributedTransactionId);
+
 	/*
 	 * If this distributed transaction is older than all the distributed
 	 * snapshots, then we can ignore it from now on.
 	 */
 	Assert(ds->xmin >= ds->xminAllDistributedSnapshots);
-		
+
 	if (distribXid < ds->xminAllDistributedSnapshots)
 		return DISTRIBUTEDSNAPSHOT_COMMITTED_IGNORE;
 
@@ -246,9 +165,11 @@ DistributedSnapshotWithLocalMapping_CommittedTest(
 	if (distribXid < ds->xmin)
 		return DISTRIBUTEDSNAPSHOT_COMMITTED_VISIBLE;
 
-	/* Any xid >= xmax is in-progress, distributed xmax points to the
-	 * committer, so it must be visible, so ">" instead of ">=" */
-	if (distribXid > ds->xmax)
+	/*
+	 * Any xid >= xmax is in-progress, distributed xmax points to the
+	 * latestCompletedDxid + 1.
+	 */
+	if (distribXid >= ds->xmax)
 	{
 		elog((Debug_print_snapshot_dtm ? LOG : DEBUG5),
 			 "distributedsnapshot committed but invisible: distribXid %d dxmax %d dxmin %d distribSnapshotId %d",
@@ -266,10 +187,9 @@ DistributedSnapshotWithLocalMapping_CommittedTest(
 			 * the distributed committed log in a subsequent check. We can
 			 * only record local xids till cache size permits.
 			 */
-			if (dslm->currentLocalXidsCount < dslm->maxLocalXidsCount)
+			if (dslm->currentLocalXidsCount < ds->count)
 			{
 				Assert(dslm->inProgressMappedLocalXids != NULL);
-
 				dslm->inProgressMappedLocalXids[dslm->currentLocalXidsCount++] =
 					localXid;
 
@@ -290,10 +210,10 @@ DistributedSnapshotWithLocalMapping_CommittedTest(
 		}
 
 		/*
-		 * Leverage the fact that ds->inProgressXidArray is sorted in ascending
-		 * order based on distribXid while creating the snapshot in
-		 * createDtxSnapshot. So, can fail fast once known are lower than
-		 * rest of them.
+		 * Leverage the fact that ds->inProgressXidArray is sorted in
+		 * ascending order based on distribXid while creating the snapshot in
+		 * CreateDistributedSnapshot(). So, can fail fast once known are
+		 * lower than rest of them.
 		 */
 		if (distribXid < ds->inProgressXidArray[i])
 			break;
@@ -318,74 +238,63 @@ DistributedSnapshot_Reset(DistributedSnapshot *distributedSnapshot)
 	distributedSnapshot->xmin = InvalidDistributedTransactionId;
 	distributedSnapshot->xmax = InvalidDistributedTransactionId;
 	distributedSnapshot->count = 0;
-	
-	/* maxCount and inProgressXidArray left untouched */
+	if (distributedSnapshot->inProgressXidArray == NULL)
+	{
+		distributedSnapshot->inProgressXidArray =
+			(DistributedTransactionId*) malloc(GetMaxSnapshotXidCount() * sizeof(DistributedTransactionId));
+		if (distributedSnapshot->inProgressXidArray == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("out of memory")));
+	}
 }
 
 /*
  * Make a copy of a DistributedSnapshot, allocating memory for the in-progress
  * array if necessary.
+ *
+ * Note: 'target' should be from a static variable, like the argument of GetSnapshotData()
  */
 void
-DistributedSnapshot_Copy(
-	DistributedSnapshot *target,
-	DistributedSnapshot *source)
+DistributedSnapshot_Copy(DistributedSnapshot *target,
+						 DistributedSnapshot *source)
 {
-	if (source->maxCount <= 0 ||
-	    source->count > source->maxCount)
-		elog(ERROR,"Invalid distributed snapshot (maxCount %d, count %d)",
-		     source->maxCount, source->count);
-
 	DistributedSnapshot_Reset(target);
 
+	Assert(source->xminAllDistributedSnapshots);
+	Assert(source->xminAllDistributedSnapshots <= source->xmin);
+
 	elog((Debug_print_full_dtm ? LOG : DEBUG5),
-		 "DistributedSnapshot_Copy target maxCount %d, inProgressXidArray %p, and "
-		 "source maxCount %d, count %d, inProgressXidArray %p", 
-		 target->maxCount,
-	 	 target->inProgressXidArray,
-		 source->maxCount,
+		 "DistributedSnapshot_Copy target inProgressXidArray %p, and "
+		 "source count %d, inProgressXidArray %p",
+		 target->inProgressXidArray,
 		 source->count,
 		 source->inProgressXidArray);
-
-	/*
-	 * If we have allocated space for the in-progress distributed
-	 * transactions, check against that space.  Otherwise,
-	 * use the source maxCount as guide in allocating space.
-	 */
-	if (target->maxCount > 0)
-	{
-		Assert(target->inProgressXidArray != NULL);
-		
-		if(source->count > target->maxCount)
-			elog(ERROR,"Too many distributed transactions for snapshot (maxCount %d, count %d)",
-			     target->maxCount, source->count);
-	}
-	else
-	{
-		Assert(target->inProgressXidArray == NULL);
-		
-		target->inProgressXidArray = 
-			(DistributedTransactionId*)
-					malloc(source->maxCount * sizeof(DistributedTransactionId));
-		if (target->inProgressXidArray == NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_OUT_OF_MEMORY),
-					 errmsg("out of memory")));
-		target->maxCount = source->maxCount;
-	}
 
 	target->distribTransactionTimeStamp = source->distribTransactionTimeStamp;
 	target->xminAllDistributedSnapshots = source->xminAllDistributedSnapshots;
 	target->distribSnapshotId = source->distribSnapshotId;
-
 	target->xmin = source->xmin;
 	target->xmax = source->xmax;
 	target->count = source->count;
 
-	memcpy(
-		target->inProgressXidArray, 
-		source->inProgressXidArray, 
-		source->count * sizeof(DistributedTransactionId));
+	if (source->count == 0)
+		return;
+
+	if (target->inProgressXidArray == NULL)
+	{
+		target->inProgressXidArray =
+			(DistributedTransactionId*) malloc(GetMaxSnapshotXidCount() * sizeof(DistributedTransactionId));
+		if (target->inProgressXidArray == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("out of memory")));
+	}
+
+	Assert(source->count <= GetMaxSnapshotXidCount());
+	memcpy(target->inProgressXidArray,
+			source->inProgressXidArray,
+			source->count * sizeof(DistributedTransactionId));
 }
 
 int
@@ -393,18 +302,18 @@ DistributedSnapshot_SerializeSize(DistributedSnapshot *ds)
 {
 	return sizeof(DistributedTransactionTimeStamp) +
 		sizeof(DistributedSnapshotId) +
-		/*xminAllDistributedSnapshots, xmin, xmax */
+	/* xminAllDistributedSnapshots, xmin, xmax */
 		3 * sizeof(DistributedTransactionId) +
-		/* count, maxCount */
-		2 * sizeof(int32) +
-		/* Size of inProgressXidArray */
+	/* count */
+		sizeof(int32) +
+	/* Size of inProgressXidArray */
 		sizeof(DistributedTransactionId) * ds->count;
 }
 
 int
 DistributedSnapshot_Serialize(DistributedSnapshot *ds, char *buf)
 {
-	char *p = buf;
+	char	   *p = buf;
 
 	memcpy(p, &ds->distribTransactionTimeStamp, sizeof(DistributedTransactionTimeStamp));
 	p += sizeof(DistributedTransactionTimeStamp);
@@ -418,11 +327,9 @@ DistributedSnapshot_Serialize(DistributedSnapshot *ds, char *buf)
 	p += sizeof(DistributedTransactionId);
 	memcpy(p, &ds->count, sizeof(int32));
 	p += sizeof(int32);
-	memcpy(p, &ds->maxCount, sizeof(int32));
-	p += sizeof(int32);
 
-	memcpy(p, ds->inProgressXidArray, sizeof(DistributedTransactionId)*ds->count);
-	p += sizeof(DistributedTransactionId)*ds->count;
+	memcpy(p, ds->inProgressXidArray, sizeof(DistributedTransactionId) * ds->count);
+	p += sizeof(DistributedTransactionId) * ds->count;
 
 	Assert((p - buf) == DistributedSnapshot_SerializeSize(ds));
 
@@ -433,7 +340,6 @@ int
 DistributedSnapshot_Deserialize(const char *buf, DistributedSnapshot *ds)
 {
 	const char *p = buf;
-	int32 maxCount;
 
 	memcpy(&ds->distribTransactionTimeStamp, p, sizeof(DistributedTransactionTimeStamp));
 	p += sizeof(DistributedTransactionTimeStamp);
@@ -448,69 +354,24 @@ DistributedSnapshot_Deserialize(const char *buf, DistributedSnapshot *ds)
 	memcpy(&ds->count, p, sizeof(int32));
 	p += sizeof(int32);
 
-	/*
-	 * Copy this one to a local variable first.
-	 */
-	memcpy(&maxCount, p, sizeof(int32));
-	p += sizeof(int32);
-	if (maxCount < 0 || ds->count > maxCount)
+	if (ds->count > 0)
 	{
-		elog(ERROR, "Invalid distributed snapshot received (maxCount %d, count %d)",
-			 maxCount, ds->count);
-	}
+		int xipsize = sizeof(DistributedTransactionId) * ds->count;
 
-	/*
-	 * If we have allocated space for the in-progress distributed
-	 * transactions, check against that space.  Otherwise,
-	 * use the received maxCount as guide in allocating space.
-	 */
-	if (ds->inProgressXidArray != NULL)
-	{
-		if (ds->maxCount == 0)
+		if (ds->inProgressXidArray == NULL)
 		{
-			elog(ERROR, "Bad allocation of in-progress array");
-		}
-
-		if (ds->count > ds->maxCount)
-		{
-			elog(ERROR, "Too many distributed transactions for snapshot (maxCount %d, count %d)",
-				 ds->maxCount, ds->count);
-		}
-	}
-	else
-	{
-		if (maxCount > 0)
-		{
-			if (maxCount < ds->maxCount)
-			{
-				maxCount = ds->maxCount;
-			}
-			else
-			{
-				ds->maxCount = maxCount;
-			}
-
-			ds->inProgressXidArray = (DistributedTransactionId *)malloc(maxCount * sizeof(DistributedTransactionId));
+			ds->inProgressXidArray =
+				(DistributedTransactionId *)malloc(sizeof(DistributedTransactionId) * GetMaxSnapshotXidCount());
 			if (ds->inProgressXidArray == NULL)
-			{
 				ereport(ERROR,
 						(errcode(ERRCODE_OUT_OF_MEMORY),
 						 errmsg("out of memory")));
-			}
 		}
-	}
 
-	if (ds->count > 0)
-	{
-		int xipsize;
-		Assert(ds->inProgressXidArray != NULL);
-
-		xipsize = sizeof(DistributedTransactionId) * ds->count;
 		memcpy(ds->inProgressXidArray, p, xipsize);
 		p += xipsize;
 	}
 
 	Assert((p - buf) == DistributedSnapshot_SerializeSize(ds));
-
 	return (p - buf);
 }

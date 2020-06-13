@@ -8,9 +8,11 @@ setup_ssh_for_user() {
   local home_dir
   home_dir=$(eval echo "~${user}")
 
-  mkdir -p "${home_dir}"/.ssh
+  mkdir -p "${home_dir}/.ssh"
   touch "${home_dir}/.ssh/authorized_keys" "${home_dir}/.ssh/known_hosts" "${home_dir}/.ssh/config"
-  ssh-keygen -t rsa -N "" -f "${home_dir}/.ssh/id_rsa"
+  if [ ! -f "${home_dir}/.ssh/id_rsa" ]; then
+    ssh-keygen -t rsa -N "" -f "${home_dir}/.ssh/id_rsa"
+  fi
   cat "${home_dir}/.ssh/id_rsa.pub" >> "${home_dir}/.ssh/authorized_keys"
   chmod 0600 "${home_dir}/.ssh/authorized_keys"
   cat << 'NOROAMING' >> "${home_dir}/.ssh/config"
@@ -28,15 +30,18 @@ ssh_keyscan_for_user() {
   {
     ssh-keyscan localhost
     ssh-keyscan 0.0.0.0
-    ssh-keyscan github.com
+    ssh-keyscan `hostname`
   } >> "${home_dir}/.ssh/known_hosts"
 }
 
 transfer_ownership() {
-  chown -R gpadmin:gpadmin gpdb_src
-  [ -d /usr/local/gpdb ] && chown -R gpadmin:gpadmin /usr/local/gpdb
-  [ -d /usr/local/greenplum-db-devel ] && chown -R gpadmin:gpadmin /usr/local/greenplum-db-devel
-  chown -R gpadmin:gpadmin /home/gpadmin
+    chmod a+w gpdb_src
+    find gpdb_src -type d -exec chmod a+w {} \;
+    # Needed for the gpload test
+    [ -f gpdb_src/gpMgmt/bin/gpload_test/gpload2/data_file.csv ] && chown gpadmin:gpadmin gpdb_src/gpMgmt/bin/gpload_test/gpload2/data_file.csv
+    [ -d /usr/local/gpdb ] && chown -R gpadmin:gpadmin /usr/local/gpdb
+    [ -d /usr/local/greenplum-db-devel ] && chown -R gpadmin:gpadmin /usr/local/greenplum-db-devel
+    chown -R gpadmin:gpadmin /home/gpadmin
 }
 
 set_limits() {
@@ -52,15 +57,30 @@ set_limits() {
   su gpadmin -c 'ulimit -a'
 }
 
+create_gpadmin_if_not_existing() {
+  gpadmin_exists=`id gpadmin > /dev/null 2>&1;echo $?`
+  if [ "0" -eq "$gpadmin_exists" ]; then
+      echo "gpadmin user already exists, skipping creating again."
+  else
+      eval "$*"
+  fi
+}
+
 setup_gpadmin_user() {
   groupadd supergroup
   case "$TEST_OS" in
-    sles)
-      groupadd gpadmin
-      /usr/sbin/useradd -G gpadmin,supergroup,tty gpadmin
-      ;;
     centos)
-      /usr/sbin/useradd -G supergroup,tty gpadmin
+      user_add_cmd="/usr/sbin/useradd -G supergroup,tty gpadmin"
+      create_gpadmin_if_not_existing ${user_add_cmd}
+      ;;
+    ubuntu)
+      user_add_cmd="/usr/sbin/useradd -G supergroup,tty gpadmin -s /bin/bash"
+      create_gpadmin_if_not_existing ${user_add_cmd}
+      ;;
+    sles)
+      # create a default group gpadmin, and add user gpadmin to group gapdmin, supergroup, tty
+      user_add_cmd="/usr/sbin/useradd -U -G supergroup,tty gpadmin"
+      create_gpadmin_if_not_existing ${user_add_cmd}
       ;;
     *) echo "Unknown OS: $TEST_OS"; exit 1 ;;
   esac
@@ -71,7 +91,9 @@ setup_gpadmin_user() {
 }
 
 setup_sshd() {
-  test -e /etc/ssh/ssh_host_key || ssh-keygen -f /etc/ssh/ssh_host_key -N '' -t rsa1
+  if [ ! "$TEST_OS" = 'ubuntu' ]; then
+    test -e /etc/ssh/ssh_host_key || ssh-keygen -f /etc/ssh/ssh_host_key -N '' -t rsa1
+  fi
   test -e /etc/ssh/ssh_host_rsa_key || ssh-keygen -f /etc/ssh/ssh_host_rsa_key -N '' -t rsa
   test -e /etc/ssh/ssh_host_dsa_key || ssh-keygen -f /etc/ssh/ssh_host_dsa_key -N '' -t dsa
 
@@ -86,6 +108,11 @@ setup_sshd() {
 
   setup_ssh_for_user root
 
+  if [ "$TEST_OS" = 'ubuntu' ]; then
+    mkdir -p /var/run/sshd
+    chmod 0755 /var/run/sshd
+  fi
+
   /usr/sbin/sshd
 
   ssh_keyscan_for_user root
@@ -97,7 +124,11 @@ determine_os() {
     echo "centos"
     return
   fi
-  if [ -f /etc/os-release ] && grep -q '^NAME=.*SLES' /etc/os-release ; then
+  if grep -q ID=ubuntu /etc/os-release ; then
+    echo "ubuntu"
+    return
+  fi
+  if grep -q 'ID="sles"' /etc/os-release ; then
     echo "sles"
     return
   fi
@@ -105,10 +136,18 @@ determine_os() {
   exit 1
 }
 
+# Set the "Set-User-ID" bit of ping, or else gpinitsystem will error by following message:
+# [FATAL]:-Unknown host d6f9f630-65a3-4c98-4c03-401fbe5dd60b: ping: socket: Operation not permitted
+# This is needed in centos7, sles12sp5, but not for ubuntu18.04
+workaround_before_concourse_stops_stripping_suid_bits() {
+  chmod u+s $(which ping)
+}
+
 _main() {
   TEST_OS=$(determine_os)
   setup_gpadmin_user
   setup_sshd
+  workaround_before_concourse_stops_stripping_suid_bits
 }
 
-_main "$@"
+[ "${BASH_SOURCE[0]}" = "$0" ] && _main "$@"

@@ -1,112 +1,213 @@
-## ======================================================================
-##   ____ ____  ____  ____     ____                         
-##  / ___|  _ \|  _ \| __ )   / ___|_   _ _ __  _ __  _   _ 
-## | |  _| |_) | | | |  _ \  | |  _| | | | '_ \| '_ \| | | |
-## | |_| |  __/| |_| | |_) | | |_| | |_| | | | | | | | |_| |
-##  \____|_|   |____/|____/   \____|\__,_|_| |_|_| |_|\__, |
-##                                                    |___/ 
 ## ----------------------------------------------------------------------
-## Travis CI build script for GPDB Open Source Project.
-## 
-## Reference:
-##   o Travis CI Docs: http://docs.travis-ci.com
+## Travis CI build script for Greenplum Database Open Source Project.
 ## ----------------------------------------------------------------------
-##
-## This project builds the core Greenplum Database Open Source
-## project.
-##
-## ======================================================================
 
-os:
-  - linux
-
-language: c
-sudo: false
+language: cpp
+cache: ccache
 
 git:
   submodules: false
 
 addons:
-  apt:
-    packages:
-    - libevent-dev
+    apt:
+        config:
+            retries: true
+        sources: &common_sources
+            - ubuntu-toolchain-r-test
+        packages: &common_packages
+            - gcc-8
+            - libxml2
+            - libxml2-dev
+            - libxerces-c-dev
+            - libevent-dev
+            - libperl-dev
+            - g++-8
+            - python-dev
+            - python-yaml
+            - libapr1-dev
+            - libzstd1
+            - libzstd1-dev
+
+matrix:
+    include:
+        # OS and Compiler variations
+        # ----------------------------------------------------------------
+        #
+        # Ubuntu Bionic, gcc 8
+        - os: linux
+          dist: bionic
+          compiler: gcc
+          env:
+              - T=debug C=""
+              - OVERRIDE_CC="CC=gcc-8" OVERRIDE_CXX="CXX=g++-8"
+          addons:
+              apt:
+                  sources:
+                      - *common_sources
+                  packages:
+                      - *common_packages
+        # Ubuntu Xenial, clang 7
+        - os: linux
+          dist: xenial
+          compiler: clang
+          env:
+              - T=debug C=""
+              - OVERRIDE_CC="CC=clang-7" OVERRIDE_CXX="CXX=clang++-7"
+          addons:
+              apt:
+                  sources:
+                      - *common_sources
+                      - llvm-toolchain-xenial-7
+                  packages:
+                      - *common_packages
+                      - clang-7
+        # macOS, XCode11
+        - os: osx
+          compiler: clang
+          osx_image: xcode11
+          env: T=macos
+          addons:
+            homebrew:
+              packages:
+                - ccache
+                - xerces-c
+        #
+        # Configuration variations
+        # ----------------------------------------------------------------
+        #
+        # Debug build without any compression algorithms supplied
+        - os: linux
+          dist: bionic
+          compiler: gcc
+          env:
+              - T=debug C="--without-zlib --without-libbz2 --without-zstd --without-quicklz"
+              - OVERRIDE_CC="CC=gcc-8" OVERRIDE_CXX="CXX=g++-8"
+          addons:
+              apt:
+                  sources: *common_sources
+                  packages: *common_packages
 
 ## ----------------------------------------------------------------------
 ## Build tools
 ## ----------------------------------------------------------------------
 
-compiler:
-  - gcc
-
 python:
-  - "2.7"
+    - "2.7"
+
+before_install:
+    - eval "${OVERRIDE_CC}"
+    - eval "${OVERRIDE_CXX}"
+    # ccache 3.2 (from Ubuntu Xenial) has CCACHE_CPP2 default to off (this
+    # setting defaults to on starting from ccache 3.3). That default leads to
+    # unlegible compiler warning outputs because GCC and Clang will emit
+    # warnings using the preprocessed output...
+    - |
+      if [ "${TRAVIS_DIST}" = xenial ]; then
+        ccache --set-config run_second_cpp=true
+      fi
+    - |
+      if [ "${TRAVIS_COMPILER}" = clang ]; then
+        case "${TRAVIS_OS_NAME}" in
+          linux)
+            sudo ln -sv ../../bin/ccache /usr/lib/ccache/${CC}
+            sudo ln -sv ../../bin/ccache /usr/lib/ccache/${CXX}
+            ;;
+          osx)
+            PATH=/usr/local/opt/ccache/libexec:$PATH
+            ;;
+        esac
+      fi
 
 ## ----------------------------------------------------------------------
 ## Install supporting Python modules
 ## ----------------------------------------------------------------------
 
 install:
-  - pip install --user --upgrade pip
-  - pip install --user --pre psutil
-  - pip install --user lockfile
-  - pip install --user paramiko
-  - pip install --user setuptools
-
-## ----------------------------------------------------------------------
-## Build APR & APR-UTIL used to build gpfdist
-## ----------------------------------------------------------------------
-
-env:
-  - APR=apr-1.6.2
-    APR_UTIL=apr-util-1.6.0
-
-before_script:
-  - export PATH=${TRAVIS_BUILD_DIR}/tools/bin:$PATH
-  - cd ${TRAVIS_BUILD_DIR}
-  - wget http://ftp.jaist.ac.jp/pub/apache/apr/${APR}.tar.gz
-  - wget http://ftp.jaist.ac.jp/pub/apache/apr/${APR_UTIL}.tar.gz
-  - tar xf ${APR}.tar.gz
-  - tar xf ${APR_UTIL}.tar.gz
-  - cd ${TRAVIS_BUILD_DIR}/${APR}
-  - ./configure --prefix=${TRAVIS_BUILD_DIR}/tools
-  - make install
-  - cd ${TRAVIS_BUILD_DIR}/${APR_UTIL}
-  - ./configure --prefix=${TRAVIS_BUILD_DIR}/tools --with-apr=${TRAVIS_BUILD_DIR}/${APR}
-  - make install
+    - pip install --user --upgrade pip
+    - pip install --user --pre psutil
+    - pip install --user lockfile
+    - pip install --user setuptools
 
 ## ----------------------------------------------------------------------
 ## Perform build:
-##   GPDB
-##   gpmapreduce
-##   orafce
-##   gpfdist
 ## ----------------------------------------------------------------------
+
+before_script:
+    - ssh-keygen -t "rsa" -f ~/.ssh/id_rsa -N ""
+    - cp ~/.ssh/{id_rsa.pub,authorized_keys}
+    - ccache --zero-stats
 
 script:
-  - cd ${TRAVIS_BUILD_DIR}
-  - ./configure --with-openssl --with-ldap --with-libcurl --prefix=${TRAVIS_BUILD_DIR}/gpsql --with-apr-config=${TRAVIS_BUILD_DIR}/tools/bin/apr-1-config --disable-orca --disable-gpcloud --enable-pxf
+  - |
+      set -eo pipefail
+      if [ "$T" = "debug" ]; then
+        ./configure \
+            --prefix=${TRAVIS_BUILD_DIR}/gpsql \
+            --enable-cassert \
+            --enable-debug \
+            --enable-debug-extensions \
+            --with-perl \
+            --with-python \
+            --enable-orca \
+            --with-openssl \
+            --with-ldap \
+            --with-libcurl \
+            --with-libxml \
+            --enable-mapreduce \
+            --enable-orafce \
+            $C
+        travis_wait 40 make -s install
+        source ${TRAVIS_BUILD_DIR}/gpsql/greenplum_path.sh
+        make -s unittest-check
+        make -C gpAux/gpdemo cluster
+        source gpAux/gpdemo/gpdemo-env.sh
+        make -C src/test/regress installcheck-small
+      fi
+  - |
+      set -eo pipefail
+      if [ "$T" = "production" ]; then
+        ./configure \
+            --prefix=${TRAVIS_BUILD_DIR}/gpsql \
+            --with-perl \
+            --with-python \
+            --enable-orca \
+            --with-openssl \
+            --with-ldap \
+            --with-libcurl \
+            --with-libxml \
+            --enable-mapreduce \
+            --enable-orafce \
+            $C
+        make -s install
+        source ${TRAVIS_BUILD_DIR}/gpsql/greenplum_path.sh
+        make -s unittest-check
+        make -C gpAux/gpdemo cluster
+        source gpAux/gpdemo/gpdemo-env.sh
+        make -C src/test/regress installcheck-small
+      fi
+  - |
+      set -eo pipefail
+      if [ "$T" = "macos" ]; then
+        ./configure \
+            --prefix=${TRAVIS_BUILD_DIR}/gpsql \
+            --with-perl \
+            --with-python \
+            --disable-orca \
+            --enable-orafce \
+            --disable-gpfdist \
+            --disable-pxf \
+            --disable-gpcloud \
+            --without-zstd \
+            --with-includes=$(brew --prefix xerces-c)/include \
+            --with-libs=$(brew --prefix xerces-c)/lib \
+            $C
+        make -s install
+        source ${TRAVIS_BUILD_DIR}/gpsql/greenplum_path.sh
+        make -s unittest-check
+      fi
 
-  - make
-  - make install
+after_script:
+  - ccache --show-stats
   - source ${TRAVIS_BUILD_DIR}/gpsql/greenplum_path.sh
-  - cd ${TRAVIS_BUILD_DIR}/gpAux/extensions/orafce
-  - make install USE_PGXS=1
-  - cd ${TRAVIS_BUILD_DIR}/gpAux/extensions/gpmapreduce
-  - make install
   - postgres --version
-  - initdb --version
-  - createdb --version
-  - psql --version
   - gpssh --version
-  - gpmapreduce --version
-  - gpfdist --version
-
-## ----------------------------------------------------------------------
-## Notification
-## ----------------------------------------------------------------------
-notifications:
-  email:
-    recipients:
-      - releng@pivotal.io
-    on_success: change
-    on_failure: always

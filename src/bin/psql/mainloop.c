@@ -1,20 +1,27 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2010, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2016, PostgreSQL Global Development Group
  *
  * src/bin/psql/mainloop.c
  */
 #include "postgres_fe.h"
 #include "mainloop.h"
 
-
 #include "command.h"
 #include "common.h"
 #include "input.h"
+#include "prompt.h"
 #include "settings.h"
 
 #include "mb/pg_wchar.h"
+
+
+/* callback functions for our flex lexer */
+const PsqlScanCallbacks psqlscan_callbacks = {
+	psql_get_variable,
+	psql_error
+};
 
 
 /*
@@ -58,9 +65,10 @@ MainLoop(FILE *source)
 	pset.cur_cmd_source = source;
 	pset.cur_cmd_interactive = ((source == stdin) && !pset.notty);
 	pset.lineno = 0;
+	pset.stmt_lineno = 1;
 
 	/* Create working state */
-	scan_state = psql_scan_create();
+	scan_state = psql_scan_create(&psqlscan_callbacks);
 
 	query_buf = createPQExpBuffer();
 	previous_buf = createPQExpBuffer();
@@ -110,6 +118,7 @@ MainLoop(FILE *source)
 			count_eof = 0;
 			slashCmdStatus = PSQL_CMD_UNKNOWN;
 			prompt_status = PROMPT_READY;
+			pset.stmt_lineno = 1;
 			cancel_pressed = false;
 
 			if (pset.cur_cmd_interactive)
@@ -131,7 +140,7 @@ MainLoop(FILE *source)
 			/* May need to reset prompt, eg after \r command */
 			if (query_buf->len == 0)
 				prompt_status = PROMPT_READY;
-			line = gets_interactive(get_prompt(prompt_status));
+			line = gets_interactive(get_prompt(prompt_status), query_buf);
 		}
 		else
 		{
@@ -173,7 +182,19 @@ MainLoop(FILE *source)
 		if (pset.lineno == 1 && pset.encoding == PG_UTF8 && strncmp(line, "\xef\xbb\xbf", 3) == 0)
 			memmove(line, line + 3, strlen(line + 3) + 1);
 
-		/* nothing left on line? then ignore */
+		/* Detect attempts to run custom-format dumps as SQL scripts */
+		if (pset.lineno == 1 && !pset.cur_cmd_interactive &&
+			strncmp(line, "PGDMP", 5) == 0)
+		{
+			free(line);
+			puts(_("The input is a PostgreSQL custom-format dump.\n"
+				   "Use the pg_restore command-line client to restore this dump to a database.\n"));
+			fflush(stdout);
+			successResult = EXIT_FAILURE;
+			break;
+		}
+
+		/* no further processing of empty lines, unless within a literal */
 		if (line[0] == '\0' && !psql_scan_in_quote(scan_state))
 		{
 			free(line);
@@ -197,10 +218,12 @@ MainLoop(FILE *source)
 			continue;
 		}
 
-		/* echo back if flag is set */
+		/* echo back if flag is set, unless interactive */
 		if (pset.echo == PSQL_ECHO_ALL && !pset.cur_cmd_interactive)
+		{
 			puts(line);
-		fflush(stdout);
+			fflush(stdout);
+		}
 
 		/* insert newlines into query buffer between source lines */
 		if (query_buf->len > 0)
@@ -217,7 +240,8 @@ MainLoop(FILE *source)
 		/*
 		 * Parse line, looking for command separators.
 		 */
-		psql_scan_setup(scan_state, line, strlen(line));
+		psql_scan_setup(scan_state, line, strlen(line),
+						pset.encoding, standard_strings());
 		success = true;
 		line_saved_in_history = false;
 
@@ -225,7 +249,10 @@ MainLoop(FILE *source)
 		{
 			PsqlScanResult scan_result;
 			promptStatus_t prompt_tmp = prompt_status;
+			size_t		pos_in_query;
+			char	   *tmp_line;
 
+			pos_in_query = query_buf->len;
 			scan_result = psql_scan(scan_state, query_buf, &prompt_tmp);
 			prompt_status = prompt_tmp;
 
@@ -234,6 +261,22 @@ MainLoop(FILE *source)
 				psql_error("out of memory\n");
 				exit(EXIT_FAILURE);
 			}
+
+			/*
+			 * Increase statement line number counter for each linebreak added
+			 * to the query buffer by the last psql_scan() call. There only
+			 * will be ones to add when navigating to a statement in
+			 * readline's history containing newlines.
+			 */
+			tmp_line = query_buf->data + pos_in_query;
+			while (*tmp_line != '\0')
+			{
+				if (*(tmp_line++) == '\n')
+					pset.stmt_lineno++;
+			}
+
+			if (scan_result == PSCAN_EOL)
+				pset.stmt_lineno++;
 
 			/*
 			 * Send command if semicolon found, or if end of line and we're in
@@ -256,6 +299,7 @@ MainLoop(FILE *source)
 				/* execute query */
 				success = SendQuery(query_buf->data);
 				slashCmdStatus = success ? PSQL_CMD_SEND : PSQL_CMD_ERROR;
+				pset.stmt_lineno = 1;
 
 				/* transfer query to previous_buf by pointer-swapping */
 				{
@@ -277,7 +321,7 @@ MainLoop(FILE *source)
 				 * If we added a newline to query_buf, and nothing else has
 				 * been inserted in query_buf by the lexer, then strip off the
 				 * newline again.  This avoids any change to query_buf when a
-				 * line contains only a backslash command.	Also, in this
+				 * line contains only a backslash command.  Also, in this
 				 * situation we force out any previous lines as a separate
 				 * history entry; we don't want SQL and backslash commands
 				 * intermixed in history if at all possible.
@@ -303,6 +347,7 @@ MainLoop(FILE *source)
 												 query_buf : previous_buf);
 
 				success = slashCmdStatus != PSQL_CMD_ERROR;
+				pset.stmt_lineno = 1;
 
 				if ((slashCmdStatus == PSQL_CMD_SEND || slashCmdStatus == PSQL_CMD_NEWEDIT) &&
 					query_buf->len == 0)
@@ -336,7 +381,8 @@ MainLoop(FILE *source)
 					resetPQExpBuffer(query_buf);
 					/* reset parsing state since we are rescanning whole line */
 					psql_scan_reset(scan_state);
-					psql_scan_setup(scan_state, line, strlen(line));
+					psql_scan_setup(scan_state, line, strlen(line),
+									pset.encoding, standard_strings());
 					line_saved_in_history = false;
 					prompt_status = PROMPT_READY;
 				}
@@ -413,13 +459,3 @@ MainLoop(FILE *source)
 
 	return successResult;
 }	/* MainLoop() */
-
-
-/*
- * psqlscan.c is #include'd here instead of being compiled on its own.
- * This is because we need postgres_fe.h to be read before any system
- * include files, else things tend to break on platforms that have
- * multiple infrastructures for stdio.h and so on.	flex is absolutely
- * uncooperative about that, so we can't compile psqlscan.c on its own.
- */
-#include "psqlscan.c"

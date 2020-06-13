@@ -2,7 +2,7 @@
  * lexical analyzer
  * This file is #included by regcomp.c.
  *
- * Copyright (c) 1998, 1999 Henry Spencer.	All rights reserved.
+ * Copyright (c) 1998, 1999 Henry Spencer.  All rights reserved.
  *
  * Development of this software was funded, in part, by Cray Research Inc.,
  * UUNET Communications Services Inc., Sun Microsystems Inc., and Scriptics
@@ -28,7 +28,7 @@
  * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
  * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
- * $PostgreSQL: pgsql/src/backend/regex/regc_lex.c,v 1.8 2008/02/14 17:33:37 tgl Exp $
+ * src/backend/regex/regc_lex.c
  *
  */
 
@@ -214,47 +214,47 @@ lexnest(struct vars * v,
 /*
  * string constants to interpolate as expansions of things like \d
  */
-static const chr backd[] = {			/* \d */
+static const chr backd[] = {	/* \d */
 	CHR('['), CHR('['), CHR(':'),
 	CHR('d'), CHR('i'), CHR('g'), CHR('i'), CHR('t'),
 	CHR(':'), CHR(']'), CHR(']')
 };
-static const chr backD[] = {			/* \D */
+static const chr backD[] = {	/* \D */
 	CHR('['), CHR('^'), CHR('['), CHR(':'),
 	CHR('d'), CHR('i'), CHR('g'), CHR('i'), CHR('t'),
 	CHR(':'), CHR(']'), CHR(']')
 };
-static const chr brbackd[] = {			/* \d within brackets */
+static const chr brbackd[] = {	/* \d within brackets */
 	CHR('['), CHR(':'),
 	CHR('d'), CHR('i'), CHR('g'), CHR('i'), CHR('t'),
 	CHR(':'), CHR(']')
 };
-static const chr backs[] = {			/* \s */
+static const chr backs[] = {	/* \s */
 	CHR('['), CHR('['), CHR(':'),
 	CHR('s'), CHR('p'), CHR('a'), CHR('c'), CHR('e'),
 	CHR(':'), CHR(']'), CHR(']')
 };
-static const chr backS[] = {			/* \S */
+static const chr backS[] = {	/* \S */
 	CHR('['), CHR('^'), CHR('['), CHR(':'),
 	CHR('s'), CHR('p'), CHR('a'), CHR('c'), CHR('e'),
 	CHR(':'), CHR(']'), CHR(']')
 };
-static const chr brbacks[] = {			/* \s within brackets */
+static const chr brbacks[] = {	/* \s within brackets */
 	CHR('['), CHR(':'),
 	CHR('s'), CHR('p'), CHR('a'), CHR('c'), CHR('e'),
 	CHR(':'), CHR(']')
 };
-static const chr backw[] = {			/* \w */
+static const chr backw[] = {	/* \w */
 	CHR('['), CHR('['), CHR(':'),
 	CHR('a'), CHR('l'), CHR('n'), CHR('u'), CHR('m'),
 	CHR(':'), CHR(']'), CHR('_'), CHR(']')
 };
-static const chr backW[] = {			/* \W */
+static const chr backW[] = {	/* \W */
 	CHR('['), CHR('^'), CHR('['), CHR(':'),
 	CHR('a'), CHR('l'), CHR('n'), CHR('u'), CHR('m'),
 	CHR(':'), CHR(']'), CHR('_'), CHR(']')
 };
-static const chr brbackw[] = {			/* \w within brackets */
+static const chr brbackw[] = {	/* \w within brackets */
 	CHR('['), CHR(':'),
 	CHR('a'), CHR('l'), CHR('n'), CHR('u'), CHR('m'),
 	CHR(':'), CHR(']'), CHR('_')
@@ -582,6 +582,8 @@ next(struct vars * v)
 			{
 				NOTE(REG_UNONPOSIX);
 				v->now++;
+				if (ATEOS())
+					FAILW(REG_BADRPT);
 				switch (*v->now++)
 				{
 					case CHR(':'):		/* non-capturing paren */
@@ -596,12 +598,31 @@ next(struct vars * v)
 						return next(v);
 						break;
 					case CHR('='):		/* positive lookahead */
-						NOTE(REG_ULOOKAHEAD);
-						RETV(LACON, 1);
+						NOTE(REG_ULOOKAROUND);
+						RETV(LACON, LATYPE_AHEAD_POS);
 						break;
 					case CHR('!'):		/* negative lookahead */
-						NOTE(REG_ULOOKAHEAD);
-						RETV(LACON, 0);
+						NOTE(REG_ULOOKAROUND);
+						RETV(LACON, LATYPE_AHEAD_NEG);
+						break;
+					case CHR('<'):
+						if (ATEOS())
+							FAILW(REG_BADRPT);
+						switch (*v->now++)
+						{
+							case CHR('='):		/* positive lookbehind */
+								NOTE(REG_ULOOKAROUND);
+								RETV(LACON, LATYPE_BEHIND_POS);
+								break;
+							case CHR('!'):		/* negative lookbehind */
+								NOTE(REG_ULOOKAROUND);
+								RETV(LACON, LATYPE_BEHIND_NEG);
+								break;
+							default:
+								FAILW(REG_BADRPT);
+								break;
+						}
+						assert(NOTREACHED);
 						break;
 					default:
 						FAILW(REG_BADRPT);
@@ -716,10 +737,10 @@ static int						/* not actually used, but convenient for RETV */
 lexescape(struct vars * v)
 {
 	chr			c;
-	static chr	alert[] = {
+	static const chr alert[] = {
 		CHR('a'), CHR('l'), CHR('e'), CHR('r'), CHR('t')
 	};
-	static chr	esc[] = {
+	static const chr esc[] = {
 		CHR('E'), CHR('S'), CHR('C')
 	};
 	const chr  *save;
@@ -792,13 +813,13 @@ lexescape(struct vars * v)
 			break;
 		case CHR('u'):
 			c = lexdigits(v, 16, 4, 4);
-			if (ISERR())
+			if (ISERR() || !CHR_IS_IN_RANGE(c))
 				FAILW(REG_EESCAPE);
 			RETV(PLAIN, c);
 			break;
 		case CHR('U'):
 			c = lexdigits(v, 16, 8, 8);
-			if (ISERR())
+			if (ISERR() || !CHR_IS_IN_RANGE(c))
 				FAILW(REG_EESCAPE);
 			RETV(PLAIN, c);
 			break;
@@ -816,7 +837,7 @@ lexescape(struct vars * v)
 		case CHR('x'):
 			NOTE(REG_UUNPORT);
 			c = lexdigits(v, 16, 1, 255);		/* REs >255 long outside spec */
-			if (ISERR())
+			if (ISERR() || !CHR_IS_IN_RANGE(c))
 				FAILW(REG_EESCAPE);
 			RETV(PLAIN, c);
 			break;
@@ -846,7 +867,7 @@ lexescape(struct vars * v)
 			if (ISERR())
 				FAILW(REG_EESCAPE);
 			/* ugly heuristic (first test is "exactly 1 digit?") */
-			if (v->now - save == 0 || ((int) c > 0 && (int) c <= v->nsubexp))
+			if (v->now == save || ((int) c > 0 && (int) c <= v->nsubexp))
 			{
 				NOTE(REG_UBACKREF);
 				RETV(BACKREF, (chr) c);
@@ -854,12 +875,19 @@ lexescape(struct vars * v)
 			/* oops, doesn't look like it's a backref after all... */
 			v->now = save;
 			/* and fall through into octal number */
+			/* fallthrough */
 		case CHR('0'):
 			NOTE(REG_UUNPORT);
 			v->now--;			/* put first digit back */
 			c = lexdigits(v, 8, 1, 3);
 			if (ISERR())
 				FAILW(REG_EESCAPE);
+			if (c > 0xff)
+			{
+				/* out of range, so we handled one digit too much */
+				v->now--;
+				c >>= 3;
+			}
 			RETV(PLAIN, c);
 			break;
 		default:
@@ -872,6 +900,9 @@ lexescape(struct vars * v)
 
 /*
  * lexdigits - slurp up digits and return chr value
+ *
+ * This does not account for overflow; callers should range-check the result
+ * if maxlen is large enough to make that possible.
  */
 static chr						/* chr value; errors signalled via ERR */
 lexdigits(struct vars * v,

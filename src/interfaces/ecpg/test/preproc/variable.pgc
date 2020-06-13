@@ -29,6 +29,7 @@ exec sql begin declare section;
 					struct birthinfo ind_birth;
 				  } ind_personal, *i;
 	ind ind_children;
+	struct t1 { str name; }; struct t2 { str name; };
 exec sql end declare section;
 
 	exec sql char *married = NULL;
@@ -93,7 +94,7 @@ exec sql end declare section;
 	strcpy(msg, "commit");
 	exec sql commit;
 
-	strcpy(msg, "disconnect"); 
+	strcpy(msg, "disconnect");
 	exec sql disconnect;
 
 	return (0);

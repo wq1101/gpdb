@@ -3,11 +3,11 @@
  * dict_ispell.c
  *		Ispell dictionary interface
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/tsearch/dict_ispell.c,v 1.7 2008/01/01 19:45:52 momjian Exp $
+ *	  src/backend/tsearch/dict_ispell.c
  *
  *-------------------------------------------------------------------------
  */
@@ -16,10 +16,7 @@
 #include "commands/defrem.h"
 #include "tsearch/dicts/spell.h"
 #include "tsearch/ts_locale.h"
-#include "tsearch/ts_public.h"
 #include "tsearch/ts_utils.h"
-#include "utils/builtins.h"
-#include "utils/memutils.h"
 
 
 typedef struct
@@ -39,6 +36,8 @@ dispell_init(PG_FUNCTION_ARGS)
 	ListCell   *l;
 
 	d = (DictISpell *) palloc0(sizeof(DictISpell));
+
+	NIStartBuild(&(d->obj));
 
 	foreach(l, dictoptions)
 	{
@@ -102,7 +101,7 @@ dispell_init(PG_FUNCTION_ARGS)
 				 errmsg("missing DictFile parameter")));
 	}
 
-	MemoryContextDeleteChildren(CurrentMemoryContext);
+	NIFinishBuild(&(d->obj));
 
 	PG_RETURN_POINTER(d);
 }
@@ -127,20 +126,19 @@ dispell_lexize(PG_FUNCTION_ARGS)
 	if (res == NULL)
 		PG_RETURN_POINTER(NULL);
 
-	ptr = cptr = res;
-	while (ptr->lexeme)
+	cptr = res;
+	for (ptr = cptr; ptr->lexeme; ptr++)
 	{
 		if (searchstoplist(&(d->stoplist), ptr->lexeme))
 		{
 			pfree(ptr->lexeme);
 			ptr->lexeme = NULL;
-			ptr++;
 		}
 		else
 		{
-			memcpy(cptr, ptr, sizeof(TSLexeme));
+			if (cptr != ptr)
+				memcpy(cptr, ptr, sizeof(TSLexeme));
 			cptr++;
-			ptr++;
 		}
 	}
 	cptr->lexeme = NULL;

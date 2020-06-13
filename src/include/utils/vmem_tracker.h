@@ -16,6 +16,8 @@
 
 #include "nodes/nodes.h"
 
+#define BITS_IN_MB 20
+
 /*
  * The cleanupCountdown in the SessionState determines how many
  * processes we need to cleanup to declare a session clean. If it
@@ -41,6 +43,7 @@ extern int runaway_detector_activation_percent;
 extern int32 VmemTracker_ConvertVmemChunksToMB(int chunks);
 extern int32 VmemTracker_ConvertVmemMBToChunks(int mb);
 extern int64 VmemTracker_ConvertVmemChunksToBytes(int chunks);
+extern int32 VmemTracker_ConvertVmemBytesToChunks(int64 bytes);
 extern int32 VmemTracker_GetReservedVmemChunks(void);
 extern int64 VmemTracker_GetReservedVmemBytes(void);
 extern int64 VmemTracker_GetMaxReservedVmemChunks(void);
@@ -58,9 +61,10 @@ extern void VmemTracker_Shutdown(void);
 extern void VmemTracker_ResetMaxVmemReserved(void);
 extern MemoryAllocationStatus VmemTracker_ReserveVmem(int64 newly_requested);
 extern void VmemTracker_ReleaseVmem(int64 to_be_freed_requested);
+extern MemoryAllocationStatus VmemTracker_RegisterStartupMemory(int64 bytes);
+extern void VmemTracker_UnregisterStartupMemory(void);
 extern void VmemTracker_RequestWaiver(int64 waiver_bytes);
 extern void VmemTracker_ResetWaiver(void);
-extern int64 VmemTracker_Fault(int32 reason, int64 arg);
 
 extern int32 RedZoneHandler_GetRedZoneLimitChunks(void);
 extern int32 RedZoneHandler_GetRedZoneLimitMB(void);
@@ -72,5 +76,6 @@ extern void RedZoneHandler_LogVmemUsageOfAllSessions(void);
 
 extern void IdleTracker_ActivateProcess(void);
 extern void IdleTracker_DeactivateProcess(void);
+extern bool VmemTrackerIsActivated(void);
 
 #endif   /* VMEMTRACKER_H */

@@ -2,27 +2,18 @@
 # Makefile for isolation tests
 #
 
+PGFILEDESC = "pg_isolation_regress/isolationtester - multi-client test driver"
+PGAPPICON = win32
+
 subdir = src/test/isolation
 top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
-# where to find psql for testing an existing installation
-PSQLDIR = $(bindir)
-
-ifeq ($(PORTNAME), win32)
-LDLIBS += -lws2_32
-endif
-
 override CPPFLAGS := -I$(srcdir) -I$(libpq_srcdir) -I$(srcdir)/../regress $(CPPFLAGS)
-override LDLIBS := $(libpq_pgport) $(LDLIBS)
 
-OBJS =  specparse.o isolationtester.o
+OBJS =  specparse.o isolationtester.o $(WIN32RES)
 
 all: isolationtester$(X) pg_isolation_regress$(X)
-
-pg_regress.o:
-	$(MAKE) -C $(top_builddir)/src/test/regress pg_regress.o
-	rm -f $@ && $(LN_S) $(top_builddir)/src/test/regress/pg_regress.o .
 
 gpstringsubs.pl:
 	rm -f $@ && $(LN_S) $(top_builddir)/src/test/regress/gpstringsubs.pl
@@ -39,39 +30,22 @@ atmsort.pm:
 explain.pm:
 	rm -f $@ && $(LN_S) $(top_builddir)/src/test/regress/explain.pm
 
-pg_isolation_regress$(X): isolation_main.o pg_regress.o
-	$(CC) $(CFLAGS) $^ $(libpq_pgport) $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@
+submake-regress:
+	$(MAKE) -C $(top_builddir)/src/test/regress pg_regress.o
+
+pg_regress.o: | submake-regress
+	rm -f $@ && $(LN_S) $(top_builddir)/src/test/regress/pg_regress.o .
+
+pg_isolation_regress$(X): isolation_main.o pg_regress.o $(WIN32RES)
+	$(CC) $(CFLAGS) $^ $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@
 
 isolationtester$(X): $(OBJS) | submake-libpq submake-libpgport
-	$(CC) $(CFLAGS) $(OBJS) $(libpq_pgport) $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@
+	$(CC) $(CFLAGS) $^ $(libpq_pgport) $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@
 
 distprep: specparse.c specscanner.c
 
-# There is no correct way to write a rule that generates two files.
-# Rules with two targets don't have that meaning, they are merely
-# shorthand for two otherwise separate rules.  To be safe for parallel
-# make, we must chain the dependencies like this.  The semicolon is
-# important, otherwise make will choose the built-in rule for
-# gram.y=>gram.c.
-
-specparse.h: specparse.c ;
-
 # specscanner is compiled as part of specparse
 specparse.o: specscanner.c
-
-specparse.c: specparse.y
-ifdef BISON
-	$(BISON) $(BISONFLAGS) -o $@ $<
-else
-	@$(missing) bison $< $@
-endif
-
-specscanner.c: specscanner.l
-ifdef FLEX
-	$(FLEX) $(FLEXFLAGS) -o'$@' $<
-else
-	@$(missing) flex $< $@
-endif
 
 # specparse.c and specscanner.c are in the distribution tarball,
 # so do not clean them here
@@ -84,20 +58,22 @@ clean distclean:
 maintainer-clean: distclean
 	rm -f specparse.c specscanner.c
 
-installcheck: all gpdiff.pl gpstringsubs.pl
-	./pg_isolation_regress --psqldir='$(PSQLDIR)' --inputdir=$(srcdir) --schedule=$(srcdir)/isolation_schedule
+# GPDB: pageinspect module is needed by some tests.
+install-tests:
+	$(MAKE) -C $(top_builddir)/contrib/pageinspect install
 
-# Version of the install check test that includes the prepared_transactions test
-# It only makes sense to run this if set up to use prepared transactions,
-# via the postgresql.conf.
-installcheck-prepared-txns: all
-	./pg_isolation_regress --psqldir='$(PSQLDIR)' --inputdir=$(srcdir) --schedule=$(srcdir)/isolation_schedule prepared-transactions
+installcheck: all gpdiff.pl gpstringsubs.pl install-tests
+	./pg_isolation_regress --bindir='$(bindir)' $(EXTRA_REGRESS_OPTS) --inputdir=$(srcdir) --init-file=$(srcdir)/init_file --load-extension=pageinspect --schedule=$(srcdir)/isolation_schedule
 
+check: all
+	$(with_temp_install) ./pg_isolation_regress --temp-instance=./tmp_check $(TEMP_CONF) --inputdir=$(srcdir) --bindir= $(EXTRA_REGRESS_OPTS) --schedule=$(srcdir)/isolation_schedule
 
-# We can't support "make check" because isolationtester requires libpq, and
-# in fact (on typical platforms using shared libraries) requires libpq to
-# already be installed.  You could run "make install" and then run a check
-# using a temp installation, but there seems little point in that.
-check:
-	@echo "'make check' is not supported."
-	@echo "Install PostgreSQL, then 'make installcheck' instead."
+# Versions of the check tests that include the prepared_transactions test
+# It only makes sense to run these if set up to use prepared transactions,
+# via TEMP_CONFIG for the check case, or via the postgresql.conf for the
+# installcheck case.
+installcheck-prepared-txns: all temp-install
+	./pg_isolation_regress --bindir='$(bindir)' $(EXTRA_REGRESS_OPTS) --inputdir=$(srcdir) --schedule=$(srcdir)/isolation_schedule prepared-transactions
+
+check-prepared-txns: all temp-install
+	./pg_isolation_regress --temp-instance=./tmp_check $(TEMP_CONF) $(EXTRA_REGRESS_OPTS) --inputdir=$(srcdir) --schedule=$(srcdir)/isolation_schedule prepared-transactions

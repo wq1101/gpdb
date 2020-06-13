@@ -11,12 +11,12 @@
  * (It's debatable whether the savings justifies carrying two plan node
  * types, though.)
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/executor/nodeUnique.c,v 1.56.2.1 2008/08/05 21:28:36 tgl Exp $
+ *	  src/backend/executor/nodeUnique.c
  *
  *-------------------------------------------------------------------------
  */
@@ -59,8 +59,8 @@ ExecUnique(UniqueState *node)
 
 	/*
 	 * now loop, returning only non-duplicate tuples. We assume that the
-	 * tuples arrive in sorted order so we can detect duplicates easily.
-	 * The first tuple of each group is returned.
+	 * tuples arrive in sorted order so we can detect duplicates easily. The
+	 * first tuple of each group is returned.
 	 */
 	for (;;)
 	{
@@ -74,8 +74,6 @@ ExecUnique(UniqueState *node)
 			ExecClearTuple(resultTupleSlot);
 			return NULL;
 		}
-
-		Gpmon_Incr_Rows_In(GpmonPktFromUniqueState(node));
 
 		/*
 		 * Always return the first tuple from the subplan.
@@ -101,12 +99,6 @@ ExecUnique(UniqueState *node)
 	 * won't guarantee that this source tuple is still accessible after
 	 * fetching the next source tuple.
 	 */
-   	if (!TupIsNull(slot))
-    	{
-  		Gpmon_Incr_Rows_Out(GpmonPktFromUniqueState(node));
-   		CheckSendPlanStateGpmonPkt(&node->ps);
-    	}
-
 	return ExecCopySlot(resultTupleSlot, slot);
 }
 
@@ -146,8 +138,6 @@ ExecInitUnique(Unique *node, EState *estate, int eflags)
 							  ALLOCSET_DEFAULT_INITSIZE,
 							  ALLOCSET_DEFAULT_MAXSIZE);
 
-#define UNIQUE_NSLOTS 1
-
 	/*
 	 * Tuple table initialization
 	 */
@@ -172,17 +162,7 @@ ExecInitUnique(Unique *node, EState *estate, int eflags)
 		execTuplesMatchPrepare(node->numCols,
 							   node->uniqOperators);
 
-	initGpmonPktForUnique((Plan *)node, &uniquestate->ps.gpmon_pkt, estate);
-	
 	return uniquestate;
-}
-
-int
-ExecCountSlotsUnique(Unique *node)
-{
-	return ExecCountSlotsNode(outerPlan(node)) +
-		ExecCountSlotsNode(innerPlan(node)) +
-		UNIQUE_NSLOTS;
 }
 
 /* ----------------------------------------------------------------
@@ -201,13 +181,11 @@ ExecEndUnique(UniqueState *node)
 	MemoryContextDelete(node->tempContext);
 
 	ExecEndNode(outerPlanState(node));
-
-	EndPlanStateGpmonPkt(&node->ps);
 }
 
 
 void
-ExecReScanUnique(UniqueState *node, ExprContext *exprCtxt)
+ExecReScanUnique(UniqueState *node)
 {
 	/* must clear result tuple so first input tuple is returned */
 	ExecClearTuple(node->ps.ps_ResultTupleSlot);
@@ -216,14 +194,6 @@ ExecReScanUnique(UniqueState *node, ExprContext *exprCtxt)
 	 * if chgParam of subnode is not null then plan will be re-scanned by
 	 * first ExecProcNode.
 	 */
-	if (((PlanState *) node)->lefttree->chgParam == NULL)
-		ExecReScan(((PlanState *) node)->lefttree, exprCtxt);
-}
-
-void
-initGpmonPktForUnique(Plan *planNode, gpmon_packet_t *gpmon_pkt, EState *estate)
-{
-	Assert(planNode != NULL && gpmon_pkt != NULL && IsA(planNode, Unique));
-
-	InitPlanNodeGpmonPkt(planNode, gpmon_pkt, estate);
+	if (node->ps.lefttree->chgParam == NULL)
+		ExecReScan(node->ps.lefttree);
 }

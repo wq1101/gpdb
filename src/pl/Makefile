@@ -4,7 +4,7 @@
 #
 # Copyright (c) 1994, Regents of the University of California
 #
-# $PostgreSQL: pgsql/src/pl/Makefile,v 1.26 2007/06/01 19:38:07 tgl Exp $
+# src/pl/Makefile
 #
 #-------------------------------------------------------------------------
 
@@ -12,29 +12,25 @@ subdir = src/pl
 top_builddir = ../..
 include $(top_builddir)/src/Makefile.global
 
-DIRS = plpgsql
+SUBDIRS = plpgsql
 
 ifeq ($(with_perl), yes)
-DIRS += plperl
+SUBDIRS += plperl
+else
+ALWAYS_SUBDIRS += plperl
 endif
 
 ifeq ($(with_python), yes)
-DIRS += plpython
+SUBDIRS += plpython
+else
+ALWAYS_SUBDIRS += plpython
 endif
 
 ifeq ($(with_tcl), yes)
-DIRS += tcl
+SUBDIRS += tcl
+else
+ALWAYS_SUBDIRS += tcl
 endif
 
-all install installdirs uninstall distprep:
-	@for dir in $(DIRS); do $(MAKE) -C $$dir $@ || exit 1; done
-
-clean distclean maintainer-clean:
-	@for dir in $(DIRS); do $(MAKE) -C $$dir $@; done
-
-# We'd like check operations to run all the subtests before failing.
-check installcheck:
-	@CHECKERR=0; for dir in $(DIRS); do \
-		$(MAKE) -C $$dir $@ || CHECKERR=$$?; \
-	done; \
-	exit $$CHECKERR
+$(recurse)
+$(recurse_always)

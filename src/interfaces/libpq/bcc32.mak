@@ -8,7 +8,7 @@
 
 !IF "$(BCB)" == ""
 !MESSAGE You must edit bcc32.mak and define BCB at the top
-!ERROR misssing BCB
+!ERROR missing BCB
 !ENDIF
 
 !IF "$(__NMAKE__)" == ""
@@ -44,9 +44,9 @@ CFG=Release
 
 !IF "$(OS)" == "Windows_NT"
 NULL=
-!ELSE 
+!ELSE
 NULL=nul
-!ENDIF 
+!ENDIF
 
 !IF "$(CFG)" == "Debug"
 DEBUG=1
@@ -76,10 +76,13 @@ ALL : config "$(OUTDIR)" "$(OUTDIR)\blibpq.dll" "$(OUTDIR)\blibpq.lib"
 CLEAN :
 	-@erase "$(INTDIR)\getaddrinfo.obj"
 	-@erase "$(INTDIR)\pgstrcasecmp.obj"
+	-@erase "$(INTDIR)\pqsignal.obj"
 	-@erase "$(INTDIR)\thread.obj"
 	-@erase "$(INTDIR)\inet_aton.obj"
 	-@erase "$(INTDIR)\crypt.obj"
 	-@erase "$(INTDIR)\noblock.obj"
+	-@erase "$(INTDIR)\chklocale.obj"
+	-@erase "$(INTDIR)\inet_net_ntop.obj"
 	-@erase "$(INTDIR)\md5.obj"
 	-@erase "$(INTDIR)\ip.obj"
 	-@erase "$(INTDIR)\fe-auth.obj"
@@ -93,7 +96,6 @@ CLEAN :
 	-@erase "$(INTDIR)\fe-secure.obj"
 	-@erase "$(INTDIR)\libpq-events.obj"
 	-@erase "$(INTDIR)\pqexpbuffer.obj"
-	-@erase "$(INTDIR)\pqsignal.obj"
 	-@erase "$(INTDIR)\win32.obj"
 	-@erase "$(INTDIR)\wchar.obj"
 	-@erase "$(INTDIR)\encnames.obj"
@@ -104,6 +106,7 @@ CLEAN :
 	-@erase "$(INTDIR)\dirmod.obj"
 	-@erase "$(INTDIR)\pgsleep.obj"
 	-@erase "$(INTDIR)\open.obj"
+	-@erase "$(INTDIR)\system.obj"
 	-@erase "$(INTDIR)\win32error.obj"
 	-@erase "$(OUTDIR)\$(OUTFILENAME).lib"
 	-@erase "$(OUTDIR)\$(OUTFILENAME)dll.lib"
@@ -114,15 +117,18 @@ CLEAN :
 
 
 LIB32=tlib.exe
-LIB32_FLAGS= 
+LIB32_FLAGS=
 LIB32_OBJS= \
 	"$(INTDIR)\win32.obj" \
 	"$(INTDIR)\getaddrinfo.obj" \
 	"$(INTDIR)\pgstrcasecmp.obj" \
+	"$(INTDIR)\pqsignal.obj" \
 	"$(INTDIR)\thread.obj" \
 	"$(INTDIR)\inet_aton.obj" \
 	"$(INTDIR)\crypt.obj" \
 	"$(INTDIR)\noblock.obj" \
+	"$(INTDIR)\chklocale.obj" \
+	"$(INTDIR)\inet_net_ntop.obj" \
 	"$(INTDIR)\md5.obj" \
 	"$(INTDIR)\ip.obj" \
 	"$(INTDIR)\fe-auth.obj" \
@@ -136,7 +142,6 @@ LIB32_OBJS= \
 	"$(INTDIR)\fe-secure.obj" \
 	"$(INTDIR)\libpq-events.obj" \
 	"$(INTDIR)\pqexpbuffer.obj" \
-	"$(INTDIR)\pqsignal.obj" \
 	"$(INTDIR)\wchar.obj" \
 	"$(INTDIR)\encnames.obj" \
 	"$(INTDIR)\snprintf.obj" \
@@ -145,14 +150,18 @@ LIB32_OBJS= \
 	"$(INTDIR)\dirmod.obj" \
 	"$(INTDIR)\pgsleep.obj" \
 	"$(INTDIR)\open.obj" \
+	"$(INTDIR)\system.obj" \
 	"$(INTDIR)\win32error.obj" \
 	"$(INTDIR)\pthread-win32.obj"
 
 
-config: ..\..\include\pg_config.h ..\..\include\pg_config_os.h pg_config_paths.h
+config: ..\..\include\pg_config.h ..\..\include\pg_config_ext.h ..\..\include\pg_config_os.h pg_config_paths.h
 
 ..\..\include\pg_config.h: ..\..\include\pg_config.h.win32
 	copy ..\..\include\pg_config.h.win32 ..\..\include\pg_config.h
+
+..\..\include\pg_config_ext.h: ..\..\include\pg_config_ext.h.win32
+	copy ..\..\include\pg_config_ext.h.win32 ..\..\include\pg_config_ext.h
 
 ..\..\include\pg_config_os.h: ..\..\include\port\win32.h
 	copy ..\..\include\port\win32.h ..\..\include\pg_config_os.h
@@ -172,7 +181,7 @@ LINK32_FLAGS = -Gn -L$(BCB)\lib;$(INTDIR); -x -Tpd -v
 
 # @<< is a Response file, http://www.opussoftware.com/tutorial/TutMakefile.htm
 
-"$(OUTDIR)\blibpq.dll": "$(OUTDIR)\blibpq.lib" "$(INTDIR)\libpq.res" blibpqdll.def 
+"$(OUTDIR)\blibpq.dll": "$(OUTDIR)\blibpq.lib" "$(INTDIR)\libpq.res" blibpqdll.def
 	$(LINK32) @<<
 	$(LINK32_FLAGS) +
 	c0d32.obj , +
@@ -202,6 +211,11 @@ LINK32_FLAGS = -Gn -L$(BCB)\lib;$(INTDIR); -x -Tpd -v
 	$(CPP_PROJ) ..\..\port\pgstrcasecmp.c
 <<
 
+"$(INTDIR)\pqsignal.obj" : ..\..\port\pqsignal.c
+	$(CPP) @<<
+	$(CPP_PROJ) ..\..\port\pqsignal.c
+<<
+
 "$(INTDIR)\thread.obj" : ..\..\port\thread.c
 	$(CPP) @<<
 	$(CPP_PROJ) ..\..\port\thread.c
@@ -220,6 +234,16 @@ LINK32_FLAGS = -Gn -L$(BCB)\lib;$(INTDIR); -x -Tpd -v
 "$(INTDIR)\noblock.obj" : ..\..\port\noblock.c
 	$(CPP) @<<
 	$(CPP_PROJ) ..\..\port\noblock.c
+<<
+
+"$(INTDIR)\chklocale.obj" : ..\..\port\chklocale.c
+	$(CPP) @<<
+	$(CPP_PROJ) ..\..\port\chklocale.c
+<<
+
+"$(INTDIR)\inet_net_ntop.obj" : ..\..\port\inet_net_ntop.c
+	$(CPP) @<<
+	$(CPP_PROJ) ..\..\port\inet_net_ntop.c
 <<
 
 "$(INTDIR)\md5.obj" : ..\..\backend\libpq\md5.c
@@ -271,6 +295,11 @@ LINK32_FLAGS = -Gn -L$(BCB)\lib;$(INTDIR); -x -Tpd -v
 "$(INTDIR)\open.obj" : ..\..\port\open.c
 	$(CPP) @<<
 	$(CPP_PROJ) /I"." ..\..\port\open.c
+<<
+
+"$(INTDIR)\system.obj" : ..\..\port\system.c
+	$(CPP) @<<
+	$(CPP_PROJ) /I"." ..\..\port\system.c
 <<
 
 "$(INTDIR)\win32error.obj" : ..\..\port\win32error.c

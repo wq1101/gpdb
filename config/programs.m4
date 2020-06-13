@@ -1,4 +1,4 @@
-# $PostgreSQL: pgsql/config/programs.m4,v 1.22 2008/02/17 16:36:42 petere Exp $
+# config/programs.m4
 
 
 # PGAC_PATH_BISON
@@ -10,7 +10,7 @@
 AC_DEFUN([PGAC_PATH_BISON],
 [# Let the user override the search
 if test -z "$BISON"; then
-  AC_CHECK_PROGS(BISON, bison)
+  AC_PATH_PROGS(BISON, bison)
 fi
 
 if test "$BISON"; then
@@ -19,15 +19,23 @@ if test "$BISON"; then
   if echo "$pgac_bison_version" | $AWK '{ if ([$]4 < 1.875) exit 0; else exit 1;}'
   then
     AC_MSG_WARN([
-*** The installed version of Bison is too old to use with PostgreSQL.
-*** Bison version 1.875 or later is required.])
+*** The installed version of Bison, $BISON, is too old to use with PostgreSQL.
+*** Bison version 1.875 or later is required, but this is $pgac_bison_version.])
     BISON=""
+  fi
+  # Bison >=3.0 issues warnings about %name-prefix="base_yy", instead
+  # of the now preferred %name-prefix "base_yy", but the latter
+  # doesn't work with Bison 2.3 or less.  So for now we silence the
+  # deprecation warnings.
+  if echo "$pgac_bison_version" | $AWK '{ if ([$]4 >= 3) exit 0; else exit 1;}'
+  then
+    BISONFLAGS="$BISONFLAGS -Wno-deprecated"
   fi
 fi
 
 if test -z "$BISON"; then
   AC_MSG_WARN([
-*** Without Bison you will not be able to build PostgreSQL from CVS nor
+*** Without Bison you will not be able to build PostgreSQL from Git nor
 *** change any of the parser definition files.  You can obtain Bison from
 *** a GNU mirror site.  (If you are using the official distribution of
 *** PostgreSQL then you do not need to worry about this, because the Bison
@@ -42,8 +50,11 @@ AC_SUBST(BISONFLAGS)
 # PGAC_PATH_FLEX
 # --------------
 # Look for Flex, set the output variable FLEX to its path if found.
-# Avoid the buggy version 2.5.3. Also find Flex if its installed
-# under `lex', but do not accept other Lex programs.
+# Reject versions before 2.5.31, as we need a reasonably non-buggy reentrant
+# scanner.  (Note: the well-publicized security problem in 2.5.31 does not
+# affect Postgres, and there are still distros shipping patched 2.5.31,
+# so allow it.)  Also find Flex if its installed under `lex', but do not
+# accept other Lex programs.
 
 AC_DEFUN([PGAC_PATH_FLEX],
 [AC_CACHE_CHECK([for flex], pgac_cv_path_flex,
@@ -75,9 +86,6 @@ else
 *** The installed version of Flex, $pgac_candidate, is too old to use with Greenplum DB.
 *** Flex version 2.5.4 or later is required, but this is $pgac_flex_version.])
           fi
-
-          pgac_cv_path_flex=$pgac_candidate
-          break 2
         fi
       fi
     done
@@ -88,14 +96,8 @@ fi
 ])[]dnl AC_CACHE_CHECK
 
 if test x"$pgac_cv_path_flex" = x"no"; then
-  if test -n "$pgac_broken_flex"; then
-    AC_MSG_WARN([
-*** The Flex version 2.5.3 you have at $pgac_broken_flex contains a bug. You
-*** should get version 2.5.4 or later.])
-  fi
-
   AC_MSG_WARN([
-*** Without Flex you will not be able to build PostgreSQL from CVS or
+*** Without Flex you will not be able to build PostgreSQL from Git nor
 *** change any of the scanner definition files.  You can obtain Flex from
 *** a GNU mirror site.  (If you are using the official distribution of
 *** PostgreSQL then you do not need to worry about this because the Flex
@@ -104,13 +106,41 @@ if test x"$pgac_cv_path_flex" = x"no"; then
   FLEX=
 else
   FLEX=$pgac_cv_path_flex
-  pgac_flex_version=`$FLEX -V 2>/dev/null`
+  pgac_flex_version=`$FLEX --version 2>/dev/null`
   AC_MSG_NOTICE([using $pgac_flex_version])
 fi
 
 AC_SUBST(FLEX)
 AC_SUBST(FLEXFLAGS)
 ])# PGAC_PATH_FLEX
+
+
+
+# PGAC_LDAP_SAFE
+# --------------
+# PostgreSQL sometimes loads libldap_r and plain libldap into the same
+# process.  Check for OpenLDAP versions known not to tolerate doing so; assume
+# non-OpenLDAP implementations are safe.  The dblink test suite exercises the
+# hazardous interaction directly.
+
+AC_DEFUN([PGAC_LDAP_SAFE],
+[AC_CACHE_CHECK([for compatible LDAP implementation], [pgac_cv_ldap_safe],
+[AC_COMPILE_IFELSE([AC_LANG_PROGRAM(
+[#include <ldap.h>
+#if !defined(LDAP_VENDOR_VERSION) || \
+     (defined(LDAP_API_FEATURE_X_OPENLDAP) && \
+      LDAP_VENDOR_VERSION >= 20424 && LDAP_VENDOR_VERSION <= 20431)
+choke me
+#endif], [])],
+[pgac_cv_ldap_safe=yes],
+[pgac_cv_ldap_safe=no])])
+
+if test "$pgac_cv_ldap_safe" != yes; then
+  AC_MSG_WARN([
+*** With OpenLDAP versions 2.4.24 through 2.4.31, inclusive, each backend
+*** process that loads libpq (via WAL receiver, dblink, or postgres_fdw) and
+*** also uses LDAP will crash on exit.])
+fi])
 
 
 
@@ -123,7 +153,7 @@ AC_SUBST(FLEXFLAGS)
 AC_DEFUN([PGAC_CHECK_READLINE],
 [AC_REQUIRE([AC_CANONICAL_HOST])
 
-AC_CACHE_VAL([pgac_cv_check_readline],
+AC_CACHE_CHECK([for library containing readline], [pgac_cv_check_readline],
 [pgac_cv_check_readline=no
 pgac_save_LIBS=$LIBS
 if test x"$with_libedit_preferred" != x"yes"
@@ -131,7 +161,6 @@ then	READLINE_ORDER="-lreadline -ledit"
 else	READLINE_ORDER="-ledit -lreadline"
 fi
 for pgac_rllib in $READLINE_ORDER ; do
-  AC_MSG_CHECKING([for ${pgac_rllib}])
   for pgac_lib in "" " -ltermcap" " -lncurses" " -lcurses" ; do
     LIBS="${pgac_rllib}${pgac_lib} $pgac_save_LIBS"
     AC_TRY_LINK_FUNC([readline], [[
@@ -150,14 +179,11 @@ for pgac_rllib in $READLINE_ORDER ; do
     ]])
   done
   if test "$pgac_cv_check_readline" != no ; then
-    AC_MSG_RESULT([yes ($pgac_cv_check_readline)])
     break
-  else
-    AC_MSG_RESULT(no)
   fi
 done
 LIBS=$pgac_save_LIBS
-])[]dnl AC_CACHE_VAL
+])[]dnl AC_CACHE_CHECK
 
 if test "$pgac_cv_check_readline" != no ; then
   LIBS="$pgac_cv_check_readline $LIBS"
@@ -173,19 +199,21 @@ fi
 # Readline versions < 2.1 don't have rl_completion_append_character
 
 AC_DEFUN([PGAC_VAR_RL_COMPLETION_APPEND_CHARACTER],
-[AC_MSG_CHECKING([for rl_completion_append_character])
-AC_TRY_LINK([#include <stdio.h>
+[AC_CACHE_CHECK([for rl_completion_append_character], pgac_cv_var_rl_completion_append_character,
+[AC_LINK_IFELSE([AC_LANG_PROGRAM([#include <stdio.h>
 #ifdef HAVE_READLINE_READLINE_H
 # include <readline/readline.h>
 #elif defined(HAVE_READLINE_H)
 # include <readline.h>
 #endif
 ],
-[rl_completion_append_character = 'x';],
-[AC_MSG_RESULT(yes)
+[rl_completion_append_character = 'x';])],
+[pgac_cv_var_rl_completion_append_character=yes],
+[pgac_cv_var_rl_completion_append_character=no])])
+if test x"$pgac_cv_var_rl_completion_append_character" = x"yes"; then
 AC_DEFINE(HAVE_RL_COMPLETION_APPEND_CHARACTER, 1,
-          [Define to 1 if you have the global variable 'rl_completion_append_character'.])],
-[AC_MSG_RESULT(no)])])# PGAC_VAR_RL_COMPLETION_APPEND_CHARACTER
+          [Define to 1 if you have the global variable 'rl_completion_append_character'.])
+fi])# PGAC_VAR_RL_COMPLETION_APPEND_CHARACTER
 
 
 
@@ -205,6 +233,11 @@ AC_DEFUN([PGAC_CHECK_GETTEXT],
   if test -z "$MSGFMT"; then
     AC_MSG_ERROR([msgfmt is required for NLS])
   fi
+  AC_CACHE_CHECK([for msgfmt flags], pgac_cv_msgfmt_flags,
+[if test x"$MSGFMT" != x"" && "$MSGFMT" --version 2>&1 | grep "GNU" >/dev/null; then
+    pgac_cv_msgfmt_flags=-c
+fi])
+  AC_SUBST(MSGFMT_FLAGS, $pgac_cv_msgfmt_flags)
   AC_CHECK_PROGS(MSGMERGE, msgmerge)
   AC_CHECK_PROGS(XGETTEXT, xgettext)
 ])# PGAC_CHECK_GETTEXT
@@ -226,35 +259,23 @@ AC_DEFUN([PGAC_CHECK_STRIP],
     STRIP_SHARED_LIB="$STRIP --strip-unneeded"
     AC_MSG_RESULT(yes)
   else
-    STRIP_STATIC_LIB=:
-    STRIP_SHARED_LIB=:
-    AC_MSG_RESULT(no)
+    case $host_os in
+      darwin*)
+        STRIP="$STRIP -x"
+        STRIP_STATIC_LIB=$STRIP
+        STRIP_SHARED_LIB=$STRIP
+        AC_MSG_RESULT(yes)
+        ;;
+      *)
+        STRIP_STATIC_LIB=:
+        STRIP_SHARED_LIB=:
+        AC_MSG_RESULT(no)
+        ;;
+    esac
   fi
   AC_SUBST(STRIP_STATIC_LIB)
   AC_SUBST(STRIP_SHARED_LIB)
 ])# PGAC_CHECK_STRIP
-
-
-# GPAC_PATH_CMAKE
-# ---------------
-# Check for the 'cmake' program which is required for compiling
-# Greenplum with Code Generation
-AC_DEFUN([GPAC_PATH_CMAKE],
-[
-if test -z "$CMAKE"; then
-  AC_PATH_PROGS(CMAKE, cmake)
-fi
-
-if test -n "$CMAKE"; then
-  gpac_cmake_version=`$CMAKE --version 2>/dev/null | sed q`
-  if test -z "$gpac_cmake_version"; then
-    AC_MSG_ERROR([cmake is required for codegen, unable to identify version])
-  fi
-  AC_MSG_NOTICE([using $gpac_cmake_version])
-else
-  AC_MSG_ERROR([cmake is required for codegen, unable to find binary])
-fi
-]) # GPAC_PATH_CMAKE
 
 
 # GPAC_PATH_APR_1_CONFIG
@@ -287,30 +308,3 @@ else
   AC_MSG_ERROR([apr-1-config is required for gpfdist, unable to find binary])
 fi
 ]) # GPAC_PATH_APR_1_CONFIG
-
-# GPAC_PATH_APU_1_CONFIG
-# ----------------------
-# Check for apu-1-config, used by gpperfmon
-AC_DEFUN([GPAC_PATH_APU_1_CONFIG],
-[
-if test x"$with_apu_config" != x; then
-  APU_1_CONFIG=$with_apu_config
-fi
-if test -z "$APU_1_CONFIG"; then
-  AC_PATH_PROGS(APU_1_CONFIG, apu-1-config)
-fi
-
-if test -n "$APU_1_CONFIG"; then
-  gpac_apu_1_config_version=`$APU_1_CONFIG --version 2>/dev/null | sed q`
-  if test -z "$gpac_apu_1_config_version"; then
-    AC_MSG_ERROR([apu-1-config is required for gpperfmon, unable to identify version])
-  fi
-  AC_MSG_NOTICE([using apu-1-config $gpac_apu_1_config_version])
-  apu_includes=`"$APU_1_CONFIG" --includes`
-  apu_link_ld_libs=`"$APU_1_CONFIG" --link-ld --libs`
-  AC_SUBST(apu_includes)
-  AC_SUBST(apu_link_ld_libs)
-else
-  AC_MSG_ERROR([apu-1-config is required for gpperfmon, unable to find binary])
-fi
-]) # GPAC_PATH_APU_1_CONFIG

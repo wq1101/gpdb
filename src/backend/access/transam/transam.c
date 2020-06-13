@@ -3,12 +3,12 @@
  * transam.c
  *	  postgres transaction log interface routines
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/access/transam/transam.c,v 1.73 2008/01/01 19:45:48 momjian Exp $
+ *	  src/backend/access/transam/transam.c
  *
  * NOTES
  *	  This file contains the high level access-method interface to the
@@ -22,8 +22,8 @@
 #include "access/clog.h"
 #include "access/subtrans.h"
 #include "access/transam.h"
-#include "utils/tqual.h"
-
+#include "cdb/cdbvars.h"
+#include "utils/snapmgr.h"
 
 /*
  * Single-item cache for results of TransactionLogFetch.  It's worth having
@@ -35,15 +35,14 @@ static TransactionId cachedFetchXid = InvalidTransactionId;
 static XidStatus cachedFetchXidStatus;
 static XLogRecPtr cachedCommitLSN;
 
-/* Handy constant for an invalid xlog recptr */
-static const XLogRecPtr InvalidXLogRecPtr = {0, 0};
+/* Local functions */
+static XidStatus TransactionLogFetch(TransactionId transactionId);
 
 
 /* ----------------------------------------------------------------
  *		Postgres log access method interface
  *
  *		TransactionLogFetch
- *		TransactionLogUpdate
  * ----------------------------------------------------------------
  */
 
@@ -95,65 +94,25 @@ TransactionLogFetch(TransactionId transactionId)
 	return xidstatus;
 }
 
-/* --------------------------------
- *		TransactionLogUpdate
- *
- * Store the new status of a transaction.  The commit record LSN must be
- * passed when recording an async commit; else it should be InvalidXLogRecPtr.
- * --------------------------------
- */
-static inline void
-TransactionLogUpdate(TransactionId transactionId,
-					 XidStatus status, XLogRecPtr lsn)
-{
-	/*
-	 * update the commit log
-	 */
-	TransactionIdSetStatus(transactionId, status, lsn);
-}
-
-/*
- * TransactionLogMultiUpdate
- *
- * Update multiple transaction identifiers to a given status.
- * Don't depend on this being atomic; it's not.
- */
-static inline void
-TransactionLogMultiUpdate(int nxids, TransactionId *xids,
-						  XidStatus status, XLogRecPtr lsn)
-{
-	int			i;
-
-	Assert(nxids != 0);
-
-	for (i = 0; i < nxids; i++)
-		TransactionIdSetStatus(xids[i], status, lsn);
-}
-
 /* ----------------------------------------------------------------
  *						Interface functions
  *
- *		TransactionId DidCommit
- *		TransactionId DidAbort
- *		TransactionId IsInProgress
+ *		TransactionIdDidCommit
+ *		TransactionIdDidAbort
  *		========
  *		   these functions test the transaction status of
  *		   a specified transaction id.
  *
- *		TransactionId Commit
- *		TransactionId Abort
+ *		TransactionIdCommitTree
+ *		TransactionIdAsyncCommitTree
+ *		TransactionIdAbortTree
  *		========
- *		   these functions set the transaction status
- *		   of the specified xid.
+ *		   these functions set the transaction status of the specified
+ *		   transaction tree.
  *
+ * See also TransactionIdIsInProgress, which once was in this module
+ * but now lives in procarray.c.
  * ----------------------------------------------------------------
- */
-
-/* --------------------------------
- *		TransactionId DidCommit
- *		TransactionId DidAbort
- *		TransactionId IsInProgress
- * --------------------------------
  */
 
 /*
@@ -187,7 +146,7 @@ TransactionIdDidCommit(TransactionId transactionId)
 	 * be a window just after database startup where we do not have complete
 	 * knowledge in pg_subtrans of the transactions after TransactionXmin.
 	 * StartupSUBTRANS() has ensured that any missing information will be
-	 * zeroed.	Since this case should not happen under normal conditions, it
+	 * zeroed.  Since this case should not happen under normal conditions, it
 	 * seems reasonable to emit a WARNING for it.
 	 */
 	if (xidstatus == TRANSACTION_STATUS_SUB_COMMITTED)
@@ -261,82 +220,71 @@ TransactionIdDidAbort(TransactionId transactionId)
 	return false;
 }
 
-/* --------------------------------
- *		TransactionId Commit
- *		TransactionId Abort
- * --------------------------------
+/*
+ * A QE reader uses this interface to determine commit status of a
+ * subtransaction ID that is known to be our own subtransaction.  This is used
+ * only in the case that subtransaction ID cache maintained in writer's PGPROC
+ * has overflown.  It's possible to use TransactionIdDidAbort() instead but it
+ * is not necessary to walk up the transaction tree and determine if a parent
+ * has aborted.  If status of the our own subtransaction is SUB_COMMITTED, it
+ * cannot have an aborted parent because upon subtransaction abort, status of
+ * the entire tree is marked as aborted in clog.  Note that this interface is
+ * used to check status of only those subtransactions that are known to be
+ * children of the top transaction that the reader backend is executing.
  */
+bool
+TransactionIdDidAbortForReader(TransactionId transactionId)
+{
+	Assert(!Gp_is_writer);
+	XidStatus status = TransactionLogFetch(transactionId);
+	/* we must be dealing with a subtransaction */
+	Assert(status != TRANSACTION_STATUS_COMMITTED);
+	return status == TRANSACTION_STATUS_ABORTED;
+}
 
 /*
- * TransactionIdCommit
- *		Commits the transaction associated with the identifier.
+ * TransactionIdIsKnownCompleted
+ *		True iff transaction associated with the identifier is currently
+ *		known to have either committed or aborted.
+ *
+ * This does NOT look into pg_clog but merely probes our local cache
+ * (and so it's not named TransactionIdDidComplete, which would be the
+ * appropriate name for a function that worked that way).  The intended
+ * use is just to short-circuit TransactionIdIsInProgress calls when doing
+ * repeated tqual.c checks for the same XID.  If this isn't extremely fast
+ * then it will be counterproductive.
  *
  * Note:
  *		Assumes transaction identifier is valid.
  */
-void
-TransactionIdCommit(TransactionId transactionId)
+bool
+TransactionIdIsKnownCompleted(TransactionId transactionId)
 {
-	TransactionLogUpdate(transactionId, TRANSACTION_STATUS_COMMITTED,
-						 InvalidXLogRecPtr);
-}
+	if (TransactionIdEquals(transactionId, cachedFetchXid))
+	{
+		/* If it's in the cache at all, it must be completed. */
+		return true;
+	}
 
-/*
- * TransactionIdAsyncCommit
- *		Same as above, but for async commits.  The commit record LSN is needed.
- */
-void
-TransactionIdAsyncCommit(TransactionId transactionId, XLogRecPtr lsn)
-{
-	TransactionLogUpdate(transactionId, TRANSACTION_STATUS_COMMITTED, lsn);
-}
-
-
-/*
- * TransactionIdAbort
- *		Aborts the transaction associated with the identifier.
- *
- * Note:
- *		Assumes transaction identifier is valid.
- *		No async version of this is needed.
- */
-void
-TransactionIdAbort(TransactionId transactionId)
-{
-	TransactionLogUpdate(transactionId, TRANSACTION_STATUS_ABORTED,
-						 InvalidXLogRecPtr);
-}
-
-/*
- * TransactionIdSubCommit
- *		Marks the subtransaction associated with the identifier as
- *		sub-committed.
- *
- * Note:
- *		No async version of this is needed.
- */
-void
-TransactionIdSubCommit(TransactionId transactionId)
-{
-	TransactionLogUpdate(transactionId, TRANSACTION_STATUS_SUB_COMMITTED,
-						 InvalidXLogRecPtr);
+	return false;
 }
 
 /*
  * TransactionIdCommitTree
- *		Marks all the given transaction ids as committed.
+ *		Marks the given transaction and children as committed
  *
- * The caller has to be sure that this is used only to mark subcommitted
- * subtransactions as committed, and only *after* marking the toplevel
- * parent as committed.  Otherwise there is a race condition against
- * TransactionIdDidCommit.
+ * "xid" is a toplevel transaction commit, and the xids array contains its
+ * committed subtransactions.
+ *
+ * This commit operation is not guaranteed to be atomic, but if not, subxids
+ * are correctly marked subcommit first.
  */
 void
-TransactionIdCommitTree(int nxids, TransactionId *xids)
+TransactionIdCommitTree(TransactionId xid, int nxids, TransactionId *xids)
 {
-	if (nxids > 0)
-		TransactionLogMultiUpdate(nxids, xids, TRANSACTION_STATUS_COMMITTED,
-								  InvalidXLogRecPtr);
+	TransactionIdSetTreeStatus(xid, nxids, xids,
+							   TRANSACTION_STATUS_COMMITTED,
+							   InvalidXLogRecPtr);
 }
 
 /*
@@ -344,27 +292,28 @@ TransactionIdCommitTree(int nxids, TransactionId *xids)
  *		Same as above, but for async commits.  The commit record LSN is needed.
  */
 void
-TransactionIdAsyncCommitTree(int nxids, TransactionId *xids, XLogRecPtr lsn)
+TransactionIdAsyncCommitTree(TransactionId xid, int nxids, TransactionId *xids,
+							 XLogRecPtr lsn)
 {
-	if (nxids > 0)
-		TransactionLogMultiUpdate(nxids, xids, TRANSACTION_STATUS_COMMITTED,
-								  lsn);
+	TransactionIdSetTreeStatus(xid, nxids, xids,
+							   TRANSACTION_STATUS_COMMITTED, lsn);
 }
-
 
 /*
  * TransactionIdAbortTree
- *		Marks all the given transaction ids as aborted.
+ *		Marks the given transaction and children as aborted.
+ *
+ * "xid" is a toplevel transaction commit, and the xids array contains its
+ * committed subtransactions.
  *
  * We don't need to worry about the non-atomic behavior, since any onlookers
  * will consider all the xacts as not-yet-committed anyway.
  */
 void
-TransactionIdAbortTree(int nxids, TransactionId *xids)
+TransactionIdAbortTree(TransactionId xid, int nxids, TransactionId *xids)
 {
-	if (nxids > 0)
-		TransactionLogMultiUpdate(nxids, xids, TRANSACTION_STATUS_ABORTED,
-								  InvalidXLogRecPtr);
+	TransactionIdSetTreeStatus(xid, nxids, xids,
+							   TRANSACTION_STATUS_ABORTED, InvalidXLogRecPtr);
 }
 
 /*
@@ -375,7 +324,7 @@ TransactionIdPrecedes(TransactionId id1, TransactionId id2)
 {
 	/*
 	 * If either ID is a permanent XID then we can just do unsigned
-	 * comparison.	If both are normal, do a modulo-2^31 comparison.
+	 * comparison.  If both are normal, do a modulo-2^32 comparison.
 	 */
 	int32		diff;
 

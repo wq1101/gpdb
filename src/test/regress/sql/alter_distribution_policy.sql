@@ -15,12 +15,12 @@ alter table atsdb set distributed by (i);
 
 -- should work
 alter table atsdb set distributed randomly;
-select localoid::regclass, attrnums from gp_distribution_policy where localoid = 'atsdb'::regclass;
+select localoid::regclass, distkey from gp_distribution_policy where localoid = 'atsdb'::regclass;
 -- not possible to correctly verify random distribution
 
 alter table atsdb set distributed by (j);
-select localoid::regclass, attrnums from gp_distribution_policy where localoid = 'atsdb'::regclass;
--- verify that the data is correctly redistributed by building a fresh 
+select localoid::regclass, distkey from gp_distribution_policy where localoid = 'atsdb'::regclass;
+-- verify that the data is correctly redistributed by building a fresh
 -- table with the same policy
 create table ats_test (i int, j text) distributed by (j);
 insert into ats_test :DATA;
@@ -29,7 +29,7 @@ select gp_segment_id, * from atsdb;
 drop table ats_test;
 
 alter table atsdb set distributed by (i, j);
-select localoid::regclass, attrnums from gp_distribution_policy where localoid = 'atsdb'::regclass;
+select localoid::regclass, distkey from gp_distribution_policy where localoid = 'atsdb'::regclass;
 -- verify
 create table ats_test (i int, j text) distributed by (i, j);
 insert into ats_test :DATA;
@@ -38,7 +38,7 @@ select gp_segment_id, * from atsdb;
 drop table ats_test;
 
 alter table atsdb set distributed by (j, i);
-select localoid::regclass, attrnums from gp_distribution_policy where localoid = 'atsdb'::regclass;
+select localoid::regclass, distkey from gp_distribution_policy where localoid = 'atsdb'::regclass;
 -- verify
 create table ats_test (i int, j text) distributed by (j, i);
 insert into ats_test :DATA;
@@ -75,73 +75,9 @@ alter table atsdb_ao set distributed randomly;
 select count(*) from atsdb_ao;
 drop table atsdb_ao;
 
--- Check divergent distribution policies for partitioning.
-create table atsdb (i int, j int, k int) distributed by (i) partition by range(k)
-(start(1) end(4) every(1));
-alter table atsdb_1_prt_2 set distributed by (j);
-alter table atsdb_1_prt_3 set distributed randomly;
--- test COPY
-copy atsdb from stdin delimiter '|';
-1|1|1
-2|1|1
-2|2|1
-3|1|1
-3|2|1
-3|3|1
-1|1|2
-2|1|2
-2|2|2
-3|1|2
-3|2|2
-3|3|2
-1|1|3
-2|1|3
-2|2|3
-3|1|3
-3|2|3
-3|3|3
-\.
-
-select count(*) from atsdb;
-
--- compare distribution: we create a table, identical to the partitioned table,
--- and compare how the tuples have been distributed.
-create table atsdb_1 (like atsdb_1_prt_1) distributed by (i);
-copy atsdb_1 from stdin delimiter '|';
-1|1|1
-2|1|1
-2|2|1
-3|1|1
-3|2|1
-3|3|1
-\.
-select gp_segment_id, * from atsdb where k = 1 except 
-select gp_segment_id, * from atsdb_1;
-
-create table atsdb_2 (like atsdb_1_prt_2) distributed by (i);
-copy atsdb_2 from stdin delimiter '|';
-1|1|2
-2|1|2
-2|2|2
-3|1|2
-3|2|2
-3|3|2
-\.
-select gp_segment_id, * from atsdb where k = 2 except
-select gp_segment_id, * from atsdb_2;
-
--- Can't test randomly distributed
-
--- Can't test INSERT (yet)
-
-drop table atsdb, atsdb_1, atsdb_2;
-
 -- Can't redistribute system catalogs
 alter table pg_class set distributed by (relname);
 alter table pg_class set with(appendonly = true);
-
--- MPP-7770: allow testing of changing storage for now
-set gp_setwith_alter_storage = true;
 
 alter table pg_class set with(appendonly = true);
 
@@ -156,7 +92,7 @@ drop table atsdb;
 
 create view distcheck as select relname as rel, attname from
 gp_distribution_policy g, pg_attribute p, pg_class c
-where g.localoid = p.attrelid and attnum = any(g.attrnums) and
+where g.localoid = p.attrelid and attnum = any(g.distkey) and
 c.oid = p.attrelid;
 
 -- dropped columns
@@ -169,7 +105,7 @@ select * from distcheck where rel = 'atsdb';
 alter table atsdb drop column n;
 
 alter table atsdb set with(appendonly = true, compresslevel = 3);
-select relname, segrelid != 0, reloptions from pg_class, pg_appendonly where pg_class.oid = 
+select relname, segrelid != 0, reloptions from pg_class, pg_appendonly where pg_class.oid =
 'atsdb'::regclass and relid = pg_class.oid;
 
 select * from distcheck where rel = 'atsdb';
@@ -190,6 +126,14 @@ alter table atsdb set with(reorganize = true, reorganize = false) distributed
 randomly;
 drop table atsdb;
 
+-- check distribution after dropping distribution key column.
+create table atsdb (i int, j int, t text, n numeric) distributed by (i, j);
+insert into atsdb select i, i+1, i+2, i+3 from generate_series(1, 20) i;
+alter table atsdb drop column i;
+select * from atsdb;
+select * from distcheck where rel = 'atsdb';
+drop table atsdb;
+
 -- Check that we correctly cascade for partitioned tables
 create table atsdb (i int, j int, k int) distributed by (i) partition by range(k)
 (start(1) end(10) every(1));
@@ -199,7 +143,7 @@ alter table atsdb set distributed by (j);
 select * from distcheck where rel like 'atsdb%';
 select * from atsdb order by 1, 2, 3;
 alter table atsdb set with(appendonly = true);
-select relname, a.blocksize, compresslevel, compresstype, checksum from pg_class c, pg_appendonly a where 
+select relname, a.blocksize, compresslevel, compresstype, checksum from pg_class c, pg_appendonly a where
 relname  like 'atsdb%' and c.oid = a.relid order by 1;
 select * from atsdb order by 1, 2, 3;
 insert into atsdb select i+2, i+1, i from generate_series(1, 9) i;
@@ -232,11 +176,11 @@ CREATE TABLE test_add_drop_rename_column_change_datatype(
  a_ts_without timestamp without time zone,
  b_ts_with timestamp with time zone,
  date_column date) distributed randomly;
- 
+
 insert into test_add_drop_rename_column_change_datatype values ('0_zero', 0, '0_zero', 0, 0, 0, '{0}', 0, 0, 0, '2004-10-19 10:23:54', '2004-10-19 10:23:54+02', '1-1-2000');
 insert into test_add_drop_rename_column_change_datatype values ('1_zero', 1, '1_zero', 1, 1, 1, '{1}', 1, 1, 1, '2005-10-19 10:23:54', '2005-10-19 10:23:54+02', '1-1-2001');
 insert into test_add_drop_rename_column_change_datatype values ('2_zero', 2, '2_zero', 2, 2, 2, '{2}', 2, 2, 2, '2006-10-19 10:23:54', '2006-10-19 10:23:54+02', '1-1-2002');
- 
+
 ALTER TABLE test_add_drop_rename_column_change_datatype ADD COLUMN added_col character varying(30);
 ALTER TABLE test_add_drop_rename_column_change_datatype DROP COLUMN drop_col ;
 ALTER TABLE test_add_drop_rename_column_change_datatype RENAME COLUMN before_rename_col TO after_rename_col;
@@ -300,31 +244,31 @@ create table owner_test(i int, toast text) distributed randomly;
 alter table owner_test owner to atsdb;
 alter table owner_test set with (reorganize = true) distributed by (i);
 -- verify, atsdb should own all three
-select a.relname, 
-       x.rolname as relowner, 
+select a.relname,
+       x.rolname as relowner,
        y.rolname as toastowner,
-	   z.rolname as toastidxowner
-from pg_class a, pg_class b, pg_class c, 
+       z.rolname as toastidxowner
+from pg_class a
+     inner join pg_class b on b.oid = a.reltoastrelid
+     inner join pg_index ti on ti.indrelid = b.oid
+     inner join pg_class c on c.oid = ti.indexrelid,
      pg_authid x, pg_authid y, pg_authid z
-where a.reltoastrelid = b.oid 
-  and b.reltoastidxid=c.oid
-  and a.relname='owner_test'
+where a.relname='owner_test'
   and x.oid = a.relowner
   and y.oid = b.relowner
   and z.oid = c.relowner;
 
 -- MPP-9663 - Check that the ownership is consistent on the segments as well
-select a.relname, 
-       x.rolname as relowner, 
+select a.relname,
+       x.rolname as relowner,
        y.rolname as toastowner,
-	   z.rolname as toastidxowner
-from gp_dist_random('pg_class') a, 
-	 gp_dist_random('pg_class') b, 
-	 gp_dist_random('pg_class') c, 
+       z.rolname as toastidxowner
+from gp_dist_random('pg_class') a
+     inner join gp_dist_random('pg_class') b on b.oid = a.reltoastrelid
+     inner join pg_index ti on ti.indrelid = b.oid
+     inner join gp_dist_random('pg_class') c on c.oid = ti.indexrelid,
      pg_authid x, pg_authid y, pg_authid z
-where a.reltoastrelid=b.oid
-  and b.reltoastidxid=c.oid
-  and a.relname='owner_test'
+where a.relname='owner_test'
   and x.oid = a.relowner
   and y.oid = b.relowner
   and z.oid = c.relowner
@@ -337,17 +281,16 @@ alter table owner_test add column d text;
 alter table owner_test drop column d;
 alter table owner_test set with (reorganize = true) distributed by (i);
 
-select a.relname, 
-       x.rolname as relowner, 
+select a.relname,
+       x.rolname as relowner,
        y.rolname as toastowner,
-	   z.rolname as toastidxowner
-from gp_dist_random('pg_class') a, 
-	 gp_dist_random('pg_class') b, 
-	 gp_dist_random('pg_class') c, 
+       z.rolname as toastidxowner
+from gp_dist_random('pg_class') a
+     inner join gp_dist_random('pg_class') b on b.oid = a.reltoastrelid
+     inner join pg_index ti on ti.indrelid = b.oid
+     inner join gp_dist_random('pg_class') c on c.oid = ti.indexrelid,
      pg_authid x, pg_authid y, pg_authid z
-where a.reltoastrelid=b.oid
-  and b.reltoastidxid=c.oid
-  and a.relname='owner_test'
+where a.relname='owner_test'
   and x.oid = a.relowner
   and y.oid = b.relowner
   and z.oid = c.relowner
@@ -364,10 +307,6 @@ Alter table abc set distributed randomly;
 Alter table abc set with (reorganize=false) distributed randomly;
 drop table abc;
 
-
--- MPP-7770: disable changing storage options (default, for now)
-set gp_setwith_alter_storage = false;
-
 -- disallow, so fails
 create table atsdb (i int, j text) distributed by (j);
 alter table atsdb set with(appendonly = true);
@@ -379,14 +318,14 @@ set enable_seqscan=off;
 
 drop table if exists distrib_index_test;
 create table distrib_index_test (a int, b text) distributed by (a);
-select count(*) from gp_distribution_policy 
+select count(*) from gp_distribution_policy
 	where localoid in (select oid from pg_class where relname='distrib_index_test');
 
 begin;
 drop table distrib_index_test;
 rollback;
 
-select count(*) from gp_distribution_policy 
+select count(*) from gp_distribution_policy
 	where localoid in (select oid from pg_class where relname='distrib_index_test');
 
 reset enable_indexscan;
@@ -400,7 +339,7 @@ drop table distrib_index_test;
 --     3. partition table have "with" option.
 drop index if exists distrib_part_test_idx;
 drop table if exists distrib_part_test;
-CREATE TABLE distrib_part_test 
+CREATE TABLE distrib_part_test
 (
   col1 int,
   col2 decimal,
@@ -417,12 +356,12 @@ ALTER TABLE public.distrib_part_test SET with (reorganize=false) DISTRIBUTED RAN
 
 -- MPP-23801
 --
--- ALTER TABLE set distribution key should check compatible with unique index. 
+-- ALTER TABLE set distribution key should check compatible with unique index.
 
 -- case 1
 
 CREATE TABLE t_dist1(col1 INTEGER, col2 INTEGER, CONSTRAINT pk_t_dist1 PRIMARY KEY(col2)) DISTRIBUTED BY(col2);
-ALTER TABLE t_dist1 SET DISTRIBUTED BY(col1); 
+ALTER TABLE t_dist1 SET DISTRIBUTED BY(col1);
 
 -- case 2
 
@@ -432,11 +371,79 @@ CREATE UNIQUE INDEX idx1_t_dist2 ON t_dist2(col1, col2);
 CREATE UNIQUE INDEX idx2_t_dist2 ON t_dist2(col1, col2, col3);
 CREATE UNIQUE INDEX idx3_t_dist2 ON t_dist2(col1, col2, col4);
 
-ALTER TABLE t_dist2 SET DISTRIBUTED BY(col1); 
-ALTER TABLE t_dist2 SET DISTRIBUTED BY(col2); 
-ALTER TABLE t_dist2 SET DISTRIBUTED BY(col1, col2); 
+ALTER TABLE t_dist2 SET DISTRIBUTED BY(col1);
+ALTER TABLE t_dist2 SET DISTRIBUTED BY(col2);
+ALTER TABLE t_dist2 SET DISTRIBUTED BY(col1, col2);
 
-ALTER TABLE t_dist2 SET DISTRIBUTED BY(col1, col2, col3); 
-ALTER TABLE t_dist2 SET DISTRIBUTED BY(col3); 
-ALTER TABLE t_dist2 SET DISTRIBUTED BY(col4); 
+ALTER TABLE t_dist2 SET DISTRIBUTED BY(col1, col2, col3);
+ALTER TABLE t_dist2 SET DISTRIBUTED BY(col3);
+ALTER TABLE t_dist2 SET DISTRIBUTED BY(col4);
 
+-- Altering distribution policy for temp tables
+create temp table atsdb (c1 int, c2 int) distributed randomly;
+select * from atsdb;
+alter table atsdb set distributed by (c1);
+select * from atsdb;
+alter table atsdb set distributed by (c2);
+select * from atsdb;
+
+--
+-- ALTER TABLE SET DATA TYPE tests, where the column is part of the
+-- distribution key.
+--
+CREATE TABLE distpol_typechange (i int2) DISTRIBUTED BY (i);
+INSERT INTO distpol_typechange values (123);
+ALTER TABLE distpol_typechange ALTER COLUMN i SET DATA TYPE int4;
+DROP TABLE distpol_typechange;
+CREATE TABLE distpol_typechange (p text) DISTRIBUTED BY (p);
+
+-- This should throw an error, you can't change the datatype of a distribution
+-- key column.
+INSERT INTO distpol_typechange VALUES ('(1,1)');
+ALTER TABLE distpol_typechange ALTER COLUMN p TYPE point USING p::point;
+
+-- unless it's completely empty! But 'point' doesn't have hash a opclass,
+-- so it cannot be part of the distribution key. We silently turn the
+-- table randomly distributed.
+TRUNCATE distpol_typechange;
+ALTER TABLE distpol_typechange ALTER COLUMN p TYPE point USING p::point;
+
+select policytype, distkey, distclass from gp_distribution_policy where localoid='distpol_typechange'::regclass;
+
+
+-- Similar case, but with CREATE UNIQUE INDEX, rather than ALTER TABLE.
+-- Creating a unique index on a completely empty table automatically updates
+-- the distribution key to match the unique index.  (This allows the common
+-- case, where no DISTRIBUTED BY was given explicitly, and the system just
+-- picked the first column, which isn't compatible with the unique index
+-- that's created later, to work.) But not if the unique column doesn't
+-- have a hash opclass!
+CREATE TABLE tstab (i int4, t tsvector) distributed by (i);
+CREATE UNIQUE INDEX tstab_idx ON tstab(t);
+INSERT INTO tstab VALUES (1, 'foo');
+
+-- ALTER TABLE SET DISTRIBUTED RANDOMLY should not work on a table
+-- that has a primary key or unique index.
+CREATE TABLE alter_table_with_primary_key (a int primary key);
+ALTER TABLE alter_table_with_primary_key SET DISTRIBUTED RANDOMLY;
+CREATE TABLE alter_table_with_unique_index (a int unique);
+ALTER TABLE alter_table_with_unique_index SET DISTRIBUTED RANDOMLY;
+
+-- Enable reorg partition leaf table
+create table reorg_leaf (a int, b int, c int) distributed by (c)
+partition by range(a)
+subpartition by range (b)
+subpartition template
+(start(0) end (10) every (5))
+(partition p0 start (0) end (5),
+	partition p1 start (5) end (10));
+insert into reorg_leaf select i, i, i from generate_series(0, 9) i;
+select *, gp_segment_id from reorg_leaf_1_prt_p0;
+alter table reorg_leaf_1_prt_p0 set with (reorganize=true) distributed by(b);
+alter table reorg_leaf_1_prt_p0 set with (reorganize=true) distributed by(c);
+alter table reorg_leaf_1_prt_p0 set with (reorganize=true);
+alter table reorg_leaf_1_prt_p0_2_prt_1 set with (reorganize=true) distributed by(b);
+alter table reorg_leaf_1_prt_p0_2_prt_1 set with (reorganize=true) distributed by(c);
+select *, gp_segment_id from reorg_leaf_1_prt_p0;
+alter table reorg_leaf_1_prt_p0_2_prt_1 set with (reorganize=true);
+select *, gp_segment_id from reorg_leaf_1_prt_p0;

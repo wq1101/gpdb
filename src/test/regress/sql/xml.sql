@@ -60,11 +60,26 @@ SELECT xmlelement(name foo, xmlattributes('infinity'::timestamp as bar));
 SELECT xmlelement(name foo, xmlattributes('<>&"''' as funny, xml 'b<a/>r' as funnier));
 
 
+SELECT xmlparse(content '');
+SELECT xmlparse(content '  ');
 SELECT xmlparse(content 'abc');
 SELECT xmlparse(content '<abc>x</abc>');
+SELECT xmlparse(content '<invalidentity>&</invalidentity>');
+SELECT xmlparse(content '<undefinedentity>&idontexist;</undefinedentity>');
+SELECT xmlparse(content '<invalidns xmlns=''&lt;''/>');
+SELECT xmlparse(content '<relativens xmlns=''relative''/>');
+SELECT xmlparse(content '<twoerrors>&idontexist;</unbalanced>');
+SELECT xmlparse(content '<nosuchprefix:tag/>');
 
+SELECT xmlparse(document '   ');
 SELECT xmlparse(document 'abc');
 SELECT xmlparse(document '<abc>x</abc>');
+SELECT xmlparse(document '<invalidentity>&</abc>');
+SELECT xmlparse(document '<undefinedentity>&idontexist;</abc>');
+SELECT xmlparse(document '<invalidns xmlns=''&lt;''/>');
+SELECT xmlparse(document '<relativens xmlns=''relative''/>');
+SELECT xmlparse(document '<twoerrors>&idontexist;</unbalanced>');
+SELECT xmlparse(document '<nosuchprefix:tag/>');
 
 
 SELECT xmlpi(name foo);
@@ -165,12 +180,58 @@ SELECT xpath('//loc:piece/@id', '<local:data xmlns:local="http://127.0.0.1"><loc
 SELECT xpath('//loc:piece', '<local:data xmlns:local="http://127.0.0.1"><local:piece id="1">number one</local:piece><local:piece id="2" /></local:data>', ARRAY[ARRAY['loc', 'http://127.0.0.1']]);
 SELECT xpath('//loc:piece', '<local:data xmlns:local="http://127.0.0.1" xmlns="http://127.0.0.2"><local:piece id="1"><internal>number one</internal><internal2/></local:piece><local:piece id="2" /></local:data>', ARRAY[ARRAY['loc', 'http://127.0.0.1']]);
 SELECT xpath('//b', '<a>one <b>two</b> three <b>etc</b></a>');
+SELECT xpath('//text()', '<root>&lt;</root>');
+SELECT xpath('//@value', '<root value="&lt;"/>');
+SELECT xpath('''<<invalid>>''', '<root/>');
+SELECT xpath('count(//*)', '<root><sub/><sub/></root>');
+SELECT xpath('count(//*)=0', '<root><sub/><sub/></root>');
+SELECT xpath('count(//*)=3', '<root><sub/><sub/></root>');
+SELECT xpath('name(/*)', '<root><sub/><sub/></root>');
+SELECT xpath('/nosuchtag', '<root/>');
+
+-- Round-trip non-ASCII data through xpath().
+DO $$
+DECLARE
+  xml_declaration text := '<?xml version="1.0" encoding="ISO-8859-1"?>';
+  degree_symbol text;
+  res xml[];
+BEGIN
+  -- Per the documentation, except when the server encoding is UTF8, xpath()
+  -- may not work on non-ASCII data.  The untranslatable_character and
+  -- undefined_function traps below, currently dead code, will become relevant
+  -- if we remove this limitation.
+  IF current_setting('server_encoding') <> 'UTF8' THEN
+    RAISE LOG 'skip: encoding % unsupported for xpath',
+      current_setting('server_encoding');
+    RETURN;
+  END IF;
+
+  degree_symbol := convert_from('\xc2b0', 'UTF8');
+  res := xpath('text()', (xml_declaration ||
+    '<x>' || degree_symbol || '</x>')::xml);
+  IF degree_symbol <> res[1]::text THEN
+    RAISE 'expected % (%), got % (%)',
+      degree_symbol, convert_to(degree_symbol, 'UTF8'),
+      res[1], convert_to(res[1]::text, 'UTF8');
+  END IF;
+EXCEPTION
+  -- character with byte sequence 0xc2 0xb0 in encoding "UTF8" has no equivalent in encoding "LATIN8"
+  WHEN untranslatable_character
+  -- default conversion function for encoding "UTF8" to "MULE_INTERNAL" does not exist
+  OR undefined_function
+  -- unsupported XML feature
+  OR feature_not_supported THEN
+    RAISE LOG 'skip: %', SQLERRM;
+END
+$$;
 
 -- Test xmlexists and xpath_exists
 SELECT xmlexists('//town[text() = ''Toronto'']' PASSING BY REF '<towns><town>Bidford-on-Avon</town><town>Cwmbran</town><town>Bristol</town></towns>');
 SELECT xmlexists('//town[text() = ''Cwmbran'']' PASSING BY REF '<towns><town>Bidford-on-Avon</town><town>Cwmbran</town><town>Bristol</town></towns>');
+SELECT xmlexists('count(/nosuchtag)' PASSING BY REF '<root/>');
 SELECT xpath_exists('//town[text() = ''Toronto'']','<towns><town>Bidford-on-Avon</town><town>Cwmbran</town><town>Bristol</town></towns>'::xml);
 SELECT xpath_exists('//town[text() = ''Cwmbran'']','<towns><town>Bidford-on-Avon</town><town>Cwmbran</town><town>Bristol</town></towns>'::xml);
+SELECT xpath_exists('count(/nosuchtag)', '<root/>'::xml);
 
 INSERT INTO xmltest VALUES (4, '<menu><beers><name>Budvar</name><cost>free</cost><name>Carling</name><cost>lots</cost></beers></menu>'::xml);
 INSERT INTO xmltest VALUES (5, '<menu><beers><name>Molson</name><cost>free</cost><name>Carling</name><cost>lots</cost></beers></menu>'::xml);
@@ -210,9 +271,35 @@ SELECT xml_is_well_formed('<foo><bar>baz</foo>');
 SELECT xml_is_well_formed('<local:data xmlns:local="http://127.0.0.1"><local:piece id="1">number one</local:piece><local:piece id="2" /></local:data>');
 SELECT xml_is_well_formed('<pg:foo xmlns:pg="http://postgresql.org/stuff">bar</my:foo>');
 SELECT xml_is_well_formed('<pg:foo xmlns:pg="http://postgresql.org/stuff">bar</pg:foo>');
+SELECT xml_is_well_formed('<invalidentity>&</abc>');
+SELECT xml_is_well_formed('<undefinedentity>&idontexist;</abc>');
+SELECT xml_is_well_formed('<invalidns xmlns=''&lt;''/>');
+SELECT xml_is_well_formed('<relativens xmlns=''relative''/>');
+SELECT xml_is_well_formed('<twoerrors>&idontexist;</unbalanced>');
 
 SET xmloption TO CONTENT;
 SELECT xml_is_well_formed('abc');
+
+-- Since xpath() deals with namespaces, it's a bit stricter about
+-- what's well-formed and what's not. If we don't obey these rules
+-- (i.e. ignore namespace-related errors from libxml), xpath()
+-- fails in subtle ways. The following would for example produce
+-- the xml value
+--   <invalidns xmlns='<'/>
+-- which is invalid because '<' may not appear un-escaped in
+-- attribute values.
+-- Since different libxml versions emit slightly different
+-- error messages, we suppress the DETAIL in this test.
+\set VERBOSITY terse
+SELECT xpath('/*', '<invalidns xmlns=''&lt;''/>');
+\set VERBOSITY default
+
+-- Again, the XML isn't well-formed for namespace purposes
+SELECT xpath('/*', '<nosuchprefix:tag/>');
+
+-- XPath deprecates relative namespaces, but they're not supposed to
+-- throw an error, only a warning.
+SELECT xpath('/*', '<relativens xmlns=''relative''/>');
 
 -- External entity references should not leak filesystem information.
 SELECT XMLPARSE(DOCUMENT '<!DOCTYPE foo [<!ENTITY c SYSTEM "/etc/passwd">]><foo>&c;</foo>');

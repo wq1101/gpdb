@@ -1,4 +1,4 @@
-/* $PostgreSQL: pgsql/src/interfaces/ecpg/ecpglib/misc.c,v 1.49 2009/06/11 14:49:13 momjian Exp $ */
+/* src/interfaces/ecpg/ecpglib/misc.c */
 
 #define POSTGRES_ECPG_INTERNAL
 #include "postgres_fe.h"
@@ -17,15 +17,15 @@
 #include "pgtypes_interval.h"
 #include "pg_config_paths.h"
 
-#ifdef HAVE_LONG_LONG_INT_64
+#ifdef HAVE_LONG_LONG_INT
 #ifndef LONG_LONG_MIN
 #ifdef LLONG_MIN
 #define LONG_LONG_MIN LLONG_MIN
 #else
 #define LONG_LONG_MIN LONGLONG_MIN
-#endif
-#endif
-#endif
+#endif   /* LLONG_MIN */
+#endif   /* LONG_LONG_MIN */
+#endif   /* HAVE_LONG_LONG_INT */
 
 bool		ecpg_internal_regression_mode = false;
 
@@ -106,6 +106,13 @@ ecpg_init(const struct connection * con, const char *connection_name, const int 
 {
 	struct sqlca_t *sqlca = ECPGget_sqlca();
 
+	if (sqlca == NULL)
+	{
+		ecpg_raise(lineno, ECPG_OUT_OF_MEMORY, ECPG_SQLSTATE_ECPG_OUT_OF_MEMORY,
+				   NULL);
+		return (false);
+	}
+
 	ecpg_init_sqlca(sqlca);
 	if (con == NULL)
 	{
@@ -143,6 +150,8 @@ ECPGget_sqlca(void)
 	if (sqlca == NULL)
 	{
 		sqlca = malloc(sizeof(struct sqlca_t));
+		if (sqlca == NULL)
+			return NULL;
 		ecpg_init_sqlca(sqlca);
 		pthread_setspecific(sqlca_key, sqlca);
 	}
@@ -170,6 +179,22 @@ ECPGstatus(int lineno, const char *connection_name)
 	return (true);
 }
 
+PGTransactionStatusType
+ECPGtransactionStatus(const char *connection_name)
+{
+	const struct connection *con;
+
+	con = ecpg_get_connection(connection_name);
+	if (con == NULL)
+	{
+		/* transaction status is unknown */
+		return PQTRANS_UNKNOWN;
+	}
+
+	return PQtransactionStatus(con->connection);
+
+}
+
 bool
 ECPGtrans(int lineno, const char *connection_name, const char *transaction)
 {
@@ -188,9 +213,15 @@ ECPGtrans(int lineno, const char *connection_name, const char *transaction)
 		 * If we got a transaction command but have no open transaction, we
 		 * have to start one, unless we are in autocommit, where the
 		 * developers have to take care themselves. However, if the command is
-		 * a begin statement, we just execute it once.
+		 * a begin statement, we just execute it once. And if the command is
+		 * commit or rollback prepared, we don't execute it.
 		 */
-		if (con->committed && !con->autocommit && strncmp(transaction, "begin", 5) != 0 && strncmp(transaction, "start", 5) != 0)
+		if (PQtransactionStatus(con->connection) == PQTRANS_IDLE &&
+			!con->autocommit &&
+			strncmp(transaction, "begin", 5) != 0 &&
+			strncmp(transaction, "start", 5) != 0 &&
+			strncmp(transaction, "commit prepared", 15) != 0 &&
+			strncmp(transaction, "rollback prepared", 17) != 0)
 		{
 			res = PQexec(con->connection, "begin transaction");
 			if (!ecpg_check_PQresult(res, lineno, con->connection, ECPG_COMPAT_PGSQL))
@@ -203,11 +234,6 @@ ECPGtrans(int lineno, const char *connection_name, const char *transaction)
 			return FALSE;
 		PQclear(res);
 	}
-
-	if (strncmp(transaction, "commit", 6) == 0 || strncmp(transaction, "rollback", 8) == 0)
-		con->committed = true;
-	else
-		con->committed = false;
 
 	return true;
 }
@@ -249,7 +275,7 @@ ecpg_log(const char *format,...)
 	if (!simple_debug)
 		return;
 
-	/* internationalize the error message string */
+	/* localize the error message string */
 	intl_format = ecpg_gettext(format);
 
 	/*
@@ -275,9 +301,11 @@ ecpg_log(const char *format,...)
 	va_end(ap);
 
 	/* dump out internal sqlca variables */
-	if (ecpg_internal_regression_mode)
+	if (ecpg_internal_regression_mode && sqlca != NULL)
+	{
 		fprintf(debugstream, "[NO_PID]: sqlca: code: %ld, state: %s\n",
 				sqlca->sqlcode, sqlca->sqlstate);
+	}
 
 	fflush(debugstream);
 
@@ -295,6 +323,7 @@ ECPGset_noind_null(enum ECPGttype type, void *ptr)
 	{
 		case ECPGt_char:
 		case ECPGt_unsigned_char:
+		case ECPGt_string:
 			*((char *) ptr) = '\0';
 			break;
 		case ECPGt_short:
@@ -310,12 +339,12 @@ ECPGset_noind_null(enum ECPGttype type, void *ptr)
 		case ECPGt_date:
 			*((long *) ptr) = LONG_MIN;
 			break;
-#ifdef HAVE_LONG_LONG_INT_64
+#ifdef HAVE_LONG_LONG_INT
 		case ECPGt_long_long:
 		case ECPGt_unsigned_long_long:
 			*((long long *) ptr) = LONG_LONG_MIN;
 			break;
-#endif   /* HAVE_LONG_LONG_INT_64 */
+#endif   /* HAVE_LONG_LONG_INT */
 		case ECPGt_float:
 			memset((char *) ptr, 0xff, sizeof(float));
 			break;
@@ -328,11 +357,11 @@ ECPGset_noind_null(enum ECPGttype type, void *ptr)
 			break;
 		case ECPGt_decimal:
 			memset((char *) ptr, 0, sizeof(decimal));
-			((decimal *) ptr)->sign = NUMERIC_NAN;
+			((decimal *) ptr)->sign = NUMERIC_NULL;
 			break;
 		case ECPGt_numeric:
 			memset((char *) ptr, 0, sizeof(numeric));
-			((numeric *) ptr)->sign = NUMERIC_NAN;
+			((numeric *) ptr)->sign = NUMERIC_NULL;
 			break;
 		case ECPGt_interval:
 			memset((char *) ptr, 0xff, sizeof(interval));
@@ -348,10 +377,11 @@ ECPGset_noind_null(enum ECPGttype type, void *ptr)
 static bool
 _check(unsigned char *ptr, int length)
 {
-	for (; length > 0 && ptr[--length] == 0xff;);
-	if (length <= 0)
-		return true;
-	return false;
+	for (length--; length >= 0; length--)
+		if (ptr[length] != 0xff)
+			return false;
+
+	return true;
 }
 
 bool
@@ -361,6 +391,7 @@ ECPGis_noind_null(enum ECPGttype type, void *ptr)
 	{
 		case ECPGt_char:
 		case ECPGt_unsigned_char:
+		case ECPGt_string:
 			if (*((char *) ptr) == '\0')
 				return true;
 			break;
@@ -380,13 +411,13 @@ ECPGis_noind_null(enum ECPGttype type, void *ptr)
 			if (*((long *) ptr) == LONG_MIN)
 				return true;
 			break;
-#ifdef HAVE_LONG_LONG_INT_64
+#ifdef HAVE_LONG_LONG_INT
 		case ECPGt_long_long:
 		case ECPGt_unsigned_long_long:
 			if (*((long long *) ptr) == LONG_LONG_MIN)
 				return true;
 			break;
-#endif   /* HAVE_LONG_LONG_INT_64 */
+#endif   /* HAVE_LONG_LONG_INT */
 		case ECPGt_float:
 			return (_check(ptr, sizeof(float)));
 			break;
@@ -398,11 +429,11 @@ ECPGis_noind_null(enum ECPGttype type, void *ptr)
 				return true;
 			break;
 		case ECPGt_decimal:
-			if (((decimal *) ptr)->sign == NUMERIC_NAN)
+			if (((decimal *) ptr)->sign == NUMERIC_NULL)
 				return true;
 			break;
 		case ECPGt_numeric:
-			if (((numeric *) ptr)->sign == NUMERIC_NAN)
+			if (((numeric *) ptr)->sign == NUMERIC_NULL)
 				return true;
 			break;
 		case ECPGt_interval:
@@ -483,7 +514,61 @@ ecpg_gettext(const char *msgid)
 #endif
 	}
 
-	return dgettext(PG_TEXTDOMAIN("ecpg"), msgid);
+	return dgettext(PG_TEXTDOMAIN("ecpglib"), msgid);
+}
+#endif   /* ENABLE_NLS */
+
+struct var_list *ivlist = NULL;
+
+void
+ECPGset_var(int number, void *pointer, int lineno)
+{
+	struct var_list *ptr;
+
+	for (ptr = ivlist; ptr != NULL; ptr = ptr->next)
+	{
+		if (ptr->number == number)
+		{
+			/* already known => just change pointer value */
+			ptr->pointer = pointer;
+			return;
+		}
+	}
+
+	/* a new one has to be added */
+	ptr = (struct var_list *) calloc(1L, sizeof(struct var_list));
+	if (!ptr)
+	{
+		struct sqlca_t *sqlca = ECPGget_sqlca();
+
+		if (sqlca == NULL)
+		{
+			ecpg_raise(lineno, ECPG_OUT_OF_MEMORY,
+					   ECPG_SQLSTATE_ECPG_OUT_OF_MEMORY, NULL);
+			return;
+		}
+
+		sqlca->sqlcode = ECPG_OUT_OF_MEMORY;
+		strncpy(sqlca->sqlstate, "YE001", sizeof(sqlca->sqlstate));
+		snprintf(sqlca->sqlerrm.sqlerrmc, sizeof(sqlca->sqlerrm.sqlerrmc), "out of memory on line %d", lineno);
+		sqlca->sqlerrm.sqlerrml = strlen(sqlca->sqlerrm.sqlerrmc);
+		/* free all memory we have allocated for the user */
+		ECPGfree_auto_mem();
+	}
+	else
+	{
+		ptr->number = number;
+		ptr->pointer = pointer;
+		ptr->next = ivlist;
+		ivlist = ptr;
+	}
 }
 
-#endif   /* ENABLE_NLS */
+void *
+ECPGget_var(int number)
+{
+	struct var_list *ptr;
+
+	for (ptr = ivlist; ptr != NULL && ptr->number != number; ptr = ptr->next);
+	return (ptr) ? ptr->pointer : NULL;
+}

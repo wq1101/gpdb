@@ -3,12 +3,12 @@
  * miscinit.c
  *	  miscellaneous initialization support stuff
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/init/miscinit.c,v 1.166.2.2 2010/08/16 17:33:07 tgl Exp $
+ *	  src/backend/utils/init/miscinit.c
  *
  *-------------------------------------------------------------------------
  */
@@ -16,9 +16,11 @@
 
 #include <sys/param.h>
 #include <signal.h>
+#include <time.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/types.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <grp.h>
@@ -29,20 +31,30 @@
 #include <utime.h>
 #endif
 
+#include "access/htup_details.h"
 #include "catalog/pg_authid.h"
 #include "cdb/cdbvars.h"
+#include "libpq/libpq.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "postmaster/autovacuum.h"
+#include "postmaster/fts.h"
+#include "postmaster/postmaster.h"
+#include "postmaster/startup.h"
 #include "replication/walsender.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
+#include "storage/latch.h"
 #include "storage/pg_shmem.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "utils/builtins.h"
+#include "utils/faultinjector.h"
+#include "utils/gdd.h"
 #include "utils/guc.h"
+#include "utils/memutils.h"
 #include "utils/resgroup.h"
+#include "utils/resource_manager.h"
 #include "utils/resscheduler.h"
 #include "utils/syscache.h"
 
@@ -51,78 +63,23 @@
 
 ProcessingMode Mode = InitProcessing;
 
-/* Note: we rely on this to initialize as zeroes */
-static char socketLockFile[MAXPGPATH];
+/* List of lock files to be removed at proc exit */
+static List *lock_files = NIL;
 
+static Latch LocalLatchData;
 
 /* ----------------------------------------------------------------
  *		ignoring system indexes support stuff
  *
  * NOTE: "ignoring system indexes" means we do not use the system indexes
  * for lookups (either in hardwired catalog accesses or in planner-generated
- * plans).	We do, however, still update the indexes when a catalog
+ * plans).  We do, however, still update the indexes when a catalog
  * modification is made.
  * ----------------------------------------------------------------
  */
 
 bool		IgnoreSystemIndexes = false;
 
-/* ----------------------------------------------------------------
- *		system index reindexing support
- *
- * When we are busy reindexing a system index, this code provides support
- * for preventing catalog lookups from using that index.
- * ----------------------------------------------------------------
- */
-
-static Oid	currentlyReindexedHeap = InvalidOid;
-static Oid	currentlyReindexedIndex = InvalidOid;
-
-/*
- * ReindexIsProcessingHeap
- *		True if heap specified by OID is currently being reindexed.
- */
-bool
-ReindexIsProcessingHeap(Oid heapOid)
-{
-	return heapOid == currentlyReindexedHeap;
-}
-
-/*
- * ReindexIsProcessingIndex
- *		True if index specified by OID is currently being reindexed.
- */
-bool
-ReindexIsProcessingIndex(Oid indexOid)
-{
-	return indexOid == currentlyReindexedIndex;
-}
-
-/*
- * SetReindexProcessing
- *		Set flag that specified heap/index are being reindexed.
- */
-void
-SetReindexProcessing(Oid heapOid, Oid indexOid)
-{
-	Assert(OidIsValid(heapOid) && OidIsValid(indexOid));
-	/* Reindexing is not re-entrant. */
-	if (OidIsValid(currentlyReindexedIndex))
-		elog(ERROR, "cannot reindex while reindexing");
-	currentlyReindexedHeap = heapOid;
-	currentlyReindexedIndex = indexOid;
-}
-
-/*
- * ResetReindexProcessing
- *		Unset reindexing status.
- */
-void
-ResetReindexProcessing(void)
-{
-	currentlyReindexedHeap = InvalidOid;
-	currentlyReindexedIndex = InvalidOid;
-}
 
 /* ----------------------------------------------------------------
  *				database path / name support stuff
@@ -132,20 +89,9 @@ ResetReindexProcessing(void)
 void
 SetDatabasePath(const char *path)
 {
-	if (DatabasePath)
-	{
-		free(DatabasePath);
-		DatabasePath = NULL;
-	}
-	/* use strdup since this is done before memory contexts are set up */
-	if (path)
-	{
-		DatabasePath = strdup(path);
-		if(!DatabasePath)
-			ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY),
-					errmsg("Set database path failed: out of memory")));
-		AssertState(DatabasePath);
-	}
+	/* This should happen only once per process */
+	Assert(!DatabasePath);
+	DatabasePath = MemoryContextStrdup(TopMemoryContext, path);
 }
 
 /*
@@ -183,77 +129,6 @@ ChangeToDataDir(void)
 				(errcode_for_file_access(),
 				 errmsg("could not change directory to \"%s\": %m",
 						DataDir)));
-}
-
-/*
- * If the given pathname isn't already absolute, make it so, interpreting
- * it relative to the current working directory.
- *
- * Also canonicalizes the path.  The result is always a malloc'd copy.
- *
- * Note: interpretation of relative-path arguments during postmaster startup
- * should happen before doing ChangeToDataDir(), else the user will probably
- * not like the results.
- */
-char *
-make_absolute_path(const char *path)
-{
-	char	   *new;
-
-	/* Returning null for null input is convenient for some callers */
-	if (path == NULL)
-		return NULL;
-
-	if (!is_absolute_path(path))
-	{
-		char	   *buf;
-		size_t		buflen;
-
-		buflen = MAXPGPATH;
-		for (;;)
-		{
-			buf = malloc(buflen);
-			if (!buf)
-				ereport(FATAL,
-						(errcode(ERRCODE_OUT_OF_MEMORY),
-						 errmsg("out of memory")));
-
-			if (getcwd(buf, buflen))
-				break;
-			else if (errno == ERANGE)
-			{
-				free(buf);
-				buflen *= 2;
-				continue;
-			}
-			else
-			{
-				free(buf);
-				elog(FATAL, "could not get current working directory: %m");
-			}
-		}
-
-		new = malloc(strlen(buf) + strlen(path) + 2);
-		if (!new)
-			ereport(FATAL,
-					(errcode(ERRCODE_OUT_OF_MEMORY),
-					 errmsg("out of memory")));
-		sprintf(new, "%s/%s", buf, path);
-		free(buf);
-	}
-	else
-	{
-		new = strdup(path);
-		if (!new)
-			ereport(FATAL,
-					(errcode(ERRCODE_OUT_OF_MEMORY),
-					 errmsg("out of memory")));
-	}
-
-	/* Make sure punctuation is canonical, too */
-	canonicalize_path(new);
-
-	return new;
 }
 
 
@@ -299,6 +174,113 @@ static int	SecurityRestrictionContext = 0;
 /* We also remember if a SET ROLE is currently active */
 static bool SetRoleIsActive = false;
 
+/*
+ * Initialize the basic environment for a postmaster child
+ *
+ * Should be called as early as possible after the child's startup.
+ */
+void
+InitPostmasterChild(void)
+{
+	IsUnderPostmaster = true;	/* we are a postmaster subprocess now */
+
+	MyProcPid = getpid();		/* reset MyProcPid */
+
+	MyStartTime = time(NULL);	/* set our start time in case we call elog */
+
+	/*
+	 * make sure stderr is in binary mode before anything can possibly be
+	 * written to it, in case it's actually the syslogger pipe, so the pipe
+	 * chunking protocol isn't disturbed. Non-logpipe data gets translated on
+	 * redirection (e.g. via pg_ctl -l) anyway.
+	 */
+#ifdef WIN32
+	_setmode(fileno(stderr), _O_BINARY);
+#endif
+
+	/* We don't want the postmaster's proc_exit() handlers */
+	on_exit_reset();
+
+	/* Initialize process-local latch support */
+	InitializeLatchSupport();
+	MyLatch = &LocalLatchData;
+	InitLatch(MyLatch);
+
+	/*
+	 * If possible, make this process a group leader, so that the postmaster
+	 * can signal any child processes too. Not all processes will have
+	 * children, but for consistency we make all postmaster child processes do
+	 * this.
+	 */
+#ifdef HAVE_SETSID
+	if (setsid() < 0)
+		elog(FATAL, "setsid() failed: %m");
+#endif
+}
+
+/*
+ * Initialize the basic environment for a standalone process.
+ *
+ * argv0 has to be suitable to find the program's executable.
+ */
+void
+InitStandaloneProcess(const char *argv0)
+{
+	Assert(!IsPostmasterEnvironment);
+
+	MyProcPid = getpid();		/* reset MyProcPid */
+
+	MyStartTime = time(NULL);	/* set our start time in case we call elog */
+
+	/* Initialize process-local latch support */
+	InitializeLatchSupport();
+	MyLatch = &LocalLatchData;
+	InitLatch(MyLatch);
+
+	/* Compute paths, no postmaster to inherit from */
+	if (my_exec_path[0] == '\0')
+	{
+		if (find_my_exec(argv0, my_exec_path) < 0)
+			elog(FATAL, "%s: could not locate my own executable path",
+				 argv0);
+	}
+
+	if (pkglib_path[0] == '\0')
+		get_pkglib_path(my_exec_path, pkglib_path);
+}
+
+void
+SwitchToSharedLatch(void)
+{
+	Assert(MyLatch == &LocalLatchData);
+	Assert(MyProc != NULL);
+
+	MyLatch = &MyProc->procLatch;
+
+	if (FeBeWaitSet)
+		ModifyWaitEvent(FeBeWaitSet, 1, WL_LATCH_SET, MyLatch);
+
+	/*
+	 * Set the shared latch as the local one might have been set. This
+	 * shouldn't normally be necessary as code is supposed to check the
+	 * condition before waiting for the latch, but a bit care can't hurt.
+	 */
+	SetLatch(MyLatch);
+}
+
+void
+SwitchBackToLocalLatch(void)
+{
+	Assert(MyLatch != &LocalLatchData);
+	Assert(MyProc != NULL && MyLatch == &MyProc->procLatch);
+
+	MyLatch = &LocalLatchData;
+
+	if (FeBeWaitSet)
+		ModifyWaitEvent(FeBeWaitSet, 1, WL_LATCH_SET, MyLatch);
+
+	SetLatch(MyLatch);
+}
 
 /*
  * GetUserId - get the current effective user ID.
@@ -369,7 +351,7 @@ IsAuthenticatedUserSuperUser()
 }
 
 /*
- * GetAuthenticatedUserId
+ * GetAuthenticatedUserId - get the authenticated user ID
  */
 Oid
 GetAuthenticatedUserId(void)
@@ -378,11 +360,12 @@ GetAuthenticatedUserId(void)
 	return AuthenticatedUserId;
 }
 
+
 /*
  * GetUserIdAndSecContext/SetUserIdAndSecContext - get/set the current user ID
  * and the SecurityRestrictionContext flags.
  *
- * Currently there are two valid bits in SecurityRestrictionContext:
+ * Currently there are three valid bits in SecurityRestrictionContext:
  *
  * SECURITY_LOCAL_USERID_CHANGE indicates that we are inside an operation
  * that is temporarily changing CurrentUserId via these functions.  This is
@@ -399,6 +382,13 @@ GetAuthenticatedUserId(void)
  * these restrictions are fairly draconian, we apply them only in contexts
  * where the called functions are really supposed to be side-effect-free
  * anyway, such as VACUUM/ANALYZE/REINDEX.
+ *
+ * SECURITY_NOFORCE_RLS indicates that we are inside an operation which should
+ * ignore the FORCE ROW LEVEL SECURITY per-table indication.  This is used to
+ * ensure that FORCE RLS does not mistakenly break referential integrity
+ * checks.  Note that this is intentionally only checked when running as the
+ * owner of the table (which should always be the case for referential
+ * integrity checks).
  *
  * Unlike GetUserId, GetUserIdAndSecContext does *not* Assert that the current
  * value of CurrentUserId is valid; nor does SetUserIdAndSecContext require
@@ -442,6 +432,15 @@ InSecurityRestrictedOperation(void)
 	return (SecurityRestrictionContext & SECURITY_RESTRICTED_OPERATION) != 0;
 }
 
+/*
+ * InNoForceRLSOperation - are we ignoring FORCE ROW LEVEL SECURITY ?
+ */
+bool
+InNoForceRLSOperation(void)
+{
+	return (SecurityRestrictionContext & SECURITY_NOFORCE_RLS) != 0;
+}
+
 
 /*
  * These are obsolete versions of Get/SetUserIdAndSecContext that are
@@ -474,14 +473,32 @@ SetUserIdAndContext(Oid userid, bool sec_def_context)
 
 
 /*
+ * Check whether specified role has explicit REPLICATION privilege
+ */
+bool
+has_rolreplication(Oid roleid)
+{
+	bool		result = false;
+	HeapTuple	utup;
+
+	utup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(roleid));
+	if (HeapTupleIsValid(utup))
+	{
+		result = ((Form_pg_authid) GETSTRUCT(utup))->rolreplication;
+		ReleaseSysCache(utup);
+	}
+	return result;
+}
+
+/*
  * Initialize user identity during normal backend startup
  */
 void
-InitializeSessionUserId(const char *rolename)
+InitializeSessionUserId(const char *rolename, Oid roleid)
 {
 	HeapTuple	roleTup;
 	Form_pg_authid rform;
-	Oid			roleid;
+	char	   *rname;
 
 	/*
 	 * Don't do scans if we're bootstrapping, none of the system catalogs
@@ -492,16 +509,26 @@ InitializeSessionUserId(const char *rolename)
 	/* call only once */
 	AssertState(!OidIsValid(AuthenticatedUserId));
 
-	roleTup = SearchSysCache(AUTHNAME,
-							 PointerGetDatum(rolename),
-							 0, 0, 0);
-	if (!HeapTupleIsValid(roleTup))
-		ereport(FATAL,
-				(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
-				 errmsg("role \"%s\" does not exist", rolename), errSendAlert(false)));
+	if (rolename != NULL)
+	{
+		roleTup = SearchSysCache1(AUTHNAME, PointerGetDatum(rolename));
+		if (!HeapTupleIsValid(roleTup))
+			ereport(FATAL,
+					(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+					 errmsg("role \"%s\" does not exist", rolename)));
+	}
+	else
+	{
+		roleTup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(roleid));
+		if (!HeapTupleIsValid(roleTup))
+			ereport(FATAL,
+					(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+					 errmsg("role with OID %u does not exist", roleid)));
+	}
 
 	rform = (Form_pg_authid) GETSTRUCT(roleTup);
 	roleid = HeapTupleGetOid(roleTup);
+	rname = NameStr(rform->rolname);
 
 	AuthenticatedUserId = roleid;
 	AuthenticatedUserIsSuperuser = rform->rolsuper;
@@ -517,10 +544,8 @@ InitializeSessionUserId(const char *rolename)
 	 * These next checks are not enforced when in standalone mode, so that
 	 * there is a way to recover from sillinesses like "UPDATE pg_authid SET
 	 * rolcanlogin = false;".
-	 *
-	 * We do not enforce them for the autovacuum process either.
 	 */
-	if (IsUnderPostmaster && !IsAutoVacuumWorkerProcess())
+	if (IsUnderPostmaster)
 	{
 		/*
 		 * Is role allowed to login at all?
@@ -529,13 +554,13 @@ InitializeSessionUserId(const char *rolename)
 			ereport(FATAL,
 					(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 					 errmsg("role \"%s\" is not permitted to log in",
-							rolename)));
+							rname)));
 
 		/*
 		 * Check connection limit for this role.
 		 *
 		 * There is a race condition here --- we create our PGPROC before
-		 * checking for other PGPROCs.	If two backends did this at about the
+		 * checking for other PGPROCs.  If two backends did this at about the
 		 * same time, they might both think they were over the limit, while
 		 * ideally one should succeed and one fail.  Getting that to work
 		 * exactly seems more trouble than it is worth, however; instead we
@@ -551,7 +576,7 @@ InitializeSessionUserId(const char *rolename)
 			ereport(FATAL,
 					(errcode(ERRCODE_TOO_MANY_CONNECTIONS),
 					 errmsg("too many connections for role \"%s\"",
-							rolename)));
+							rname)));
 	}
 
 	/*
@@ -565,7 +590,7 @@ InitializeSessionUserId(const char *rolename)
 	}
 
 	/* Record username and superuser status as GUC settings too */
-	SetConfigOption("session_authorization", rolename,
+	SetConfigOption("session_authorization", rname,
 					PGC_BACKEND, PGC_S_OVERRIDE);
 	SetConfigOption("is_superuser",
 					AuthenticatedUserIsSuperuser ? "on" : "off",
@@ -581,8 +606,14 @@ InitializeSessionUserId(const char *rolename)
 void
 InitializeSessionUserIdStandalone(void)
 {
-	/* This function should only be called in a single-user backend. */
-	AssertState(!IsUnderPostmaster || IsAutoVacuumWorkerProcess() || am_startup);
+	/*
+	 * This function should only be called in single-user mode, in autovacuum
+	 * workers, and in background workers.
+	 */
+	AssertState(!IsUnderPostmaster || IsAutoVacuumWorkerProcess() || IsBackgroundWorker
+				|| am_startup
+				|| (IsFaultHandler && am_mirror)
+				|| (am_ftshandler && am_mirror));
 
 	/* call only once */
 	AssertState(!OidIsValid(AuthenticatedUserId));
@@ -651,7 +682,7 @@ GetCurrentRoleId(void)
  * Change Role ID while running (SET ROLE)
  *
  * If roleid is InvalidOid, we are doing SET ROLE NONE: revert to the
- * session user authorization.	In this case the is_superuser argument
+ * session user authorization.  In this case the is_superuser argument
  * is ignored.
  *
  * When roleid is not InvalidOid, the caller must have checked whether
@@ -697,25 +728,29 @@ SetCurrentRoleId(Oid roleid, bool is_superuser)
 
 
 /*
- * Get user name from user oid
+ * Get user name from user oid, returns NULL for nonexistent roleid if noerr
+ * is true.
  */
 char *
-GetUserNameFromId(Oid roleid)
+GetUserNameFromId(Oid roleid, bool noerr)
 {
 	HeapTuple	tuple;
 	char	   *result;
 
-	tuple = SearchSysCache(AUTHOID,
-						   ObjectIdGetDatum(roleid),
-						   0, 0, 0);
+	tuple = SearchSysCache1(AUTHOID, ObjectIdGetDatum(roleid));
 	if (!HeapTupleIsValid(tuple))
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("invalid role OID: %u", roleid)));
-
-	result = pstrdup(NameStr(((Form_pg_authid) GETSTRUCT(tuple))->rolname));
-
-	ReleaseSysCache(tuple);
+	{
+		if (!noerr)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("invalid role OID: %u", roleid)));
+		result = NULL;
+	}
+	else
+	{
+		result = pstrdup(NameStr(((Form_pg_authid) GETSTRUCT(tuple))->rolname));
+		ReleaseSysCache(tuple);
+	}
 	return result;
 }
 
@@ -724,19 +759,11 @@ GetUserNameFromId(Oid roleid)
  *				Interlock-file support
  *
  * These routines are used to create both a data-directory lockfile
- * ($DATADIR/postmaster.pid) and a Unix-socket-file lockfile ($SOCKFILE.lock).
- * Both kinds of files contain the same info:
- *
- *		Owning process' PID
- *		Data directory path
- *
- * By convention, the owning process' PID is negated if it is a standalone
- * backend rather than a postmaster.  This is just for informational purposes.
- * The path is also just for informational purposes (so that a socket lockfile
- * can be more easily traced to the associated postmaster).
- *
- * A data-directory lockfile can optionally contain a third line, containing
- * the key and ID for the shared memory block used by this postmaster.
+ * ($DATADIR/postmaster.pid) and Unix-socket-file lockfiles ($SOCKFILE.lock).
+ * Both kinds of files contain the same info initially, although we can add
+ * more information to a data-directory lockfile after it's created, using
+ * AddToDataDirLockFile().  See miscadmin.h for documentation of the contents
+ * of these lockfiles.
  *
  * On successful lockfile creation, a proc_exit callback to remove the
  * lockfile is automatically created.
@@ -744,44 +771,98 @@ GetUserNameFromId(Oid roleid)
  */
 
 /*
- * proc_exit callback to remove a lockfile.
+ * proc_exit callback to remove lockfiles.
  */
 static void
-UnlinkLockFile(int status, Datum filename)
+UnlinkLockFiles(int status, Datum arg)
 {
-	char	   *fname = (char *) DatumGetPointer(filename);
+	ListCell   *l;
 
-	if (fname != NULL)
+	foreach(l, lock_files)
 	{
-		if (unlink(fname) != 0)
-		{
-			/* Should we complain if the unlink fails? */
-		}
-		free(fname);
+		char	   *curfile = (char *) lfirst(l);
+
+		unlink(curfile);
+		/* Should we complain if the unlink fails? */
 	}
+	/* Since we're about to exit, no need to reclaim storage */
+	lock_files = NIL;
+
+	/*
+	 * Lock file removal should always be the last externally visible action
+	 * of a postmaster or standalone backend, while we won't come here at all
+	 * when exiting postmaster child processes.  Therefore, this is a good
+	 * place to log completion of shutdown.  We could alternatively teach
+	 * proc_exit() to do it, but that seems uglier.  In a standalone backend,
+	 * use NOTICE elevel to be less chatty.
+	 */
+	ereport(IsPostmasterEnvironment ? LOG : NOTICE,
+			(errmsg("database system is shut down")));
 }
 
 /*
  * Create a lockfile.
  *
- * filename is the name of the lockfile to create.
+ * filename is the path name of the lockfile to create.
  * amPostmaster is used to determine how to encode the output PID.
+ * socketDir is the Unix socket directory path to include (possibly empty).
  * isDDLock and refName are used to determine what error message to produce.
  */
 static void
 CreateLockFile(const char *filename, bool amPostmaster,
+			   const char *socketDir,
 			   bool isDDLock, const char *refName)
 {
 	int			fd;
-	char		buffer[MAXPGPATH + 100];
+	char		buffer[MAXPGPATH * 2 + 256];
 	int			ntries;
 	int			len;
 	int			encoded_pid;
 	pid_t		other_pid;
-	pid_t		my_pid = getpid();
+	pid_t		my_pid,
+				my_p_pid,
+				my_gp_pid;
+	const char *envvar;
 
 	/*
-	 * We need a loop here because of race conditions.	But don't loop forever
+	 * If the PID in the lockfile is our own PID or our parent's or
+	 * grandparent's PID, then the file must be stale (probably left over from
+	 * a previous system boot cycle).  We need to check this because of the
+	 * likelihood that a reboot will assign exactly the same PID as we had in
+	 * the previous reboot, or one that's only one or two counts larger and
+	 * hence the lockfile's PID now refers to an ancestor shell process.  We
+	 * allow pg_ctl to pass down its parent shell PID (our grandparent PID)
+	 * via the environment variable PG_GRANDPARENT_PID; this is so that
+	 * launching the postmaster via pg_ctl can be just as reliable as
+	 * launching it directly.  There is no provision for detecting
+	 * further-removed ancestor processes, but if the init script is written
+	 * carefully then all but the immediate parent shell will be root-owned
+	 * processes and so the kill test will fail with EPERM.  Note that we
+	 * cannot get a false negative this way, because an existing postmaster
+	 * would surely never launch a competing postmaster or pg_ctl process
+	 * directly.
+	 */
+	my_pid = getpid();
+
+#ifndef WIN32
+	my_p_pid = getppid();
+#else
+
+	/*
+	 * Windows hasn't got getppid(), but doesn't need it since it's not using
+	 * real kill() either...
+	 */
+	my_p_pid = 0;
+#endif
+
+	envvar = getenv("PG_GRANDPARENT_PID");
+	if (envvar)
+		my_gp_pid = atoi(envvar);
+	else
+		my_gp_pid = 0;
+
+	/*
+	 * We need a loop here because of race conditions.  But don't loop forever
 	 * (for example, a non-writable $PGDATA directory might cause a failure
 	 * that won't go away).  100 tries seems like plenty.
 	 */
@@ -790,7 +871,7 @@ CreateLockFile(const char *filename, bool amPostmaster,
 		/*
 		 * Try to create the lock file --- O_EXCL makes this atomic.
 		 *
-		 * Think not to make the file protection weaker than 0600.	See
+		 * Think not to make the file protection weaker than 0600.  See
 		 * comments below.
 		 */
 		fd = open(filename, O_RDWR | O_CREAT | O_EXCL, 0600);
@@ -827,6 +908,14 @@ CreateLockFile(const char *filename, bool amPostmaster,
 							filename)));
 		close(fd);
 
+		if (len == 0)
+		{
+			ereport(FATAL,
+					(errcode(ERRCODE_LOCK_FILE_EXISTS),
+					 errmsg("lock file \"%s\" is empty", filename),
+					 errhint("Either another server is starting, or the lock file is the remnant of a previous server startup crash.")));
+		}
+
 		buffer[len] = '\0';
 		encoded_pid = atoi(buffer);
 
@@ -840,23 +929,17 @@ CreateLockFile(const char *filename, bool amPostmaster,
 		/*
 		 * Check to see if the other process still exists
 		 *
-		 * If the PID in the lockfile is our own PID or our parent's PID, then
-		 * the file must be stale (probably left over from a previous system
-		 * boot cycle).  We need this test because of the likelihood that a
-		 * reboot will assign exactly the same PID as we had in the previous
-		 * reboot.	Also, if there is just one more process launch in this
-		 * reboot than in the previous one, the lockfile might mention our
-		 * parent's PID.  We can reject that since we'd never be launched
-		 * directly by a competing postmaster.	We can't detect grandparent
-		 * processes unfortunately, but if the init script is written
-		 * carefully then all but the immediate parent shell will be
-		 * root-owned processes and so the kill test will fail with EPERM.
+		 * Per discussion above, my_pid, my_p_pid, and my_gp_pid can be
+		 * ignored as false matches.
+		 *
+		 * Normally kill() will fail with ESRCH if the given PID doesn't
+		 * exist.
 		 *
 		 * We can treat the EPERM-error case as okay because that error
 		 * implies that the existing process has a different userid than we
 		 * do, which means it cannot be a competing postmaster.  A postmaster
 		 * cannot successfully attach to a data directory owned by a userid
-		 * other than its own.	(This is now checked directly in
+		 * other than its own.  (This is now checked directly in
 		 * checkDataDir(), but has been true for a long time because of the
 		 * restriction that the data directory isn't group- or
 		 * world-accessible.)  Also, since we create the lockfiles mode 600,
@@ -867,18 +950,9 @@ CreateLockFile(const char *filename, bool amPostmaster,
 		 * Unix socket file belonging to an instance of Postgres being run by
 		 * someone else, at least on machines where /tmp hasn't got a
 		 * stickybit.)
-		 *
-		 * Windows hasn't got getppid(), but doesn't need it since it's not
-		 * using real kill() either...
-		 *
-		 * Normally kill() will fail with ESRCH if the given PID doesn't
-		 * exist.
 		 */
-		if (other_pid != my_pid
-#ifndef WIN32
-			&& other_pid != getppid()
-#endif
-			)
+		if (other_pid != my_pid && other_pid != my_p_pid &&
+			other_pid != my_gp_pid)
 		{
 			if (kill(other_pid, 0) == 0 ||
 				(errno != ESRCH && errno != EPERM))
@@ -947,47 +1021,50 @@ CreateLockFile(const char *filename, bool amPostmaster,
 		}
 
 		/*
-		 * No, the creating process did not exist.	However, it could be that
+		 * No, the creating process did not exist.  However, it could be that
 		 * the postmaster crashed (or more likely was kill -9'd by a clueless
-		 * admin) but has left orphan backends behind.	Check for this by
+		 * admin) but has left orphan backends behind.  Check for this by
 		 * looking to see if there is an associated shmem segment that is
 		 * still in use.
 		 *
-		 * Note: because postmaster.pid is written in two steps, we might not
-		 * find the shmem ID values in it; we can't treat that as an error.
+		 * Note: because postmaster.pid is written in multiple steps, we might
+		 * not find the shmem ID values in it; we can't treat that as an
+		 * error.
 		 */
 		if (isDDLock)
 		{
-			char	   *ptr;
+			char	   *ptr = buffer;
 			unsigned long id1,
 						id2;
+			int			lineno;
 
-			ptr = strchr(buffer, '\n');
-			if (ptr != NULL &&
-				(ptr = strchr(ptr + 1, '\n')) != NULL)
+			for (lineno = 1; lineno < LOCK_FILE_LINE_SHMEM_KEY; lineno++)
 			{
+				if ((ptr = strchr(ptr, '\n')) == NULL)
+					break;
 				ptr++;
-				if (sscanf(ptr, "%lu %lu", &id1, &id2) == 2)
-				{
-					if (PGSharedMemoryIsInUse(id1, id2))
-						ereport(FATAL,
-								(errcode(ERRCODE_LOCK_FILE_EXISTS),
-								 errmsg("pre-existing shared memory block "
-										"(key %lu, ID %lu) is still in use",
-										id1, id2),
-								 errhint("If you're sure there are no old "
-									"server processes still running, remove "
-										 "the shared memory block with "
-									  "the command \"ipcclean\", \"ipcrm\", "
-										 "or just delete the file \"%s\".",
-										 filename)));
-				}
+			}
+
+			if (ptr != NULL &&
+				sscanf(ptr, "%lu %lu", &id1, &id2) == 2)
+			{
+				if (PGSharedMemoryIsInUse(id1, id2))
+					ereport(FATAL,
+							(errcode(ERRCODE_LOCK_FILE_EXISTS),
+							 errmsg("pre-existing shared memory block "
+									"(key %lu, ID %lu) is still in use",
+									id1, id2),
+							 errhint("If you're sure there are no old "
+									 "server processes still running, remove "
+									 "the shared memory block "
+									 "or just delete the file \"%s\".",
+									 filename)));
 			}
 		}
 
 		/*
 		 * Looks like nobody's home.  Unlink the file and try again to create
-		 * it.	Need a loop because of possible race condition against other
+		 * it.  Need a loop because of possible race condition against other
 		 * would-be creators.
 		 */
 		if (unlink(filename) < 0)
@@ -1001,11 +1078,25 @@ CreateLockFile(const char *filename, bool amPostmaster,
 	}
 
 	/*
-	 * Successfully created the file, now fill it.
+	 * Successfully created the file, now fill it.  See comment in miscadmin.h
+	 * about the contents.  Note that we write the same first five lines into
+	 * both datadir and socket lockfiles; although more stuff may get added to
+	 * the datadir lockfile later.
 	 */
-	snprintf(buffer, sizeof(buffer), "%d\n%s\n",
+	snprintf(buffer, sizeof(buffer), "%d\n%s\n%ld\n%d\n%s\n",
 			 amPostmaster ? (int) my_pid : -((int) my_pid),
-			 DataDir);
+			 DataDir,
+			 (long) MyStartTime,
+			 PostPortNumber,
+			 socketDir);
+
+	/*
+	 * In a standalone backend, the next line (LOCK_FILE_LINE_LISTEN_ADDR)
+	 * will never receive data, so fill it in as empty now.
+	 */
+	if (isDDLock && !amPostmaster)
+		strlcat(buffer, "\n", sizeof(buffer));
+
 	errno = 0;
 	if (write(fd, buffer, strlen(buffer)) != strlen(buffer))
 	{
@@ -1042,15 +1133,18 @@ CreateLockFile(const char *filename, bool amPostmaster,
 	}
 
 	/*
-	 * Arrange for automatic removal of lockfile at proc_exit.
+	 * Arrange to unlink the lock file(s) at proc_exit.  If this is the first
+	 * one, set up the on_proc_exit function to do it; then add this lock file
+	 * to the list of files to unlink.
 	 */
-	 {
-		 char *tmpptr = strdup(filename);
-		 if(!tmpptr)
-			 ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY),
-			 		errmsg("Create lock file failed: out of memory")));
-		 on_proc_exit(UnlinkLockFile, CStringGetDatum(tmpptr)); 
-	 }
+	if (lock_files == NIL)
+		on_proc_exit(UnlinkLockFiles, 0);
+
+	/*
+	 * Use lcons so that the lock files are unlinked in reverse order of
+	 * creation; this is critical!
+	 */
+	lock_files = lcons(pstrdup(filename), lock_files);
 }
 
 /*
@@ -1059,41 +1153,50 @@ CreateLockFile(const char *filename, bool amPostmaster,
  * When this is called, we must have already switched the working
  * directory to DataDir, so we can just use a relative path.  This
  * helps ensure that we are locking the directory we should be.
+ *
+ * Note that the socket directory path line is initially written as empty.
+ * postmaster.c will rewrite it upon creating the first Unix socket.
  */
 void
 CreateDataDirLockFile(bool amPostmaster)
 {
-	CreateLockFile(DIRECTORY_LOCK_FILE, amPostmaster, true, DataDir);
+	CreateLockFile(DIRECTORY_LOCK_FILE, amPostmaster, "", true, DataDir);
 }
 
 /*
  * Create a lockfile for the specified Unix socket file.
  */
 void
-CreateSocketLockFile(const char *socketfile, bool amPostmaster)
+CreateSocketLockFile(const char *socketfile, bool amPostmaster,
+					 const char *socketDir)
 {
 	char		lockfile[MAXPGPATH];
 
 	snprintf(lockfile, sizeof(lockfile), "%s.lock", socketfile);
-	CreateLockFile(lockfile, amPostmaster, false, socketfile);
-	/* Save name of lockfile for TouchSocketLockFile */
-	strcpy(socketLockFile, lockfile);
+	CreateLockFile(lockfile, amPostmaster, socketDir, false, socketfile);
 }
 
 /*
- * TouchSocketLockFile -- mark socket lock file as recently accessed
+ * TouchSocketLockFiles -- mark socket lock files as recently accessed
  *
- * This routine should be called every so often to ensure that the lock file
- * has a recent mod or access date.  That saves it
+ * This routine should be called every so often to ensure that the socket
+ * lock files have a recent mod or access date.  That saves them
  * from being removed by overenthusiastic /tmp-directory-cleaner daemons.
  * (Another reason we should never have put the socket file in /tmp...)
  */
 void
-TouchSocketLockFile(void)
+TouchSocketLockFiles(void)
 {
-	/* Do nothing if we did not create a socket... */
-	if (socketLockFile[0] != '\0')
+	ListCell   *l;
+
+	foreach(l, lock_files)
 	{
+		char	   *socketLockFile = (char *) lfirst(l);
+
+		/* No need to touch the data directory lock file, we trust */
+		if (strcmp(socketLockFile, DIRECTORY_LOCK_FILE) == 0)
+			continue;
+
 		/*
 		 * utime() is POSIX standard, utimes() is a common alternative; if we
 		 * have neither, fall back to actually reading the file (which only
@@ -1120,23 +1223,26 @@ TouchSocketLockFile(void)
 	}
 }
 
+
 /*
- * Append information about a shared memory segment to the data directory
- * lock file.
+ * Add (or replace) a line in the data directory lock file.
+ * The given string should not include a trailing newline.
  *
- * This may be called multiple times in the life of a postmaster, if we
- * delete and recreate shmem due to backend crash.	Therefore, be prepared
- * to overwrite existing information.  (As of 7.1, a postmaster only creates
- * one shm seg at a time; but for the purposes here, if we did have more than
- * one then any one of them would do anyway.)
+ * Note: because we don't truncate the file, if we were to rewrite a line
+ * with less data than it had before, there would be garbage after the last
+ * line.  We don't ever actually do that, so not worth adding another kernel
+ * call to cover the possibility.
  */
 void
-RecordSharedMemoryInLockFile(unsigned long id1, unsigned long id2)
+AddToDataDirLockFile(int target_line, const char *str)
 {
 	int			fd;
 	int			len;
-	char	   *ptr;
-	char		buffer[BLCKSZ];
+	int			lineno;
+	char	   *srcptr;
+	char	   *destptr;
+	char		srcbuffer[BLCKSZ];
+	char		destbuffer[BLCKSZ];
 
 	fd = open(DIRECTORY_LOCK_FILE, O_RDWR | PG_BINARY, 0);
 	if (fd < 0)
@@ -1147,7 +1253,7 @@ RecordSharedMemoryInLockFile(unsigned long id1, unsigned long id2)
 						DIRECTORY_LOCK_FILE)));
 		return;
 	}
-	len = read(fd, buffer, sizeof(buffer) - 100);
+	len = read(fd, srcbuffer, sizeof(srcbuffer) - 1);
 	if (len < 0)
 	{
 		ereport(LOG,
@@ -1157,35 +1263,51 @@ RecordSharedMemoryInLockFile(unsigned long id1, unsigned long id2)
 		close(fd);
 		return;
 	}
-	buffer[len] = '\0';
+	srcbuffer[len] = '\0';
 
 	/*
-	 * Skip over first two lines (PID and path).
+	 * Advance over lines we are not supposed to rewrite, then copy them to
+	 * destbuffer.
 	 */
-	ptr = strchr(buffer, '\n');
-	if (ptr == NULL ||
-		(ptr = strchr(ptr + 1, '\n')) == NULL)
+	srcptr = srcbuffer;
+	for (lineno = 1; lineno < target_line; lineno++)
 	{
-		elog(LOG, "bogus data in \"%s\"", DIRECTORY_LOCK_FILE);
-		close(fd);
-		return;
+		if ((srcptr = strchr(srcptr, '\n')) == NULL)
+		{
+			elog(LOG, "incomplete data in \"%s\": found only %d newlines while trying to add line %d",
+				 DIRECTORY_LOCK_FILE, lineno - 1, target_line);
+			close(fd);
+			return;
+		}
+		srcptr++;
 	}
-	ptr++;
+	memcpy(destbuffer, srcbuffer, srcptr - srcbuffer);
+	destptr = destbuffer + (srcptr - srcbuffer);
 
 	/*
-	 * Append key information.	Format to try to keep it the same length
-	 * always (trailing junk won't hurt, but might confuse humans).
+	 * Write or rewrite the target line.
 	 */
-	sprintf(ptr, "%9lu %9lu\n", id1, id2);
+	snprintf(destptr, destbuffer + sizeof(destbuffer) - destptr, "%s\n", str);
+	destptr += strlen(destptr);
+
+	/*
+	 * If there are more lines in the old file, append them to destbuffer.
+	 */
+	if ((srcptr = strchr(srcptr, '\n')) != NULL)
+	{
+		srcptr++;
+		snprintf(destptr, destbuffer + sizeof(destbuffer) - destptr, "%s",
+				 srcptr);
+	}
 
 	/*
 	 * And rewrite the data.  Since we write in a single kernel call, this
 	 * update should appear atomic to onlookers.
 	 */
-	len = strlen(buffer);
+	len = strlen(destbuffer);
 	errno = 0;
 	if (lseek(fd, (off_t) 0, SEEK_SET) != 0 ||
-		(int) write(fd, buffer, len) != len)
+		(int) write(fd, destbuffer, len) != len)
 	{
 		/* if write didn't set errno, assume problem is no disk space */
 		if (errno == 0)
@@ -1211,6 +1333,76 @@ RecordSharedMemoryInLockFile(unsigned long id1, unsigned long id2)
 				 errmsg("could not write to file \"%s\": %m",
 						DIRECTORY_LOCK_FILE)));
 	}
+}
+
+
+/*
+ * Recheck that the data directory lock file still exists with expected
+ * content.  Return TRUE if the lock file appears OK, FALSE if it isn't.
+ *
+ * We call this periodically in the postmaster.  The idea is that if the
+ * lock file has been removed or replaced by another postmaster, we should
+ * do a panic database shutdown.  Therefore, we should return TRUE if there
+ * is any doubt: we do not want to cause a panic shutdown unnecessarily.
+ * Transient failures like EINTR or ENFILE should not cause us to fail.
+ * (If there really is something wrong, we'll detect it on a future recheck.)
+ */
+bool
+RecheckDataDirLockFile(void)
+{
+	int			fd;
+	int			len;
+	long		file_pid;
+	char		buffer[BLCKSZ];
+
+	fd = open(DIRECTORY_LOCK_FILE, O_RDWR | PG_BINARY, 0);
+	if (fd < 0)
+	{
+		/*
+		 * There are many foreseeable false-positive error conditions.  For
+		 * safety, fail only on enumerated clearly-something-is-wrong
+		 * conditions.
+		 */
+		switch (errno)
+		{
+			case ENOENT:
+			case ENOTDIR:
+				/* disaster */
+				ereport(LOG,
+						(errcode_for_file_access(),
+						 errmsg("could not open file \"%s\": %m",
+								DIRECTORY_LOCK_FILE)));
+				return false;
+			default:
+				/* non-fatal, at least for now */
+				ereport(LOG,
+						(errcode_for_file_access(),
+				  errmsg("could not open file \"%s\": %m; continuing anyway",
+						 DIRECTORY_LOCK_FILE)));
+				return true;
+		}
+	}
+	len = read(fd, buffer, sizeof(buffer) - 1);
+	if (len < 0)
+	{
+		ereport(LOG,
+				(errcode_for_file_access(),
+				 errmsg("could not read from file \"%s\": %m",
+						DIRECTORY_LOCK_FILE)));
+		close(fd);
+		return true;			/* treat read failure as nonfatal */
+	}
+	buffer[len] = '\0';
+	close(fd);
+	file_pid = atol(buffer);
+	if (file_pid == getpid())
+		return true;			/* all is well */
+
+	/* Trouble: someone's overwritten the lock file */
+	ereport(LOG,
+			(errmsg("lock file \"%s\" contains wrong PID: %ld instead of %ld",
+					DIRECTORY_LOCK_FILE, file_pid, (long) getpid())));
+	return false;
 }
 
 
@@ -1289,6 +1481,7 @@ ValidatePgVersion(const char *path)
  * GUC variables: lists of library names to be preloaded at postmaster
  * start and at backend start
  */
+char	   *session_preload_libraries_string = NULL;
 char	   *shared_preload_libraries_string = NULL;
 char	   *local_preload_libraries_string = NULL;
 
@@ -1306,7 +1499,6 @@ load_libraries(const char *libraries, const char *gucname, bool restricted)
 {
 	char	   *rawstring;
 	List	   *elemlist;
-	int			elevel;
 	ListCell   *l;
 
 	if (libraries == NULL || libraries[0] == '\0')
@@ -1328,18 +1520,6 @@ load_libraries(const char *libraries, const char *gucname, bool restricted)
 		return;
 	}
 
-	/*
-	 * Choose notice level: avoid repeat messages when re-loading a library
-	 * that was preloaded into the postmaster.	(Only possible in EXEC_BACKEND
-	 * configurations)
-	 */
-#ifdef EXEC_BACKEND
-	if (IsUnderPostmaster && process_shared_preload_libraries_in_progress)
-		elevel = DEBUG2;
-	else
-#endif
-		elevel = LOG;
-
 	foreach(l, elemlist)
 	{
 		char	   *tok = (char *) lfirst(l);
@@ -1352,14 +1532,12 @@ load_libraries(const char *libraries, const char *gucname, bool restricted)
 		{
 			char	   *expanded;
 
-			expanded = palloc(strlen("$libdir/plugins/") + strlen(filename) + 1);
-			strcpy(expanded, "$libdir/plugins/");
-			strcat(expanded, filename);
+			expanded = psprintf("$libdir/plugins/%s", filename);
 			pfree(filename);
 			filename = expanded;
 		}
 		load_file(filename, restricted);
-		ereport(elevel,
+		ereport(DEBUG1,
 				(errmsg("loaded library \"%s\"", filename)));
 		pfree(filename);
 	}
@@ -1375,9 +1553,11 @@ void
 process_shared_preload_libraries(void)
 {
 	process_shared_preload_libraries_in_progress = true;
+
 	load_libraries(shared_preload_libraries_string,
 				   "shared_preload_libraries",
 				   false);
+
 	process_shared_preload_libraries_in_progress = false;
 }
 
@@ -1385,8 +1565,11 @@ process_shared_preload_libraries(void)
  * process any libraries that should be preloaded at backend start
  */
 void
-process_local_preload_libraries(void)
+process_session_preload_libraries(void)
 {
+	load_libraries(session_preload_libraries_string,
+				   "session_preload_libraries",
+				   false);
 	load_libraries(local_preload_libraries_string,
 				   "local_preload_libraries",
 				   true);

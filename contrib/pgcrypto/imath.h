@@ -1,7 +1,7 @@
 /*
   Name:		imath.h
   Purpose:	Arbitrary precision integer arithmetic routines.
-  Author:	M. J. Fromberger <http://www.dartmouth.edu/~sting/>
+  Author:	M. J. Fromberger <http://spinning-yarns.org/michael/sw/>
   Info:		Id: imath.h 21 2006-04-02 18:58:36Z sting
 
   Copyright (C) 2002 Michael J. Fromberger, All Rights Reserved.
@@ -26,7 +26,7 @@
   CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
   SOFTWARE.
  */
-/* $PostgreSQL: pgsql/contrib/pgcrypto/imath.h,v 1.7 2009/06/11 14:48:52 momjian Exp $ */
+/* contrib/pgcrypto/imath.h */
 
 #ifndef IMATH_H_
 #define IMATH_H_
@@ -117,14 +117,11 @@ mp_result	mp_int_mul_value(mp_int a, int value, mp_int c);
 mp_result	mp_int_mul_pow2(mp_int a, int p2, mp_int c);
 mp_result	mp_int_sqr(mp_int a, mp_int c);		/* c = a * a */
 
-mp_result
-mp_int_div(mp_int a, mp_int b,	/* q = a / b */
+mp_result mp_int_div(mp_int a, mp_int b,	/* q = a / b */
 		   mp_int q, mp_int r); /* r = a % b */
-mp_result
-mp_int_div_value(mp_int a, int value,	/* q = a / value */
+mp_result mp_int_div_value(mp_int a, int value,	/* q = a / value */
 				 mp_int q, int *r);		/* r = a % value */
-mp_result
-mp_int_div_pow2(mp_int a, int p2,		/* q = a / 2^p2  */
+mp_result mp_int_div_pow2(mp_int a, int p2,		/* q = a / 2^p2  */
 				mp_int q, mp_int r);	/* r = q % 2^p2  */
 mp_result	mp_int_mod(mp_int a, mp_int m, mp_int c);	/* c = a % m */
 
@@ -143,17 +140,13 @@ int			mp_int_divisible_value(mp_int a, int v);
 /* Returns k >= 0 such that z = 2^k, if one exists; otherwise < 0 */
 int			mp_int_is_pow2(mp_int z);
 
-mp_result
-mp_int_exptmod(mp_int a, mp_int b, mp_int m,
+mp_result mp_int_exptmod(mp_int a, mp_int b, mp_int m,
 			   mp_int c);		/* c = a^b (mod m) */
-mp_result
-mp_int_exptmod_evalue(mp_int a, int value,
+mp_result mp_int_exptmod_evalue(mp_int a, int value,
 					  mp_int m, mp_int c);		/* c = a^v (mod m) */
-mp_result
-mp_int_exptmod_bvalue(int value, mp_int b,
+mp_result mp_int_exptmod_bvalue(int value, mp_int b,
 					  mp_int m, mp_int c);		/* c = v^b (mod m) */
-mp_result
-mp_int_exptmod_known(mp_int a, mp_int b,
+mp_result mp_int_exptmod_known(mp_int a, mp_int b,
 					 mp_int m, mp_int mu,
 					 mp_int c); /* c = a^b (mod m) */
 mp_result	mp_int_redux_const(mp_int m, mp_int c);
@@ -162,8 +155,7 @@ mp_result	mp_int_invmod(mp_int a, mp_int m, mp_int c);		/* c = 1/a (mod m) */
 
 mp_result	mp_int_gcd(mp_int a, mp_int b, mp_int c);	/* c = gcd(a, b)   */
 
-mp_result
-mp_int_egcd(mp_int a, mp_int b, mp_int c,		/* c = gcd(a, b)   */
+mp_result mp_int_egcd(mp_int a, mp_int b, mp_int c,		/* c = gcd(a, b)   */
 			mp_int x, mp_int y);	/* c = ax + by	   */
 
 mp_result	mp_int_sqrt(mp_int a, mp_int c);	/* c = floor(sqrt(q)) */

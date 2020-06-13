@@ -3,11 +3,11 @@
  * tsvector.c
  *	  I/O functions for tsvector
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/adt/tsvector.c,v 1.16 2009/05/21 12:54:27 meskes Exp $
+ *	  src/backend/utils/adt/tsvector.c
  *
  *-------------------------------------------------------------------------
  */
@@ -15,7 +15,6 @@
 #include "postgres.h"
 
 #include "libpq/pqformat.h"
-#include "tsearch/ts_type.h"
 #include "tsearch/ts_locale.h"
 #include "tsearch/ts_utils.h"
 #include "utils/memutils.h"
@@ -29,8 +28,8 @@ typedef struct
 
 
 /* Compare two WordEntryPos values for qsort */
-static int
-comparePos(const void *a, const void *b)
+int
+compareWordEntryPos(const void *a, const void *b)
 {
 	int			apos = WEP_GETPOS(*(const WordEntryPos *) a);
 	int			bpos = WEP_GETPOS(*(const WordEntryPos *) b);
@@ -55,7 +54,7 @@ uniquePos(WordEntryPos *a, int l)
 	if (l <= 1)
 		return l;
 
-	qsort((void *) a, l, sizeof(WordEntryPos), comparePos);
+	qsort((void *) a, l, sizeof(WordEntryPos), compareWordEntryPos);
 
 	res = a;
 	ptr = a + 1;
@@ -85,14 +84,9 @@ compareentry(const void *va, const void *vb, void *arg)
 	const WordEntryIN *b = (const WordEntryIN *) vb;
 	char	   *BufferStr = (char *) arg;
 
-	if (a->entry.len == b->entry.len)
-	{
-		return strncmp(&BufferStr[a->entry.pos],
-					   &BufferStr[b->entry.pos],
-					   a->entry.len);
-	}
-
-	return (a->entry.len > b->entry.len) ? 1 : -1;
+	return tsCompareString(&BufferStr[a->entry.pos], a->entry.len,
+						   &BufferStr[b->entry.pos], b->entry.len,
+						   false);
 }
 
 /*
@@ -130,7 +124,8 @@ uniqueentry(WordEntryIN *a, int l, char *buf, int *outbuflen)
 				buflen += res->poslen * sizeof(WordEntryPos) + sizeof(uint16);
 			}
 			res++;
-			memcpy(res, ptr, sizeof(WordEntryIN));
+			if (res != ptr)
+				memcpy(res, ptr, sizeof(WordEntryIN));
 		}
 		else if (ptr->entry.haspos)
 		{
@@ -204,8 +199,6 @@ tsvectorin(PG_FUNCTION_ARGS)
 	char	   *cur;
 	int			buflen = 256;	/* allocated size of tmpbuf */
 
-	pg_verifymbstr(buf, strlen(buf), false);
-
 	state = init_tsvector_parser(buf, false, false);
 
 	arrlen = 64;
@@ -224,7 +217,8 @@ tsvectorin(PG_FUNCTION_ARGS)
 		if (cur - tmpbuf > MAXSTRPOS)
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("string is too long for tsvector")));
+					 errmsg("string is too long for tsvector (%ld bytes, max %ld bytes)",
+							(long) (cur - tmpbuf), (long) MAXSTRPOS)));
 
 		/*
 		 * Enlarge buffers if needed
@@ -273,7 +267,7 @@ tsvectorin(PG_FUNCTION_ARGS)
 	if (buflen > MAXSTRPOS)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("string is too long for tsvector")));
+				 errmsg("string is too long for tsvector (%d bytes, max %d bytes)", buflen, MAXSTRPOS)));
 
 	totallen = CALCDATASIZE(len, buflen);
 	in = (TSVector) palloc0(totallen);
@@ -316,7 +310,7 @@ tsvectorout(PG_FUNCTION_ARGS)
 {
 	TSVector	out = PG_GETARG_TSVECTOR(0);
 	char	   *outbuf;
-	int4		i,
+	int32		i,
 				lenbuf = 0,
 				pp;
 	WordEntry  *ptr = ARRPTR(out);
@@ -455,6 +449,7 @@ tsvectorrecv(PG_FUNCTION_ARGS)
 								 * WordEntries */
 	Size		hdrlen;
 	Size		len;			/* allocated size of vec */
+	bool		needSort = false;
 
 	nentries = pq_getmsgint(buf, sizeof(int32));
 	if (nentries < 0 || nentries > (MaxAllocSize / sizeof(WordEntry)))
@@ -511,7 +506,7 @@ tsvectorrecv(PG_FUNCTION_ARGS)
 		if (i > 0 && WordEntryCMP(&vec->entries[i],
 								  &vec->entries[i - 1],
 								  STRPTR(vec)) <= 0)
-			elog(ERROR, "lexemes are misordered");
+			needSort = true;
 
 		/* Receive positions */
 		if (npos > 0)
@@ -545,6 +540,10 @@ tsvectorrecv(PG_FUNCTION_ARGS)
 	}
 
 	SET_VARSIZE(vec, hdrlen + datalen);
+
+	if (needSort)
+		qsort_arg((void *) ARRPTR(vec), vec->size, sizeof(WordEntry),
+				  compareentry, (void *) STRPTR(vec));
 
 	PG_RETURN_TSVECTOR(vec);
 }

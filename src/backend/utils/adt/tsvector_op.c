@@ -3,27 +3,30 @@
  * tsvector_op.c
  *	  operations over tsvector
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/adt/tsvector_op.c,v 1.12.2.1 2008/04/08 18:20:34 tgl Exp $
+ *	  src/backend/utils/adt/tsvector_op.c
  *
  *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_type.h"
 #include "commands/trigger.h"
 #include "executor/spi.h"
 #include "funcapi.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
-#include "tsearch/ts_type.h"
+#include "parser/parse_coerce.h"
 #include "tsearch/ts_utils.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/rel.h"
 
 
 typedef struct
@@ -34,70 +37,36 @@ typedef struct
 	char	   *operand;
 } CHKVAL;
 
-typedef struct
-{
-	uint32		cur;
-	TSVector	stat;
-} StatStorage;
 
-typedef struct
+typedef struct StatEntry
 {
-	uint32		len;
-	uint32		pos;
-	uint32		ndoc;
+	uint32		ndoc;			/* zero indicates that we were already here
+								 * while walking through the tree */
 	uint32		nentry;
+	struct StatEntry *left;
+	struct StatEntry *right;
+	uint32		lenlexeme;
+	char		lexeme[FLEXIBLE_ARRAY_MEMBER];
 } StatEntry;
 
+#define STATENTRYHDRSZ	(offsetof(StatEntry, lexeme))
+
 typedef struct
 {
-	int32		vl_len_;		/* varlena header (do not touch directly!) */
-	int4		size;
-	int4		weight;
-	char		data[1];
-} tsstat;
+	int32		weight;
 
-#define STATHDRSIZE (sizeof(int4) * 4)
-#define CALCSTATSIZE(x, lenstr) ( (x) * sizeof(StatEntry) + STATHDRSIZE + (lenstr) )
-#define STATPTR(x)	( (StatEntry*) ( (char*)(x) + STATHDRSIZE ) )
-#define STATSTRPTR(x)	( (char*)(x) + STATHDRSIZE + ( sizeof(StatEntry) * ((TSVector)(x))->size ) )
-#define STATSTRSIZE(x)	( VARSIZE((TSVector)(x)) - STATHDRSIZE - ( sizeof(StatEntry) * ((TSVector)(x))->size ) )
+	uint32		maxdepth;
 
+	StatEntry **stack;
+	uint32		stackpos;
+
+	StatEntry  *root;
+} TSVectorStat;
+
+#define STATHDRSIZE (offsetof(TSVectorStat, data))
 
 static Datum tsvector_update_trigger(PG_FUNCTION_ARGS, bool config_column);
-
-
-/*
- * Check if datatype is the specified type or equivalent to it.
- *
- * Note: we could just do getBaseType() unconditionally, but since that's
- * a relatively expensive catalog lookup that most users won't need, we
- * try the straight comparison first.
- */
-static bool
-is_expected_type(Oid typid, Oid expected_type)
-{
-	if (typid == expected_type)
-		return true;
-	typid = getBaseType(typid);
-	if (typid == expected_type)
-		return true;
-	return false;
-}
-
-/* Check if datatype is TEXT or binary-equivalent to it */
-static bool
-is_text_type(Oid typid)
-{
-	/* varchar(n) and char(n) are binary-compatible with text */
-	if (typid == TEXTOID || typid == VARCHAROID || typid == BPCHAROID)
-		return true;
-	/* Allow domains over these types, too */
-	typid = getBaseType(typid);
-	if (typid == TEXTOID || typid == VARCHAROID || typid == BPCHAROID)
-		return true;
-	return false;
-}
-
+static int	tsvector_bsearch(const TSVector tsv, char *lexeme, int lexeme_len);
 
 /*
  * Order: haspos, len, word, for all positions (pos, weight)
@@ -127,11 +96,7 @@ silly_cmp_tsvector(const TSVector a, const TSVector b)
 			{
 				return (aptr->haspos > bptr->haspos) ? -1 : 1;
 			}
-			else if (aptr->len != bptr->len)
-			{
-				return (aptr->len > bptr->len) ? -1 : 1;
-			}
-			else if ((res = strncmp(STRPTR(a) + aptr->pos, STRPTR(b) + bptr->pos, bptr->len)) != 0)
+			else if ((res = tsCompareString(STRPTR(a) + aptr->pos, aptr->len, STRPTR(b) + bptr->pos, bptr->len, false)) != 0)
 			{
 				return res;
 			}
@@ -176,7 +141,9 @@ tsvector_##type(PG_FUNCTION_ARGS)						\
 	PG_FREE_IF_COPY(a,0);								\
 	PG_FREE_IF_COPY(b,1);								\
 	PG_RETURN_##ret( res action 0 );					\
-}
+}	\
+/* keep compiler quiet - no extra ; */					\
+extern int no_such_variable
 
 TSVECTORCMPFUNC(lt, <, BOOL);
 TSVECTORCMPFUNC(le, <=, BOOL);
@@ -223,7 +190,7 @@ Datum
 tsvector_length(PG_FUNCTION_ARGS)
 {
 	TSVector	in = PG_GETARG_TSVECTOR(0);
-	int4		ret = in->size;
+	int32		ret = in->size;
 
 	PG_FREE_IF_COPY(in, 0);
 	PG_RETURN_INT32(ret);
@@ -286,27 +253,108 @@ tsvector_setweight(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(out);
 }
 
-static int
-compareEntry(char *ptra, WordEntry *a, char *ptrb, WordEntry *b)
+/*
+ * setweight(tsin tsvector, char_weight "char", lexemes "text"[])
+ *
+ * Assign weight w to elements of tsin that are listed in lexemes.
+ */
+Datum
+tsvector_setweight_by_filter(PG_FUNCTION_ARGS)
 {
-	if (a->len == b->len)
+	TSVector	tsin = PG_GETARG_TSVECTOR(0);
+	char		char_weight = PG_GETARG_CHAR(1);
+	ArrayType  *lexemes = PG_GETARG_ARRAYTYPE_P(2);
+
+	TSVector	tsout;
+	int			i,
+				j,
+				nlexemes,
+				weight;
+	WordEntry  *entry;
+	Datum	   *dlexemes;
+	bool	   *nulls;
+
+	switch (char_weight)
 	{
-		return strncmp(
-					   ptra + a->pos,
-					   ptrb + b->pos,
-					   a->len);
+		case 'A':
+		case 'a':
+			weight = 3;
+			break;
+		case 'B':
+		case 'b':
+			weight = 2;
+			break;
+		case 'C':
+		case 'c':
+			weight = 1;
+			break;
+		case 'D':
+		case 'd':
+			weight = 0;
+			break;
+		default:
+			/* internal error */
+			elog(ERROR, "unrecognized weight: %c", char_weight);
 	}
-	return (a->len > b->len) ? 1 : -1;
+
+	tsout = (TSVector) palloc(VARSIZE(tsin));
+	memcpy(tsout, tsin, VARSIZE(tsin));
+	entry = ARRPTR(tsout);
+
+	deconstruct_array(lexemes, TEXTOID, -1, false, 'i',
+					  &dlexemes, &nulls, &nlexemes);
+
+	/*
+	 * Assuming that lexemes array is significantly shorter than tsvector we
+	 * can iterate through lexemes performing binary search of each lexeme
+	 * from lexemes in tsvector.
+	 */
+	for (i = 0; i < nlexemes; i++)
+	{
+		char	   *lex;
+		int			lex_len,
+					lex_pos;
+
+		if (nulls[i])
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("lexeme array may not contain nulls")));
+
+		lex = VARDATA(dlexemes[i]);
+		lex_len = VARSIZE_ANY_EXHDR(dlexemes[i]);
+		lex_pos = tsvector_bsearch(tsout, lex, lex_len);
+
+		if (lex_pos >= 0 && (j = POSDATALEN(tsout, entry + lex_pos)) != 0)
+		{
+			WordEntryPos *p = POSDATAPTR(tsout, entry + lex_pos);
+
+			while (j--)
+			{
+				WEP_SETWEIGHT(*p, weight);
+				p++;
+			}
+		}
+	}
+
+	PG_FREE_IF_COPY(tsin, 0);
+	PG_FREE_IF_COPY(lexemes, 2);
+
+	PG_RETURN_POINTER(tsout);
 }
+
+#define compareEntry(pa, a, pb, b) \
+	tsCompareString((pa) + (a)->pos, (a)->len,	\
+					(pb) + (b)->pos, (b)->len,	\
+					false)
 
 /*
  * Add positions from src to dest after offsetting them by maxpos.
  * Return the number added (might be less than expected due to overflow)
  */
-static int4
+static int32
 add_pos(TSVector src, WordEntry *srcptr,
 		TSVector dest, WordEntry *destptr,
-		int4 maxpos)
+		int32 maxpos)
 {
 	uint16	   *clen = &_POSVECPTR(dest, destptr)->npos;
 	int			i;
@@ -334,6 +382,550 @@ add_pos(TSVector src, WordEntry *srcptr,
 	return *clen - startlen;
 }
 
+/*
+ * Perform binary search of given lexeme in TSVector.
+ * Returns lexeme position in TSVector's entry array or -1 if lexeme wasn't
+ * found.
+ */
+static int
+tsvector_bsearch(const TSVector tsv, char *lexeme, int lexeme_len)
+{
+	WordEntry  *arrin = ARRPTR(tsv);
+	int			StopLow = 0,
+				StopHigh = tsv->size,
+				StopMiddle,
+				cmp;
+
+	while (StopLow < StopHigh)
+	{
+		StopMiddle = (StopLow + StopHigh) / 2;
+
+		cmp = tsCompareString(lexeme, lexeme_len,
+							  STRPTR(tsv) + arrin[StopMiddle].pos,
+							  arrin[StopMiddle].len,
+							  false);
+
+		if (cmp < 0)
+			StopHigh = StopMiddle;
+		else if (cmp > 0)
+			StopLow = StopMiddle + 1;
+		else	/* found it */
+			return StopMiddle;
+	}
+
+	return -1;
+}
+
+/*
+ * qsort comparator functions
+ */
+
+static int
+compare_int(const void *va, const void *vb)
+{
+	int			a = *((const int *) va);
+	int			b = *((const int *) vb);
+
+	if (a == b)
+		return 0;
+	return (a > b) ? 1 : -1;
+}
+
+static int
+compare_text_lexemes(const void *va, const void *vb)
+{
+	Datum		a = *((const Datum *) va);
+	Datum		b = *((const Datum *) vb);
+	char	   *alex = VARDATA_ANY(a);
+	int			alex_len = VARSIZE_ANY_EXHDR(a);
+	char	   *blex = VARDATA_ANY(b);
+	int			blex_len = VARSIZE_ANY_EXHDR(b);
+
+	return tsCompareString(alex, alex_len, blex, blex_len, false);
+}
+
+/*
+ * Internal routine to delete lexemes from TSVector by array of offsets.
+ *
+ * int *indices_to_delete -- array of lexeme offsets to delete (modified here!)
+ * int indices_count -- size of that array
+ *
+ * Returns new TSVector without given lexemes along with their positions
+ * and weights.
+ */
+static TSVector
+tsvector_delete_by_indices(TSVector tsv, int *indices_to_delete,
+						   int indices_count)
+{
+	TSVector	tsout;
+	WordEntry  *arrin = ARRPTR(tsv),
+			   *arrout;
+	char	   *data = STRPTR(tsv),
+			   *dataout;
+	int			i,				/* index in arrin */
+				j,				/* index in arrout */
+				k,				/* index in indices_to_delete */
+				curoff;			/* index in dataout area */
+
+	/*
+	 * Sort the filter array to simplify membership checks below.  Also, get
+	 * rid of any duplicate entries, so that we can assume that indices_count
+	 * is exactly equal to the number of lexemes that will be removed.
+	 */
+	if (indices_count > 1)
+	{
+		int			kp;
+
+		qsort(indices_to_delete, indices_count, sizeof(int), compare_int);
+		kp = 0;
+		for (k = 1; k < indices_count; k++)
+		{
+			if (indices_to_delete[k] != indices_to_delete[kp])
+				indices_to_delete[++kp] = indices_to_delete[k];
+		}
+		indices_count = ++kp;
+	}
+
+	/*
+	 * Here we overestimate tsout size, since we don't know how much space is
+	 * used by the deleted lexeme(s).  We will set exact size below.
+	 */
+	tsout = (TSVector) palloc0(VARSIZE(tsv));
+
+	/* This count must be correct because STRPTR(tsout) relies on it. */
+	tsout->size = tsv->size - indices_count;
+
+	/*
+	 * Copy tsv to tsout, skipping lexemes listed in indices_to_delete.
+	 */
+	arrout = ARRPTR(tsout);
+	dataout = STRPTR(tsout);
+	curoff = 0;
+	for (i = j = k = 0; i < tsv->size; i++)
+	{
+		/*
+		 * If current i is present in indices_to_delete, skip this lexeme.
+		 * Since indices_to_delete is already sorted, we only need to check
+		 * the current (k'th) entry.
+		 */
+		if (k < indices_count && i == indices_to_delete[k])
+		{
+			k++;
+			continue;
+		}
+
+		/* Copy lexeme and its positions and weights */
+		memcpy(dataout + curoff, data + arrin[i].pos, arrin[i].len);
+		arrout[j].haspos = arrin[i].haspos;
+		arrout[j].len = arrin[i].len;
+		arrout[j].pos = curoff;
+		curoff += arrin[i].len;
+		if (arrin[i].haspos)
+		{
+			int			len = POSDATALEN(tsv, arrin + i) * sizeof(WordEntryPos)
+			+ sizeof(uint16);
+
+			curoff = SHORTALIGN(curoff);
+			memcpy(dataout + curoff,
+				   STRPTR(tsv) + SHORTALIGN(arrin[i].pos + arrin[i].len),
+				   len);
+			curoff += len;
+		}
+
+		j++;
+	}
+
+	/*
+	 * k should now be exactly equal to indices_count. If it isn't then the
+	 * caller provided us with indices outside of [0, tsv->size) range and
+	 * estimation of tsout's size is wrong.
+	 */
+	Assert(k == indices_count);
+
+	SET_VARSIZE(tsout, CALCDATASIZE(tsout->size, curoff));
+	return tsout;
+}
+
+/*
+ * Delete given lexeme from tsvector.
+ * Implementation of user-level ts_delete(tsvector, text).
+ */
+Datum
+tsvector_delete_str(PG_FUNCTION_ARGS)
+{
+	TSVector	tsin = PG_GETARG_TSVECTOR(0),
+				tsout;
+	text	   *tlexeme = PG_GETARG_TEXT_P(1);
+	char	   *lexeme = VARDATA(tlexeme);
+	int			lexeme_len = VARSIZE_ANY_EXHDR(tlexeme),
+				skip_index;
+
+	if ((skip_index = tsvector_bsearch(tsin, lexeme, lexeme_len)) == -1)
+		PG_RETURN_POINTER(tsin);
+
+	tsout = tsvector_delete_by_indices(tsin, &skip_index, 1);
+
+	PG_FREE_IF_COPY(tsin, 0);
+	PG_FREE_IF_COPY(tlexeme, 1);
+	PG_RETURN_POINTER(tsout);
+}
+
+/*
+ * Delete given array of lexemes from tsvector.
+ * Implementation of user-level ts_delete(tsvector, text[]).
+ */
+Datum
+tsvector_delete_arr(PG_FUNCTION_ARGS)
+{
+	TSVector	tsin = PG_GETARG_TSVECTOR(0),
+				tsout;
+	ArrayType  *lexemes = PG_GETARG_ARRAYTYPE_P(1);
+	int			i,
+				nlex,
+				skip_count,
+			   *skip_indices;
+	Datum	   *dlexemes;
+	bool	   *nulls;
+
+	deconstruct_array(lexemes, TEXTOID, -1, false, 'i',
+					  &dlexemes, &nulls, &nlex);
+
+	/*
+	 * In typical use case array of lexemes to delete is relatively small. So
+	 * here we optimize things for that scenario: iterate through lexarr
+	 * performing binary search of each lexeme from lexarr in tsvector.
+	 */
+	skip_indices = palloc0(nlex * sizeof(int));
+	for (i = skip_count = 0; i < nlex; i++)
+	{
+		char	   *lex;
+		int			lex_len,
+					lex_pos;
+
+		if (nulls[i])
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("lexeme array may not contain nulls")));
+
+		lex = VARDATA_ANY(dlexemes[i]);
+		lex_len = VARSIZE_ANY_EXHDR(dlexemes[i]);
+		lex_pos = tsvector_bsearch(tsin, lex, lex_len);
+
+		if (lex_pos >= 0)
+			skip_indices[skip_count++] = lex_pos;
+	}
+
+	tsout = tsvector_delete_by_indices(tsin, skip_indices, skip_count);
+
+	pfree(skip_indices);
+	PG_FREE_IF_COPY(tsin, 0);
+	PG_FREE_IF_COPY(lexemes, 1);
+
+	PG_RETURN_POINTER(tsout);
+}
+
+/*
+ * Expand tsvector as table with following columns:
+ *	   lexeme: lexeme text
+ *	   positions: integer array of lexeme positions
+ *	   weights: char array of weights corresponding to positions
+ */
+Datum
+tsvector_unnest(PG_FUNCTION_ARGS)
+{
+	FuncCallContext *funcctx;
+	TSVector	tsin;
+
+	if (SRF_IS_FIRSTCALL())
+	{
+		MemoryContext oldcontext;
+		TupleDesc	tupdesc;
+
+		funcctx = SRF_FIRSTCALL_INIT();
+		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+		tupdesc = CreateTemplateTupleDesc(3, false);
+		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "lexeme",
+						   TEXTOID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "positions",
+						   INT2ARRAYOID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) 3, "weights",
+						   TEXTARRAYOID, -1, 0);
+		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
+
+		funcctx->user_fctx = PG_GETARG_TSVECTOR_COPY(0);
+
+		MemoryContextSwitchTo(oldcontext);
+	}
+
+	funcctx = SRF_PERCALL_SETUP();
+	tsin = (TSVector) funcctx->user_fctx;
+
+	if (funcctx->call_cntr < tsin->size)
+	{
+		WordEntry  *arrin = ARRPTR(tsin);
+		char	   *data = STRPTR(tsin);
+		HeapTuple	tuple;
+		int			j,
+					i = funcctx->call_cntr;
+		bool		nulls[] = {false, false, false};
+		Datum		values[3];
+
+		values[0] = PointerGetDatum(
+				  cstring_to_text_with_len(data + arrin[i].pos, arrin[i].len)
+			);
+
+		if (arrin[i].haspos)
+		{
+			WordEntryPosVector *posv;
+			Datum	   *positions;
+			Datum	   *weights;
+			char		weight;
+
+			/*
+			 * Internally tsvector stores position and weight in the same
+			 * uint16 (2 bits for weight, 14 for position). Here we extract
+			 * that in two separate arrays.
+			 */
+			posv = _POSVECPTR(tsin, arrin + i);
+			positions = palloc(posv->npos * sizeof(Datum));
+			weights = palloc(posv->npos * sizeof(Datum));
+			for (j = 0; j < posv->npos; j++)
+			{
+				positions[j] = Int16GetDatum(WEP_GETPOS(posv->pos[j]));
+				weight = 'D' - WEP_GETWEIGHT(posv->pos[j]);
+				weights[j] = PointerGetDatum(
+										 cstring_to_text_with_len(&weight, 1)
+					);
+			}
+
+			values[1] = PointerGetDatum(
+			  construct_array(positions, posv->npos, INT2OID, 2, true, 's'));
+			values[2] = PointerGetDatum(
+			  construct_array(weights, posv->npos, TEXTOID, -1, false, 'i'));
+		}
+		else
+		{
+			nulls[1] = nulls[2] = true;
+		}
+
+		tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
+		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
+	}
+	else
+	{
+		pfree(tsin);
+		SRF_RETURN_DONE(funcctx);
+	}
+}
+
+/*
+ * Convert tsvector to array of lexemes.
+ */
+Datum
+tsvector_to_array(PG_FUNCTION_ARGS)
+{
+	TSVector	tsin = PG_GETARG_TSVECTOR(0);
+	WordEntry  *arrin = ARRPTR(tsin);
+	Datum	   *elements;
+	int			i;
+	ArrayType  *array;
+
+	elements = palloc(tsin->size * sizeof(Datum));
+
+	for (i = 0; i < tsin->size; i++)
+	{
+		elements[i] = PointerGetDatum(
+		  cstring_to_text_with_len(STRPTR(tsin) + arrin[i].pos, arrin[i].len)
+			);
+	}
+
+	array = construct_array(elements, tsin->size, TEXTOID, -1, false, 'i');
+
+	pfree(elements);
+	PG_FREE_IF_COPY(tsin, 0);
+	PG_RETURN_POINTER(array);
+}
+
+/*
+ * Build tsvector from array of lexemes.
+ */
+Datum
+array_to_tsvector(PG_FUNCTION_ARGS)
+{
+	ArrayType  *v = PG_GETARG_ARRAYTYPE_P(0);
+	TSVector	tsout;
+	Datum	   *dlexemes;
+	WordEntry  *arrout;
+	bool	   *nulls;
+	int			nitems,
+				i,
+				j,
+				tslen,
+				datalen = 0;
+	char	   *cur;
+
+	deconstruct_array(v, TEXTOID, -1, false, 'i', &dlexemes, &nulls, &nitems);
+
+	/* Reject nulls (maybe we should just ignore them, instead?) */
+	for (i = 0; i < nitems; i++)
+	{
+		if (nulls[i])
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("lexeme array may not contain nulls")));
+	}
+
+	/* Sort and de-dup, because this is required for a valid tsvector. */
+	if (nitems > 1)
+	{
+		qsort(dlexemes, nitems, sizeof(Datum), compare_text_lexemes);
+		j = 0;
+		for (i = 1; i < nitems; i++)
+		{
+			if (compare_text_lexemes(&dlexemes[j], &dlexemes[i]) < 0)
+				dlexemes[++j] = dlexemes[i];
+		}
+		nitems = ++j;
+	}
+
+	/* Calculate space needed for surviving lexemes. */
+	for (i = 0; i < nitems; i++)
+		datalen += VARSIZE_ANY_EXHDR(dlexemes[i]);
+	tslen = CALCDATASIZE(nitems, datalen);
+
+	/* Allocate and fill tsvector. */
+	tsout = (TSVector) palloc0(tslen);
+	SET_VARSIZE(tsout, tslen);
+	tsout->size = nitems;
+
+	arrout = ARRPTR(tsout);
+	cur = STRPTR(tsout);
+	for (i = 0; i < nitems; i++)
+	{
+		char	   *lex = VARDATA_ANY(dlexemes[i]);
+		int			lex_len = VARSIZE_ANY_EXHDR(dlexemes[i]);
+
+		memcpy(cur, lex, lex_len);
+		arrout[i].haspos = 0;
+		arrout[i].len = lex_len;
+		arrout[i].pos = cur - STRPTR(tsout);
+		cur += lex_len;
+	}
+
+	PG_FREE_IF_COPY(v, 0);
+	PG_RETURN_POINTER(tsout);
+}
+
+/*
+ * ts_filter(): keep only lexemes with given weights in tsvector.
+ */
+Datum
+tsvector_filter(PG_FUNCTION_ARGS)
+{
+	TSVector	tsin = PG_GETARG_TSVECTOR(0),
+				tsout;
+	ArrayType  *weights = PG_GETARG_ARRAYTYPE_P(1);
+	WordEntry  *arrin = ARRPTR(tsin),
+			   *arrout;
+	char	   *datain = STRPTR(tsin),
+			   *dataout;
+	Datum	   *dweights;
+	bool	   *nulls;
+	int			nweights;
+	int			i,
+				j;
+	int			cur_pos = 0;
+	char		mask = 0;
+
+	deconstruct_array(weights, CHAROID, 1, true, 'c',
+					  &dweights, &nulls, &nweights);
+
+	for (i = 0; i < nweights; i++)
+	{
+		char		char_weight;
+
+		if (nulls[i])
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("weight array may not contain nulls")));
+
+		char_weight = DatumGetChar(dweights[i]);
+		switch (char_weight)
+		{
+			case 'A':
+			case 'a':
+				mask = mask | 8;
+				break;
+			case 'B':
+			case 'b':
+				mask = mask | 4;
+				break;
+			case 'C':
+			case 'c':
+				mask = mask | 2;
+				break;
+			case 'D':
+			case 'd':
+				mask = mask | 1;
+				break;
+			default:
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("unrecognized weight: \"%c\"", char_weight)));
+		}
+	}
+
+	tsout = (TSVector) palloc0(VARSIZE(tsin));
+	tsout->size = tsin->size;
+	arrout = ARRPTR(tsout);
+	dataout = STRPTR(tsout);
+
+	for (i = j = 0; i < tsin->size; i++)
+	{
+		WordEntryPosVector *posvin,
+				   *posvout;
+		int			npos = 0;
+		int			k;
+
+		if (!arrin[i].haspos)
+			continue;
+
+		posvin = _POSVECPTR(tsin, arrin + i);
+		posvout = (WordEntryPosVector *)
+			(dataout + SHORTALIGN(cur_pos + arrin[i].len));
+
+		for (k = 0; k < posvin->npos; k++)
+		{
+			if (mask & (1 << WEP_GETWEIGHT(posvin->pos[k])))
+				posvout->pos[npos++] = posvin->pos[k];
+		}
+
+		/* if no satisfactory positions found, skip lexeme */
+		if (!npos)
+			continue;
+
+		arrout[j].haspos = true;
+		arrout[j].len = arrin[i].len;
+		arrout[j].pos = cur_pos;
+
+		memcpy(dataout + cur_pos, datain + arrin[i].pos, arrin[i].len);
+		posvout->npos = npos;
+		cur_pos += SHORTALIGN(arrin[i].len);
+		cur_pos += POSDATALEN(tsout, arrout + j) * sizeof(WordEntryPos) +
+			sizeof(uint16);
+		j++;
+	}
+
+	tsout->size = j;
+	if (dataout != STRPTR(tsout))
+		memmove(STRPTR(tsout), dataout, cur_pos);
+
+	SET_VARSIZE(tsout, CALCDATASIZE(tsout->size, cur_pos));
+
+	PG_FREE_IF_COPY(tsin, 0);
+	PG_RETURN_POINTER(tsout);
+}
 
 Datum
 tsvector_concat(PG_FUNCTION_ARGS)
@@ -383,9 +975,9 @@ tsvector_concat(PG_FUNCTION_ARGS)
 	i2 = in2->size;
 
 	/*
-	 * Conservative estimate of space needed.  We might need all the data
-	 * in both inputs, and conceivably add a pad byte before position data
-	 * for each item where there was none before.
+	 * Conservative estimate of space needed.  We might need all the data in
+	 * both inputs, and conceivably add a pad byte before position data for
+	 * each item where there was none before.
 	 */
 	output_bytes = VARSIZE(in1) + VARSIZE(in2) + i1 + i2;
 
@@ -537,7 +1129,7 @@ tsvector_concat(PG_FUNCTION_ARGS)
 	if (dataoff > MAXSTRPOS)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("string is too long for tsvector")));
+				 errmsg("string is too long for tsvector (%d bytes, max %d bytes)", dataoff, MAXSTRPOS)));
 
 	/*
 	 * Adjust sizes (asserting that we didn't overrun the original estimates)
@@ -558,115 +1150,504 @@ tsvector_concat(PG_FUNCTION_ARGS)
 }
 
 /*
- * compare 2 string values
+ * Compare two strings by tsvector rules.
+ *
+ * if isPrefix = true then it returns zero value iff b has prefix a
  */
-static int4
-ValCompare(CHKVAL *chkval, WordEntry *ptr, QueryOperand *item)
+int32
+tsCompareString(char *a, int lena, char *b, int lenb, bool prefix)
 {
-	if (ptr->len == item->length)
-		return strncmp(
-					   &(chkval->values[ptr->pos]),
-					   &(chkval->operand[item->distance]),
-					   item->length);
+	int			cmp;
 
-	return (ptr->len > item->length) ? 1 : -1;
+	if (lena == 0)
+	{
+		if (prefix)
+			cmp = 0;			/* empty string is prefix of anything */
+		else
+			cmp = (lenb > 0) ? -1 : 0;
+	}
+	else if (lenb == 0)
+	{
+		cmp = (lena > 0) ? 1 : 0;
+	}
+	else
+	{
+		cmp = memcmp(a, b, Min(lena, lenb));
+
+		if (prefix)
+		{
+			if (cmp == 0 && lena > lenb)
+				cmp = 1;		/* a is longer, so not a prefix of b */
+		}
+		else if (cmp == 0 && lena != lenb)
+		{
+			cmp = (lena < lenb) ? -1 : 1;
+		}
+	}
+
+	return cmp;
 }
 
 /*
- * check weight info
+ * Check weight info or/and fill 'data' with the required positions
  */
 static bool
-checkclass_str(CHKVAL *chkval, WordEntry *val, QueryOperand *item)
+checkclass_str(CHKVAL *chkval, WordEntry *entry, QueryOperand *val,
+			   ExecPhraseData *data)
 {
-	WordEntryPosVector *posvec;
-	WordEntryPos *ptr;
-	uint16		len;
+	bool		result = false;
 
-	posvec = (WordEntryPosVector *)
-		(chkval->values + SHORTALIGN(val->pos + val->len));
-
-	len = posvec->npos;
-	ptr = posvec->pos;
-
-	while (len--)
+	if (entry->haspos && (val->weight || data))
 	{
-		if (item->weight & (1 << WEP_GETWEIGHT(*ptr)))
-			return true;
-		ptr++;
+		WordEntryPosVector *posvec;
+
+		/*
+		 * We can't use the _POSVECPTR macro here because the pointer to the
+		 * tsvector's lexeme storage is already contained in chkval->values.
+		 */
+		posvec = (WordEntryPosVector *)
+			(chkval->values + SHORTALIGN(entry->pos + entry->len));
+
+		if (val->weight && data)
+		{
+			WordEntryPos *posvec_iter = posvec->pos;
+			WordEntryPos *dptr;
+
+			/*
+			 * Filter position information by weights
+			 */
+			dptr = data->pos = palloc(sizeof(WordEntryPos) * posvec->npos);
+			data->allocated = true;
+
+			/* Is there a position with a matching weight? */
+			while (posvec_iter < posvec->pos + posvec->npos)
+			{
+				/* If true, append this position to the data->pos */
+				if (val->weight & (1 << WEP_GETWEIGHT(*posvec_iter)))
+				{
+					*dptr = WEP_GETPOS(*posvec_iter);
+					dptr++;
+				}
+
+				posvec_iter++;
+			}
+
+			data->npos = dptr - data->pos;
+
+			if (data->npos > 0)
+				result = true;
+		}
+		else if (val->weight)
+		{
+			WordEntryPos *posvec_iter = posvec->pos;
+
+			/* Is there a position with a matching weight? */
+			while (posvec_iter < posvec->pos + posvec->npos)
+			{
+				if (val->weight & (1 << WEP_GETWEIGHT(*posvec_iter)))
+				{
+					result = true;
+					break;		/* no need to go further */
+				}
+
+				posvec_iter++;
+			}
+		}
+		else	/* data != NULL */
+		{
+			data->npos = posvec->npos;
+			data->pos = posvec->pos;
+			data->allocated = false;
+			result = true;
+		}
 	}
-	return false;
+	else
+	{
+		result = true;
+	}
+
+	return result;
+}
+
+/*
+ * Removes duplicate pos entries. We can't use uniquePos() from
+ * tsvector.c because array might be longer than MAXENTRYPOS
+ *
+ * Returns new length.
+ */
+static int
+uniqueLongPos(WordEntryPos *pos, int npos)
+{
+	WordEntryPos *pos_iter,
+			   *result;
+
+	if (npos <= 1)
+		return npos;
+
+	qsort((void *) pos, npos, sizeof(WordEntryPos), compareWordEntryPos);
+
+	result = pos;
+	pos_iter = pos + 1;
+	while (pos_iter < pos + npos)
+	{
+		if (WEP_GETPOS(*pos_iter) != WEP_GETPOS(*result))
+		{
+			result++;
+			*result = WEP_GETPOS(*pos_iter);
+		}
+
+		pos_iter++;
+	}
+
+	return result + 1 - pos;
 }
 
 /*
  * is there value 'val' in array or not ?
  */
 static bool
-checkcondition_str(void *checkval, QueryOperand *val)
+checkcondition_str(void *checkval, QueryOperand *val, ExecPhraseData *data)
 {
 	CHKVAL	   *chkval = (CHKVAL *) checkval;
 	WordEntry  *StopLow = chkval->arrb;
 	WordEntry  *StopHigh = chkval->arre;
-	WordEntry  *StopMiddle;
-	int			difference;
+	WordEntry  *StopMiddle = StopHigh;
+	int			difference = -1;
+	bool		res = false;
 
 	/* Loop invariant: StopLow <= val < StopHigh */
-
 	while (StopLow < StopHigh)
 	{
 		StopMiddle = StopLow + (StopHigh - StopLow) / 2;
-		difference = ValCompare(chkval, StopMiddle, val);
+		difference = tsCompareString(chkval->operand + val->distance,
+									 val->length,
+									 chkval->values + StopMiddle->pos,
+									 StopMiddle->len,
+									 false);
+
 		if (difference == 0)
-			return (val->weight && StopMiddle->haspos) ?
-				checkclass_str(chkval, StopMiddle, val) : true;
-		else if (difference < 0)
+		{
+			/* Check weight info & fill 'data' with positions */
+			res = checkclass_str(chkval, StopMiddle, val, data);
+			break;
+		}
+		else if (difference > 0)
 			StopLow = StopMiddle + 1;
 		else
 			StopHigh = StopMiddle;
 	}
 
-	return (false);
+	if ((!res || data) && val->prefix)
+	{
+		WordEntryPos *allpos = NULL;
+		int			npos = 0,
+					totalpos = 0;
+
+		/*
+		 * there was a failed exact search, so we should scan further to find
+		 * a prefix match. We also need to do so if caller needs position info
+		 */
+		if (StopLow >= StopHigh)
+			StopMiddle = StopHigh;
+
+		while ((!res || data) && StopMiddle < chkval->arre &&
+			   tsCompareString(chkval->operand + val->distance,
+							   val->length,
+							   chkval->values + StopMiddle->pos,
+							   StopMiddle->len,
+							   true) == 0)
+		{
+			if (data)
+			{
+				/*
+				 * We need to join position information
+				 */
+				res = checkclass_str(chkval, StopMiddle, val, data);
+
+				if (res)
+				{
+					while (npos + data->npos >= totalpos)
+					{
+						if (totalpos == 0)
+						{
+							totalpos = 256;
+							allpos = palloc(sizeof(WordEntryPos) * totalpos);
+						}
+						else
+						{
+							totalpos *= 2;
+							allpos = repalloc(allpos, sizeof(WordEntryPos) * totalpos);
+						}
+					}
+
+					memcpy(allpos + npos, data->pos, sizeof(WordEntryPos) * data->npos);
+					npos += data->npos;
+				}
+			}
+			else
+			{
+				res = checkclass_str(chkval, StopMiddle, val, NULL);
+			}
+
+			StopMiddle++;
+		}
+
+		if (res && data)
+		{
+			/* Sort and make unique array of found positions */
+			data->pos = allpos;
+			data->npos = uniqueLongPos(allpos, npos);
+			data->allocated = true;
+		}
+	}
+
+	return res;
 }
 
 /*
- * check for boolean condition.
- *
- * if calcnot is false, NOT expressions are always evaluated to be true. This is used in ranking.
- * checkval can be used to pass information to the callback. TS_execute doesn't
- * do anything with it.
- * chkcond is a callback function used to evaluate each VAL node in the query.
- *
+ * Check for phrase condition. Fallback to the AND operation
+ * if there is no positional information.
  */
-bool
-TS_execute(QueryItem *curitem, void *checkval, bool calcnot,
-		   bool (*chkcond) (void *checkval, QueryOperand *val))
+static bool
+TS_phrase_execute(QueryItem *curitem,
+				  void *checkval, uint32 flags, ExecPhraseData *data,
+				  bool (*chkcond) (void *, QueryOperand *, ExecPhraseData *))
 {
 	/* since this function recurses, it could be driven to stack overflow */
 	check_stack_depth();
 
 	if (curitem->type == QI_VAL)
-		return chkcond(checkval, (QueryOperand *) curitem);
+	{
+		return chkcond(checkval, (QueryOperand *) curitem, data);
+	}
+	else
+	{
+		ExecPhraseData Ldata = {0, false, NULL},
+					Rdata = {0, false, NULL};
+		WordEntryPos *Lpos,
+				   *LposStart,
+				   *Rpos,
+				   *pos_iter = NULL;
 
-	switch (curitem->operator.oper)
+		Assert(curitem->qoperator.oper == OP_PHRASE);
+
+		if (!TS_phrase_execute(curitem + curitem->qoperator.left,
+							   checkval, flags, &Ldata, chkcond))
+			return false;
+
+		if (!TS_phrase_execute(curitem + 1, checkval, flags, &Rdata, chkcond))
+			return false;
+
+		/*
+		 * if at least one of the operands has no position information, then
+		 * return false. But if TS_EXEC_PHRASE_AS_AND flag is set then we
+		 * return true as it is a AND operation
+		 */
+		if (Ldata.npos == 0 || Rdata.npos == 0)
+			return (flags & TS_EXEC_PHRASE_AS_AND) ? true : false;
+
+		/*
+		 * Result of the operation is a list of the corresponding positions of
+		 * RIGHT operand.
+		 */
+		if (data)
+		{
+			if (!Rdata.allocated)
+
+				/*
+				 * OP_PHRASE is based on the OP_AND, so the number of
+				 * resulting positions could not be greater than the total
+				 * amount of operands.
+				 */
+				data->pos = palloc(sizeof(WordEntryPos) * Min(Ldata.npos, Rdata.npos));
+			else
+				data->pos = Rdata.pos;
+
+			data->allocated = true;
+			data->npos = 0;
+			pos_iter = data->pos;
+		}
+
+		/*
+		 * Find matches by distance, WEP_GETPOS() is needed because
+		 * ExecPhraseData->data can point to the tsvector's WordEntryPosVector
+		 */
+
+		Rpos = Rdata.pos;
+		LposStart = Ldata.pos;
+		while (Rpos < Rdata.pos + Rdata.npos)
+		{
+			/*
+			 * We need to check all possible distances, so reset Lpos to
+			 * guaranteed not yet satisfied position.
+			 */
+			Lpos = LposStart;
+			while (Lpos < Ldata.pos + Ldata.npos)
+			{
+				if (WEP_GETPOS(*Rpos) - WEP_GETPOS(*Lpos) ==
+					curitem->qoperator.distance)
+				{
+					/* MATCH! */
+					if (data)
+					{
+						/* Store position for upper phrase operator */
+						*pos_iter = WEP_GETPOS(*Rpos);
+						pos_iter++;
+
+						/*
+						 * Set left start position to next, because current
+						 * one could not satisfy distance for any other right
+						 * position
+						 */
+						LposStart = Lpos + 1;
+						break;
+					}
+					else
+					{
+						/*
+						 * We are in the root of the phrase tree and hence we
+						 * don't have to store the resulting positions
+						 */
+						return true;
+					}
+
+				}
+				else if (WEP_GETPOS(*Rpos) <= WEP_GETPOS(*Lpos) ||
+						 WEP_GETPOS(*Rpos) - WEP_GETPOS(*Lpos) <
+						 curitem->qoperator.distance)
+				{
+					/*
+					 * Go to the next Rpos, because Lpos is ahead or on less
+					 * distance than required by current operator
+					 */
+					break;
+
+				}
+
+				Lpos++;
+			}
+
+			Rpos++;
+		}
+
+		if (data)
+		{
+			data->npos = pos_iter - data->pos;
+
+			if (data->npos > 0)
+				return true;
+		}
+	}
+
+	return false;
+}
+
+
+/*
+ * Evaluate tsquery boolean expression.
+ *
+ * chkcond is a callback function used to evaluate each VAL node in the query.
+ * checkval can be used to pass information to the callback. TS_execute doesn't
+ * do anything with it.
+ * It believes that ordinary operators are always closier to root than phrase
+ * operator, so, TS_execute() may not take care of lexeme's position at all.
+ */
+bool
+TS_execute(QueryItem *curitem, void *checkval, uint32 flags,
+   bool (*chkcond) (void *checkval, QueryOperand *val, ExecPhraseData *data))
+{
+	/* since this function recurses, it could be driven to stack overflow */
+	check_stack_depth();
+
+	if (curitem->type == QI_VAL)
+		return chkcond(checkval, (QueryOperand *) curitem,
+					   NULL /* we don't need position info */ );
+
+	switch (curitem->qoperator.oper)
 	{
 		case OP_NOT:
-			if (calcnot)
-				return !TS_execute(curitem + 1, checkval, calcnot, chkcond);
+			if (flags & TS_EXEC_CALC_NOT)
+				return !TS_execute(curitem + 1, checkval, flags, chkcond);
 			else
 				return true;
+
 		case OP_AND:
-			if (TS_execute(curitem + curitem->operator.left, checkval, calcnot, chkcond))
-				return TS_execute(curitem + 1, checkval, calcnot, chkcond);
+			if (TS_execute(curitem + curitem->qoperator.left, checkval, flags, chkcond))
+				return TS_execute(curitem + 1, checkval, flags, chkcond);
 			else
 				return false;
 
 		case OP_OR:
-			if (TS_execute(curitem + curitem->operator.left, checkval, calcnot, chkcond))
+			if (TS_execute(curitem + curitem->qoperator.left, checkval, flags, chkcond))
 				return true;
 			else
-				return TS_execute(curitem + 1, checkval, calcnot, chkcond);
+				return TS_execute(curitem + 1, checkval, flags, chkcond);
+
+		case OP_PHRASE:
+
+			/*
+			 * do not check TS_EXEC_PHRASE_AS_AND here because chkcond() could
+			 * do something more if it's called from TS_phrase_execute()
+			 */
+			return TS_phrase_execute(curitem, checkval, flags, NULL, chkcond);
 
 		default:
-			elog(ERROR, "unrecognized operator: %d", curitem->operator.oper);
+			elog(ERROR, "unrecognized operator: %d", curitem->qoperator.oper);
+	}
+
+	/* not reachable, but keep compiler quiet */
+	return false;
+}
+
+/*
+ * Detect whether a tsquery boolean expression requires any positive matches
+ * to values shown in the tsquery.
+ *
+ * This is needed to know whether a GIN index search requires full index scan.
+ * For example, 'x & !y' requires a match of x, so it's sufficient to scan
+ * entries for x; but 'x | !y' could match rows containing neither x nor y.
+ */
+bool
+tsquery_requires_match(QueryItem *curitem)
+{
+	/* since this function recurses, it could be driven to stack overflow */
+	check_stack_depth();
+
+	if (curitem->type == QI_VAL)
+		return true;
+
+	switch (curitem->qoperator.oper)
+	{
+		case OP_NOT:
+
+			/*
+			 * Assume there are no required matches underneath a NOT.  For
+			 * some cases with nested NOTs, we could prove there's a required
+			 * match, but it seems unlikely to be worth the trouble.
+			 */
+			return false;
+
+		case OP_PHRASE:
+
+			/*
+			 * Treat OP_PHRASE as OP_AND here
+			 */
+		case OP_AND:
+			/* If either side requires a match, we're good */
+			if (tsquery_requires_match(curitem + curitem->qoperator.left))
+				return true;
+			else
+				return tsquery_requires_match(curitem + 1);
+
+		case OP_OR:
+			/* Both sides must require a match */
+			if (tsquery_requires_match(curitem + curitem->qoperator.left))
+				return tsquery_requires_match(curitem + 1);
+			else
+				return false;
+
+		default:
+			elog(ERROR, "unrecognized operator: %d", curitem->qoperator.oper);
 	}
 
 	/* not reachable, but keep compiler quiet */
@@ -692,7 +1673,8 @@ ts_match_vq(PG_FUNCTION_ARGS)
 	CHKVAL		chkval;
 	bool		result;
 
-	if (!val->size || !query->size)
+	/* empty query matches nothing */
+	if (!query->size)
 	{
 		PG_FREE_IF_COPY(val, 0);
 		PG_FREE_IF_COPY(query, 1);
@@ -706,7 +1688,7 @@ ts_match_vq(PG_FUNCTION_ARGS)
 	result = TS_execute(
 						GETQUERY(query),
 						&chkval,
-						true,
+						TS_EXEC_CALC_NOT,
 						checkcondition_str
 		);
 
@@ -782,136 +1764,95 @@ check_weight(TSVector txt, WordEntry *wptr, int8 weight)
 	return num;
 }
 
-static WordEntry **
-SEI_realloc(WordEntry **in, uint32 *len)
+#define compareStatWord(a,e,t)							\
+	tsCompareString((a)->lexeme, (a)->lenlexeme,		\
+					STRPTR(t) + (e)->pos, (e)->len,		\
+					false)
+
+static void
+insertStatEntry(MemoryContext persistentContext, TSVectorStat *stat, TSVector txt, uint32 off)
 {
-	if (*len == 0 || in == NULL)
-	{
-		*len = 8;
-		in = palloc(sizeof(WordEntry *) * (*len));
-	}
+	WordEntry  *we = ARRPTR(txt) + off;
+	StatEntry  *node = stat->root,
+			   *pnode = NULL;
+	int			n,
+				res = 0;
+	uint32		depth = 1;
+
+	if (stat->weight == 0)
+		n = (we->haspos) ? POSDATALEN(txt, we) : 1;
 	else
+		n = (we->haspos) ? check_weight(txt, we, stat->weight) : 0;
+
+	if (n == 0)
+		return;					/* nothing to insert */
+
+	while (node)
 	{
-		*len *= 2;
-		in = repalloc(in, sizeof(WordEntry *) * (*len));
-	}
-	return in;
-}
+		res = compareStatWord(node, we, txt);
 
-static int
-compareStatWord(StatEntry *a, WordEntry *b, tsstat *stat, TSVector txt)
-{
-	if (a->len == b->len)
-		return strncmp(
-					   STATSTRPTR(stat) + a->pos,
-					   STRPTR(txt) + b->pos,
-					   a->len
-			);
-	return (a->len > b->len) ? 1 : -1;
-}
-
-static tsstat *
-formstat(tsstat *stat, TSVector txt, WordEntry **entry, uint32 len)
-{
-	tsstat	   *newstat;
-	uint32		totallen,
-				nentry;
-	uint32		slen = 0;
-	WordEntry **ptr = entry;
-	char	   *curptr;
-	StatEntry  *sptr,
-			   *nptr;
-
-	while (ptr - entry < len)
-	{
-		slen += (*ptr)->len;
-		ptr++;
-	}
-
-	nentry = stat->size + len;
-	slen += STATSTRSIZE(stat);
-	totallen = CALCSTATSIZE(nentry, slen);
-	newstat = palloc(totallen);
-	SET_VARSIZE(newstat, totallen);
-	newstat->weight = stat->weight;
-	newstat->size = nentry;
-
-	memcpy(STATSTRPTR(newstat), STATSTRPTR(stat), STATSTRSIZE(stat));
-	curptr = STATSTRPTR(newstat) + STATSTRSIZE(stat);
-
-	ptr = entry;
-	sptr = STATPTR(stat);
-	nptr = STATPTR(newstat);
-
-	if (len == 1)
-	{
-		StatEntry  *StopLow = STATPTR(stat);
-		StatEntry  *StopHigh = (StatEntry *) STATSTRPTR(stat);
-
-		while (StopLow < StopHigh)
+		if (res == 0)
 		{
-			sptr = StopLow + (StopHigh - StopLow) / 2;
-			if (compareStatWord(sptr, *ptr, stat, txt) < 0)
-				StopLow = sptr + 1;
-			else
-				StopHigh = sptr;
+			break;
 		}
-		nptr = STATPTR(newstat) + (StopLow - STATPTR(stat));
-		memcpy(STATPTR(newstat), STATPTR(stat), sizeof(StatEntry) * (StopLow - STATPTR(stat)));
-		if ((*ptr)->haspos)
-			nptr->nentry = (stat->weight) ? check_weight(txt, *ptr, stat->weight) : POSDATALEN(txt, *ptr);
 		else
-			nptr->nentry = 1;
-		nptr->ndoc = 1;
-		nptr->len = (*ptr)->len;
-		memcpy(curptr, STRPTR(txt) + (*ptr)->pos, nptr->len);
-		nptr->pos = curptr - STATSTRPTR(newstat);
-		memcpy(nptr + 1, StopLow, sizeof(StatEntry) * (((StatEntry *) STATSTRPTR(stat)) - StopLow));
+		{
+			pnode = node;
+			node = (res < 0) ? node->left : node->right;
+		}
+		depth++;
+	}
+
+	if (depth > stat->maxdepth)
+		stat->maxdepth = depth;
+
+	if (node == NULL)
+	{
+		node = MemoryContextAlloc(persistentContext, STATENTRYHDRSZ + we->len);
+		node->left = node->right = NULL;
+		node->ndoc = 1;
+		node->nentry = n;
+		node->lenlexeme = we->len;
+		memcpy(node->lexeme, STRPTR(txt) + we->pos, node->lenlexeme);
+
+		if (pnode == NULL)
+		{
+			stat->root = node;
+		}
+		else
+		{
+			if (res < 0)
+				pnode->left = node;
+			else
+				pnode->right = node;
+		}
+
 	}
 	else
 	{
-		while (sptr - STATPTR(stat) < stat->size && ptr - entry < len)
-		{
-			if (compareStatWord(sptr, *ptr, stat, txt) < 0)
-			{
-				memcpy(nptr, sptr, sizeof(StatEntry));
-				sptr++;
-			}
-			else
-			{
-				if ((*ptr)->haspos)
-					nptr->nentry = (stat->weight) ? check_weight(txt, *ptr, stat->weight) : POSDATALEN(txt, *ptr);
-				else
-					nptr->nentry = 1;
-				nptr->ndoc = 1;
-				nptr->len = (*ptr)->len;
-				memcpy(curptr, STRPTR(txt) + (*ptr)->pos, nptr->len);
-				nptr->pos = curptr - STATSTRPTR(newstat);
-				curptr += nptr->len;
-				ptr++;
-			}
-			nptr++;
-		}
-
-		memcpy(nptr, sptr, sizeof(StatEntry) * (stat->size - (sptr - STATPTR(stat))));
-
-		while (ptr - entry < len)
-		{
-			if ((*ptr)->haspos)
-				nptr->nentry = (stat->weight) ? check_weight(txt, *ptr, stat->weight) : POSDATALEN(txt, *ptr);
-			else
-				nptr->nentry = 1;
-			nptr->ndoc = 1;
-			nptr->len = (*ptr)->len;
-			memcpy(curptr, STRPTR(txt) + (*ptr)->pos, nptr->len);
-			nptr->pos = curptr - STATSTRPTR(newstat);
-			curptr += nptr->len;
-			ptr++;
-			nptr++;
-		}
+		node->ndoc++;
+		node->nentry += n;
 	}
+}
 
-	return newstat;
+static void
+chooseNextStatEntry(MemoryContext persistentContext, TSVectorStat *stat, TSVector txt,
+					uint32 low, uint32 high, uint32 offset)
+{
+	uint32		pos;
+	uint32		middle = (low + high) >> 1;
+
+	pos = (low + middle) >> 1;
+	if (low != middle && pos >= offset && pos - offset < txt->size)
+		insertStatEntry(persistentContext, stat, txt, pos - offset);
+	pos = (high + middle + 1) >> 1;
+	if (middle + 1 != high && pos >= offset && pos - offset < txt->size)
+		insertStatEntry(persistentContext, stat, txt, pos - offset);
+
+	if (low != middle)
+		chooseNextStatEntry(persistentContext, stat, txt, low, middle, offset);
+	if (high != middle + 1)
+		chooseNextStatEntry(persistentContext, stat, txt, middle + 1, high, offset);
 }
 
 /*
@@ -926,161 +1867,73 @@ formstat(tsstat *stat, TSVector txt, WordEntry **entry, uint32 len)
  *	where vector_column is a tsvector-type column in vector_table.
  */
 
-static tsstat *
-ts_accum(tsstat *stat, Datum data)
+static TSVectorStat *
+ts_accum(MemoryContext persistentContext, TSVectorStat *stat, Datum data)
 {
-	tsstat	   *newstat;
 	TSVector	txt = DatumGetTSVector(data);
-	WordEntry **newentry = NULL;
-	uint32		len = 0,
-				cur = 0;
-	StatEntry  *sptr;
-	WordEntry  *wptr;
-	int			n = 0;
+	uint32		i,
+				nbit = 0,
+				offset;
 
 	if (stat == NULL)
 	{							/* Init in first */
-		stat = palloc(STATHDRSIZE);
-		SET_VARSIZE(stat, STATHDRSIZE);
-		stat->size = 0;
-		stat->weight = 0;
+		stat = MemoryContextAllocZero(persistentContext, sizeof(TSVectorStat));
+		stat->maxdepth = 1;
 	}
 
 	/* simple check of correctness */
 	if (txt == NULL || txt->size == 0)
 	{
-		if (txt != (TSVector) DatumGetPointer(data))
+		if (txt && txt != (TSVector) DatumGetPointer(data))
 			pfree(txt);
 		return stat;
 	}
 
-	sptr = STATPTR(stat);
-	wptr = ARRPTR(txt);
+	i = txt->size - 1;
+	for (; i > 0; i >>= 1)
+		nbit++;
 
-	if (stat->size < 100 * txt->size)
-	{							/* merge */
-		while (sptr - STATPTR(stat) < stat->size && wptr - ARRPTR(txt) < txt->size)
-		{
-			int			cmp = compareStatWord(sptr, wptr, stat, txt);
+	nbit = 1 << nbit;
+	offset = (nbit - txt->size) / 2;
 
-			if (cmp < 0)
-				sptr++;
-			else if (cmp == 0)
-			{
-				if (stat->weight == 0)
-				{
-					sptr->ndoc++;
-					sptr->nentry += (wptr->haspos) ? POSDATALEN(txt, wptr) : 1;
-				}
-				else if (wptr->haspos && (n = check_weight(txt, wptr, stat->weight)) != 0)
-				{
-					sptr->ndoc++;
-					sptr->nentry += n;
-				}
-				sptr++;
-				wptr++;
-			}
-			else
-			{
-				if (stat->weight == 0 || check_weight(txt, wptr, stat->weight) != 0)
-				{
-					if (cur == len)
-						newentry = SEI_realloc(newentry, &len);
-					newentry[cur] = wptr;
-					cur++;
-				}
-				wptr++;
-			}
-		}
+	insertStatEntry(persistentContext, stat, txt, (nbit >> 1) - offset);
+	chooseNextStatEntry(persistentContext, stat, txt, 0, nbit, offset);
 
-		while (wptr - ARRPTR(txt) < txt->size)
-		{
-			if (stat->weight == 0 || check_weight(txt, wptr, stat->weight) != 0)
-			{
-				if (cur == len)
-					newentry = SEI_realloc(newentry, &len);
-				newentry[cur] = wptr;
-				cur++;
-			}
-			wptr++;
-		}
-	}
-	else
-	{							/* search */
-		while (wptr - ARRPTR(txt) < txt->size)
-		{
-			StatEntry  *StopLow = STATPTR(stat);
-			StatEntry  *StopHigh = (StatEntry *) STATSTRPTR(stat);
-			int			cmp;
-
-			while (StopLow < StopHigh)
-			{
-				sptr = StopLow + (StopHigh - StopLow) / 2;
-				cmp = compareStatWord(sptr, wptr, stat, txt);
-				if (cmp == 0)
-				{
-					if (stat->weight == 0)
-					{
-						sptr->ndoc++;
-						sptr->nentry += (wptr->haspos) ? POSDATALEN(txt, wptr) : 1;
-					}
-					else if (wptr->haspos && (n = check_weight(txt, wptr, stat->weight)) != 0)
-					{
-						sptr->ndoc++;
-						sptr->nentry += n;
-					}
-					break;
-				}
-				else if (cmp < 0)
-					StopLow = sptr + 1;
-				else
-					StopHigh = sptr;
-			}
-
-			if (StopLow >= StopHigh)
-			{					/* not found */
-				if (stat->weight == 0 || check_weight(txt, wptr, stat->weight) != 0)
-				{
-					if (cur == len)
-						newentry = SEI_realloc(newentry, &len);
-					newentry[cur] = wptr;
-					cur++;
-				}
-			}
-			wptr++;
-		}
-	}
-
-
-	if (cur == 0)
-	{							/* no new words */
-		if (txt != (TSVector) DatumGetPointer(data))
-			pfree(txt);
-		return stat;
-	}
-
-	newstat = formstat(stat, txt, newentry, cur);
-	pfree(newentry);
-
-	if (txt != (TSVector) DatumGetPointer(data))
-		pfree(txt);
-	return newstat;
+	return stat;
 }
 
 static void
 ts_setup_firstcall(FunctionCallInfo fcinfo, FuncCallContext *funcctx,
-				   tsstat *stat)
+				   TSVectorStat *stat)
 {
 	TupleDesc	tupdesc;
 	MemoryContext oldcontext;
-	StatStorage *st;
+	StatEntry  *node;
+
+	funcctx->user_fctx = (void *) stat;
 
 	oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
-	st = palloc(sizeof(StatStorage));
-	st->cur = 0;
-	st->stat = palloc(VARSIZE(stat));
-	memcpy(st->stat, stat, VARSIZE(stat));
-	funcctx->user_fctx = (void *) st;
+
+	stat->stack = palloc0(sizeof(StatEntry *) * (stat->maxdepth + 1));
+	stat->stackpos = 0;
+
+	node = stat->root;
+	/* find leftmost value */
+	if (node == NULL)
+		stat->stack[stat->stackpos] = NULL;
+	else
+		for (;;)
+		{
+			stat->stack[stat->stackpos] = node;
+			if (node->left)
+			{
+				stat->stackpos++;
+				node = node->left;
+			}
+			else
+				break;
+		}
+	Assert(stat->stackpos <= stat->maxdepth);
 
 	tupdesc = CreateTemplateTupleDesc(3, false);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 1, "word",
@@ -1095,26 +1948,73 @@ ts_setup_firstcall(FunctionCallInfo fcinfo, FuncCallContext *funcctx,
 	MemoryContextSwitchTo(oldcontext);
 }
 
+static StatEntry *
+walkStatEntryTree(TSVectorStat *stat)
+{
+	StatEntry  *node = stat->stack[stat->stackpos];
+
+	if (node == NULL)
+		return NULL;
+
+	if (node->ndoc != 0)
+	{
+		/* return entry itself: we already was at left sublink */
+		return node;
+	}
+	else if (node->right && node->right != stat->stack[stat->stackpos + 1])
+	{
+		/* go on right sublink */
+		stat->stackpos++;
+		node = node->right;
+
+		/* find most-left value */
+		for (;;)
+		{
+			stat->stack[stat->stackpos] = node;
+			if (node->left)
+			{
+				stat->stackpos++;
+				node = node->left;
+			}
+			else
+				break;
+		}
+		Assert(stat->stackpos <= stat->maxdepth);
+	}
+	else
+	{
+		/* we already return all left subtree, itself and  right subtree */
+		if (stat->stackpos == 0)
+			return NULL;
+
+		stat->stackpos--;
+		return walkStatEntryTree(stat);
+	}
+
+	return node;
+}
 
 static Datum
 ts_process_call(FuncCallContext *funcctx)
 {
-	StatStorage *st;
+	TSVectorStat *st;
+	StatEntry  *entry;
 
-	st = (StatStorage *) funcctx->user_fctx;
+	st = (TSVectorStat *) funcctx->user_fctx;
 
-	if (st->cur < st->stat->size)
+	entry = walkStatEntryTree(st);
+
+	if (entry != NULL)
 	{
 		Datum		result;
 		char	   *values[3];
 		char		ndoc[16];
 		char		nentry[16];
-		StatEntry  *entry = STATPTR(st->stat) + st->cur;
 		HeapTuple	tuple;
 
-		values[0] = palloc(entry->len + 1);
-		memcpy(values[0], STATSTRPTR(st->stat) + entry->pos, entry->len);
-		(values[0])[entry->len] = '\0';
+		values[0] = palloc(entry->lenlexeme + 1);
+		memcpy(values[0], entry->lexeme, entry->lenlexeme);
+		(values[0])[entry->lenlexeme] = '\0';
 		sprintf(ndoc, "%d", entry->ndoc);
 		values[1] = ndoc;
 		sprintf(nentry, "%d", entry->nentry);
@@ -1124,25 +2024,21 @@ ts_process_call(FuncCallContext *funcctx)
 		result = HeapTupleGetDatum(tuple);
 
 		pfree(values[0]);
-		st->cur++;
+
+		/* mark entry as already visited */
+		entry->ndoc = 0;
+
 		return result;
-	}
-	else
-	{
-		pfree(st->stat);
-		pfree(st);
 	}
 
 	return (Datum) 0;
 }
 
-static tsstat *
-ts_stat_sql(text *txt, text *ws)
+static TSVectorStat *
+ts_stat_sql(MemoryContext persistentContext, text *txt, text *ws)
 {
-	char	   *query = TextPGetCString(txt);
-	int			i;
-	tsstat	   *newstat,
-			   *stat;
+	char	   *query = text_to_cstring(txt);
+	TSVectorStat *stat;
 	bool		isnull;
 	Portal		portal;
 	SPIPlanPtr	plan;
@@ -1159,16 +2055,14 @@ ts_stat_sql(text *txt, text *ws)
 
 	if (SPI_tuptable == NULL ||
 		SPI_tuptable->tupdesc->natts != 1 ||
-		!is_expected_type(SPI_gettypeid(SPI_tuptable->tupdesc, 1),
-						  TSVECTOROID))
+		!IsBinaryCoercible(SPI_gettypeid(SPI_tuptable->tupdesc, 1),
+						   TSVECTOROID))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("ts_stat query must return one tsvector column")));
 
-	stat = palloc(STATHDRSIZE);
-	SET_VARSIZE(stat, STATHDRSIZE);
-	stat->size = 0;
-	stat->weight = 0;
+	stat = MemoryContextAllocZero(persistentContext, sizeof(TSVectorStat));
+	stat->maxdepth = 1;
 
 	if (ws)
 	{
@@ -1207,17 +2101,14 @@ ts_stat_sql(text *txt, text *ws)
 
 	while (SPI_processed > 0)
 	{
+		uint64		i;
+
 		for (i = 0; i < SPI_processed; i++)
 		{
 			Datum		data = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull);
 
 			if (!isnull)
-			{
-				newstat = ts_accum(stat, data);
-				if (stat != newstat && stat)
-					pfree(stat);
-				stat = newstat;
-			}
+				stat = ts_accum(persistentContext, stat, data);
 		}
 
 		SPI_freetuptable(SPI_tuptable);
@@ -1240,12 +2131,12 @@ ts_stat1(PG_FUNCTION_ARGS)
 
 	if (SRF_IS_FIRSTCALL())
 	{
-		tsstat	   *stat;
+		TSVectorStat *stat;
 		text	   *txt = PG_GETARG_TEXT_P(0);
 
 		funcctx = SRF_FIRSTCALL_INIT();
 		SPI_connect();
-		stat = ts_stat_sql(txt, NULL);
+		stat = ts_stat_sql(funcctx->multi_call_memory_ctx, txt, NULL);
 		PG_FREE_IF_COPY(txt, 0);
 		ts_setup_firstcall(fcinfo, funcctx, stat);
 		SPI_finish();
@@ -1265,13 +2156,13 @@ ts_stat2(PG_FUNCTION_ARGS)
 
 	if (SRF_IS_FIRSTCALL())
 	{
-		tsstat	   *stat;
+		TSVectorStat *stat;
 		text	   *txt = PG_GETARG_TEXT_P(0);
 		text	   *ws = PG_GETARG_TEXT_P(1);
 
 		funcctx = SRF_FIRSTCALL_INIT();
 		SPI_connect();
-		stat = ts_stat_sql(txt, ws);
+		stat = ts_stat_sql(funcctx->multi_call_memory_ctx, txt, ws);
 		PG_FREE_IF_COPY(txt, 0);
 		PG_FREE_IF_COPY(ws, 1);
 		ts_setup_firstcall(fcinfo, funcctx, stat);
@@ -1327,9 +2218,9 @@ tsvector_update_trigger(PG_FUNCTION_ARGS, bool config_column)
 		elog(ERROR, "tsvector_update_trigger: not fired by trigger manager");
 
 	trigdata = (TriggerData *) fcinfo->context;
-	if (TRIGGER_FIRED_FOR_STATEMENT(trigdata->tg_event))
-		elog(ERROR, "tsvector_update_trigger: can't process STATEMENT events");
-	if (TRIGGER_FIRED_AFTER(trigdata->tg_event))
+	if (!TRIGGER_FIRED_FOR_ROW(trigdata->tg_event))
+		elog(ERROR, "tsvector_update_trigger: must be fired for row");
+	if (!TRIGGER_FIRED_BEFORE(trigdata->tg_event))
 		elog(ERROR, "tsvector_update_trigger: must be fired BEFORE event");
 
 	if (TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))
@@ -1352,8 +2243,8 @@ tsvector_update_trigger(PG_FUNCTION_ARGS, bool config_column)
 				(errcode(ERRCODE_UNDEFINED_COLUMN),
 				 errmsg("tsvector column \"%s\" does not exist",
 						trigger->tgargs[0])));
-	if (!is_expected_type(SPI_gettypeid(rel->rd_att, tsvector_attr_num),
-						  TSVECTOROID))
+	if (!IsBinaryCoercible(SPI_gettypeid(rel->rd_att, tsvector_attr_num),
+						   TSVECTOROID))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATATYPE_MISMATCH),
 				 errmsg("column \"%s\" is not of tsvector type",
@@ -1370,8 +2261,8 @@ tsvector_update_trigger(PG_FUNCTION_ARGS, bool config_column)
 					(errcode(ERRCODE_UNDEFINED_COLUMN),
 					 errmsg("configuration column \"%s\" does not exist",
 							trigger->tgargs[1])));
-		if (!is_expected_type(SPI_gettypeid(rel->rd_att, config_attr_num),
-							  REGCONFIGOID))
+		if (!IsBinaryCoercible(SPI_gettypeid(rel->rd_att, config_attr_num),
+							   REGCONFIGOID))
 			ereport(ERROR,
 					(errcode(ERRCODE_DATATYPE_MISMATCH),
 					 errmsg("column \"%s\" is not of regconfig type",
@@ -1396,7 +2287,7 @@ tsvector_update_trigger(PG_FUNCTION_ARGS, bool config_column)
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("text search configuration name \"%s\" must be schema-qualified",
 							trigger->tgargs[1])));
-		cfgId = TSConfigGetCfgid(names, false);
+		cfgId = get_ts_config_oid(names, false);
 	}
 
 	/* initialize parse state */
@@ -1416,10 +2307,10 @@ tsvector_update_trigger(PG_FUNCTION_ARGS, bool config_column)
 					(errcode(ERRCODE_UNDEFINED_COLUMN),
 					 errmsg("column \"%s\" does not exist",
 							trigger->tgargs[i])));
-		if (!is_text_type(SPI_gettypeid(rel->rd_att, numattr)))
+		if (!IsBinaryCoercible(SPI_gettypeid(rel->rd_att, numattr), TEXTOID))
 			ereport(ERROR,
 					(errcode(ERRCODE_DATATYPE_MISMATCH),
-					 errmsg("column \"%s\" is not of character type",
+					 errmsg("column \"%s\" is not of a character type",
 							trigger->tgargs[i])));
 
 		datum = SPI_getbinval(rettuple, rel->rd_att, numattr, &isnull);

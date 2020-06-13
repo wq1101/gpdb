@@ -21,10 +21,10 @@
  * are different.
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- *	$PostgreSQL: pgsql/src/backend/libpq/pqformat.c,v 1.52 2010/01/07 04:53:34 tgl Exp $
+ *	src/backend/libpq/pqformat.c
  *
  *-------------------------------------------------------------------------
  */
@@ -65,6 +65,7 @@
  *		pq_copymsgbytes - copy raw data from a message buffer
  *		pq_getmsgtext	- get a counted text string (with conversion)
  *		pq_getmsgstring - get a null-terminated text string (with conversion)
+ *		pq_getmsgrawstring - get a null-terminated text string - NO conversion
  *		pq_getmsgend	- verify message fully consumed
  */
 
@@ -120,7 +121,7 @@ pq_sendbytes(StringInfo buf, const char *data, int datalen)
  *		pq_sendcountedtext - append a counted text string (with character set conversion)
  *
  * The data sent to the frontend by this routine is a 4-byte count field
- * followed by the string.	The count includes itself or not, as per the
+ * followed by the string.  The count includes itself or not, as per the
  * countincludesself flag (pre-3.0 protocol requires it to include itself).
  * The passed text string need not be null-terminated, and the data sent
  * to the frontend isn't either.
@@ -218,7 +219,7 @@ pq_send_ascii_string(StringInfo buf, const char *str)
 {
 	while (*str)
 	{
-		char	ch = *str++;
+		char		ch = *str++;
 
 		if (IS_HIGHBIT_SET(ch))
 			ch = '?';
@@ -637,6 +638,35 @@ pq_getmsgstring(StringInfo msg)
 	msg->cursor += slen + 1;
 
 	return pg_client_to_server(str, slen);
+}
+
+/* --------------------------------
+ *		pq_getmsgrawstring - get a null-terminated text string - NO conversion
+ *
+ *		Returns a pointer directly into the message buffer.
+ * --------------------------------
+ */
+const char *
+pq_getmsgrawstring(StringInfo msg)
+{
+	char	   *str;
+	int			slen;
+
+	str = &msg->data[msg->cursor];
+
+	/*
+	 * It's safe to use strlen() here because a StringInfo is guaranteed to
+	 * have a trailing null byte.  But check we found a null inside the
+	 * message.
+	 */
+	slen = strlen(str);
+	if (msg->cursor + slen >= msg->len)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROTOCOL_VIOLATION),
+				 errmsg("invalid string in message")));
+	msg->cursor += slen + 1;
+
+	return str;
 }
 
 /* --------------------------------

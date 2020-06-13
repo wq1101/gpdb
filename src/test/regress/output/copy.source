@@ -10,6 +10,14 @@ COPY onek TO '@abs_builddir@/results/onek.data';
 DELETE FROM onek;
 COPY onek FROM '@abs_builddir@/results/onek.data';
 COPY tenk1 FROM '@abs_srcdir@/data/tenk.data';
+-- Create a table that's identical to 'tenk1', but all the data is in a single
+-- segment. This comes handy in making some PostgreSQL tests pass on GPDB,
+-- where data distribution might make a difference to a test result.
+CREATE SCHEMA singleseg;
+create table singleseg.tenk1 (like tenk1, distkey int4) distributed by (distkey);
+NOTICE:  OIDS=TRUE is not recommended for user-created tables
+HINT:  Use OIDS=FALSE to prevent wrap-around of the OID counter.
+COPY singleseg.tenk1 (unique1,unique2,two,four,ten,twenty,hundred,thousand,twothousand,fivethous,tenthous,odd,even,stringu1,stringu2,string4) FROM '@abs_srcdir@/data/tenk.data';
 COPY slow_emp4000 FROM '@abs_srcdir@/data/rect.data';
 COPY person FROM '@abs_srcdir@/data/person.data';
 COPY emp FROM '@abs_srcdir@/data/emp.data';
@@ -22,6 +30,7 @@ COPY hash_name_heap FROM '@abs_srcdir@/data/hash.data';
 COPY hash_txt_heap FROM '@abs_srcdir@/data/hash.data';
 COPY hash_f8_heap FROM '@abs_srcdir@/data/hash.data';
 COPY test_tsvector FROM '@abs_srcdir@/data/tsearch.data';
+COPY testjsonb FROM '@abs_srcdir@/data/jsonb.data';
 -- the data in this file has a lot of duplicates in the index key
 -- fields, leading to long bucket chains and lots of table expansion.
 -- this is therefore a stress test of the bucket overflow code (unlike
@@ -34,6 +43,29 @@ COPY bt_txt_heap FROM '@abs_srcdir@/data/desc.data';
 COPY bt_f8_heap FROM '@abs_srcdir@/data/hash.data';
 COPY array_op_test FROM '@abs_srcdir@/data/array.data';
 COPY array_index_op_test FROM '@abs_srcdir@/data/array.data';
+-- analyze all the data we just loaded, to ensure plan consistency
+-- in later tests
+ANALYZE aggtest;
+ANALYZE onek;
+ANALYZE tenk1;
+ANALYZE slow_emp4000;
+ANALYZE person;
+ANALYZE emp;
+ANALYZE student;
+ANALYZE stud_emp;
+ANALYZE road;
+ANALYZE real_city;
+ANALYZE hash_i4_heap;
+ANALYZE hash_name_heap;
+ANALYZE hash_txt_heap;
+ANALYZE hash_f8_heap;
+ANALYZE test_tsvector;
+ANALYZE bt_i4_heap;
+ANALYZE bt_name_heap;
+ANALYZE bt_txt_heap;
+ANALYZE bt_f8_heap;
+ANALYZE array_op_test;
+ANALYZE array_index_op_test;
 --- test copying in CSV mode with various styles
 --- of embedded line ending characters
 create temp table copytest (
@@ -64,8 +96,8 @@ select * from copytest except select * from copytest2 order by 1,2,3;
 
 -- test header line feature
 create temp table copytest3 (
-	c1 int, 
-	"col with , comma" text, 
+	c1 int,
+	"col with , comma" text,
 	"col with "" quote"  int) distributed by (c1);
 copy copytest3 from stdin csv header;
 copy copytest3 to stdout csv header;
@@ -92,7 +124,7 @@ CREATE TEMP TABLE venue(
     venueseats integer) DISTRIBUTED BY (venueid);
 COPY venue FROM '@abs_srcdir@/data/venue_pipe.txt' WITH DELIMITER AS '|';
 SELECT count(*) FROM venue;
- count
+ count 
 -------
     10
 (1 row)

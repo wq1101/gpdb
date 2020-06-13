@@ -4,7 +4,7 @@
 --
 -- awk '{print $3;}' onek.data | sort -n | uniq
 --
-SELECT DISTINCT two FROM tmp  ORDER BY 1;
+SELECT DISTINCT two FROM tmp ORDER BY 1;
  two 
 -----
    0
@@ -125,6 +125,42 @@ SELECT DISTINCT p.age FROM person* p ORDER BY age using >;
 (20 rows)
 
 --
+-- Check mentioning same column more than once
+--
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT count(*) FROM
+  (SELECT DISTINCT two, four, two FROM tenk1) ss;
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Finalize Aggregate
+   Output: count(*)
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         Output: (PARTIAL count(*))
+         ->  Partial Aggregate
+               Output: PARTIAL count(*)
+               ->  Finalize HashAggregate
+                     Output: tenk1.two, tenk1.four, tenk1.two
+                     Group Key: tenk1.two, tenk1.four, tenk1.two
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Output: tenk1.two, tenk1.four, tenk1.two
+                           Hash Key: tenk1.two, tenk1.four, tenk1.two
+                           ->  Partial HashAggregate
+                                 Output: tenk1.two, tenk1.four, tenk1.two
+                                 Group Key: tenk1.two, tenk1.four, tenk1.two
+                                 ->  Seq Scan on public.tenk1
+                                       Output: tenk1.two, tenk1.four, tenk1.two
+ Optimizer: Postgres query optimizer
+ Settings: optimizer=off
+(19 rows)
+
+SELECT count(*) FROM
+  (SELECT DISTINCT two, four, two FROM tenk1) ss;
+ count 
+-------
+     4
+(1 row)
+
+--
 -- Also, some tests of IS DISTINCT FROM, which doesn't quite deserve its
 -- very own regression file.
 --
@@ -134,7 +170,7 @@ INSERT INTO DISTTABLE VALUES(2);
 INSERT INTO DISTTABLE VALUES(3);
 INSERT INTO DISTTABLE VALUES(NULL);
 -- basic cases
-SELECT f1, f1 IS DISTINCT FROM 2 as "not 2" FROM disttable ORDER BY 1;
+SELECT f1, f1 IS DISTINCT FROM 2 as "not 2" FROM disttable;
  f1 | not 2 
 ----+-------
   1 | t
@@ -143,7 +179,7 @@ SELECT f1, f1 IS DISTINCT FROM 2 as "not 2" FROM disttable ORDER BY 1;
     | t
 (4 rows)
 
-SELECT f1, f1 IS DISTINCT FROM NULL as "not null" FROM disttable ORDER BY 1;
+SELECT f1, f1 IS DISTINCT FROM NULL as "not null" FROM disttable;
  f1 | not null 
 ----+----------
   1 | t
@@ -152,7 +188,7 @@ SELECT f1, f1 IS DISTINCT FROM NULL as "not null" FROM disttable ORDER BY 1;
     | f
 (4 rows)
 
-SELECT f1, f1 IS DISTINCT FROM f1 as "false" FROM disttable ORDER BY 1;
+SELECT f1, f1 IS DISTINCT FROM f1 as "false" FROM disttable;
  f1 | false 
 ----+-------
   1 | f
@@ -161,7 +197,7 @@ SELECT f1, f1 IS DISTINCT FROM f1 as "false" FROM disttable ORDER BY 1;
     | f
 (4 rows)
 
-SELECT f1, f1 IS DISTINCT FROM f1+1 as "not null" FROM disttable ORDER BY 1;
+SELECT f1, f1 IS DISTINCT FROM f1+1 as "not null" FROM disttable;
  f1 | not null 
 ----+----------
   1 | t
@@ -195,7 +231,7 @@ SELECT null IS DISTINCT FROM null as "no";
  f
 (1 row)
 
--- ANSI SQL 2003 form
+-- negated form
 SELECT 1 IS NOT DISTINCT FROM 2 as "no";
  no 
 ----

@@ -5,28 +5,29 @@
   ditaarch:DITAArchVersion="1.1"
   domains="(topic ui-d) (topic hi-d) (topic pr-d) (topic sw-d)                          (topic ut-d) (topic indexing-d)"
   class="- topic/topic ">
-  <title id="ie179298" class="- topic/title ">The gp_toolkit
-    Administrative Schema</title>
+  <title id="ie179298" class="- topic/title ">The gp_toolkit Administrative Schema</title>
   <body class="- topic/body ">
     <p>Greenplum Database provides an administrative schema called <codeph
-        class="+ topic/ph pr-d/codeph ">gp_toolkit</codeph> that you
-      can use to query the system catalogs, log files, and operating environment for system status
-      information. The <codeph class="+ topic/ph pr-d/codeph ">gp_toolkit</codeph> schema contains a number of views that you can access using SQL commands.
-      The <codeph class="+ topic/ph pr-d/codeph ">gp_toolkit</codeph>
-      schema is accessible to all database users, although some objects may require superuser
-      permissions. For convenience, you may want to add the <codeph class="+ topic/ph pr-d/codeph "
-          >gp_toolkit</codeph> schema to your schema search path. For
+        class="+ topic/ph pr-d/codeph ">gp_toolkit</codeph> that you can use to query the system
+      catalogs, log files, and operating environment for system status information. The <codeph
+        class="+ topic/ph pr-d/codeph ">gp_toolkit</codeph> schema contains a number of views that
+      you can access using SQL commands. The <codeph class="+ topic/ph pr-d/codeph "
+        >gp_toolkit</codeph> schema is accessible to all database users, although some objects may
+      require superuser permissions. For convenience, you may want to add the <codeph
+        class="+ topic/ph pr-d/codeph ">gp_toolkit</codeph> schema to your schema search path. For
       example:</p>
     <codeblock>=&gt; ALTER ROLE myrole SET search_path TO myschema,gp_toolkit;</codeblock>
     <p>This documentation describes the most useful views in <codeph class="+ topic/ph pr-d/codeph "
-          >gp_toolkit</codeph>. You may notice other objects (views,
-      functions, and external tables) within the <codeph class="+ topic/ph pr-d/codeph ">gp_toolkit</codeph> schema that are not described in this
-      documentation (these are supporting objects to the views described in this section).</p>
-    <note type="warning" class="- topic/note ">Do not change database objects in the gp_toolkit schema. Do not create database objects in the schema.
-      Changes to objects in the schema might affect the accuracy of administrative information
-      returned by schema objects. <ph>Any changes made in the gp_toolkit schema are lost when the database is backed up and then
-        restored with the <codeph class="+ topic/ph pr-d/codeph ">gpcrondump</codeph> and <codeph
-          class="+ topic/ph pr-d/codeph ">gpdbrestore</codeph> utilities. </ph></note>
+        >gp_toolkit</codeph>. You may notice other objects (views, functions, and external tables)
+      within the <codeph class="+ topic/ph pr-d/codeph ">gp_toolkit</codeph> schema that are not
+      described in this documentation (these are supporting objects to the views described in this
+      section).</p>
+    <note type="warning" class="- topic/note ">Do not change database objects in the gp_toolkit
+      schema. Do not create database objects in the schema. Changes to objects in the schema might
+      affect the accuracy of administrative information returned by schema objects. <ph>Any changes
+        made in the gp_toolkit schema are lost when the database is backed up and then restored with
+        the <codeph class="+ topic/ph pr-d/codeph ">gpbackup</codeph> and <codeph
+          class="+ topic/ph pr-d/codeph ">gprestore</codeph> utilities. </ph></note>
     <p otherprops="op-print">These are the categories for views in the <codeph>gp_toolkit</codeph>
       schema.</p>
   </body>
@@ -49,14 +50,14 @@
       <p>The <codeph class="+ topic/ph pr-d/codeph ">VACUUM</codeph> or <codeph
           class="+ topic/ph pr-d/codeph ">VACUUM FULL</codeph> command reclaims disk space occupied
         by deleted or obsolete rows. Because of the MVCC transaction concurrency model used in
-          Greenplum Database, data rows that are deleted or updated still occupy
-        physical space on disk even though they are not visible to any new transactions. Expired
-        rows increase table size on disk and eventually slow down scans of the table.</p>
+        Greenplum Database, data rows that are deleted or updated still occupy physical space on
+        disk even though they are not visible to any new transactions. Expired rows increase table
+        size on disk and eventually slow down scans of the table.</p>
       <p>The <codeph class="+ topic/ph pr-d/codeph ">ANALYZE</codeph> command collects column-level
-        statistics needed by the query optimizer. Greenplum Database uses a cost-based
-        query optimizer that relies on database statistics. Accurate statistics allow the query
-        optimizer to better estimate selectivity and the number of rows retrieved by a query
-        operation in order to choose the most efficient query plan.</p>
+        statistics needed by the query optimizer. Greenplum Database uses a cost-based query
+        optimizer that relies on database statistics. Accurate statistics allow the query optimizer
+        to better estimate selectivity and the number of rows retrieved by a query operation in
+        order to choose the most efficient query plan.</p>
     </body>
     <topic id="topic3" xml:lang="en" ditaarch:DITAArchVersion="1.1"
       domains="(topic ui-d) (topic hi-d) (topic pr-d) (topic sw-d)                          (topic ut-d) (topic indexing-d)"
@@ -68,9 +69,9 @@
           bloated require a <codeph class="+ topic/ph pr-d/codeph ">VACUUM</codeph> or a <codeph
             class="+ topic/ph pr-d/codeph ">VACUUM FULL</codeph> in order to reclaim disk space
           occupied by deleted or obsolete rows. This view is accessible to all users, however
-          non-superusers will only be able to see the tables that they have permission to
-            access.<note> For diagnostic functions that return append-optimized table information,
-            see <xref href="#topic8" format="dita"/>.</note></p>
+          non-superusers will only be able to see the tables that they have permission to access.
+          <note> For diagnostic functions that return append-optimized table information, see <xref
+              href="#topic8" format="dita"/>.</note></p>
         <table id="ie184997" class="- topic/table ">
           <title class="- topic/title ">gp_bloat_diag view</title>
           <tgroup cols="2" class="- topic/tgroup ">
@@ -172,7 +173,7 @@
         the type of lock acquired, subsequent transactions may have to wait before they can access
         the same relation. For more information on the types of locks, see "Managing Data" in the
           <i>Greenplum Database Administrator Guide</i>. Greenplum Database resource queues (used
-        for workload management) also use locks to control the admission of queries into the
+        for resource management) also use locks to control the admission of queries into the
         system.</p>
       <p>The <codeph class="+ topic/ph pr-d/codeph ">gp_locks_*</codeph> family of views can help
         diagnose queries and sessions that are waiting to access an object due to a lock. </p>
@@ -269,6 +270,8 @@
       class="- topic/topic ">
       <title id="ie179843" class="- topic/title ">gp_locks_on_resqueue </title>
       <body class="- topic/body ">
+        <note>The <codeph>gp_locks_on_resqueue</codeph> view is valid only when resource queue-based
+          resource management is active.</note>
         <p>This view shows any locks currently being held on a resource queue, and the associated
           session information about the query associated with the lock. This view is accessible to
           all users, however non-superusers will only be able to see the locks associated with their
@@ -335,9 +338,7 @@
       </body>
     </topic>
   </topic>
-  <topic id="topic8" xml:lang="en" ditaarch:DITAArchVersion="1.1"
-    domains="(topic ui-d) (topic hi-d) (topic pr-d) (topic sw-d)                          (topic ut-d) (topic indexing-d)"
-    class="- topic/topic ">
+  <topic id="topic8" xml:lang="en" class="- topic/topic ">
     <title class="- topic/title ">Checking Append-Optimized Tables</title>
     <body class="- topic/body ">
       <p>The <codeph>gp_toolkit</codeph> schema includes a set of diagnostic functions you can use
@@ -351,10 +352,9 @@
           class="+ topic/ph pr-d/codeph ">VACUUM</codeph>. The hidden rows are tracked using an
         auxiliary visibility map table, or visimap. </p>
       <p>The following functions let you access the metadata for append-optimized and
-        column-oriented tables and view non-visible rows. Some of the functions have two versions:
-        one that takes the <codeph class="+ topic/ph pr-d/codeph ">oid</codeph> of the table, and
-        one that takes the name of the table. The latter version has "_name" appended to the
-        function name.</p>
+        column-oriented tables and view non-visible rows. </p>
+      <p>For most of the functions, the input argument is <codeph>regclass</codeph>, either the
+        table <codeph>name</codeph> or the <codeph>oid</codeph> of a table.</p>
     </body>
     <topic id="topic_ylp_gxw_yq">
       <title>__gp_aovisimap_compaction_info(oid)</title>
@@ -365,8 +365,10 @@
           by a <codeph>VACUUM</codeph> operation on an append-optimized table.</p>
         <note>Until a <cmdname>VACUUM</cmdname> operation deletes the row from the data file,
           deleted or updated data rows occupy physical space on disk even though they are hidden to
-          new transactions. The configuration parameter <codeph>gp_appendonly_compaction</codeph>
-          controls the functionality of the <codeph>VACUUM</codeph> command.</note>
+          new transactions. The configuration parameter <codeph><xref
+              href="config_params/guc-list.xml#gp_appendonly_compaction"
+              >gp_appendonly_compaction</xref></codeph> controls the functionality of the
+            <codeph>VACUUM</codeph> command.</note>
         <p>This table describes the <cmdname>__gp_aovisimap_compaction_info</cmdname> function
           output table.</p>
         <table id="table_wr2_dcv_mq">
@@ -415,13 +417,12 @@
         </table>
       </body>
     </topic>
-    <topic id="topic9" xml:lang="en" ditaarch:DITAArchVersion="1.1"
-      domains="(topic ui-d) (topic hi-d) (topic pr-d) (topic sw-d)                          (topic ut-d) (topic indexing-d)"
-      class="- topic/topic ">
-      <title class="- topic/title ">__gp_aoseg_name('table_name')</title>
+    <topic id="topic9" xml:lang="en">
+      <title class="- topic/title ">__gp_aoseg(regclass)</title>
       <body class="- topic/body ">
         <p>This function returns metadata information contained in the append-optimized table's
           on-disk segment file. </p>
+        <p>The input argument is the name or the oid of an append-optimized table. </p>
         <table id="ie202159" class="- topic/table ">
           <title class="- topic/title ">__gp_aoseg_name output table</title>
           <tgroup cols="2" class="- topic/tgroup ">
@@ -474,18 +475,14 @@
         </table>
       </body>
     </topic>
-    <topic id="topic10" xml:lang="en" ditaarch:DITAArchVersion="1.1"
-      domains="(topic ui-d) (topic hi-d) (topic pr-d) (topic sw-d)                          (topic ut-d) (topic indexing-d)"
-      class="- topic/topic ">
-      <title class="- topic/title ">__gp_aoseg_history(oid)</title>
+    <topic id="topic10" xml:lang="en" class="- topic/topic ">
+      <title class="- topic/title ">__gp_aoseg_history(regclass)</title>
       <body class="- topic/body ">
         <p>This function returns metadata information contained in the append-optimized table's
           on-disk segment file. It displays all different versions (heap tuples) of the aoseg meta
           information. The data is complex, but users with a deep understanding of the system may
-          find it usefulfor debugging.</p>
-        <p>The input argument is the oid of the append-optimized table. </p>
-        <p>Call __gp_aoseg_history_name('table_name') to get the same result with the table name as
-          an argument.</p>
+          find it useful for debugging.</p>
+        <p>The input argument is the name or the oid of an append-optimized table. </p>
         <table id="ie202200" class="- topic/table ">
           <title class="- topic/title ">__gp_aoseg_history output table</title>
           <tgroup cols="2" class="- topic/tgroup ">
@@ -583,17 +580,13 @@
         </table>
       </body>
     </topic>
-    <topic id="topic11" xml:lang="en" ditaarch:DITAArchVersion="1.1"
-      domains="(topic ui-d) (topic hi-d) (topic pr-d) (topic sw-d)                          (topic ut-d) (topic indexing-d)"
-      class="- topic/topic ">
-      <title class="- topic/title ">__gp_aocsseg(oid)</title>
+    <topic id="topic11" xml:lang="en" class="- topic/topic ">
+      <title class="- topic/title ">__gp_aocsseg(regclass)</title>
       <body class="- topic/body ">
         <p>This function returns metadata information contained in a column-oriented
           append-optimized table's on-disk segment file, excluding non-visible rows. Each row
           describes a segment for a column in the table.</p>
-        <p>The input argument is the oid of a column-oriented append-optimized table. Call as
-          __gp_aocsseg_name('table_name') to get the same result with the table name as an
-          argument.</p>
+        <p>The input argument is the name or the oid of a column-oriented append-optimized table. </p>
         <table id="ie202280" class="- topic/table ">
           <title class="- topic/title ">__gp_aocsseg(oid) output table</title>
           <tgroup cols="2" class="- topic/tgroup ">
@@ -652,18 +645,14 @@
         </table>
       </body>
     </topic>
-    <topic id="topic12" xml:lang="en" ditaarch:DITAArchVersion="1.1"
-      domains="(topic ui-d) (topic hi-d) (topic pr-d) (topic sw-d)                          (topic ut-d) (topic indexing-d)"
-      class="- topic/topic ">
-      <title class="- topic/title ">__gp_aocsseg_history(oid)</title>
+    <topic id="topic12" xml:lang="en" class="- topic/topic ">
+      <title class="- topic/title ">__gp_aocsseg_history(regclass)</title>
       <body class="- topic/body ">
         <p>This function returns metadata information contained in a column-oriented
           append-optimized table's on-disk segment file. Each row describes a segment for a column
           in the table. The data is complex, but users with a deep understanding of the system may
           find it useful for debugging.</p>
-        <p>The input argument is the oid of a column-oriented append-optimized table. Call as
-          __gp_aocsseg_history_name('table_name') to get the same result with the table name as
-          argument.</p>
+        <p> The input argument is the name or the oid of a column-oriented append-optimized table. </p>
         <table id="ie202328" class="- topic/table ">
           <title class="- topic/title ">__gp_aocsseg_history output table</title>
           <tgroup cols="2" class="- topic/tgroup ">
@@ -768,16 +757,12 @@
         </table>
       </body>
     </topic>
-    <topic id="topic13" xml:lang="en" ditaarch:DITAArchVersion="1.1"
-      domains="(topic ui-d) (topic hi-d) (topic pr-d) (topic sw-d)                          (topic ut-d) (topic indexing-d)"
-      class="- topic/topic ">
-      <title class="- topic/title ">__gp_aovisimap(oid)</title>
+    <topic id="topic13" xml:lang="en" class="- topic/topic ">
+      <title class="- topic/title ">__gp_aovisimap(regclass)</title>
       <body class="- topic/body ">
-        <p>This function returns the tuple id, the segment file, and the row number of each
+        <p>This function returns the tuple ID, the segment file, and the row number of each
           non-visible tuple according to the visibility map.</p>
-        <p>The input argument is the oid of an append-optimized table.</p>
-        <p>Use __gp_aovisimap_name('table_name') to get the same result with the table name as
-          argument.</p>
+        <p>The input argument is the name or the oid of an append-optimized table.</p>
         <table id="ie202417" class="- topic/table ">
           <tgroup cols="2" class="- topic/tgroup ">
             <colspec colnum="1" colname="col1" colwidth="108pt" class="- topic/colspec "/>
@@ -807,16 +792,12 @@
         </table>
       </body>
     </topic>
-    <topic id="topic14" xml:lang="en" ditaarch:DITAArchVersion="1.1"
-      domains="(topic ui-d) (topic hi-d) (topic pr-d) (topic sw-d)                          (topic ut-d) (topic indexing-d)"
-      class="- topic/topic ">
-      <title class="- topic/title ">__gp_aovisimap_hidden_info(oid)</title>
+    <topic id="topic14" xml:lang="en" class="- topic/topic ">
+      <title class="- topic/title ">__gp_aovisimap_hidden_info(regclass)</title>
       <body class="- topic/body ">
         <p>This function returns the numbers of hidden and visible tuples in the segment files for
           an append-optimized table.</p>
-        <p>The input argument is the oid of the append-optimized table. </p>
-        <p>Call __gp_aovisimap_hidden_info_name('table_name') to get the same result with a table
-          name argument.</p>
+        <p>The input argument is the name or the oid of an append-optimized table. </p>
         <table id="ie202442" class="- topic/table ">
           <tgroup cols="2" class="- topic/tgroup ">
             <colspec colnum="1" colname="col1" colwidth="108pt" class="- topic/colspec "/>
@@ -847,15 +828,11 @@
         </table>
       </body>
     </topic>
-    <topic id="topic15" xml:lang="en" ditaarch:DITAArchVersion="1.1"
-      domains="(topic ui-d) (topic hi-d) (topic pr-d) (topic sw-d)                          (topic ut-d) (topic indexing-d)"
-      class="- topic/topic ">
-      <title class="- topic/title ">__gp_aovisimap_entry(oid) </title>
+    <topic id="topic15" xml:lang="en" class="- topic/topic ">
+      <title class="- topic/title ">__gp_aovisimap_entry(regclass) </title>
       <body class="- topic/body ">
         <p>This function returns information about each visibility map entry for the table.</p>
-        <p>The input argument is the oid of an append-optimized table.</p>
-        <p>Call __gp_aovisimap_entry_name('table_name') to get the same result with a table name
-          argument.</p>
+        <p>The input argument is the name or the oid of an append-optimized table.</p>
         <table id="ie202467" class="- topic/table ">
           <title class="- topic/title ">__gp_aovisimap_entry output table</title>
           <tgroup cols="2" class="- topic/tgroup ">
@@ -899,11 +876,11 @@
     class="- topic/topic ">
     <title class="- topic/title ">Viewing Greenplum Database Server Log Files</title>
     <body class="- topic/body ">
-      <p>Each component of a Greenplum Database system (master, standby master,
-        primary segments, and mirror segments) keeps its own server log files. The <codeph
-          class="+ topic/ph pr-d/codeph ">gp_log_*</codeph> family of
-        views allows you to issue SQL queries against the server log files to find particular
-        entries of interest. The use of these views require superuser permissions.</p>
+      <p>Each component of a Greenplum Database system (master, standby master, primary segments,
+        and mirror segments) keeps its own server log files. The <codeph
+          class="+ topic/ph pr-d/codeph ">gp_log_*</codeph> family of views allows you to issue SQL
+        queries against the server log files to find particular entries of interest. The use of
+        these views require superuser permissions.</p>
       <ul class="- topic/ul ">
         <li id="ie192338" class="- topic/li ">
           <xref href="#topic17" type="topic" format="dita" class="- topic/xref "/>
@@ -928,8 +905,7 @@
           execution time of SQL commands executed in a database session. The use of this view
           requires superuser permissions.</p>
         <table id="ie176169" class="- topic/table ">
-          <title class="- topic/title ">gp_log_command_timings
-            view</title>
+          <title class="- topic/title ">gp_log_command_timings view</title>
           <tgroup cols="2" class="- topic/tgroup ">
             <colspec colnum="1" colname="col1" colwidth="114pt" class="- topic/colspec "/>
             <colspec colnum="2" colname="col2" colwidth="262pt" class="- topic/colspec "/>
@@ -988,10 +964,10 @@
       class="- topic/topic ">
       <title id="ie173484" class="- topic/title ">gp_log_database</title>
       <body class="- topic/body ">
-        <p>This view uses an external table to read the server log files of the entire Greenplum system (master, segments, and mirrors) and lists log
-          entries associated with the current database. Associated log entries can be identified by
-          the session id (logsession) and command id (logcmdcount). The use of this view requires
-          superuser permissions.</p>
+        <p>This view uses an external table to read the server log files of the entire Greenplum
+          system (master, segments, and mirrors) and lists log entries associated with the current
+          database. Associated log entries can be identified by the session id (logsession) and
+          command id (logcmdcount). The use of this view requires superuser permissions.</p>
         <table id="ie177059" class="- topic/table ">
           <title class="- topic/title ">gp_log_database view</title>
           <tgroup cols="2" class="- topic/tgroup ">
@@ -1160,8 +1136,7 @@
         <p>This view uses an external table to read a subset of the log fields from the master log
           file. The use of this view requires superuser permissions.</p>
         <table id="ie177543" class="- topic/table ">
-          <title class="- topic/title ">gp_log_master_concise
-            view</title>
+          <title class="- topic/title ">gp_log_master_concise view</title>
           <tgroup cols="2" class="- topic/tgroup ">
             <colspec colnum="1" colname="col1" colwidth="113pt" class="- topic/colspec "/>
             <colspec colnum="2" colname="col2" colwidth="263pt" class="- topic/colspec "/>
@@ -1205,9 +1180,10 @@
       class="- topic/topic ">
       <title id="ie173472" class="- topic/title ">gp_log_system</title>
       <body class="- topic/body ">
-        <p>This view uses an external table to read the server log files of the entire Greenplum system (master, segments, and mirrors) and lists all log
-          entries. Associated log entries can be identified by the session id (logsession) and
-          command id (logcmdcount). The use of this view requires superuser permissions. </p>
+        <p>This view uses an external table to read the server log files of the entire Greenplum
+          system (master, segments, and mirrors) and lists all log entries. Associated log entries
+          can be identified by the session id (logsession) and command id (logcmdcount). The use of
+          this view requires superuser permissions. </p>
         <table id="ie177596" class="- topic/table ">
           <title class="- topic/title ">gp_log_system view</title>
           <tgroup cols="2" class="- topic/tgroup ">
@@ -1532,11 +1508,396 @@
       </body>
     </topic>
   </topic>
+  <topic id="topic26x">
+    <title class="- topic/title ">Checking Resource Group Activity and Status</title>
+    <body class="- topic/body ">
+      <note>The resource group activity and status views described in this section are valid only
+        when resource group-based resource management is active.</note>
+      <p>Resource groups manage transactions to avoid exhausting system CPU and memory resources.
+        Every database user is assigned a resource group. Greenplum Database evaluates every
+        transaction submitted by a user against the limits configured for the user's resource group
+        before running the transaction.</p>
+      <p>You can use the <codeph>gp_resgroup_config</codeph> view to check the configuration of each
+        resource group. You can use the <codeph>gp_resgroup_status*</codeph> views to display the
+        current transaction status and resource usage of each resource group.</p>
+      <ul class="- topic/ul ">
+        <li id="ie193806" class="- topic/li ">
+          <xref href="#topic27x" type="topic" format="dita"/>
+        </li>
+        <li id="ie193833" class="- topic/li ">
+          <xref href="#topic31x" type="topic" format="dita"/>
+        </li>
+        <li id="tperhost" class="- topic/li ">
+          <xref href="#perhost" type="topic" format="dita"/>
+        </li>
+        <li id="tperseg" class="- topic/li ">
+          <xref href="#perseg" type="topic" format="dita"/>
+        </li>
+      </ul>
+    </body>
+    <topic id="topic27x" xml:lang="en" ditaarch:DITAArchVersion="1.1"
+      domains="(topic ui-d) (topic hi-d) (topic pr-d) (topic sw-d)                          (topic ut-d) (topic indexing-d)"
+      class="- topic/topic ">
+      <title id="ie193152x" class="- topic/title ">gp_resgroup_config</title>
+      <body class="- topic/body ">
+        <p>The <codeph>gp_resgroup_config</codeph> view allows administrators to see the current
+          CPU, memory, and concurrency limits for a resource group.</p>
+        <p>This view is accessible to all users.</p>
+        <table id="ie177971x" class="- topic/table ">
+          <title class="- topic/title ">gp_resgroup_config</title>
+          <tgroup cols="2" class="- topic/tgroup ">
+            <colspec colnum="1" colname="col1" colwidth="85pt" class="- topic/colspec "/>
+            <colspec colnum="2" colname="col2" colwidth="291pt" class="- topic/colspec "/>
+            <thead class="- topic/thead ">
+              <row class="- topic/row ">
+                <entry colname="col1" class="- topic/entry ">Column</entry>
+                <entry colname="col2" class="- topic/entry ">Description</entry>
+              </row>
+            </thead>
+            <tbody class="- topic/tbody ">
+              <row class="- topic/row ">
+                <entry colname="col1" class="- topic/entry ">groupid</entry>
+                <entry colname="col2" class="- topic/entry ">The ID of the resource group.</entry>
+              </row>
+              <row class="- topic/row ">
+                <entry colname="col1" class="- topic/entry ">groupname</entry>
+                <entry colname="col2" class="- topic/entry ">The name of the resource group.</entry>
+              </row>
+              <row class="- topic/row ">
+                <entry colname="col1" class="- topic/entry ">concurrency</entry>
+                <entry colname="col2" class="- topic/entry ">The concurrency
+                    (<codeph>CONCURRENCY</codeph>) value specified for the resource group.</entry>
+              </row>
+              <row class="- topic/row ">
+                <entry colname="col1" class="- topic/entry ">cpu_rate_limit</entry>
+                <entry colname="col2" class="- topic/entry ">The CPU limit
+                    (<codeph>CPU_RATE_LIMIT</codeph>) value specified for the resource group, or
+                  -1.</entry>
+              </row>
+              <row class="- topic/row ">
+                <entry colname="col1" class="- topic/entry ">memory_limit</entry>
+                <entry colname="col2" class="- topic/entry ">The memory limit
+                    (<codeph>MEMORY_LIMIT</codeph>) value specified for the resource group.</entry>
+              </row>
+              <row class="- topic/row ">
+                <entry colname="col1" class="- topic/entry ">memory_shared_quota</entry>
+                <entry colname="col2" class="- topic/entry ">The shared memory quota
+                    (<codeph>MEMORY_SHARED_QUOTA</codeph>) value specified for the resource
+                  group.</entry>
+              </row>
+              <row class="- topic/row ">
+                <entry colname="col1" class="- topic/entry ">memory_spill_ratio</entry>
+                <entry colname="col2" class="- topic/entry ">The memory spill ratio
+                    (<codeph>MEMORY_SPILL_RATIO</codeph>) value specified for the resource
+                  group.</entry>
+              </row>
+              <row class="- topic/row ">
+                <entry colname="col1" class="- topic/entry ">memory_auditor</entry>
+                <entry colname="col2" class="- topic/entry ">The memory auditor for the resource
+                  group.</entry>
+              </row>
+              <row class="- topic/row ">
+                <entry colname="col1" class="- topic/entry ">cpuset</entry>
+                <entry colname="col2" class="- topic/entry ">The CPU cores reserved for the resource
+                  group, or -1.</entry>
+              </row>
+            </tbody>
+          </tgroup>
+        </table>
+      </body>
+    </topic>
+    <topic id="topic31x" xml:lang="en" ditaarch:DITAArchVersion="1.1"
+      domains="(topic ui-d) (topic hi-d) (topic pr-d) (topic sw-d)                          (topic ut-d) (topic indexing-d)"
+      class="- topic/topic ">
+      <title id="ie196285" class="- topic/title ">gp_resgroup_status</title>
+      <body class="- topic/body ">
+        <p>The <codeph>gp_resgroup_status</codeph> view allows administrators to see status and
+          activity for a resource group. It shows how many queries are waiting to run and how many
+          queries are currently active in the system for each resource group. The view also displays
+          current memory and CPU usage for the resource group.</p>
+        <note>Resource groups use the Linux control groups (cgroups) configured on the host systems.
+          The cgroups are used to manage host system resources. When resource groups use cgroups
+          that are as part of a nested set of cgroups, resource group limits are relative to the
+          parent cgroup allotment. For information about nested cgroups and Greenplum Database
+          resource group limits, see <xref
+            href="../admin_guide/workload_mgmt_resgroups.xml#topic8339intro"/>.</note>
+        <p>This view is accessible to all users.</p>
+        <table id="ie196287x" class="- topic/table ">
+          <title class="- topic/title ">gp_resgroup_status view</title>
+          <tgroup cols="2" class="- topic/tgroup ">
+            <colspec colnum="1" colname="col1" colwidth="178pt" class="- topic/colspec "/>
+            <colspec colnum="2" colname="col2" colwidth="198pt" class="- topic/colspec "/>
+            <thead class="- topic/thead ">
+              <row class="- topic/row ">
+                <entry colname="col1" class="- topic/entry ">Column</entry>
+                <entry colname="col2" class="- topic/entry ">Description</entry>
+              </row>
+            </thead>
+            <tbody class="- topic/tbody ">
+              <row class="- topic/row ">
+                <entry colname="col1" class="- topic/entry ">rsgname</entry>
+                <entry colname="col2" class="- topic/entry ">The name of the resource group.</entry>
+              </row>
+              <row class="- topic/row ">
+                <entry colname="col1" class="- topic/entry ">groupid</entry>
+                <entry colname="col2" class="- topic/entry ">The ID of the resource group.</entry>
+              </row>
+              <row class="- topic/row ">
+                <entry colname="col1" class="- topic/entry ">num_running</entry>
+                <entry colname="col2" class="- topic/entry ">The number of transactions currently
+                  executing in the resource group.</entry>
+              </row>
+              <row class="- topic/row ">
+                <entry colname="col1" class="- topic/entry ">num_queueing</entry>
+                <entry colname="col2" class="- topic/entry ">The number of currently queued
+                  transactions for the resource group.</entry>
+              </row>
+              <row class="- topic/row ">
+                <entry colname="col1" class="- topic/entry ">num_queued</entry>
+                <entry colname="col2" class="- topic/entry ">The total number of queued transactions
+                  for the resource group since the Greenplum Database cluster was last started,
+                  excluding the num_queueing.</entry>
+              </row>
+              <row class="- topic/row ">
+                <entry colname="col1" class="- topic/entry ">num_executed</entry>
+                <entry colname="col2" class="- topic/entry ">The total number of executed
+                  transactions in the resource group since the Greenplum Database cluster was last
+                  started, excluding the num_running.</entry>
+              </row>
+              <row class="- topic/row ">
+                <entry colname="col1" class="- topic/entry ">total_queue_duration</entry>
+                <entry colname="col2" class="- topic/entry ">The total time any transaction was
+                  queued since the Greenplum Database cluster was last started.</entry>
+              </row>
+              <row class="- topic/row ">
+                <entry colname="col1" class="- topic/entry ">cpu_usage</entry>
+                <entry colname="col2" class="- topic/entry ">A set of key-value pairs. For each
+                  segment instance (the key), the value is the real-time, per-segment instance CPU
+                  core usage by a resource group. The value is the sum of the percentages (as a
+                  decimal value) of CPU cores that are used by the resource group for the segment
+                  instance.</entry>
+              </row>
+              <row class="- topic/row ">
+                <entry colname="col1" class="- topic/entry ">memory_usage</entry>
+                <entry colname="col2" class="- topic/entry ">The real-time memory usage of the
+                  resource group on each Greenplum Database segment's host.</entry>
+              </row>
+            </tbody>
+          </tgroup>
+        </table>
+        <p id="json_field_info1">The <codeph>cpu_usage</codeph> field is a JSON-formatted, key:value
+          string that identifies, for each resource group, the per-segment instance CPU core usage.
+          The key is the segment id, the value is the sum of the percentages (as a decimal value) of
+          the CPU cores used by the segment instance's resource group on the segment host. For
+          example, if a segment host has 8 cores, the maximum value can be 8.00 (1.00 for 8 CPU
+          cores). The total CPU usage of all segment instances running on a host should not exceed
+          the <codeph>gp_resource_group_cpu_limit</codeph>. Example <codeph>cpu_usage</codeph>
+          column output:<codeblock>
+{"-1":0.01, "0":0.31, "1":0.31}</codeblock>In the example,
+          segment <codeph>0</codeph> and segment <codeph>1</codeph> are running on the same host;
+          their CPU usage is the same.</p>
+        <p id="json_field_info2">The <codeph>memory_usage</codeph> field is also a JSON-formatted,
+          key:value string. The string contents differ depending upon the type of resource group.
+          For each resource group that you assign to a role (default memory auditor
+            <codeph>vmtracker</codeph>), this string identifies the used and available
+          fixed and shared memory quota allocations on each segment. The key is segment id.
+          The values are memory values displayed in MB units. The following example shows
+            <codeph>memory_usage</codeph> column output for a single segment for a resource group
+          that you assign to a
+          role:<codeblock>
+"0":{"used":0, "available":76, "quota_used":-1, "quota_available":60, "shared_used":0, "shared_available":16}</codeblock>
+          For each resource group that you assign to an external component, the
+            <codeph>memory_usage</codeph> JSON-formatted string identifies the memory used and the
+          memory limit on each segment. The following example shows <codeph>memory_usage</codeph>
+          column output for an external component resource group for a single segment:
+          <codeblock>"1":{"used":11, "limit_granted":15}</codeblock></p>
+        <note>See the <codeph>gp_resgroup_status_per_host</codeph> and
+          <codeph>gp_resgroup_status_per_segment</codeph> views, described below, for
+          more user-friendly display of CPU and memory usage.</note>
+      </body>
+    </topic>
+    <topic id="perhost">
+      <title id="ie193152x">gp_resgroup_status_per_host</title>
+      <body>
+        <p>The <codeph><xref href="system_catalogs/gp_resgroup_status_per_host.xml"
+          type="topic" format="dita">gp_resgroup_status_per_host</xref></codeph>
+          view displays the real-time CPU and memory usage (MBs) for each resource
+          group on a per-host basis. The view also displays available and granted
+          group fixed and shared memory for each resource group on a host.</p>
+        
+        <table id="fp141982">
+          <title class="- topic/title ">gp_resgroup_status_per_host view</title>
+          <tgroup cols="2" class="- topic/tgroup ">
+            <colspec colnum="1" colname="col1" colwidth="130pt" class="- topic/colspec "/>
+            <colspec colnum="2" colname="col2" colwidth="238pt" class="- topic/colspec "/>
+            <thead class="- topic/thead ">
+              <row class="- topic/row ">
+                <entry colname="col1" class="- topic/entry ">Column</entry>
+                <entry colname="col2" class="- topic/entry ">Description</entry>
+              </row>
+            </thead>
+            <tbody>
+              <row>
+                <entry colname="col1"><codeph>rsgname</codeph></entry>
+                <entry colname="col2">The name of the resource group.</entry>
+              </row>
+              <row>
+                <entry colname="col1"><codeph>groupid</codeph></entry>
+                <entry colname="col2">The ID of the resource group.</entry>
+              </row>
+              <row>
+                <entry colname="col1"><codeph>hostname</codeph></entry>
+                <entry colname="col2">The hostname of the segment host.</entry>
+              </row>
+              <row>
+                <entry colname="col1"><codeph>cpu</codeph></entry>
+                <entry colname="col2">The real-time CPU core usage by the resource group on a host.
+                  The value is the sum of the percentages (as a decimal value) of the CPU cores that
+                  are used by the resource group on the host.</entry>
+              </row>
+              <row>
+                <entry colname="col1"> <codeph>memory_used</codeph> </entry>
+                <entry colname="col2">The real-time memory usage of the resource group on
+                  the host. This total includes resource group fixed and shared memory.
+                  It also includes global shared memory used by the resource group.</entry>
+              </row>
+              <row>
+                <entry colname="col1"> <codeph>memory_available</codeph> </entry>
+                <entry colname="col2">The unused fixed and shared memory for the resource
+                  group that is available on the host. This total does not include available
+                  resource group global shared memory.</entry>
+              </row>
+              <row>
+                <entry colname="col1"> <codeph>memory_quota_used</codeph> </entry>
+                <entry colname="col2">The real-time fixed memory usage for the resource
+                  group on the host.</entry>
+              </row>
+              <row>
+                <entry colname="col1"> <codeph>memory_quota_available</codeph> </entry>
+                <entry colname="col2">The fixed memory available to the resource group
+                  on the host.</entry>
+              </row>
+              <row>
+                <entry colname="col1"> <codeph>memory_shared_used</codeph> </entry>
+                <entry colname="col2">The group shared memory used by the resource
+                  group on the host. If any global shared memory is used by the resource
+                  group, this amount is included in the total as well.</entry>
+              </row>
+              <row>
+                <entry colname="col1"> <codeph>memory_shared_available</codeph> </entry>
+                <entry colname="col2">The amount of group shared memory available to the
+                  resource group on the host. Resource group global shared memory is not
+                  included in this total.</entry>
+              </row>
+            </tbody>
+          </tgroup>
+        </table>
+        <p>Sample output for the <codeph>gp_resgroup_status_per_host</codeph> view:</p>
+        <codeblock> rsgname       | groupid | hostname   | cpu  | memory_used | memory_available | memory_quota_used | memory_quota_available | memory_shared_used | memory_shared_available 
+---------------+---------+------------+------+-------------+------------------+-------------------+------------------------+---------------------+---------------------
+ admin_group   | 6438    | my-desktop | 0.84 | 1           | 271              | 68                | 68                     | 0                  | 136                     
+ default_group | 6437    | my-desktop | 0.00 | 0           | 816              | 0                 | 400                    | 0                  | 416                     
+(2 rows)</codeblock>
+      </body>
+    </topic>
+    <topic id="perseg">
+      <title id="ie193152x">gp_resgroup_status_per_segment</title>
+      <body>
+        <p>The <codeph><xref href="system_catalogs/gp_resgroup_status_per_segment.xml"
+          type="topic" format="dita">gp_resgroup_status_per_segment</xref></codeph>
+          view displays the real-time CPU and memory usage (MBs) for each resource
+          group on a per-segment-instance and per-host basis. The view also
+          displays available and granted group fixed and shared memory for each
+          resource group and segment instance combination on the host.</p>
+        
+        
+        <table id="fp141982">
+          <title class="- topic/title ">gp_resgroup_status_per_segment view</title>
+          <tgroup cols="2" class="- topic/tgroup ">
+            <colspec colnum="1" colname="col1" colwidth="130pt" class="- topic/colspec "/>
+            <colspec colnum="2" colname="col2" colwidth="238pt" class="- topic/colspec "/>
+            <thead class="- topic/thead ">
+              <row class="- topic/row ">
+                <entry colname="col1" class="- topic/entry ">Column</entry>
+                <entry colname="col2" class="- topic/entry ">Description</entry>
+              </row>
+            </thead>
+            <tbody>
+              <row>
+                <entry colname="col1"> <codeph>rsgname</codeph> </entry>
+                <entry colname="col4">The name of the resource group.</entry>
+              </row>
+              <row>
+                <entry colname="col1"> <codeph>groupid</codeph> </entry>
+                <entry colname="col4">The ID of the resource group.</entry>
+              </row>
+              <row>
+                <entry colname="col1"> <codeph>hostname</codeph> </entry>
+                <entry colname="col4">The hostname of the segment host.</entry>
+              </row>
+              <row>
+                <entry colname="col1"> <codeph>segment_id</codeph> </entry>
+                <entry colname="col4">The content ID for a segment instance on the
+                  segment host.</entry>
+              </row>
+              <row>
+                <entry colname="col1">
+                  <codeph>cpu</codeph>
+                </entry>
+                <entry colname="col4">The real-time, per-segment instance CPU core usage by the
+                  resource group on the host. The value is the sum of the percentages (as a decimal
+                  value) of the CPU cores that are used by the resource group for the segment
+                  instance.</entry>
+              </row>
+              <row>
+                <entry colname="col1"> <codeph>memory_used</codeph> </entry>
+                <entry colname="col4">The real-time memory usage of the resource group for
+                  the segment instance on the host. This total includes resource group
+                  fixed and shared memory. It also includes global shared memory used by
+                  the resource group.</entry>
+              </row>
+              <row>
+                <entry colname="col1"> <codeph>memory_available</codeph> </entry>
+                <entry colname="col4">The unused fixed and shared memory for the resource
+                  group for the segment instance on the host.</entry>
+              </row>
+              <row>
+                <entry colname="col1"> <codeph>memory_quota_used</codeph> </entry>
+                <entry colname="col4">The real-time fixed memory usage for the resource group
+                  for the segment instance on the host.</entry>
+              </row>
+              <row>
+                <entry colname="col1"> <codeph>memory_quota_available</codeph> </entry>
+                <entry colname="col4">The fixed memory available to the resource group for
+                  the segment instance on the host.</entry>
+              </row>
+              <row>
+                <entry colname="col1"> <codeph>memory_shared_used</codeph> </entry>
+                <entry colname="col4">The group shared memory used by the resource
+                  group for the segment instance on the host.</entry>
+              </row>
+              <row>
+                <entry colname="col1"> <codeph>memory_shared_available</codeph> </entry>
+                <entry colname="col4">The amount of group shared memory available
+                  for the segment instance on the host. Resource group global shared memory
+                  is not included in this total.</entry>
+              </row>
+            </tbody>
+          </tgroup>
+        </table>
+        <p>Query output for this view is similar to that of the
+          <codeph>gp_resgroup_status_per_host</codeph> view, and breaks out the CPU and
+          memory (used and available) for each segment instance on each host.</p>
+      </body>
+    </topic>
+  </topic>
   <topic id="topic26" xml:lang="en" ditaarch:DITAArchVersion="1.1"
     domains="(topic ui-d) (topic hi-d) (topic pr-d) (topic sw-d)                          (topic ut-d) (topic indexing-d)"
     class="- topic/topic ">
     <title class="- topic/title ">Checking Resource Queue Activity and Status</title>
     <body class="- topic/body ">
+      <note>The resource queue activity and status views described in this section are valid only
+        when resource queue-based resource management is active.</note>
       <p>The purpose of resource queues is to limit the number of active queries in the system at
         any given time in order to avoid exhausting system resources such as memory, CPU, and disk
         I/O. All database users are assigned to a resource queue, and every statement submitted by a
@@ -1759,9 +2120,9 @@
       class="- topic/topic ">
       <title id="ie196285" class="- topic/title ">gp_resqueue_status</title>
       <body class="- topic/body ">
-        <p>This view allows administrators to see status and activity for a workload management
-          resource queue. It shows how many queries are waiting to run and how many queries are
-          currently active in the system from a particular resource queue.</p>
+        <p>This view allows administrators to see status and activity for a resource queue. It shows
+          how many queries are waiting to run and how many queries are currently active in the
+          system from a particular resource queue.</p>
         <table id="ie196287" class="- topic/table ">
           <title class="- topic/title ">gp_resqueue_status view</title>
           <tgroup cols="2" class="- topic/tgroup ">
@@ -1854,12 +2215,13 @@
     class="- topic/topic ">
     <title class="- topic/title ">Checking Query Disk Spill Space Usage</title>
     <body class="- topic/body ">
-      <p>The <i class="+ topic/ph hi-d/i ">gp_workfile_*</i> views
-        show information about all the queries that are currently using disk spill space. Greenplum Database creates work files on disk if it does not have sufficient memory
-        to execute the query in memory. This information can be used for troubleshooting and tuning
-        queries. The information in the views can also be used to specify the values for the
-          Greenplum Database configuration parameters <codeph
-          class="+ topic/ph pr-d/codeph ">gp_workfile_limit_per_query</codeph> and <codeph class="+ topic/ph pr-d/codeph ">gp_workfile_limit_per_segment</codeph>.</p>
+      <p>The <i class="+ topic/ph hi-d/i ">gp_workfile_*</i> views show information about all the
+        queries that are currently using disk spill space. Greenplum Database creates work files on
+        disk if it does not have sufficient memory to execute the query in memory. This information
+        can be used for troubleshooting and tuning queries. The information in the views can also be
+        used to specify the values for the Greenplum Database configuration parameters <codeph
+          class="+ topic/ph pr-d/codeph ">gp_workfile_limit_per_query</codeph> and <codeph
+          class="+ topic/ph pr-d/codeph ">gp_workfile_limit_per_segment</codeph>.</p>
       <ul class="- topic/ul ">
         <li id="ie202605" class="- topic/li ">
           <xref href="#topic33" type="topic" format="dita" class="- topic/xref "/>
@@ -1880,7 +2242,7 @@
         <p>This view contains one row for each operator using disk space for workfiles on a segment
           at the current time. The view is accessible to all users, however non-superusers only to
           see information for the databases that they have permission to access.</p>
-        <table id="ie202617" class="- topic/table ">
+        <table class="- topic/table " id="table_zt5_yl1_gjb">
           <title class="- topic/title ">gp_workfile_entries</title>
           <tgroup cols="4" class="- topic/tgroup ">
             <colspec colnum="1" colname="col1" colwidth="131pt" class="- topic/colspec "/>
@@ -1898,59 +2260,15 @@
             <tbody class="- topic/tbody ">
               <row class="- topic/row ">
                 <entry colname="col1" class="- topic/entry ">
-                  <codeph class="+ topic/ph pr-d/codeph ">command_cnt</codeph>
-                </entry>
-                <entry colname="col2" class="- topic/entry ">integer</entry>
-                <entry colname="col3" class="- topic/entry "/>
-                <entry colname="col4" class="- topic/entry ">Command ID of the query.</entry>
-              </row>
-              <row class="- topic/row ">
-                <entry colname="col1" class="- topic/entry ">
-                  <codeph class="+ topic/ph pr-d/codeph ">content</codeph>
-                </entry>
-                <entry colname="col2" class="- topic/entry ">smallint</entry>
-                <entry colname="col3" class="- topic/entry "/>
-                <entry colname="col4" class="- topic/entry ">The content identifier for a segment
-                  instance.</entry>
-              </row>
-              <row class="- topic/row ">
-                <entry colname="col1" class="- topic/entry ">
-                  <codeph class="+ topic/ph pr-d/codeph ">current_query</codeph>
-                </entry>
-                <entry colname="col2" class="- topic/entry ">text</entry>
-                <entry colname="col3" class="- topic/entry "/>
-                <entry colname="col4" class="- topic/entry ">Current query that the process is
-                  running.</entry>
-              </row>
-              <row class="- topic/row ">
-                <entry colname="col1" class="- topic/entry ">
                   <codeph class="+ topic/ph pr-d/codeph ">datname</codeph>
                 </entry>
                 <entry colname="col2" class="- topic/entry ">name</entry>
                 <entry colname="col3" class="- topic/entry "/>
-                <entry colname="col4" class="- topic/entry ">Greenplum
-                  database name.</entry>
+                <entry colname="col4" class="- topic/entry ">Greenplum database name.</entry>
               </row>
               <row class="- topic/row ">
                 <entry colname="col1" class="- topic/entry ">
-                  <codeph class="+ topic/ph pr-d/codeph ">directory</codeph>
-                </entry>
-                <entry colname="col2" class="- topic/entry ">text</entry>
-                <entry colname="col3" class="- topic/entry "/>
-                <entry colname="col4" class="- topic/entry ">Path to the work file.</entry>
-              </row>
-              <row class="- topic/row ">
-                <entry colname="col1" class="- topic/entry ">
-                  <codeph class="+ topic/ph pr-d/codeph ">optype</codeph>
-                </entry>
-                <entry colname="col2" class="- topic/entry ">text</entry>
-                <entry colname="col3" class="- topic/entry "/>
-                <entry colname="col4" class="- topic/entry ">The query operator type that created
-                  the work file.</entry>
-              </row>
-              <row class="- topic/row ">
-                <entry colname="col1" class="- topic/entry ">
-                  <codeph class="+ topic/ph pr-d/codeph ">procpid </codeph>
+                  <codeph class="+ topic/ph pr-d/codeph ">pid </codeph>
                 </entry>
                 <entry colname="col2" class="- topic/entry ">integer</entry>
                 <entry colname="col3" class="- topic/entry "/>
@@ -1967,38 +2285,11 @@
               </row>
               <row class="- topic/row ">
                 <entry colname="col1" class="- topic/entry ">
-                  <codeph class="+ topic/ph pr-d/codeph ">size </codeph>
+                  <codeph class="+ topic/ph pr-d/codeph ">command_cnt</codeph>
                 </entry>
-                <entry colname="col2" class="- topic/entry ">bigint</entry>
+                <entry colname="col2" class="- topic/entry ">integer</entry>
                 <entry colname="col3" class="- topic/entry "/>
-                <entry colname="col4" class="- topic/entry ">The size of the work file in
-                  bytes.</entry>
-              </row>
-              <row class="- topic/row ">
-                <entry colname="col1" class="- topic/entry ">
-                  <codeph class="+ topic/ph pr-d/codeph ">numfiles</codeph>
-                </entry>
-                <entry colname="col2" class="- topic/entry ">bigint</entry>
-                <entry colname="col3" class="- topic/entry "/>
-                <entry colname="col4" class="- topic/entry ">The number of files created.</entry>
-              </row>
-              <row class="- topic/row ">
-                <entry colname="col1" class="- topic/entry ">
-                  <codeph class="+ topic/ph pr-d/codeph ">slice</codeph>
-                </entry>
-                <entry colname="col2" class="- topic/entry ">smallint</entry>
-                <entry colname="col3" class="- topic/entry "/>
-                <entry colname="col4" class="- topic/entry ">The query plan slice. The portion of
-                  the query plan that is being executed.</entry>
-              </row>
-              <row class="- topic/row ">
-                <entry colname="col1" class="- topic/entry ">
-                  <codeph class="+ topic/ph pr-d/codeph ">state</codeph>
-                </entry>
-                <entry colname="col2" class="- topic/entry ">text</entry>
-                <entry colname="col3" class="- topic/entry "/>
-                <entry colname="col4" class="- topic/entry ">The state of the query that created the
-                  work file.</entry>
+                <entry colname="col4" class="- topic/entry ">Command ID of the query.</entry>
               </row>
               <row class="- topic/row ">
                 <entry colname="col1" class="- topic/entry ">
@@ -2010,12 +2301,62 @@
               </row>
               <row class="- topic/row ">
                 <entry colname="col1" class="- topic/entry ">
-                  <codeph class="+ topic/ph pr-d/codeph ">workmem</codeph>
+                  <codeph class="+ topic/ph pr-d/codeph ">query</codeph>
+                </entry>
+                <entry colname="col2" class="- topic/entry ">text</entry>
+                <entry colname="col3" class="- topic/entry "/>
+                <entry colname="col4" class="- topic/entry ">Current query that the process is
+                  running.</entry>
+              </row>
+              <row>
+                <entry colname="col1" class="- topic/entry ">
+                  <codeph>segid</codeph></entry>
+                <entry colname="col2" class="- topic/entry ">integer</entry>
+                <entry colname="col3" class="- topic/entry "/>
+                <entry colname="col4" class="- topic/entry ">Segment ID.</entry>
+              </row>
+              <row class="- topic/row ">
+                <entry colname="col1" class="- topic/entry ">
+                  <codeph class="+ topic/ph pr-d/codeph ">slice</codeph>
                 </entry>
                 <entry colname="col2" class="- topic/entry ">integer</entry>
                 <entry colname="col3" class="- topic/entry "/>
-                <entry colname="col4" class="- topic/entry ">The amount of memory allocated to the
-                  operator in KB.</entry>
+                <entry colname="col4" class="- topic/entry ">The query plan slice. The portion of
+                  the query plan that is being executed.</entry>
+              </row>
+              <row class="- topic/row ">
+                <entry colname="col1" class="- topic/entry ">
+                  <codeph class="+ topic/ph pr-d/codeph ">optype</codeph>
+                </entry>
+                <entry colname="col2" class="- topic/entry ">text</entry>
+                <entry colname="col3" class="- topic/entry "/>
+                <entry colname="col4" class="- topic/entry ">The query operator type that created
+                  the work file.</entry>
+              </row>
+              <row class="- topic/row ">
+                <entry colname="col1" class="- topic/entry ">
+                  <codeph class="+ topic/ph pr-d/codeph ">size</codeph>
+                </entry>
+                <entry colname="col2" class="- topic/entry ">bigint</entry>
+                <entry colname="col3" class="- topic/entry "/>
+                <entry colname="col4" class="- topic/entry ">The size of the work file in
+                  bytes.</entry>
+              </row>
+              <row class="- topic/row ">
+                <entry colname="col1" class="- topic/entry ">
+                  <codeph class="+ topic/ph pr-d/codeph ">numfiles</codeph>
+                </entry>
+                <entry colname="col2" class="- topic/entry ">integer</entry>
+                <entry colname="col3" class="- topic/entry "/>
+                <entry colname="col4" class="- topic/entry ">The number of files created.</entry>
+              </row>
+              <row>
+                <entry colname="col1" class="- topic/entry ">
+                  <codeph>prefix</codeph></entry>
+                <entry colname="col2" class="- topic/entry ">text</entry>
+                <entry colname="col3" class="- topic/entry "/>
+                <entry colname="col4" class="- topic/entry ">Prefix used when naming a related set
+                  of workfiles.</entry>
               </row>
             </tbody>
           </tgroup>
@@ -2048,42 +2389,15 @@
             <tbody class="- topic/tbody ">
               <row class="- topic/row ">
                 <entry colname="col1" class="- topic/entry ">
-                  <codeph class="+ topic/ph pr-d/codeph ">command_cnt</codeph>
-                </entry>
-                <entry colname="col2" class="- topic/entry ">integer</entry>
-                <entry colname="col3" class="- topic/entry "/>
-                <entry colname="col4" class="- topic/entry ">Command ID of the query.</entry>
-              </row>
-              <row class="- topic/row ">
-                <entry colname="col1" class="- topic/entry ">
-                  <codeph class="+ topic/ph pr-d/codeph ">content</codeph>
-                </entry>
-                <entry colname="col2" class="- topic/entry ">smallint</entry>
-                <entry colname="col3" class="- topic/entry "/>
-                <entry colname="col4" class="- topic/entry ">The content identifier for a segment
-                  instance.</entry>
-              </row>
-              <row class="- topic/row ">
-                <entry colname="col1" class="- topic/entry ">
-                  <codeph class="+ topic/ph pr-d/codeph ">current_query</codeph>
-                </entry>
-                <entry colname="col2" class="- topic/entry ">text</entry>
-                <entry colname="col3" class="- topic/entry "/>
-                <entry colname="col4" class="- topic/entry ">Current query that the process is
-                  running.</entry>
-              </row>
-              <row class="- topic/row ">
-                <entry colname="col1" class="- topic/entry ">
                   <codeph class="+ topic/ph pr-d/codeph ">datname</codeph>
                 </entry>
                 <entry colname="col2" class="- topic/entry ">name</entry>
                 <entry colname="col3" class="- topic/entry "/>
-                <entry colname="col4" class="- topic/entry ">Greenplum
-                  database name.</entry>
+                <entry colname="col4" class="- topic/entry ">Greenplum database name.</entry>
               </row>
               <row class="- topic/row ">
                 <entry colname="col1" class="- topic/entry ">
-                  <codeph class="+ topic/ph pr-d/codeph ">procpid </codeph>
+                  <codeph class="+ topic/ph pr-d/codeph ">pid </codeph>
                 </entry>
                 <entry colname="col2" class="- topic/entry ">integer</entry>
                 <entry colname="col3" class="- topic/entry "/>
@@ -2100,9 +2414,41 @@
               </row>
               <row class="- topic/row ">
                 <entry colname="col1" class="- topic/entry ">
+                  <codeph class="+ topic/ph pr-d/codeph ">command_cnt</codeph>
+                </entry>
+                <entry colname="col2" class="- topic/entry ">integer</entry>
+                <entry colname="col3" class="- topic/entry "/>
+                <entry colname="col4" class="- topic/entry ">Command ID of the query.</entry>
+              </row>
+              <row class="- topic/row ">
+                <entry colname="col1" class="- topic/entry ">
+                  <codeph class="+ topic/ph pr-d/codeph ">usename</codeph>
+                </entry>
+                <entry colname="col2" class="- topic/entry ">name</entry>
+                <entry colname="col3" class="- topic/entry "/>
+                <entry colname="col4" class="- topic/entry ">Role name.</entry>
+              </row>
+              <row class="- topic/row ">
+                <entry colname="col1" class="- topic/entry ">
+                  <codeph class="+ topic/ph pr-d/codeph ">query</codeph>
+                </entry>
+                <entry colname="col2" class="- topic/entry ">text</entry>
+                <entry colname="col3" class="- topic/entry "/>
+                <entry colname="col4" class="- topic/entry ">Current query that the process is
+                  running.</entry>
+              </row>
+              <row>
+                <entry colname="col1" class="- topic/entry ">
+                  <codeph>segid</codeph></entry>
+                <entry colname="col2" class="- topic/entry ">integer</entry>
+                <entry colname="col3" class="- topic/entry "/>
+                <entry colname="col4" class="- topic/entry ">Segment ID.</entry>
+              </row>
+              <row class="- topic/row ">
+                <entry colname="col1" class="- topic/entry ">
                   <codeph class="+ topic/ph pr-d/codeph ">size</codeph>
                 </entry>
-                <entry colname="col2" class="- topic/entry ">bigint</entry>
+                <entry colname="col2" class="- topic/entry ">numeric</entry>
                 <entry colname="col3" class="- topic/entry "/>
                 <entry colname="col4" class="- topic/entry ">The size of the work file in
                   bytes.</entry>
@@ -2114,23 +2460,6 @@
                 <entry colname="col2" class="- topic/entry ">bigint</entry>
                 <entry colname="col3" class="- topic/entry "/>
                 <entry colname="col4" class="- topic/entry ">The number of files created.</entry>
-              </row>
-              <row class="- topic/row ">
-                <entry colname="col1" class="- topic/entry ">
-                  <codeph class="+ topic/ph pr-d/codeph ">state</codeph>
-                </entry>
-                <entry colname="col2" class="- topic/entry ">text</entry>
-                <entry colname="col3" class="- topic/entry "/>
-                <entry colname="col4" class="- topic/entry ">The state of the query that created the
-                  work file.</entry>
-              </row>
-              <row class="- topic/row ">
-                <entry colname="col1" class="- topic/entry ">
-                  <codeph class="+ topic/ph pr-d/codeph ">usename</codeph>
-                </entry>
-                <entry colname="col2" class="- topic/entry ">name</entry>
-                <entry colname="col3" class="- topic/entry "/>
-                <entry colname="col4" class="- topic/entry ">Role name.</entry>
               </row>
             </tbody>
           </tgroup>
@@ -2164,18 +2493,17 @@
             <tbody class="- topic/tbody ">
               <row class="- topic/row ">
                 <entry colname="col1" class="- topic/entry ">
-                  <codeph class="+ topic/ph pr-d/codeph ">content</codeph>
+                  <codeph class="+ topic/ph pr-d/codeph ">segid</codeph>
                 </entry>
                 <entry colname="col2" class="- topic/entry ">smallint</entry>
                 <entry colname="col3" class="- topic/entry "/>
-                <entry colname="col4" class="- topic/entry ">The content identifier for a segment
-                  instance.</entry>
+                <entry colname="col4" class="- topic/entry ">Segment ID.</entry>
               </row>
               <row class="- topic/row ">
                 <entry colname="col1" class="- topic/entry ">
                   <codeph class="+ topic/ph pr-d/codeph ">size</codeph>
                 </entry>
-                <entry colname="col2" class="- topic/entry ">bigint</entry>
+                <entry colname="col2" class="- topic/entry ">numeric</entry>
                 <entry colname="col3" class="- topic/entry "/>
                 <entry colname="col4" class="- topic/entry ">The total size of the work files on a
                   segment.</entry>
@@ -2258,10 +2586,10 @@
     <title id="ie192708" class="- topic/title ">Checking Database Object Sizes and Disk
       Space</title>
     <body class="- topic/body ">
-      <p>The <codeph class="+ topic/ph pr-d/codeph ">gp_size_*</codeph> family of views can be used to determine the disk space usage for a
-        distributed Greenplum Database, schema, table, or index. The following views
-        calculate the total size of an object across all primary segments (mirrors are not included
-        in the size calculations).</p>
+      <p>The <codeph class="+ topic/ph pr-d/codeph ">gp_size_*</codeph> family of views can be used
+        to determine the disk space usage for a distributed Greenplum Database, schema, table, or
+        index. The following views calculate the total size of an object across all primary segments
+        (mirrors are not included in the size calculations).</p>
       <ul class="- topic/ul " id="ul_jyr_wk5_vp">
         <li id="ie192740" class="- topic/li ">
           <xref href="#topic39" type="topic" format="dita" class="- topic/xref "/>
@@ -2312,8 +2640,7 @@ WHERE sotd.sotdoid=pg_class.oid ORDER BY relname;</codeblock>
           users, however non-superusers will only be able to see relations that they have permission
           to access.</p>
         <table id="ie181657" class="- topic/table ">
-          <title class="- topic/title ">
-            gp_size_of_all_table_indexes view</title>
+          <title class="- topic/title "> gp_size_of_all_table_indexes view</title>
           <tgroup cols="2" class="- topic/tgroup ">
             <colspec colnum="1" colname="col1" colwidth="114pt" class="- topic/colspec "/>
             <colspec colnum="2" colname="col2" colwidth="262pt" class="- topic/colspec "/>
@@ -2355,8 +2682,7 @@ WHERE sotd.sotdoid=pg_class.oid ORDER BY relname;</codeblock>
           however non-superusers will only be able to see databases that they have permission to
           access.</p>
         <table id="ie181758" class="- topic/table ">
-          <title class="- topic/title ">gp_size_of_database
-            view</title>
+          <title class="- topic/title ">gp_size_of_database view</title>
           <tgroup cols="2" class="- topic/tgroup ">
             <colspec colnum="1" colname="col1" colwidth="114pt" class="- topic/colspec "/>
             <colspec colnum="2" colname="col2" colwidth="261pt" class="- topic/colspec "/>
@@ -2389,8 +2715,7 @@ WHERE sotd.sotdoid=pg_class.oid ORDER BY relname;</codeblock>
         <p>This view shows the total size of an index. This view is accessible to all users, however
           non-superusers will only be able to see relations that they have permission to access.</p>
         <table id="ie181709" class="- topic/table ">
-          <title class="- topic/title ">
-            gp_size_of_index view</title>
+          <title class="- topic/title "> gp_size_of_index view</title>
           <tgroup cols="2" class="- topic/tgroup ">
             <colspec colnum="1" colname="col1" colwidth="114pt" class="- topic/colspec "/>
             <colspec colnum="2" colname="col2" colwidth="262pt" class="- topic/colspec "/>
@@ -2442,7 +2767,7 @@ WHERE sotd.sotdoid=pg_class.oid ORDER BY relname;</codeblock>
       <body class="- topic/body ">
         <p>This view shows the size on disk of partitioned child tables and their indexes. This view
           is accessible to all users, however non-superusers will only be able to see relations that
-          they have permission to access..</p>
+          they have permission to access.</p>
         <table id="ie181803" class="- topic/table ">
           <title class="- topic/title ">gp_size_of_partition_and_indexes_disk view</title>
           <tgroup cols="2" class="- topic/tgroup ">
@@ -2506,8 +2831,7 @@ WHERE sotd.sotdoid=pg_class.oid ORDER BY relname;</codeblock>
           current database. This view is accessible to all users, however non-superusers will be
           able to see only the schemas that they have permission to access. </p>
         <table id="ie183105" class="- topic/table ">
-          <title class="- topic/title ">gp_size_of_schema_disk
-            view</title>
+          <title class="- topic/title ">gp_size_of_schema_disk view</title>
           <tgroup cols="2" class="- topic/tgroup ">
             <colspec colnum="1" colname="col1" colwidth="145pt" class="- topic/colspec "/>
             <colspec colnum="2" colname="col2" colwidth="230pt" class="- topic/colspec "/>
@@ -2644,8 +2968,7 @@ WHERE sotd.sotdoid=pg_class.oid ORDER BY relname;</codeblock>
           however non-superusers will only be able to see tables that they have permission to
           access</p>
         <table id="ie183408" class="- topic/table ">
-          <title class="- topic/title ">gp_size_of_table_disk
-            view</title>
+          <title class="- topic/title ">gp_size_of_table_disk view</title>
           <tgroup cols="2" class="- topic/tgroup ">
             <colspec colnum="1" colname="col1" colwidth="114pt" class="- topic/colspec "/>
             <colspec colnum="2" colname="col2" colwidth="262pt" class="- topic/colspec "/>
@@ -2698,8 +3021,7 @@ WHERE sotd.sotdoid=pg_class.oid ORDER BY relname;</codeblock>
         <p>This view shows the uncompressed table size for append-optimized (AO) tables. Otherwise,
           the table size on disk is shown. The use of this view requires superuser permissions.</p>
         <table id="ie183582" class="- topic/table ">
-          <title class="- topic/title ">gp_size_of_table_uncompressed
-            view</title>
+          <title class="- topic/title ">gp_size_of_table_uncompressed view</title>
           <tgroup cols="2" class="- topic/tgroup ">
             <colspec colnum="1" colname="col1" colwidth="114pt" class="- topic/colspec "/>
             <colspec colnum="2" colname="col2" colwidth="262pt" class="- topic/colspec "/>

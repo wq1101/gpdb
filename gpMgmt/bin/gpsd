@@ -17,7 +17,8 @@ gpsd_version = '%prog 1.0'
 
 sysnslist = "('pg_toast', 'pg_bitmapindex', 'pg_temp_1', 'pg_catalog', 'information_schema')"
 orca = False
-pgoptions = '-c gp_session_role=utility'
+# unset search path due to CVE-2018-1058
+pgoptions = '-c gp_role=utility -c search_path='
 
 
 def ResultIter(cursor, arraysize=1000):
@@ -74,7 +75,7 @@ def dumpTupleCount(cur):
                                             t, zip(columns[2:], vals[2:], types))), vals[0], vals[1])
 
 
-def dumpStats(cur):
+def dumpStats(cur, inclHLL):
     query = 'SELECT pgc.relname, pgn.nspname, pga.attname, pgt.typname, pgs.* ' \
         'FROM pg_class pgc, pg_statistic pgs, pg_namespace pgn, pg_attribute pga, pg_type pgt ' \
         'WHERE pgc.relnamespace = pgn.oid and pgn.nspname NOT IN ' + \
@@ -90,6 +91,7 @@ def dumpStats(cur):
         'INSERT INTO pg_statistic VALUES (\n' \
         '{2});\n\n'
     types = ['smallint',  # staattnum
+             'boolean',
              'real',
              'integer',
              'real',
@@ -97,10 +99,13 @@ def dumpStats(cur):
              'smallint',
              'smallint',
              'smallint',
+             'smallint',
              'oid',
              'oid',
              'oid',
              'oid',
+             'oid',
+             'real[]',
              'real[]',
              'real[]',
              'real[]',
@@ -112,22 +117,37 @@ def dumpStats(cur):
     for vals in ResultIter(cur):
         rowVals = ["\t'%s.%s'::regclass" % tuple(vals[1::-1])]
 
+        i = 0
+        hll = False
         if vals[3][0] == '_':
-            rowTypes = types + [vals[3]] * 4
+            rowTypes = types + [vals[3]] * 5
         else:
-            rowTypes = types + [vals[3] + '[]'] * 4
+            rowTypes = types + [vals[3] + '[]'] * 5
         for val, typ in zip(vals[5:], rowTypes):
+            i = i + 1
+            str_val = "'%s'" % val
+            if i == 10 and (val == 98 or val == 99):
+                if inclHLL == False:
+                    val = 0
+                hll = True
+
             if val is None:
                 val = 'NULL'
             elif isinstance(val, (str, unicode)) and val[0] == '{':
                 val = val.replace("'", "''").replace('\\', '\\\\')
                 val = "E'" + val + "'"
-            rowVals.append('\t{0}::{1}'.format(val, typ))
+            if i == 25 and hll == True:
+                if inclHLL == True:
+                    rowVals.append('\t{0}::{1}'.format(str_val, 'bytea[]'))
+                else:
+                    rowVals.append('\t{0}'.format('NULL::int4[]'))
+            else:
+                rowVals.append('\t{0}::{1}'.format(val, typ))
         print pstring.format(vals[0], vals[2], ',\n'.join(rowVals))
 
 
 def parseCmdLine():
-    p = OptionParser(usage='Usage: %prog [options] <database>', version=gpsd_version, conflict_handler="resolve")
+    p = OptionParser(usage='Usage: %prog [options] <database>', version=gpsd_version, conflict_handler="resolve", epilog="WARNING: This tool collects statistics about your data, including most common values, which requires some data elements to be included in the output file. Please review output file to ensure it is within corporate policy to transport the output file.")
     p.add_option('-?', '--help', action='help', help='Show this help message and exit')
     p.add_option('-h', '--host', action='store',
                  dest='host', help='Specify a remote host')
@@ -137,6 +157,8 @@ def parseCmdLine():
                  help='Connect as someone other than current user')
     p.add_option('-s', '--stats-only', action='store_false', dest='dumpSchema',
                  default=True, help='Just dump the stats, do not do a schema dump')
+    p.add_option('-l', '--hll', action='store_true', dest='dumpHLL',
+                 default=False, help='Include HLL stats')
     return p
 
 
@@ -164,6 +186,7 @@ def main():
     user = options.user or os.getlogin()
     port = options.port or '5432'
     inclSchema = options.dumpSchema
+    inclHLL = options.dumpHLL
 
     envOpts = os.environ
     envOpts['PGOPTIONS'] = pgoptions
@@ -208,14 +231,19 @@ def main():
     sys.stdout.writelines(['\n-- ',
                            '\n-- Allow system table modifications',
                            '\n-- ',
-                           '\nset allow_system_table_mods="DML";\n\n'])
+                           '\nset allow_system_table_mods=true;\n\n'])
     sys.stdout.flush()
 
     try:
         with closing(pgdb.connect(connectionString)) as connection:
             with closing(connection.cursor()) as cursor:
                 dumpTupleCount(cursor)
-                dumpStats(cursor)
+                dumpStats(cursor, inclHLL)
+        # Upon success, leave a warning message about data collected
+        sys.stderr.writelines(['WARNING: This tool collects statistics about your data, including most common values, '
+                               'which requires some data elements to be included in the output file.\n',
+                               'Please review output file to ensure it is within corporate policy to transport the output file.\n'])
+
     except pgdb.DatabaseError, err:  # catch *all* exceptions
         sys.stderr.write('Error while dumping statistics:\n')
         sys.stderr.write(err.message)

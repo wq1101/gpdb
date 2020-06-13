@@ -74,8 +74,16 @@
             exceeds the <codeph>MAX_COST</codeph> value set for the resource queue, the query is
             rejected as too expensive.</pd>
           <pd>
-            <note>Use <codeph>MEMORY_LIMIT</codeph> and <codeph>ACTIVE_STATEMENTS</codeph> to set
-              limits for resource queues rather than <codeph>MAX_COST</codeph>. </note>
+            <note>GPORCA and the Postgres Planner utilize different
+              query costing models and may compute different costs for the same query.
+              The Greenplum Database resource queue resource management scheme neither
+              differentiates nor aligns costs between GPORCA and the Postgres Planner; it
+              uses the literal cost value returned from the optimizer to throttle
+              queries.<p> When resource queue-based resource management is active, use the
+              <codeph>MEMORY_LIMIT</codeph> and <codeph>ACTIVE_STATEMENTS</codeph> limits for
+              resource queues rather than configuring cost-based limits. Even when using GPORCA,
+              Greenplum Database may fall back to using the Postgres Planner for certain
+              queries, so using cost-based limits can lead to unexpected results.</p></note>
           </pd>
         </plentry>
       </parml></p>
@@ -231,6 +239,15 @@
         unbounded amounts of memory.</p>
       <p>For more information on configuring memory limits on a resource queue, and other memory
         utilization controls, see <xref href="#topic12" type="topic" format="dita"/>.</p>
+    <section id="topic113x" xml:lang="en">
+      <title>statement_mem and Low Memory Queries</title>
+        <p>A low <codeph>statement_mem</codeph> setting (for example, in the 
+          1-3MB range) has been shown
+          to increase the performance of queries with low memory requirements. Use
+          the <codeph>statement_mem</codeph> server configuration parameter to
+          override the setting on a per-query basis. For example:
+          <codeblock>SET statement_mem='2MB';</codeblock></p>
+    </section>
     </body>
   </topic>
   <topic id="priorities">
@@ -289,31 +306,31 @@
   </topic>
 
   <topic id="topic8" xml:lang="en">
-    <title id="iz153124">Steps to Enable Workload Management</title>
+    <title id="iz153124">Steps to Enable Resource Management</title>
     <body>
-      <p>Enabling and using workload management in Greenplum Database involves the following
+      <p>Enabling and using resource management in Greenplum Database involves the following
         high-level tasks:</p>
       <ol id="ol_ec5_4dy_wq">
-        <li>Configure workload managment. See <xref href="#topic9" format="dita"/>.</li>
+        <li>Configure resource management. See <xref href="#topic9" format="dita"/>.</li>
         <li id="iz153167">Create the resource queues and set limits on them. See <xref
             href="#topic10" type="topic" format="dita"/> and <xref href="#topic19" format="dita"
           />.</li>
         <li id="iz153172">Assign a queue to one or more user roles. See <xref href="#topic17"
             type="topic" format="dita"/>.</li>
-        <li id="iz153188">Use the workload management system views to monitor and manage the
+        <li id="iz153188">Use the resource management system views to monitor and manage the
           resource queues. See <xref href="#topic22" type="topic" format="dita"/>.</li>
       </ol>
     </body>
   </topic>
   <topic id="topic9" xml:lang="en">
-    <title id="iz139711">Configuring Workload Management</title>
+    <title id="iz139711">Configuring Resource Management</title>
     <body>
       <p>Resource scheduling is enabled by default when you install Greenplum Database, and is
         required for all roles. The default resource queue, <codeph>pg_default</codeph>, has an
         active statement limit of 20, no memory limit, and a medium priority setting. Create
         resource queues for the various types of workloads.</p>
       <section id="iz169600">
-        <title>To configure workload management</title>
+        <title>To configure resource management</title>
         <ol>
           <li id="iz169263">The following parameters are for the general configuration of resource
               queues:<ul id="ul_gln_v3c_34">
@@ -377,8 +394,7 @@
                 value for this parameter should be sufficient for typical database operations. </li>
               <li id="iz174445"><codeph>gp_resqueue_priority_cpucores_per_segment</codeph> -
                 Specifies the number of CPU cores allocated per segment instance. The default value
-                is 4 for the master and segments. For Greenplum Data Computing Appliance Version 2,
-                the default value is 4 for segments and 25 for the master. <p>Each host checks its
+                is 4 for the master and segments. <p>Each host checks its
                   own <codeph>postgresql.conf</codeph> file for the value of this parameter. This
                   parameter also affects the master node, where it should be set to a value
                   reflecting the higher ratio of CPU cores. For example, on a cluster that has 10
@@ -395,7 +411,7 @@
                   available to the operating system is included in the number of CPU cores. For
                   example, virtual CPU cores are included in the number of CPU cores.</p></li>
             </ul></li>
-          <li id="iz171977">If you wish to view or change any of the workload management parameter
+          <li id="iz171977">If you wish to view or change any of the resource management parameter
             values, you can use the <codeph>gpconfig</codeph> utility. </li>
           <li id="iz169849">For example, to see the setting of a particular parameter:<p>
               <codeblock>$ gpconfig --show gp_vmem_protect_limit
@@ -625,7 +641,7 @@ MEMORY_LIMIT='2000MB');
       <title id="iz151568">Viewing Queued Statements and Resource Queue Status</title>
       <body>
         <p>The <codeph>gp_toolkit.gp_resqueue_status</codeph> view allows administrators to see
-          status and activity for a workload management resource queue. It shows how many queries
+          status and activity for a resource queue. It shows how many queries
           are waiting to run and how many queries are currently active in the system from a
           particular resource queue. To see the resource queues created in the system, their limit
           attributes, and their current status:</p>
@@ -714,23 +730,23 @@ MEMORY_LIMIT='2000MB');
         <p>For example, to see process information about all statements currently active or waiting
           in all resource queues, run the following query:</p>
         <p>
-          <codeblock>=# SELECT rolname, rsqname, pid, granted,
-          current_query, datname 
+          <codeblock>=# SELECT rolname, rsqname, pg_locks.pid as pid, granted, state,
+          query, datname 
    FROM pg_roles, gp_toolkit.gp_resqueue_status, pg_locks,
         pg_stat_activity 
    WHERE pg_roles.rolresqueue=pg_locks.objid 
    AND pg_locks.objid=gp_toolkit.gp_resqueue_status.queueid
-   AND pg_stat_activity.procpid=pg_locks.pid;
+   AND pg_stat_activity.pid=pg_locks.pid
    AND pg_stat_activity.usename=pg_roles.rolname;
 </codeblock>
         </p>
         <p>If this query returns no results, then that means there are currently no statements in a
           resource queue. A sample of a resource queue with two statements in it looks something
           like this:</p>
-        <codeblock>rolname | rsqname |  pid  | granted |     current_query      | datname 
------------------------------------------------------------------------ 
-  sammy | webuser | 31861 | t       | &lt;IDLE&gt; in transaction  | namesdb
-  daria | webuser | 31905 | f       | SELECT * FROM topten;  | namesdb</codeblock>
+        <codeblock>rolname | rsqname |  pid  | granted | state  |         query          | datname 
+--------+---------+-------+---------+--------+------------------------+--------- 
+  sammy | webuser | 31861 | t       | idle   | SELECT * FROM testtbl; | namesdb
+  daria | webuser | 31905 | f       | active | SELECT * FROM topten;  | namesdb</codeblock>
         <p>Use this output to identify the process id (pid) of the statement you want to clear from
           the resource queue. To clear the statement, you would then open a terminal window (as the
             <codeph>gpadmin</codeph> database superuser or as root) on the master host and cancel
@@ -739,9 +755,7 @@ MEMORY_LIMIT='2000MB');
           <codeblock>=# pg_cancel_backend(31905)
 </codeblock>
         </p>
-        <note type="note">
-          <p>Do not use any operating system <codeph>KILL</codeph> command.</p>
-        </note>
+        <note type="important">Do not use the operating system <codeph>KILL</codeph> command.</note>
       </body>
     </topic>
     <topic id="topic28" xml:lang="en">

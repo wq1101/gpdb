@@ -1,22 +1,23 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/alter_function.sgml,v 1.15 2007/09/03 18:46:29 tgl Exp $
+doc/src/sgml/ref/alter_function.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-ALTERFUNCTION">
+ <indexterm zone="sql-alterfunction">
+  <primary>ALTER FUNCTION</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="SQL-ALTERFUNCTION-TITLE">ALTER FUNCTION</refentrytitle>
+  <refentrytitle>ALTER FUNCTION</refentrytitle>
+  <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
 
  <refnamediv>
   <refname>ALTER FUNCTION</refname>
   <refpurpose>change the definition of a function</refpurpose>
- </refnamediv>  
-  
- <indexterm zone="sql-alterfunction">
-  <primary>ALTER FUNCTION</primary>
- </indexterm>
+ </refnamediv>
 
  <refsynopsisdiv>
 <synopsis>
@@ -25,15 +26,19 @@ ALTER FUNCTION <replaceable>name</replaceable> ( [ [ <replaceable class="paramet
 ALTER FUNCTION <replaceable>name</replaceable> ( [ [ <replaceable class="parameter">argmode</replaceable> ] [ <replaceable class="parameter">argname</replaceable> ] <replaceable class="parameter">argtype</replaceable> [, ...] ] )
     RENAME TO <replaceable>new_name</replaceable>
 ALTER FUNCTION <replaceable>name</replaceable> ( [ [ <replaceable class="parameter">argmode</replaceable> ] [ <replaceable class="parameter">argname</replaceable> ] <replaceable class="parameter">argtype</replaceable> [, ...] ] )
-    OWNER TO <replaceable>new_owner</replaceable>
+    OWNER TO { <replaceable>new_owner</replaceable> | CURRENT_USER | SESSION_USER }
 ALTER FUNCTION <replaceable>name</replaceable> ( [ [ <replaceable class="parameter">argmode</replaceable> ] [ <replaceable class="parameter">argname</replaceable> ] <replaceable class="parameter">argtype</replaceable> [, ...] ] )
     SET SCHEMA <replaceable>new_schema</replaceable>
+ALTER FUNCTION <replaceable>name</replaceable> ( [ [ <replaceable class="parameter">argmode</replaceable> ] [ <replaceable class="parameter">argname</replaceable> ] <replaceable class="parameter">argtype</replaceable> [, ...] ] )
+    DEPENDS ON EXTENSION <replaceable>extension_name</replaceable>
 
-where <replaceable class="PARAMETER">action</replaceable> is one of:
+<phrase>where <replaceable class="PARAMETER">action</replaceable> is one of:</phrase>
 
     CALLED ON NULL INPUT | RETURNS NULL ON NULL INPUT | STRICT
-    IMMUTABLE | STABLE | VOLATILE
+    IMMUTABLE | STABLE | VOLATILE | [ NOT ] LEAKPROOF
     [ EXTERNAL ] SECURITY INVOKER | [ EXTERNAL ] SECURITY DEFINER
+    PARALLEL { UNSAFE | RESTRICTED | SAFE }
+    EXECUTE ON { ANY | MASTER | ALL SEGMENTS }
     COST <replaceable class="parameter">execution_cost</replaceable>
     ROWS <replaceable class="parameter">result_rows</replaceable>
     SET <replaceable class="parameter">configuration_parameter</replaceable> { TO | = } { <replaceable class="parameter">value</replaceable> | DEFAULT }
@@ -42,7 +47,7 @@ where <replaceable class="PARAMETER">action</replaceable> is one of:
     RESET ALL
 </synopsis>
  </refsynopsisdiv>
-  
+
  <refsect1>
   <title>Description</title>
 
@@ -62,7 +67,7 @@ where <replaceable class="PARAMETER">action</replaceable> is one of:
    However, a superuser can alter ownership of any function anyway.)
   </para>
  </refsect1>
-  
+
  <refsect1>
   <title>Parameters</title>
 
@@ -81,13 +86,14 @@ where <replaceable class="PARAMETER">action</replaceable> is one of:
 
     <listitem>
      <para>
-      The mode of an argument: either <literal>IN</>, <literal>OUT</>,
-      or <literal>INOUT</>.  If omitted, the default is <literal>IN</>.
+      The mode of an argument: <literal>IN</>, <literal>OUT</>,
+      <literal>INOUT</>, or <literal>VARIADIC</>.
+      If omitted, the default is <literal>IN</>.
       Note that <command>ALTER FUNCTION</command> does not actually pay
       any attention to <literal>OUT</> arguments, since only the input
       arguments are needed to determine the function's identity.
-      So it is sufficient to list the <literal>IN</> and <literal>INOUT</>
-      arguments.
+      So it is sufficient to list the <literal>IN</>, <literal>INOUT</>,
+      and <literal>VARIADIC</> arguments.
      </para>
     </listitem>
    </varlistentry>
@@ -110,7 +116,7 @@ where <replaceable class="PARAMETER">action</replaceable> is one of:
 
     <listitem>
      <para>
-      The data type(s) of the function's arguments (optionally 
+      The data type(s) of the function's arguments (optionally
       schema-qualified), if any.
      </para>
     </listitem>
@@ -145,20 +151,28 @@ where <replaceable class="PARAMETER">action</replaceable> is one of:
     </listitem>
    </varlistentry>
 
+   <varlistentry>
+    <term><replaceable class="parameter">extension_name</replaceable></term>
+    <listitem>
+     <para>
+      The name of the extension that the function is to depend on.
+     </para>
+    </listitem>
+   </varlistentry>
+
     <varlistentry>
      <term><literal>CALLED ON NULL INPUT</literal></term>
      <term><literal>RETURNS NULL ON NULL INPUT</literal></term>
      <term><literal>STRICT</literal></term>
 
      <listitem>
-      <para>
-       <literal>CALLED ON NULL INPUT</literal> changes the function so
+      <para><literal>CALLED ON NULL INPUT</literal> changes the function so
        that it will be invoked when some or all of its arguments are
        null. <literal>RETURNS NULL ON NULL INPUT</literal> or
        <literal>STRICT</literal> changes the function so that it is not
        invoked if any of its arguments are null; instead, a null result
-       is assumed automatically.  See <xref linkend="sql-createfunction"
-       endterm="sql-createfunction-title"> for more information.
+       is assumed automatically.  See <xref linkend="sql-createfunction">
+       for more information.
       </para>
      </listitem>
    </varlistentry>
@@ -171,8 +185,7 @@ where <replaceable class="PARAMETER">action</replaceable> is one of:
      <listitem>
       <para>
        Change the volatility of the function to the specified setting.
-       See <xref linkend="sql-createfunction"
-       endterm="sql-createfunction-title"> for details.
+       See <xref linkend="sql-createfunction"> for details.
       </para>
     </listitem>
    </varlistentry>
@@ -185,8 +198,29 @@ where <replaceable class="PARAMETER">action</replaceable> is one of:
      <para>
       Change whether the function is a security definer or not. The
       key word <literal>EXTERNAL</literal> is ignored for SQL
-      conformance. See <xref linkend="sql-createfunction"
-      endterm="sql-createfunction-title"> for more information about
+      conformance. See <xref linkend="sql-createfunction"> for more information about
+      this capability.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><literal>PARALLEL</literal></term>
+
+    <listitem>
+     <para>
+      Change whether the function is deemed safe for parallelism.
+      See <xref linkend="sql-createfunction"> for details.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><literal>LEAKPROOF</literal></term>
+    <listitem>
+     <para>
+      Change whether the function is considered leakproof or not.
+      See <xref linkend="sql-createfunction"> for more information about
       this capability.
      </para>
     </listitem>
@@ -198,8 +232,7 @@ where <replaceable class="PARAMETER">action</replaceable> is one of:
      <listitem>
       <para>
        Change the estimated execution cost of the function.
-       See <xref linkend="sql-createfunction"
-       endterm="sql-createfunction-title"> for more information.
+       See <xref linkend="sql-createfunction"> for more information.
       </para>
      </listitem>
    </varlistentry>
@@ -210,8 +243,7 @@ where <replaceable class="PARAMETER">action</replaceable> is one of:
      <listitem>
       <para>
        Change the estimated number of rows returned by a set-returning
-       function.  See <xref linkend="sql-createfunction"
-       endterm="sql-createfunction-title"> for more information.
+       function.  See <xref linkend="sql-createfunction"> for more information.
       </para>
      </listitem>
    </varlistentry>
@@ -228,12 +260,13 @@ where <replaceable class="PARAMETER">action</replaceable> is one of:
         setting is removed, so that the function executes with the value
         present in its environment.  Use <literal>RESET
         ALL</literal> to clear all function-local settings.
-        <literal>SET FROM CURRENT</> saves the session's current value of
-        the parameter as the value to be applied when the function is entered.
+        <literal>SET FROM CURRENT</> saves the value of the parameter that
+        is current when <command>ALTER FUNCTION</> is executed as the value
+        to be applied when the function is entered.
        </para>
 
        <para>
-        See <xref linkend="sql-set" endterm="sql-set-title"> and
+        See <xref linkend="sql-set"> and
         <xref linkend="runtime-config">
         for more information about allowed parameter names and values.
        </para>
@@ -280,6 +313,15 @@ ALTER FUNCTION sqrt(integer) SET SCHEMA maths;
   </para>
 
   <para>
+   To mark the function <literal>sqrt</literal> for type
+   <type>integer</type> as being dependent on the extension
+   <literal>mathlib</literal>:
+<programlisting>
+ALTER FUNCTION sqrt(integer) DEPENDS ON EXTENSION mathlib;
+</programlisting>
+  </para>
+
+  <para>
    To adjust the search path that is automatically set for a function:
 <programlisting>
 ALTER FUNCTION check_password(text) SET search_path = admin, pg_temp;
@@ -315,8 +357,8 @@ ALTER FUNCTION check_password(text) RESET search_path;
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-createfunction" endterm="sql-createfunction-title"></member>
-   <member><xref linkend="sql-dropfunction" endterm="sql-dropfunction-title"></member>
+   <member><xref linkend="sql-createfunction"></member>
+   <member><xref linkend="sql-dropfunction"></member>
   </simplelist>
  </refsect1>
 </refentry>

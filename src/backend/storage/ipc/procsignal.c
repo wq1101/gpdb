@@ -4,7 +4,7 @@
  *	  Routines for interprocess signalling
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -17,16 +17,20 @@
 #include <signal.h>
 #include <unistd.h>
 
-#include "cdb/cdbvars.h"
+#include "access/parallel.h"
 #include "commands/async.h"
 #include "miscadmin.h"
+#include "replication/walsender.h"
 #include "storage/latch.h"
 #include "storage/ipc.h"
+#include "storage/latch.h"
 #include "storage/proc.h"
-#include "storage/procsignal.h"
+#include "storage/shmem.h"
 #include "storage/sinval.h"
 #include "tcop/tcopprot.h"
+#include "utils/resgroup.h"
 
+#include "cdb/cdbvars.h"
 
 /*
  * The SIGUSR1 signal is multiplexed to support signalling multiple event
@@ -57,7 +61,7 @@ typedef struct
  * possible auxiliary process type.  (This scheme assumes there is not
  * more than one of any auxiliary process type at a time.)
  */
-#define NumProcSignalSlots	(MaxBackends + NUM_AUXILIARY_PROCS)
+#define NumProcSignalSlots	(MaxBackends + NUM_AUXPROCTYPES)
 
 static ProcSignalSlot *ProcSignalSlots = NULL;
 static volatile ProcSignalSlot *MyProcSignalSlot = NULL;
@@ -142,6 +146,13 @@ CleanupProcSignalState(int status, Datum arg)
 
 	slot = &ProcSignalSlots[pss_idx - 1];
 	Assert(slot == MyProcSignalSlot);
+
+	/*
+	 * Clear MyProcSignalSlot, so that a SIGUSR1 received after this point
+	 * won't try to access it after it's no longer ours (and perhaps even
+	 * after we've unmapped the shared memory segment).
+	 */
+	MyProcSignalSlot = NULL;
 
 	/* sanity check */
 	if (slot->pss_pid != MyProcPid)
@@ -275,7 +286,7 @@ QueryFinishHandler(void)
 void
 procsignal_sigusr1_handler(SIGNAL_ARGS)
 {
-	int save_errno = errno;
+	int			save_errno = errno;
 
 	PG_TRY();
 	{
@@ -296,6 +307,37 @@ procsignal_sigusr1_handler(SIGNAL_ARGS)
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+
+	if (CheckProcSignal(PROCSIG_WALSND_INIT_STOPPING))
+		HandleWalSndInitStopping();
+
+	if (CheckProcSignal(PROCSIG_PARALLEL_MESSAGE))
+		HandleParallelMessageInterrupt();
+
+	if (CheckProcSignal(PROCSIG_RECOVERY_CONFLICT_DATABASE))
+		RecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_DATABASE);
+
+	if (CheckProcSignal(PROCSIG_RECOVERY_CONFLICT_TABLESPACE))
+		RecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_TABLESPACE);
+
+	if (CheckProcSignal(PROCSIG_RECOVERY_CONFLICT_LOCK))
+		RecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_LOCK);
+
+	if (CheckProcSignal(PROCSIG_RECOVERY_CONFLICT_SNAPSHOT))
+		RecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_SNAPSHOT);
+
+	if (CheckProcSignal(PROCSIG_RECOVERY_CONFLICT_STARTUP_DEADLOCK))
+		RecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_STARTUP_DEADLOCK);
+
+	if (CheckProcSignal(PROCSIG_RECOVERY_CONFLICT_BUFFERPIN))
+		RecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_BUFFERPIN);
+
+	if (CheckProcSignal(PROCSIG_RESOURCE_GROUP_MOVE_QUERY))
+		HandleMoveResourceGroup();
+
+	SetLatch(MyLatch);
+
+	latch_sigusr1_handler();
 
 	errno = save_errno;
 }

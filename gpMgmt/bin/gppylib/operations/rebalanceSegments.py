@@ -2,9 +2,13 @@ import sys
 import signal
 from gppylib.gparray import GpArray
 from gppylib.db import dbconn
-from gppylib.commands.gp import GpSegStopCmd, GpRecoverseg
+from gppylib.commands.gp import GpSegStopCmd
 from gppylib.commands import base
 from gppylib import gplog
+
+from gppylib.operations.segment_reconfigurer import SegmentReconfigurer
+
+MIRROR_PROMOTION_TIMEOUT=30
 
 
 class ReconfigDetectionSQLQueryCommand(base.SQLCommand):
@@ -33,7 +37,6 @@ class GpSegmentRebalanceOperation:
         self.logger.info("Getting unbalanced segments")
         unbalanced_primary_segs = GpArray.getSegmentsByHostName(self.gpArray.get_unbalanced_primary_segdbs())
         pool = base.WorkerPool()
-        count = 0
 
         try:
             # Disable ctrl-c
@@ -50,9 +53,8 @@ class GpSegmentRebalanceOperation:
                                    remoteHost=hostname,
                                    timeout=600)
                 pool.addCommand(cmd)
-                count += 1
 
-            pool.wait_and_printdots(count, False)
+            base.join_and_indicate_progress(pool)
             
             failed_count = 0
             completed = pool.getCompletedItems()
@@ -70,22 +72,9 @@ class GpSegmentRebalanceOperation:
                 self.logger.info("gprecoverseg will continue with a partial rebalance.")
 
             pool.empty_completed_items()
-            # issue a distributed query to make sure we pick up the fault
-            # that we just caused by shutting down segments
-            conn = None
-            try:
-                self.logger.info("Triggering segment reconfiguration")
-                dburl = dbconn.DbURL()
-                conn = dbconn.connect(dburl)
-                cmd = ReconfigDetectionSQLQueryCommand(conn)
-                pool.addCommand(cmd)
-                pool.wait_and_printdots(1, False)
-            except Exception:
-                # This exception is expected
-                pass
-            finally:
-                if conn:
-                    conn.close()
+            segment_reconfigurer = SegmentReconfigurer(logger=self.logger,
+                    worker_pool=pool, timeout=MIRROR_PROMOTION_TIMEOUT)
+            segment_reconfigurer.reconfigure()
 
             # Final step is to issue a recoverseg operation to resync segments
             self.logger.info("Starting segment synchronization")

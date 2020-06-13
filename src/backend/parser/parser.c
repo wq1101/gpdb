@@ -10,29 +10,21 @@
  * analyze.c and related files.
  *
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/parser/parser.c,v 1.78 2009/06/11 14:49:00 momjian Exp $
+ *	  src/backend/parser/parser.c
  *
  *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
 
-#include "parser/gramparse.h"	/* required before parser/gram.h! */
-#include "parser/gram.h"
+#include "parser/gramparse.h"
 #include "parser/parser.h"
 
-
-List	   *parsetree;			/* result of parsing is left here */
-
-static bool have_lookahead;		/* is lookahead info valid? */
-static int	lookahead_token;	/* one-token lookahead */
-static YYSTYPE lookahead_yylval;	/* yylval for lookahead token */
-static YYLTYPE lookahead_yylloc;	/* yylloc for lookahead token */
-
+#include "cdb/cdbvars.h"
 
 /*
  * raw_parser
@@ -43,132 +35,185 @@ static YYLTYPE lookahead_yylloc;	/* yylloc for lookahead token */
 List *
 raw_parser(const char *str)
 {
+	core_yyscan_t yyscanner;
+	base_yy_extra_type yyextra;
 	int			yyresult;
 
-	parsetree = NIL;			/* in case grammar forgets to set it */
-	have_lookahead = false;
+	/*
+	 * In GPDB, temporarily disable escape_string_warning, if we're in a QE
+	 * node. When we're parsing a PL/pgSQL function, e.g. in a CREATE FUNCTION
+	 * command, you should've gotten the same warning from the QD node already.
+	 * We could probably disable the warning in QE nodes altogether, not just
+	 * in PL/pgSQL, but it can be useful for catching escaping bugs, when
+	 * internal queries are dispatched from QD to QEs.
+	 */
+	bool            save_escape_string_warning = escape_string_warning;
+	PG_TRY();
+	{
+		if (Gp_role == GP_ROLE_EXECUTE)
+			escape_string_warning = false;
 
-	scanner_init(str);
-	parser_init();
+		/* initialize the flex scanner */
+		yyscanner = scanner_init(str, &yyextra.core_yy_extra,
+								 ScanKeywords, NumScanKeywords);
 
-	yyresult = base_yyparse();
+		if (Gp_role == GP_ROLE_EXECUTE)
+			escape_string_warning = save_escape_string_warning;
+	}
+	PG_CATCH();
+	{
+		if (Gp_role == GP_ROLE_EXECUTE)
+			escape_string_warning = save_escape_string_warning;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
-	scanner_finish();
+	/* base_yylex() only needs this much initialization */
+	yyextra.have_lookahead = false;
+
+	/* initialize the bison parser */
+	parser_init(&yyextra);
+
+	/* Parse! */
+	yyresult = base_yyparse(yyscanner);
+
+	/* Clean up (release memory) */
+	scanner_finish(yyscanner);
 
 	if (yyresult)				/* error */
 		return NIL;
 
-	return parsetree;
+	return yyextra.parsetree;
 }
 
 
 /*
- * Intermediate filter between parser and base lexer (base_yylex in scan.l).
+ * Intermediate filter between parser and core lexer (core_yylex in scan.l).
  *
- * The filter is needed because in some cases the standard SQL grammar
- * requires more than one token lookahead.	We reduce these cases to one-token
- * lookahead by combining tokens here, in order to keep the grammar LALR(1).
+ * This filter is needed because in some cases the standard SQL grammar
+ * requires more than one token lookahead.  We reduce these cases to one-token
+ * lookahead by replacing tokens here, in order to keep the grammar LALR(1).
  *
  * Using a filter is simpler than trying to recognize multiword tokens
  * directly in scan.l, because we'd have to allow for comments between the
- * words.  Furthermore it's not clear how to do it without re-introducing
+ * words.  Furthermore it's not clear how to do that without re-introducing
  * scanner backtrack, which would cost more performance than this filter
  * layer does.
+ *
+ * The filter also provides a convenient place to translate between
+ * the core_YYSTYPE and YYSTYPE representations (which are really the
+ * same thing anyway, but notationally they're different).
  */
 int
-filtered_base_yylex(void)
+base_yylex(YYSTYPE *lvalp, YYLTYPE *llocp, core_yyscan_t yyscanner)
 {
+	base_yy_extra_type *yyextra = pg_yyget_extra(yyscanner);
 	int			cur_token;
 	int			next_token;
-	YYSTYPE		cur_yylval;
+	int			cur_token_length;
 	YYLTYPE		cur_yylloc;
 
 	/* Get next token --- we might already have it */
-	if (have_lookahead)
+	if (yyextra->have_lookahead)
 	{
-		cur_token = lookahead_token;
-		base_yylval = lookahead_yylval;
-		base_yylloc = lookahead_yylloc;
-		have_lookahead = false;
+		cur_token = yyextra->lookahead_token;
+		lvalp->core_yystype = yyextra->lookahead_yylval;
+		*llocp = yyextra->lookahead_yylloc;
+		*(yyextra->lookahead_end) = yyextra->lookahead_hold_char;
+		yyextra->have_lookahead = false;
 	}
 	else
-		cur_token = base_yylex();
+		cur_token = core_yylex(&(lvalp->core_yystype), llocp, yyscanner);
 
-	/* Do we need to look ahead for a possible multiword token? */
+	/*
+	 * If this token isn't one that requires lookahead, just return it.  If it
+	 * does, determine the token length.  (We could get that via strlen(), but
+	 * since we have such a small set of possibilities, hardwiring seems
+	 * feasible and more efficient.)
+	 */
 	switch (cur_token)
 	{
+		case NOT:
+			cur_token_length = 3;
+			break;
 		case NULLS_P:
+			cur_token_length = 5;
+			break;
+		case WITH:
+			cur_token_length = 4;
+			break;
+		default:
+			return cur_token;
+	}
 
-			/*
-			 * NULLS FIRST and NULLS LAST must be reduced to one token
-			 */
-			cur_yylval = base_yylval;
-			cur_yylloc = base_yylloc;
-			next_token = base_yylex();
+	/*
+	 * Identify end+1 of current token.  core_yylex() has temporarily stored a
+	 * '\0' here, and will undo that when we call it again.  We need to redo
+	 * it to fully revert the lookahead call for error reporting purposes.
+	 */
+	yyextra->lookahead_end = yyextra->core_yy_extra.scanbuf +
+		*llocp + cur_token_length;
+	Assert(*(yyextra->lookahead_end) == '\0');
+
+	/*
+	 * Save and restore *llocp around the call.  It might look like we could
+	 * avoid this by just passing &lookahead_yylloc to core_yylex(), but that
+	 * does not work because flex actually holds onto the last-passed pointer
+	 * internally, and will use that for error reporting.  We need any error
+	 * reports to point to the current token, not the next one.
+	 */
+	cur_yylloc = *llocp;
+
+	/* Get next token, saving outputs into lookahead variables */
+	next_token = core_yylex(&(yyextra->lookahead_yylval), llocp, yyscanner);
+	yyextra->lookahead_token = next_token;
+	yyextra->lookahead_yylloc = *llocp;
+
+	*llocp = cur_yylloc;
+
+	/* Now revert the un-truncation of the current token */
+	yyextra->lookahead_hold_char = *(yyextra->lookahead_end);
+	*(yyextra->lookahead_end) = '\0';
+
+	yyextra->have_lookahead = true;
+
+	/* Replace cur_token if needed, based on lookahead */
+	switch (cur_token)
+	{
+		case NOT:
+			/* Replace NOT by NOT_LA if it's followed by BETWEEN, IN, etc */
+			switch (next_token)
+			{
+				case BETWEEN:
+				case IN_P:
+				case LIKE:
+				case ILIKE:
+				case SIMILAR:
+					cur_token = NOT_LA;
+					break;
+			}
+			break;
+
+		case NULLS_P:
+			/* Replace NULLS_P by NULLS_LA if it's followed by FIRST or LAST */
 			switch (next_token)
 			{
 				case FIRST_P:
-					cur_token = NULLS_FIRST;
-					break;
 				case LAST_P:
-					cur_token = NULLS_LAST;
-					break;
-				default:
-					/* save the lookahead token for next time */
-					lookahead_token = next_token;
-					lookahead_yylval = base_yylval;
-					lookahead_yylloc = base_yylloc;
-					have_lookahead = true;
-					/* and back up the output info to cur_token */
-					base_yylval = cur_yylval;
-					base_yylloc = cur_yylloc;
+					cur_token = NULLS_LA;
 					break;
 			}
 			break;
 
 		case WITH:
-
-			/*
-			 * WITH TIME, CASCADED, LOCAL, or CHECK must be reduced to one token
-			 *
-			 * XXX an alternative way is to recognize just WITH_TIME and put
-			 * the ugliness into the datetime datatype productions instead of
-			 * WITH CHECK OPTION.  However that requires promoting WITH to a
-			 * fully reserved word.  If we ever have to do that anyway
-			 * (perhaps for SQL99 recursive queries), come back and simplify
-			 * this code.
-			 */
-			cur_yylval = base_yylval;
-			cur_yylloc = base_yylloc;
-			next_token = base_yylex();
+			/* Replace WITH by WITH_LA if it's followed by TIME or ORDINALITY */
 			switch (next_token)
 			{
 				case TIME:
-					cur_token = WITH_TIME;
-					break;
-				case CASCADED:
-					cur_token = WITH_CASCADED;
-					break;
-				case LOCAL:
-					cur_token = WITH_LOCAL;
-					break;
-				case CHECK:
-					cur_token = WITH_CHECK;
-					break;
-				default:
-					/* save the lookahead token for next time */
-					lookahead_token = next_token;
-					lookahead_yylval = base_yylval;
-					lookahead_yylloc = base_yylloc;
-					have_lookahead = true;
-					/* and back up the output info to cur_token */
-					base_yylval = cur_yylval;
-					base_yylloc = cur_yylloc;
+				case ORDINALITY:
+					cur_token = WITH_LA;
 					break;
 			}
-			break;
-
-		default:
 			break;
 	}
 

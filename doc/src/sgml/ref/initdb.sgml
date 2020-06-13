@@ -1,11 +1,15 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/initdb.sgml,v 1.43 2007/03/26 17:23:36 tgl Exp $
+doc/src/sgml/ref/initdb.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="APP-INITDB">
+ <indexterm zone="app-initdb">
+  <primary>initdb</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="APP-INITDB-TITLE">initdb</refentrytitle>
+  <refentrytitle>initdb</refentrytitle>
   <manvolnum>1</manvolnum>
   <refmiscinfo>Application</refmiscinfo>
  </refmeta>
@@ -15,18 +19,16 @@ PostgreSQL documentation
   <refpurpose>create a new <productname>PostgreSQL</productname> database cluster</refpurpose>
  </refnamediv>
 
- <indexterm zone="app-initdb">
-  <primary>initdb</primary>
- </indexterm>
-
  <refsynopsisdiv>
   <cmdsynopsis>
    <command>initdb</command>
-   <arg rep="repeat"><replaceable>option</></arg>
+   <arg rep="repeat"><replaceable>option</replaceable></arg>
    <group choice="plain">
-    <arg>--pgdata </arg>
-    <arg>-D </arg>
-    <replaceable>directory</replaceable>
+    <group choice="opt">
+     <arg choice="plain"><option>--pgdata</option></arg>
+     <arg choice="plain"><option>-D</option></arg>
+    </group>
+    <replaceable> directory</replaceable>
    </group>
   </cmdsynopsis>
  </refsynopsisdiv>
@@ -47,8 +49,8 @@ PostgreSQL documentation
    which the database data will live, generating the shared catalog
    tables (tables that belong to the whole cluster rather than to any
    particular database), and creating the <literal>template1</literal>
-   and <literal>postgres</literal> databases. When you later create a 
-   new database, everything in the <literal>template1</literal> database is 
+   and <literal>postgres</literal> databases. When you later create a
+   new database, everything in the <literal>template1</literal> database is
    copied.  (Therefore, anything installed in <literal>template1</literal>
    is automatically copied into each database created later.)
    The <literal>postgres</literal> database is a default database meant
@@ -76,25 +78,34 @@ PostgreSQL documentation
 
   <para>
    <command>initdb</command> initializes the database cluster's default
-   locale and character set encoding. The collation order
-   (<literal>LC_COLLATE</>) and character set classes
-   (<literal>LC_CTYPE</>, e.g. upper, lower, digit) are fixed for all
-   databases and cannot be changed. Collation orders other than
-   <literal>C</> or <literal>POSIX</> also have a performance penalty.
-   For these reasons it is important to choose the right locale when
-   running <command>initdb</command>. The remaining locale categories
-   can be changed later when the server is started. All server locale
-   values (<literal>lc_*</>) can be displayed via <command>SHOW ALL</>.
+   locale and character set encoding. The character set encoding,
+   collation order (<literal>LC_COLLATE</>) and character set classes
+   (<literal>LC_CTYPE</>, e.g. upper, lower, digit) can be set separately
+   for a database when it is created. <command>initdb</command> determines
+   those settings for the <literal>template1</literal> database, which will
+   serve as the default for all other databases.
+  </para>
+
+  <para>
+   To alter the default collation order or character set classes, use the
+   <option>--lc-collate</option> and <option>--lc-ctype</option> options.
+   Collation orders other than <literal>C</> or <literal>POSIX</> also have
+   a performance penalty.  For these reasons it is important to choose the
+   right locale when running <command>initdb</command>.
+  </para>
+
+  <para>
+   The remaining locale categories can be changed later when the server
+   is started.  You can also use <option>--locale</option> to set the
+   default for all locale categories, including collation order and
+   character set classes. All server locale values (<literal>lc_*</>) can
+   be displayed via <command>SHOW ALL</>.
    More details can be found in <xref linkend="locale">.
   </para>
 
   <para>
-   The character set encoding can be set separately for a database when
-   it is created. <command>initdb</command> determines the encoding for
-   the <literal>template1</literal> database, which will serve as the
-   default for all other databases. To alter the default encoding use
-   the <option>--encoding</option> option. More details can be found in
-   <xref linkend="multibyte">.
+   To alter the default encoding, use the <option>--encoding</option>.
+   More details can be found in <xref linkend="multibyte">.
   </para>
 
  </refsect1>
@@ -109,10 +120,33 @@ PostgreSQL documentation
       <term><option>--auth=<replaceable class="parameter">authmethod</replaceable></option></term>
       <listitem>
        <para>
-        This option specifies the authentication method for local users
-        used in <filename>pg_hba.conf</>.  Do not use <literal>trust</>
-        unless you trust all local users on your system.  <literal>Trust</> 
-        is the default for ease of installation.
+        This option specifies the authentication method for local users used
+        in <filename>pg_hba.conf</> (<literal>host</literal>
+        and <literal>local</literal> lines).  Do not use <literal>trust</>
+        unless you trust all local users on your system.  <literal>trust</> is
+        the default for ease of installation.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><option>--auth-host=<replaceable class="parameter">authmethod</replaceable></option></term>
+      <listitem>
+       <para>
+        This option specifies the authentication method for local users via
+        TCP/IP connections used in <filename>pg_hba.conf</>
+        (<literal>host</literal> lines).
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><option>--auth-local=<replaceable class="parameter">authmethod</replaceable></option></term>
+      <listitem>
+       <para>
+        This option specifies the authentication method for local users via
+        Unix-domain socket connections used in <filename>pg_hba.conf</>
+        (<literal>local</literal> lines).
        </para>
       </listitem>
      </varlistentry>
@@ -194,18 +228,54 @@ PostgreSQL documentation
       <term><option>--no-locale</option></term>
       <listitem>
        <para>
-		Equivalent to <option>--locale=C</option>.
+        Equivalent to <option>--locale=C</option>.
        </para>
       </listitem>
      </varlistentry>
 
      <varlistentry>
-      <term><option>-X <replaceable class="parameter">directory</replaceable></option></term>
-      <term><option>--xlogdir=<replaceable class="parameter">directory</replaceable></option></term>
+      <term><option>-N</option></term>
+      <term><option>--nosync</option></term>
       <listitem>
        <para>
-        This option specifies the directory where the transaction log
-        should be stored.
+        By default, <command>initdb</command> will wait for all files to be
+        written safely to disk.  This option causes <command>initdb</command>
+        to return without waiting, which is faster, but means that a
+        subsequent operating system crash can leave the data directory
+        corrupt.  Generally, this option is useful for testing, but should not
+        be used when creating a production installation.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><option>--pwfile=<replaceable>filename</></option></term>
+      <listitem>
+       <para>
+        Makes <command>initdb</command> read the database superuser's password
+        from a file.  The first line of the file is taken as the password.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><option>-S</option></term>
+      <term><option>--sync-only</option></term>
+      <listitem>
+       <para>
+        Safely write all database files to disk and exit.  This does not
+        perform any of the normal <application>initdb</> operations.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><option>-T <replaceable>CFG</></option></term>
+      <term><option>--text-search-config=<replaceable>CFG</></option></term>
+      <listitem>
+       <para>
+        Sets the default text search configuration.
+        See <xref linkend="guc-default-text-search-config"> for further information.
        </para>
       </listitem>
      </varlistentry>
@@ -224,7 +294,7 @@ PostgreSQL documentation
        </para>
       </listitem>
      </varlistentry>
- 
+
      <varlistentry>
       <term><option>-W</option></term>
       <term><option>--pwprompt</option></term>
@@ -240,11 +310,12 @@ PostgreSQL documentation
      </varlistentry>
 
      <varlistentry>
-      <term><option>--pwfile=<replaceable>filename</></option></term>
+      <term><option>-X <replaceable class="parameter">directory</replaceable></option></term>
+      <term><option>--xlogdir=<replaceable class="parameter">directory</replaceable></option></term>
       <listitem>
        <para>
-        Makes <command>initdb</command> read the database superuser's password
-        from a file.  The first line of the file is taken as the password.
+        This option specifies the directory where the transaction log
+        should be stored.
        </para>
       </listitem>
      </varlistentry>
@@ -253,8 +324,8 @@ PostgreSQL documentation
      <term><option>--text-search-config=<replaceable>CFG</></option></term>
      <listitem>
       <para>
-	   Sets the default text search configuration.
-	   See <xref linkend="guc-default-text-search-config"> for further information.
+       Sets the default text search configuration.
+       See <xref linkend="guc-default-text-search-config"> for further information.
       </para>
      </listitem>
     </varlistentry>
@@ -263,7 +334,7 @@ PostgreSQL documentation
    </para>
 
    <para>
-    Other, less commonly used, parameters are also available:
+    Other, less commonly used, options are also available:
 
     <variablelist>
      <varlistentry>
@@ -308,6 +379,34 @@ PostgreSQL documentation
     </variablelist>
    </para>
 
+   <para>
+    Other options:
+
+    <variablelist>
+     <varlistentry>
+       <term><option>-V</></term>
+       <term><option>--version</></term>
+       <listitem>
+       <para>
+       Print the <application>initdb</application> version and exit.
+       </para>
+       </listitem>
+     </varlistentry>
+
+     <varlistentry>
+       <term><option>-?</></term>
+       <term><option>--help</></term>
+       <listitem>
+       <para>
+       Show help about <application>initdb</application> command line
+       arguments, and exit.
+       </para>
+       </listitem>
+     </varlistentry>
+
+    </variablelist>
+   </para>
+
  </refsect1>
 
  <refsect1>
@@ -324,6 +423,18 @@ PostgreSQL documentation
      </para>
     </listitem>
    </varlistentry>
+
+   <varlistentry>
+    <term><envar>TZ</envar></term>
+
+    <listitem>
+     <para>
+      Specifies the default time zone of the created database cluster.  The
+      value should be a full time zone name
+      (see <xref linkend="datatype-timezones">).
+     </para>
+    </listitem>
+   </varlistentry>
   </variablelist>
 
   <para>
@@ -335,9 +446,19 @@ PostgreSQL documentation
  </refsect1>
 
  <refsect1>
+  <title>Notes</title>
+
+  <para>
+   <command>initdb</command> can also be invoked via
+   <command>pg_ctl initdb</command>.
+  </para>
+ </refsect1>
+
+ <refsect1>
   <title>See Also</title>
 
   <simplelist type="inline">
+   <member><xref linkend="app-pg-ctl"></member>
    <member><xref linkend="app-postgres"></member>
   </simplelist>
  </refsect1>

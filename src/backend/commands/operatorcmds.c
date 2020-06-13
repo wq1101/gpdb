@@ -4,12 +4,12 @@
  *
  *	  Routines for operator manipulation commands
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/commands/operatorcmds.c,v 1.39 2008/01/01 19:45:49 momjian Exp $
+ *	  src/backend/commands/operatorcmds.c
  *
  * DESCRIPTION
  *	  The "DefineFoo" routines take the parse tree and pick out the
@@ -35,24 +35,30 @@
 #include "postgres.h"
 
 #include "access/heapam.h"
+#include "access/htup_details.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
-#include "catalog/namespace.h"
 #include "catalog/oid_dispatch.h"
+#include "catalog/objectaccess.h"
 #include "catalog/pg_operator.h"
+#include "catalog/pg_operator_fn.h"
+#include "catalog/pg_type.h"
 #include "commands/alter.h"
 #include "commands/defrem.h"
 #include "miscadmin.h"
+#include "parser/parse_func.h"
 #include "parser/parse_oper.h"
 #include "parser/parse_type.h"
-#include "utils/acl.h"
+#include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/rel.h"
 #include "utils/syscache.h"
 
 #include "cdb/cdbvars.h"
 #include "cdb/cdbdisp_query.h"
 
-static void AlterOperatorOwner_internal(Relation rel, Oid operOid, Oid newOwnerId);
+static Oid	ValidateRestrictionEstimator(List *restrictionName);
+static Oid	ValidateJoinEstimator(List *joinName);
 
 /*
  * DefineOperator
@@ -62,7 +68,7 @@ static void AlterOperatorOwner_internal(Relation rel, Oid operOid, Oid newOwnerI
  *
  * 'parameters' is a list of DefElem
  */
-void
+ObjectAddress
 DefineOperator(List *names, List *parameters)
 {
 	char	   *oprName;
@@ -75,14 +81,32 @@ DefineOperator(List *names, List *parameters)
 	TypeName   *typeName2 = NULL;		/* second type name */
 	Oid			typeId1 = InvalidOid;	/* types converted to OID */
 	Oid			typeId2 = InvalidOid;
+	Oid			rettype;
 	List	   *commutatorName = NIL;	/* optional commutator operator name */
 	List	   *negatorName = NIL;		/* optional negator operator name */
 	List	   *restrictionName = NIL;	/* optional restrict. sel. procedure */
 	List	   *joinName = NIL; /* optional join sel. procedure */
+	Oid			functionOid;	/* functions converted to OID */
+	Oid			restrictionOid;
+	Oid			joinOid;
+	Oid			typeId[2];		/* to hold left and right arg */
+	int			nargs;
 	ListCell   *pl;
 
 	/* Convert list of names to a name and namespace */
 	oprNamespace = QualifiedNameGetCreationNamespace(names, &oprName);
+
+	/*
+	 * The SQL standard committee has decided that => should be used for named
+	 * parameters; therefore, a future release of PostgreSQL may disallow it
+	 * as the name of a user-defined operator.
+	 *
+	 * Only complain in the QD node, to avoid being too noisy.
+	 */
+	if (Gp_role != GP_ROLE_EXECUTE && strcmp(oprName, "=>") == 0)
+		ereport(WARNING,
+				(errmsg("=> is deprecated as an operator name"),
+				 errdetail("This name may be disallowed altogether in future versions of PostgreSQL.")));
 
 	/* Check we have creation rights in target namespace */
 	aclresult = pg_namespace_aclcheck(oprNamespace, GetUserId(), ACL_CREATE);
@@ -137,10 +161,13 @@ DefineOperator(List *names, List *parameters)
 		else if (pg_strcasecmp(defel->defname, "gtcmp") == 0)
 			canMerge = true;
 		else
+		{
+			/* WARNING, not ERROR, for historical backwards-compatibility */
 			ereport(WARNING,
 					(errcode(ERRCODE_SYNTAX_ERROR),
 					 errmsg("operator attribute \"%s\" not recognized",
 							defel->defname)));
+		}
 	}
 
 	/*
@@ -153,24 +180,92 @@ DefineOperator(List *names, List *parameters)
 
 	/* Transform type names to type OIDs */
 	if (typeName1)
-		typeId1 = typenameTypeId(NULL, typeName1, NULL);
+		typeId1 = typenameTypeId(NULL, typeName1);
 	if (typeName2)
-		typeId2 = typenameTypeId(NULL, typeName2, NULL);
+		typeId2 = typenameTypeId(NULL, typeName2);
+
+	if (!OidIsValid(typeId1) && !OidIsValid(typeId2))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+		   errmsg("at least one of leftarg or rightarg must be specified")));
+
+	if (typeName1)
+	{
+		aclresult = pg_type_aclcheck(typeId1, GetUserId(), ACL_USAGE);
+		if (aclresult != ACLCHECK_OK)
+			aclcheck_error_type(aclresult, typeId1);
+	}
+
+	if (typeName2)
+	{
+		aclresult = pg_type_aclcheck(typeId2, GetUserId(), ACL_USAGE);
+		if (aclresult != ACLCHECK_OK)
+			aclcheck_error_type(aclresult, typeId2);
+	}
+
+	/*
+	 * Look up the operator's underlying function.
+	 */
+	if (!OidIsValid(typeId1))
+	{
+		typeId[0] = typeId2;
+		nargs = 1;
+	}
+	else if (!OidIsValid(typeId2))
+	{
+		typeId[0] = typeId1;
+		nargs = 1;
+	}
+	else
+	{
+		typeId[0] = typeId1;
+		typeId[1] = typeId2;
+		nargs = 2;
+	}
+	functionOid = LookupFuncName(functionName, nargs, typeId, false);
+
+	/*
+	 * We require EXECUTE rights for the function.  This isn't strictly
+	 * necessary, since EXECUTE will be checked at any attempted use of the
+	 * operator, but it seems like a good idea anyway.
+	 */
+	aclresult = pg_proc_aclcheck(functionOid, GetUserId(), ACL_EXECUTE);
+	if (aclresult != ACLCHECK_OK)
+		aclcheck_error(aclresult, ACL_KIND_PROC,
+					   NameListToString(functionName));
+
+	rettype = get_func_rettype(functionOid);
+	aclresult = pg_type_aclcheck(rettype, GetUserId(), ACL_USAGE);
+	if (aclresult != ACLCHECK_OK)
+		aclcheck_error_type(aclresult, rettype);
+
+	/*
+	 * Look up restriction and join estimators if specified
+	 */
+	if (restrictionName)
+		restrictionOid = ValidateRestrictionEstimator(restrictionName);
+	else
+		restrictionOid = InvalidOid;
+	if (joinName)
+		joinOid = ValidateJoinEstimator(joinName);
+	else
+		joinOid = InvalidOid;
 
 	/*
 	 * now have OperatorCreate do all the work..
 	 */
-	OperatorCreate(oprName,		/* operator name */
-				   oprNamespace,	/* namespace */
-				   typeId1,		/* left type id */
-				   typeId2,		/* right type id */
-				   functionName,	/* function for operator */
-				   commutatorName,		/* optional commutator operator name */
-				   negatorName, /* optional negator operator name */
-				   restrictionName,		/* optional restrict. sel. procedure */
-				   joinName,	/* optional join sel. procedure name */
-				   canMerge,	/* operator merges */
-				   canHash);	/* operator hashes */
+	ObjectAddress objAddr =
+		OperatorCreate(oprName, /* operator name */
+					   oprNamespace,	/* namespace */
+					   typeId1, /* left type id */
+					   typeId2, /* right type id */
+					   functionOid,		/* function for operator */
+					   commutatorName,	/* optional commutator operator name */
+					   negatorName,		/* optional negator operator name */
+					   restrictionOid,	/* optional restrict. sel. procedure */
+					   joinOid, /* optional join sel. procedure name */
+					   canMerge,	/* operator merges */
+					   canHash);	/* operator hashes */
 
 	if (Gp_role == GP_ROLE_DISPATCH)
 	{
@@ -187,69 +282,88 @@ DefineOperator(List *names, List *parameters)
 									GetAssignedOidsForDispatch(),
 									NULL);
 	}
+	return objAddr;
 }
 
+/*
+ * Look up a restriction estimator function ny name, and verify that it has
+ * the correct signature and we have the permissions to attach it to an
+ * operator.
+ */
+static Oid
+ValidateRestrictionEstimator(List *restrictionName)
+{
+	Oid			typeId[4];
+	Oid			restrictionOid;
+	AclResult	aclresult;
+
+	typeId[0] = INTERNALOID;	/* PlannerInfo */
+	typeId[1] = OIDOID;			/* operator OID */
+	typeId[2] = INTERNALOID;	/* args list */
+	typeId[3] = INT4OID;		/* varRelid */
+
+	restrictionOid = LookupFuncName(restrictionName, 4, typeId, false);
+
+	/* estimators must return float8 */
+	if (get_func_rettype(restrictionOid) != FLOAT8OID)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+			  errmsg("restriction estimator function %s must return type %s",
+					 NameListToString(restrictionName), "float8")));
+
+	/* Require EXECUTE rights for the estimator */
+	aclresult = pg_proc_aclcheck(restrictionOid, GetUserId(), ACL_EXECUTE);
+	if (aclresult != ACLCHECK_OK)
+		aclcheck_error(aclresult, ACL_KIND_PROC,
+					   NameListToString(restrictionName));
+
+	return restrictionOid;
+}
 
 /*
- * RemoveOperator
- *		Deletes an operator.
+ * Look up a join estimator function ny name, and verify that it has the
+ * correct signature and we have the permissions to attach it to an
+ * operator.
  */
-void
-RemoveOperator(RemoveFuncStmt *stmt)
+static Oid
+ValidateJoinEstimator(List *joinName)
 {
-	List	   *operatorName = stmt->name;
-	TypeName   *typeName1 = (TypeName *) linitial(stmt->args);
-	TypeName   *typeName2 = (TypeName *) lsecond(stmt->args);
-	Oid			operOid;
-	HeapTuple	tup;
-	ObjectAddress object;
+	Oid			typeId[5];
+	Oid			joinOid;
+	AclResult	aclresult;
 
-	Assert(list_length(stmt->args) == 2);
-	operOid = LookupOperNameTypeNames(NULL, operatorName,
-									  typeName1, typeName2,
-									  stmt->missing_ok, -1);
-
-	if (stmt->missing_ok && !OidIsValid(operOid))
-	{
-		ereport(NOTICE,
-				(errmsg("operator %s does not exist, skipping",
-						NameListToString(operatorName))));
-		return;
-	}
-
-	tup = SearchSysCache(OPEROID,
-						 ObjectIdGetDatum(operOid),
-						 0, 0, 0);
-	if (!HeapTupleIsValid(tup)) /* should not happen */
-		elog(ERROR, "cache lookup failed for operator %u", operOid);
-
-	/* Permission check: must own operator or its namespace */
-	if (!pg_oper_ownercheck(operOid, GetUserId()) &&
-		!pg_namespace_ownercheck(((Form_pg_operator) GETSTRUCT(tup))->oprnamespace,
-								 GetUserId()))
-		aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_OPER,
-					   NameListToString(operatorName));
-
-	ReleaseSysCache(tup);
+	typeId[0] = INTERNALOID;	/* PlannerInfo */
+	typeId[1] = OIDOID;			/* operator OID */
+	typeId[2] = INTERNALOID;	/* args list */
+	typeId[3] = INT2OID;		/* jointype */
+	typeId[4] = INTERNALOID;	/* SpecialJoinInfo */
 
 	/*
-	 * Do the deletion
+	 * As of Postgres 8.4, the preferred signature for join estimators has 5
+	 * arguments, but we still allow the old 4-argument form. Try the
+	 * preferred form first.
 	 */
-	object.classId = OperatorRelationId;
-	object.objectId = operOid;
-	object.objectSubId = 0;
+	joinOid = LookupFuncName(joinName, 5, typeId, true);
+	if (!OidIsValid(joinOid))
+		joinOid = LookupFuncName(joinName, 4, typeId, true);
+	/* If not found, reference the 5-argument signature in error msg */
+	if (!OidIsValid(joinOid))
+		joinOid = LookupFuncName(joinName, 5, typeId, false);
 
-	performDeletion(&object, stmt->behavior);
-	
-	if (Gp_role == GP_ROLE_DISPATCH)
-	{
-		CdbDispatchUtilityStatement((Node *) stmt,
-									DF_CANCEL_ON_ERROR|
-									DF_WITH_SNAPSHOT|
-									DF_NEED_TWO_PHASE,
-									NIL,
-									NULL);
-	}
+	/* estimators must return float8 */
+	if (get_func_rettype(joinOid) != FLOAT8OID)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+				 errmsg("join estimator function %s must return type %s",
+						NameListToString(joinName), "float8")));
+
+	/* Require EXECUTE rights for the estimator */
+	aclresult = pg_proc_aclcheck(joinOid, GetUserId(), ACL_EXECUTE);
+	if (aclresult != ACLCHECK_OK)
+		aclcheck_error(aclresult, ACL_KIND_PROC,
+					   NameListToString(joinName));
+
+	return joinOid;
 }
 
 /*
@@ -260,14 +374,32 @@ RemoveOperatorById(Oid operOid)
 {
 	Relation	relation;
 	HeapTuple	tup;
+	Form_pg_operator op;
 
 	relation = heap_open(OperatorRelationId, RowExclusiveLock);
 
-	tup = SearchSysCache(OPEROID,
-						 ObjectIdGetDatum(operOid),
-						 0, 0, 0);
+	tup = SearchSysCache1(OPEROID, ObjectIdGetDatum(operOid));
 	if (!HeapTupleIsValid(tup)) /* should not happen */
 		elog(ERROR, "cache lookup failed for operator %u", operOid);
+	op = (Form_pg_operator) GETSTRUCT(tup);
+
+	/*
+	 * Reset links from commutator and negator, if any.  In case of a
+	 * self-commutator or self-negator, this means we have to re-fetch the
+	 * updated tuple.  (We could optimize away updates on the tuple we're
+	 * about to drop, but it doesn't seem worth convoluting the logic for.)
+	 */
+	if (OidIsValid(op->oprcom) || OidIsValid(op->oprnegate))
+	{
+		OperatorUpd(operOid, op->oprcom, op->oprnegate, true);
+		if (operOid == op->oprcom || operOid == op->oprnegate)
+		{
+			ReleaseSysCache(tup);
+			tup = SearchSysCache1(OPEROID, ObjectIdGetDatum(operOid));
+			if (!HeapTupleIsValid(tup)) /* should not happen */
+				elog(ERROR, "cache lookup failed for operator %u", operOid);
+		}
+	}
 
 	simple_heap_delete(relation, &tup->t_self);
 
@@ -276,147 +408,157 @@ RemoveOperatorById(Oid operOid)
 	heap_close(relation, RowExclusiveLock);
 }
 
-void
-AlterOperatorOwner_oid(Oid operOid, Oid newOwnerId)
-{
-	Relation	rel;
-
-	rel = heap_open(OperatorRelationId, RowExclusiveLock);
-
-	AlterOperatorOwner_internal(rel, operOid, newOwnerId);
-
-	heap_close(rel, NoLock);
-}
-
 /*
- * change operator owner
+ * AlterOperator
+ *		routine implementing ALTER OPERATOR <operator> SET (option = ...).
+ *
+ * Currently, only RESTRICT and JOIN estimator functions can be changed.
  */
-void
-AlterOperatorOwner(List *name, TypeName *typeName1, TypeName *typeName2,
-				   Oid newOwnerId)
+ObjectAddress
+AlterOperator(AlterOperatorStmt *stmt)
 {
-	Oid			operOid;
-	Relation	rel;
-
-	rel = heap_open(OperatorRelationId, RowExclusiveLock);
-
-	operOid = LookupOperNameTypeNames(NULL, name,
-									  typeName1, typeName2,
-									  false, -1);
-
-	AlterOperatorOwner_internal(rel, operOid, newOwnerId);
-
-	heap_close(rel, NoLock);
-}
-
-static void
-AlterOperatorOwner_internal(Relation rel, Oid operOid, Oid newOwnerId)
-{
+	ObjectAddress address;
+	Oid			oprId;
+	Relation	catalog;
 	HeapTuple	tup;
-	AclResult	aclresult;
 	Form_pg_operator oprForm;
+	int			i;
+	ListCell   *pl;
+	Datum		values[Natts_pg_operator];
+	bool		nulls[Natts_pg_operator];
+	bool		replaces[Natts_pg_operator];
+	List	   *restrictionName = NIL;	/* optional restrict. sel. procedure */
+	bool		updateRestriction = false;
+	Oid			restrictionOid;
+	List	   *joinName = NIL; /* optional join sel. procedure */
+	bool		updateJoin = false;
+	Oid			joinOid;
 
-	Assert(RelationGetRelid(rel) == OperatorRelationId);
-
-	tup = SearchSysCacheCopy(OPEROID,
-							 ObjectIdGetDatum(operOid),
-							 0, 0, 0);
-	if (!HeapTupleIsValid(tup)) /* should not happen */
-		elog(ERROR, "cache lookup failed for operator %u", operOid);
-
+	/* Look up the operator */
+	oprId = LookupOperNameTypeNames(NULL, stmt->opername,
+									(TypeName *) linitial(stmt->operargs),
+									(TypeName *) lsecond(stmt->operargs),
+									false, -1);
+	catalog = heap_open(OperatorRelationId, RowExclusiveLock);
+	tup = SearchSysCacheCopy1(OPEROID, ObjectIdGetDatum(oprId));
+	if (tup == NULL)
+		elog(ERROR, "cache lookup failed for operator %u", oprId);
 	oprForm = (Form_pg_operator) GETSTRUCT(tup);
 
-	/*
-	 * If the new owner is the same as the existing owner, consider the
-	 * command to have succeeded.  This is for dump restoration purposes.
-	 */
-	if (oprForm->oprowner != newOwnerId)
+	/* Process options */
+	foreach(pl, stmt->options)
 	{
-		/* Superusers can always do it */
-		if (!superuser())
+		DefElem    *defel = (DefElem *) lfirst(pl);
+		List	   *param;
+
+		if (defel->arg == NULL)
+			param = NIL;		/* NONE, removes the function */
+		else
+			param = defGetQualifiedName(defel);
+
+		if (pg_strcasecmp(defel->defname, "restrict") == 0)
 		{
-			/* Otherwise, must be owner of the existing object */
-			if (!pg_oper_ownercheck(operOid, GetUserId()))
-				aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_OPER,
-							   NameStr(oprForm->oprname));
-
-			/* Must be able to become new owner */
-			check_is_member_of_role(GetUserId(), newOwnerId);
-
-			/* New owner must have CREATE privilege on namespace */
-			aclresult = pg_namespace_aclcheck(oprForm->oprnamespace,
-											  newOwnerId,
-											  ACL_CREATE);
-			if (aclresult != ACLCHECK_OK)
-				aclcheck_error(aclresult, ACL_KIND_NAMESPACE,
-							   get_namespace_name(oprForm->oprnamespace));
+			restrictionName = param;
+			updateRestriction = true;
+		}
+		else if (pg_strcasecmp(defel->defname, "join") == 0)
+		{
+			joinName = param;
+			updateJoin = true;
 		}
 
 		/*
-		 * Modify the owner --- okay to scribble on tup because it's a copy
+		 * The rest of the options that CREATE accepts cannot be changed.
+		 * Check for them so that we can give a meaningful error message.
 		 */
-		oprForm->oprowner = newOwnerId;
-
-		simple_heap_update(rel, &tup->t_self, tup);
-
-		CatalogUpdateIndexes(rel, tup);
-
-		/* Update owner dependency reference */
-		changeDependencyOnOwner(OperatorRelationId, operOid, newOwnerId);
+		else if (pg_strcasecmp(defel->defname, "leftarg") == 0 ||
+				 pg_strcasecmp(defel->defname, "rightarg") == 0 ||
+				 pg_strcasecmp(defel->defname, "procedure") == 0 ||
+				 pg_strcasecmp(defel->defname, "commutator") == 0 ||
+				 pg_strcasecmp(defel->defname, "negator") == 0 ||
+				 pg_strcasecmp(defel->defname, "hashes") == 0 ||
+				 pg_strcasecmp(defel->defname, "merges") == 0)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("operator attribute \"%s\" cannot be changed",
+							defel->defname)));
+		}
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("operator attribute \"%s\" not recognized",
+							defel->defname)));
 	}
 
-	heap_freetuple(tup);
-}
+	/* Check permissions. Must be owner. */
+	if (!pg_oper_ownercheck(oprId, GetUserId()))
+		aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_OPER,
+					   NameStr(oprForm->oprname));
 
-/*
- * Execute ALTER OPERATOR SET SCHEMA
- */
-void
-AlterOperatorNamespace(List *names, List *argtypes, const char *newschema)
-{
-	List	   *operatorName = names;
-	TypeName   *typeName1 = (TypeName *) linitial(argtypes);
-	TypeName   *typeName2 = (TypeName *) lsecond(argtypes);
-	Oid			operOid,
-				nspOid;
-	Relation	rel;
+	/*
+	 * Look up restriction and join estimators if specified
+	 */
+	if (restrictionName)
+		restrictionOid = ValidateRestrictionEstimator(restrictionName);
+	else
+		restrictionOid = InvalidOid;
+	if (joinName)
+		joinOid = ValidateJoinEstimator(joinName);
+	else
+		joinOid = InvalidOid;
 
-	rel = heap_open(OperatorRelationId, RowExclusiveLock);
+	/* Perform additional checks, like OperatorCreate does */
+	if (!(OidIsValid(oprForm->oprleft) && OidIsValid(oprForm->oprright)))
+	{
+		/* If it's not a binary op, these things mustn't be set: */
+		if (OidIsValid(joinOid))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+				 errmsg("only binary operators can have join selectivity")));
+	}
 
-	Assert(list_length(argtypes) == 2);
-	operOid = LookupOperNameTypeNames(NULL, operatorName,
-									  typeName1, typeName2,
-									  false, -1);
+	if (oprForm->oprresult != BOOLOID)
+	{
+		if (OidIsValid(restrictionOid))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+					 errmsg("only boolean operators can have restriction selectivity")));
+		if (OidIsValid(joinOid))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+				errmsg("only boolean operators can have join selectivity")));
+	}
 
-	/* get schema OID */
-	nspOid = LookupCreationNamespace(newschema);
+	/* Update the tuple */
+	for (i = 0; i < Natts_pg_operator; ++i)
+	{
+		values[i] = (Datum) 0;
+		replaces[i] = false;
+		nulls[i] = false;
+	}
+	if (updateRestriction)
+	{
+		replaces[Anum_pg_operator_oprrest - 1] = true;
+		values[Anum_pg_operator_oprrest - 1] = restrictionOid;
+	}
+	if (updateJoin)
+	{
+		replaces[Anum_pg_operator_oprjoin - 1] = true;
+		values[Anum_pg_operator_oprjoin - 1] = joinOid;
+	}
 
-	AlterObjectNamespace(rel, OPEROID, -1,
-						 operOid, nspOid,
-						 Anum_pg_operator_oprname,
-						 Anum_pg_operator_oprnamespace,
-						 Anum_pg_operator_oprowner,
-						 ACL_KIND_OPER);
+	tup = heap_modify_tuple(tup, RelationGetDescr(catalog),
+							values, nulls, replaces);
 
-	heap_close(rel, RowExclusiveLock);
-}
+	simple_heap_update(catalog, &tup->t_self, tup);
+	CatalogUpdateIndexes(catalog, tup);
 
-Oid
-AlterOperatorNamespace_oid(Oid operOid, Oid newNspOid)
-{
-	Oid			oldNspOid;
-	Relation	rel;
+	address = makeOperatorDependencies(tup, true);
 
-	rel = heap_open(OperatorRelationId, RowExclusiveLock);
+	InvokeObjectPostAlterHook(OperatorRelationId, oprId, 0);
 
-	oldNspOid = AlterObjectNamespace(rel, OPEROID, -1,
-									 operOid, newNspOid,
-									 Anum_pg_operator_oprname,
-									 Anum_pg_operator_oprnamespace,
-									 Anum_pg_operator_oprowner,
-									 ACL_KIND_OPER);
+	heap_close(catalog, NoLock);
 
-	heap_close(rel, RowExclusiveLock);
-
-	return oldNspOid;
+	return address;
 }

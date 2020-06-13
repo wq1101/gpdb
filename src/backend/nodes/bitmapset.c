@@ -11,21 +11,20 @@
  * bms_is_empty() in preference to testing for NULL.)
  *
  *
- * Copyright (c) 2003-2008, PostgreSQL Global Development Group
+ * Copyright (c) 2003-2016, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/nodes/bitmapset.c,v 1.14 2008/01/01 19:45:49 momjian Exp $
+ *	  src/backend/nodes/bitmapset.c
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
-#include "nodes/bitmapset.h"
 #include "access/hash.h"
 
 
-#define WORDNUM(x)	((int)((unsigned)(x) >> BITS_PER_BITMAPWORD_LOG2))
-#define BITNUM(x)	((int)((unsigned)(x) & (BITS_PER_BITMAPWORD - 1)))
+#define WORDNUM(x)	((x) / BITS_PER_BITMAPWORD)
+#define BITNUM(x)	((x) % BITS_PER_BITMAPWORD)
 
 #define BITMAPSET_SIZE(nwords)	\
 	(offsetof(Bitmapset, words) + (nwords) * sizeof(bitmapword))
@@ -39,7 +38,7 @@
  * where x's are unspecified bits.  The two's complement negative is formed
  * by inverting all the bits and adding one.  Inversion gives
  *				yyyyyy01111
- * where each y is the inverse of the corresponding x.	Incrementing gives
+ * where each y is the inverse of the corresponding x.  Incrementing gives
  *				yyyyyy10000
  * and then ANDing with the original value gives
  *				00000010000
@@ -55,12 +54,34 @@
 /*
  * Lookup tables to avoid need for bit-by-bit groveling
  *
+ * rightmost_one_pos[x] gives the bit number (0-7) of the rightmost one bit
+ * in a nonzero byte value x.  The entry for x=0 is never used.
+ *
  * number_of_ones[x] gives the number of one-bits (0-8) in a byte value x.
  *
  * We could make these tables larger and reduce the number of iterations
  * in the functions that use them, but bytewise shifts and masks are
  * especially fast on many machines, so working a byte at a time seems best.
  */
+
+static const uint8 rightmost_one_pos[256] = {
+	0, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0,
+	4, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0,
+	5, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0,
+	4, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0,
+	6, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0,
+	4, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0,
+	5, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0,
+	4, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0,
+	7, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0,
+	4, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0,
+	5, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0,
+	4, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0,
+	6, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0,
+	4, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0,
+	5, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0,
+	4, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0
+};
 
 static const uint8 number_of_ones[256] = {
 	0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4,
@@ -80,31 +101,6 @@ static const uint8 number_of_ones[256] = {
 	3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7,
 	4, 5, 5, 6, 5, 6, 6, 7, 5, 6, 6, 7, 6, 7, 7, 8
 };
-
-
-/*
- * num_low_order_zero_bits
- */
-static inline int
-num_low_order_zero_bits(bitmapword w)
-{
-	int			x = 0;
-	int			i;
-	bitmapword	m;
-
-	for (i = BITS_PER_BITMAPWORD / 2; i; i >>= 1)
-	{							/* i = 16, 8, 4, 2, 1 */
-		m = (1 << i) - 1;		/* m = 0xffff, 0xff, 0xf, 3, 1 */
-		if ((w & m) == 0)
-		{
-			w >>= i;
-			x += i;
-		}
-	}
-	if (w == 0)					/* all 0 => return BITS_PER_BITMAPWORD */
-		x++;
-	return x;
-}
 
 
 /*
@@ -403,6 +399,83 @@ bms_is_subset(const Bitmapset *a, const Bitmapset *b)
 }
 
 /*
+ * bms_subset_compare - compare A and B for equality/subset relationships
+ *
+ * This is more efficient than testing bms_is_subset in both directions.
+ */
+BMS_Comparison
+bms_subset_compare(const Bitmapset *a, const Bitmapset *b)
+{
+	BMS_Comparison result;
+	int			shortlen;
+	int			longlen;
+	int			i;
+
+	/* Handle cases where either input is NULL */
+	if (a == NULL)
+	{
+		if (b == NULL)
+			return BMS_EQUAL;
+		return bms_is_empty(b) ? BMS_EQUAL : BMS_SUBSET1;
+	}
+	if (b == NULL)
+		return bms_is_empty(a) ? BMS_EQUAL : BMS_SUBSET2;
+	/* Check common words */
+	result = BMS_EQUAL;			/* status so far */
+	shortlen = Min(a->nwords, b->nwords);
+	for (i = 0; i < shortlen; i++)
+	{
+		bitmapword	aword = a->words[i];
+		bitmapword	bword = b->words[i];
+
+		if ((aword & ~bword) != 0)
+		{
+			/* a is not a subset of b */
+			if (result == BMS_SUBSET1)
+				return BMS_DIFFERENT;
+			result = BMS_SUBSET2;
+		}
+		if ((bword & ~aword) != 0)
+		{
+			/* b is not a subset of a */
+			if (result == BMS_SUBSET2)
+				return BMS_DIFFERENT;
+			result = BMS_SUBSET1;
+		}
+	}
+	/* Check extra words */
+	if (a->nwords > b->nwords)
+	{
+		longlen = a->nwords;
+		for (; i < longlen; i++)
+		{
+			if (a->words[i] != 0)
+			{
+				/* a is not a subset of b */
+				if (result == BMS_SUBSET1)
+					return BMS_DIFFERENT;
+				result = BMS_SUBSET2;
+			}
+		}
+	}
+	else if (a->nwords < b->nwords)
+	{
+		longlen = b->nwords;
+		for (; i < longlen; i++)
+		{
+			if (b->words[i] != 0)
+			{
+				/* b is not a subset of a */
+				if (result == BMS_SUBSET2)
+					return BMS_DIFFERENT;
+				result = BMS_SUBSET1;
+			}
+		}
+	}
+	return result;
+}
+
+/*
  * bms_is_member - is X a member of A?
  */
 bool
@@ -500,12 +573,62 @@ bms_singleton_member(const Bitmapset *a)
 		{
 			if (result >= 0 || HAS_MULTIPLE_ONES(w))
 				elog(ERROR, "bitmapset has multiple members");
-			result = num_low_order_zero_bits(w) + wordnum * BITS_PER_BITMAPWORD;
+			result = wordnum * BITS_PER_BITMAPWORD;
+			while ((w & 255) == 0)
+			{
+				w >>= 8;
+				result += 8;
+			}
+			result += rightmost_one_pos[w & 255];
 		}
 	}
 	if (result < 0)
 		elog(ERROR, "bitmapset is empty");
 	return result;
+}
+
+/*
+ * bms_get_singleton_member
+ *
+ * Test whether the given set is a singleton.
+ * If so, set *member to the value of its sole member, and return TRUE.
+ * If not, return FALSE, without changing *member.
+ *
+ * This is more convenient and faster than calling bms_membership() and then
+ * bms_singleton_member(), if we don't care about distinguishing empty sets
+ * from multiple-member sets.
+ */
+bool
+bms_get_singleton_member(const Bitmapset *a, int *member)
+{
+	int			result = -1;
+	int			nwords;
+	int			wordnum;
+
+	if (a == NULL)
+		return false;
+	nwords = a->nwords;
+	for (wordnum = 0; wordnum < nwords; wordnum++)
+	{
+		bitmapword	w = a->words[wordnum];
+
+		if (w != 0)
+		{
+			if (result >= 0 || HAS_MULTIPLE_ONES(w))
+				return false;
+			result = wordnum * BITS_PER_BITMAPWORD;
+			while ((w & 255) == 0)
+			{
+				w >>= 8;
+				result += 8;
+			}
+			result += rightmost_one_pos[w & 255];
+		}
+	}
+	if (result < 0)
+		return false;
+	*member = result;
+	return true;
 }
 
 /*
@@ -616,21 +739,20 @@ bms_add_member(Bitmapset *a, int x)
 		return bms_make_singleton(x);
 	wordnum = WORDNUM(x);
 	bitnum = BITNUM(x);
+
+	/* enlarge the set if necessary */
 	if (wordnum >= a->nwords)
 	{
-		/* Slow path: make a larger set and union the input set into it */
-		Bitmapset  *result;
-		int			nwords;
+		int			oldnwords = a->nwords;
 		int			i;
 
-		result = bms_make_singleton(x);
-		nwords = a->nwords;
-		for (i = 0; i < nwords; i++)
-			result->words[i] |= a->words[i];
-		pfree(a);
-		return result;
+		a = (Bitmapset *) repalloc(a, BITMAPSET_SIZE(wordnum + 1));
+		a->nwords = wordnum + 1;
+		/* zero out the enlarged portion */
+		for (i = oldnwords; i < a->nwords; i++)
+			a->words[i] = 0;
 	}
-	/* Fast path: x fits in existing set */
+
 	a->words[wordnum] |= ((bitmapword) 1 << bitnum);
 	return a;
 }
@@ -815,64 +937,19 @@ bms_join(Bitmapset *a, Bitmapset *b)
 	return result;
 }
 
-/*----------
- * bms_first_from - find first member of a set, starting at given index
- *
- * Returns -1 if no members >= x.	The set is not modified.
- *
- * This is intended as support for iterating through the members of a set.
- * The typical pattern is
- *
- *          x = bms_first_from(set, 0);
- *          while (x >= 0)
- *          {
- *              process member x;
- *              x = bms_first_from(set, x + 1);
- *          }
- *----------
- */
-int
-bms_first_from(const Bitmapset *a, int x)
-{
-	int			wordnum;
-	bitmapword	w;
-
-	if (a == NULL)
-		return -1;
-
-	wordnum = WORDNUM(x);
-
-	if ((unsigned) wordnum >= (unsigned) a->nwords)
-		return -1;
-
-	w = a->words[wordnum] >> BITNUM(x);
-	if (w & 1)
-		return x;
-	if (w)
-		return x + num_low_order_zero_bits(w);
-
-	for (wordnum++; wordnum < a->nwords; wordnum++)
-	{
-		w = a->words[wordnum];
-		if (w)
-			return wordnum * BITS_PER_BITMAPWORD + num_low_order_zero_bits(w);
-	}
-	return -1;
-}
-
-/*----------
+/*
  * bms_first_member - find and remove first member of a set
  *
- * Returns -1 if set is empty.	NB: set is destructively modified!
+ * Returns -1 if set is empty.  NB: set is destructively modified!
  *
  * This is intended as support for iterating through the members of a set.
  * The typical pattern is
  *
- *			tmpset = bms_copy(inputset);
- *			while ((x = bms_first_member(tmpset)) >= 0)
+ *			while ((x = bms_first_member(inputset)) >= 0)
  *				process member x;
- *			bms_free(tmpset);
- *----------
+ *
+ * CAUTION: this destroys the content of "inputset".  If the set must
+ * not be modified, use bms_next_member instead.
  */
 int
 bms_first_member(Bitmapset *a)
@@ -889,13 +966,80 @@ bms_first_member(Bitmapset *a)
 
 		if (w != 0)
 		{
+			int			result;
+
 			w = RIGHTMOST_ONE(w);
 			a->words[wordnum] &= ~w;
 
-			return num_low_order_zero_bits(w) + wordnum * BITS_PER_BITMAPWORD;
+			result = wordnum * BITS_PER_BITMAPWORD;
+			while ((w & 255) == 0)
+			{
+				w >>= 8;
+				result += 8;
+			}
+			result += rightmost_one_pos[w & 255];
+			return result;
 		}
 	}
 	return -1;
+}
+
+/*
+ * bms_next_member - find next member of a set
+ *
+ * Returns smallest member greater than "prevbit", or -2 if there is none.
+ * "prevbit" must NOT be less than -1, or the behavior is unpredictable.
+ *
+ * This is intended as support for iterating through the members of a set.
+ * The typical pattern is
+ *
+ *			x = -1;
+ *			while ((x = bms_next_member(inputset, x)) >= 0)
+ *				process member x;
+ *
+ * Notice that when there are no more members, we return -2, not -1 as you
+ * might expect.  The rationale for that is to allow distinguishing the
+ * loop-not-started state (x == -1) from the loop-completed state (x == -2).
+ * It makes no difference in simple loop usage, but complex iteration logic
+ * might need such an ability.
+ */
+int
+bms_next_member(const Bitmapset *a, int prevbit)
+{
+	int			nwords;
+	int			wordnum;
+	bitmapword	mask;
+
+	if (a == NULL)
+		return -2;
+	nwords = a->nwords;
+	prevbit++;
+	mask = (~(bitmapword) 0) << BITNUM(prevbit);
+	for (wordnum = WORDNUM(prevbit); wordnum < nwords; wordnum++)
+	{
+		bitmapword	w = a->words[wordnum];
+
+		/* ignore bits before prevbit */
+		w &= mask;
+
+		if (w != 0)
+		{
+			int			result;
+
+			result = wordnum * BITS_PER_BITMAPWORD;
+			while ((w & 255) == 0)
+			{
+				w >>= 8;
+				result += 8;
+			}
+			result += rightmost_one_pos[w & 255];
+			return result;
+		}
+
+		/* in subsequent words, consider all bits */
+		mask = (~(bitmapword) 0);
+	}
+	return -2;
 }
 
 /*

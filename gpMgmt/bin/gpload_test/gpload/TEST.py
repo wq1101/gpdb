@@ -10,7 +10,10 @@ import socket
 import fileinput
 import platform
 import re
-import subprocess
+try:
+    import subprocess32 as subprocess
+except:
+    import subprocess
 from pygresql import pg
 
 """
@@ -91,13 +94,13 @@ def psql_run(ifile = None, ofile = None, cmd = None,
     @param port    : port where gpdb is running
     @param PGOPTIONS: connects to postgres via utility mode
     '''
-    if dbname == None:
+    if dbname is None:
         dbname = DBNAME
 
-    if username == None:
+    if username is None:
         username = PGUSER  # Use the default login user
 
-    if PGOPTIONS == None:
+    if PGOPTIONS is None:
         PGOPTIONS = ""
     else:
         PGOPTIONS = "PGOPTIONS='%s'" % PGOPTIONS
@@ -181,17 +184,17 @@ def isFileEqual( f1, f2, optionalFlags = "", outputPath = "", myinitfile = ""):
     # Gets the suitePath name to add init_file
     suitePath = f1[0:f1.rindex( "/" )]
     if os.path.exists(suitePath + "/init_file"):
-        (ok, out) = run('gpdiff.pl -w ' + optionalFlags + \
+        (ok, out) = run('../gpdiff.pl -w ' + optionalFlags + \
                               ' -I NOTICE: -I HINT: -I CONTEXT: -I GP_IGNORE: --gp_init_file=%s/global_init_file --gp_init_file=%s/init_file '
                               '%s %s > %s 2>&1' % (LMYD, suitePath, f1, f2, dfile))
 
     else:
         if os.path.exists(myinitfile):
-            (ok, out) = run('gpdiff.pl -w ' + optionalFlags + \
+            (ok, out) = run('../gpdiff.pl -w ' + optionalFlags + \
                                   ' -I NOTICE: -I HINT: -I CONTEXT: -I GP_IGNORE: --gp_init_file=%s/global_init_file --gp_init_file=%s '
                                   '%s %s > %s 2>&1' % (LMYD, myinitfile, f1, f2, dfile))
         else:
-            (ok, out) = run( 'gpdiff.pl -w ' + optionalFlags + \
+            (ok, out) = run( '../gpdiff.pl -w ' + optionalFlags + \
                               ' -I NOTICE: -I HINT: -I CONTEXT: -I GP_IGNORE: --gp_init_file=%s/global_init_file '
                               '%s %s > %s 2>&1' % ( LMYD, f1, f2, dfile ) )
 
@@ -199,6 +202,15 @@ def isFileEqual( f1, f2, optionalFlags = "", outputPath = "", myinitfile = ""):
     if ok:
         os.unlink( dfile )
     return ok
+
+def read_diff(ifile, outputPath):
+    """
+    Opens the diff file that is assocated with the given input file and returns
+    its contents as a string.
+    """
+    dfile = diffFile(ifile, outputPath)
+    with open(dfile, 'r') as diff:
+        return diff.read()
 
 def write_config_file(database='gptest',user='',host='localhost',port='',table='lineitem',file='lineitem.tbl.small'):
     if (not user or user == '') and (not os.environ.get('PGUSER') or os.environ.get('PGUSER') == ''):
@@ -370,7 +382,7 @@ class GPLoad_Env_TestCase(unittest.TestCase):
         (ok, out) = runfile(file)
         self.check_result(file)
 
-    def check_result(self,ifile, optionalFlags = "", outputPath = ""):
+    def check_result(self,ifile, optionalFlags = "-U3", outputPath = ""):
         """
         PURPOSE: compare the actual and expected output files and report an
             error if they don't match.
@@ -381,13 +393,15 @@ class GPLoad_Env_TestCase(unittest.TestCase):
                 figure out the proper names of the .out and .ans files.
             optionalFlags: command-line options (if any) for diff.
                 For example, pass " -B " (with the blank spaces) to ignore
-                blank lines.
+                blank lines. By default, diffs are unified with 3 lines of
+                context (i.e. optionalFlags is "-U3").
         """
-        f1 = outFile(ifile, outputPath=outputPath)
-        f2 = gpdbAnsFile(ifile)
+        f1 = gpdbAnsFile(ifile)
+        f2 = outFile(ifile, outputPath=outputPath)
 
         result = isFileEqual(f1, f2, optionalFlags, outputPath=outputPath)
-        self.failUnless(result)
+        diff = None if result else read_diff(ifile, outputPath)
+        self.assertTrue(result, "query resulted in diff:\n{}".format(diff))
 
         return True
 

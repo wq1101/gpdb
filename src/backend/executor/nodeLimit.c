@@ -5,12 +5,12 @@
  *
  * Portions Copyright (c) 2005-2008, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/executor/nodeLimit.c,v 1.33 2008/01/01 19:45:49 momjian Exp $
+ *	  src/backend/executor/nodeLimit.c
  *
  *-------------------------------------------------------------------------
  */
@@ -26,8 +26,10 @@
 #include "cdb/cdbvars.h"
 #include "executor/executor.h"
 #include "executor/nodeLimit.h"
+#include "nodes/nodeFuncs.h"
 
 static void recompute_limits(LimitState *node);
+static void pass_down_bound(LimitState *node, PlanState *child_node);
 
 
 /* ----------------------------------------------------------------
@@ -37,8 +39,8 @@ static void recompute_limits(LimitState *node);
  *		filtering on the stream of tuples returned by a subplan.
  * ----------------------------------------------------------------
  */
-TupleTableSlot *				/* return: a tuple or NULL */
-ExecLimit(LimitState *node)
+static TupleTableSlot *				/* return: a tuple or NULL */
+ExecLimit_guts(LimitState *node)
 {
 	ScanDirection direction;
 	TupleTableSlot *slot;
@@ -81,14 +83,6 @@ ExecLimit(LimitState *node)
 			if (node->count <= 0 && !node->noCount)
 			{
 				node->lstate = LIMIT_EMPTY;
-
-				/*
-				 * CDB: We'll read no more from outer subtree. To keep our
-				 * sibling QEs from being starved, tell source QEs not to clog
-				 * up the pipeline with our never-to-be-consumed data.
-				 */
-				ExecSquelchNode(outerPlan);
-
 				return NULL;
 			}
 
@@ -122,9 +116,8 @@ ExecLimit(LimitState *node)
 
 			/*
 			 * The subplan is known to return no tuples (or not more than
-			 * OFFSET tuples, in general).	So we return no tuples.
+			 * OFFSET tuples, in general).  So we return no tuples.
 			 */
-			ExecSquelchNode(outerPlan); /* CDB */
 			return NULL;
 
 		case LIMIT_INWINDOW:
@@ -140,7 +133,6 @@ ExecLimit(LimitState *node)
 					node->position - node->offset >= node->count)
 				{
 					node->lstate = LIMIT_WINDOWEND;
-					ExecSquelchNode(outerPlan); /* CDB */
 					return NULL;
 				}
 
@@ -165,7 +157,6 @@ ExecLimit(LimitState *node)
 				if (node->position <= node->offset + 1)
 				{
 					node->lstate = LIMIT_WINDOWSTART;
-					ExecSquelchNode(outerPlan); /* CDB */
 					return NULL;
 				}
 
@@ -232,12 +223,28 @@ ExecLimit(LimitState *node)
 	/* Return the current tuple */
 	Assert(!TupIsNull(slot));
 
-        if (!TupIsNull(slot))
-        {
-            Gpmon_Incr_Rows_Out(GpmonPktFromLimitState(node));
-            CheckSendPlanStateGpmonPkt(&node->ps); 
-        }
 	return slot;
+}
+
+TupleTableSlot *
+ExecLimit(LimitState *node)
+{
+	TupleTableSlot *result;
+
+	result = ExecLimit_guts(node);
+
+	if (TupIsNull(result) && ScanDirectionIsForward(node->ps.state->es_direction) &&
+		!node->expect_rescan)
+	{
+		/*
+		 * CDB: We'll read no more from inner subtree. To keep our sibling
+		 * QEs from being starved, tell source QEs not to clog up the
+		 * pipeline with our never-to-be-consumed data.
+		 */
+		ExecSquelchNode((PlanState *) node);
+	}
+
+	return result;
 }
 
 /*
@@ -265,7 +272,9 @@ recompute_limits(LimitState *node)
 		{
 			node->offset = DatumGetInt64(val);
 			if (node->offset < 0)
-				node->offset = 0;
+				ereport(ERROR,
+				 (errcode(ERRCODE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE),
+				  errmsg("OFFSET must not be negative")));
 		}
 	}
 	else
@@ -290,7 +299,9 @@ recompute_limits(LimitState *node)
 		{
 			node->count = DatumGetInt64(val);
 			if (node->count < 0)
-				node->count = 0;
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE),
+						 errmsg("LIMIT must not be negative")));
 			node->noCount = false;
 		}
 	}
@@ -308,23 +319,32 @@ recompute_limits(LimitState *node)
 	/* Set state-machine state */
 	node->lstate = LIMIT_RESCAN;
 
-	/*
-	 * If we have a COUNT, and our input is a Sort node, notify it that it can
-	 * use bounded sort.
-	 *
-	 * This is a bit of a kluge, but we don't have any more-abstract way of
-	 * communicating between the two nodes; and it doesn't seem worth trying
-	 * to invent one without some more examples of special communication
-	 * needs.
-	 *
-	 * Note: it is the responsibility of nodeSort.c to react properly to
-	 * changes of these parameters.  If we ever do redesign this, it'd be a
-	 * good idea to integrate this signaling with the parameter-change
-	 * mechanism.
-	 */
-	if (IsA(outerPlanState(node), SortState))
+	/* Notify child node about limit, if useful */
+	pass_down_bound(node, outerPlanState(node));
+}
+
+/*
+ * If we have a COUNT, and our input is a Sort node, notify it that it can
+ * use bounded sort.  Also, if our input is a MergeAppend, we can apply the
+ * same bound to any Sorts that are direct children of the MergeAppend,
+ * since the MergeAppend surely need read no more than that many tuples from
+ * any one input.  We also have to be prepared to look through a Result,
+ * since the planner might stick one atop MergeAppend for projection purposes.
+ *
+ * This is a bit of a kluge, but we don't have any more-abstract way of
+ * communicating between the two nodes; and it doesn't seem worth trying
+ * to invent one without some more examples of special communication needs.
+ *
+ * Note: it is the responsibility of nodeSort.c to react properly to
+ * changes of these parameters.  If we ever do redesign this, it'd be a
+ * good idea to integrate this signaling with the parameter-change mechanism.
+ */
+static void
+pass_down_bound(LimitState *node, PlanState *child_node)
+{
+	if (IsA(child_node, SortState))
 	{
-		SortState  *sortState = (SortState *) outerPlanState(node);
+		SortState  *sortState = (SortState *) child_node;
 		int64		tuples_needed = node->count + node->offset;
 
 		/* negative test checks for overflow */
@@ -338,6 +358,31 @@ recompute_limits(LimitState *node)
 			sortState->bounded = true;
 			sortState->bound = tuples_needed;
 		}
+	}
+	else if (IsA(child_node, MergeAppendState))
+	{
+		MergeAppendState *maState = (MergeAppendState *) child_node;
+		int			i;
+
+		for (i = 0; i < maState->ms_nplans; i++)
+			pass_down_bound(node, maState->mergeplans[i]);
+	}
+	else if (IsA(child_node, ResultState))
+	{
+		/*
+		 * An extra consideration here is that if the Result is projecting a
+		 * targetlist that contains any SRFs, we can't assume that every input
+		 * tuple generates an output tuple, so a Sort underneath might need to
+		 * return more than N tuples to satisfy LIMIT N. So we cannot use
+		 * bounded sort.
+		 *
+		 * If Result supported qual checking, we'd have to punt on seeing a
+		 * qual, too.  Note that having a resconstantqual is not a
+		 * showstopper: if that fails we're not getting any rows at all.
+		 */
+		if (outerPlanState(child_node) &&
+			!expression_returns_set((Node *) child_node->plan->targetlist))
+			pass_down_bound(node, outerPlanState(child_node));
 	}
 }
 
@@ -382,8 +427,6 @@ ExecInitLimit(Limit *node, EState *estate, int eflags)
 	limitstate->limitCount = ExecInitExpr((Expr *) node->limitCount,
 										  (PlanState *) limitstate);
 
-#define LIMIT_NSLOTS 1
-
 	/*
 	 * Tuple table initialization (XXX not actually used...)
 	 */
@@ -402,17 +445,9 @@ ExecInitLimit(Limit *node, EState *estate, int eflags)
 	ExecAssignResultTypeFromTL(&limitstate->ps);
 	limitstate->ps.ps_ProjInfo = NULL;
 
-	initGpmonPktForLimit((Plan *)node, &limitstate->ps.gpmon_pkt, estate);
-	
-	return limitstate;
-}
+	limitstate->expect_rescan = ((eflags & EXEC_FLAG_REWIND) != 0);
 
-int
-ExecCountSlotsLimit(Limit *node)
-{
-	return ExecCountSlotsNode(outerPlan(node)) +
-		ExecCountSlotsNode(innerPlan(node)) +
-		LIMIT_NSLOTS;
+	return limitstate;
 }
 
 /* ----------------------------------------------------------------
@@ -427,13 +462,11 @@ ExecEndLimit(LimitState *node)
 {
 	ExecFreeExprContext(&node->ps);
 	ExecEndNode(outerPlanState(node));
-
-	EndPlanStateGpmonPkt(&node->ps);
 }
 
 
 void
-ExecReScanLimit(LimitState *node, ExprContext *exprCtxt)
+ExecReScanLimit(LimitState *node)
 {
 	/*
 	 * Recompute limit/offset in case parameters changed, and reset the state
@@ -446,14 +479,6 @@ ExecReScanLimit(LimitState *node, ExprContext *exprCtxt)
 	 * if chgParam of subnode is not null then plan will be re-scanned by
 	 * first ExecProcNode.
 	 */
-	if (((PlanState *) node)->lefttree->chgParam == NULL)
-		ExecReScan(((PlanState *) node)->lefttree, exprCtxt);
-}
-
-void
-initGpmonPktForLimit(Plan *planNode, gpmon_packet_t *gpmon_pkt, EState *estate)
-{
-	Assert(planNode != NULL && gpmon_pkt != NULL && IsA(planNode, Limit));
-
-	InitPlanNodeGpmonPkt(planNode, gpmon_pkt, estate);
+	if (node->ps.lefttree->chgParam == NULL)
+		ExecReScan(node->ps.lefttree);
 }

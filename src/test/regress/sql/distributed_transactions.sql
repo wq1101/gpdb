@@ -13,6 +13,9 @@
 -- m/NOTICE:  exchanged partition .*/
 -- s/pg_temp_\d+/pg_temp_DUMMY/gm
 --
+-- m/^DETAIL:.*gid=.*/
+-- s/gid=\d+-\d+/gid DUMMY/
+--
 -- end_matchsubs
 --
 --
@@ -61,6 +64,7 @@ INSERT INTO distxact1_2 VALUES (25);
 INSERT INTO distxact1_2 VALUES (26);
 INSERT INTO distxact1_2 VALUES (27);
 INSERT INTO distxact1_2 VALUES (28);
+SET debug_dtm_action_segment=1;
 SET debug_dtm_action = "fail_begin_command";
 SET debug_dtm_action_target = "protocol";
 SET debug_dtm_action_protocol = "prepare";
@@ -84,11 +88,13 @@ INSERT INTO distxact1_3 VALUES (35);
 INSERT INTO distxact1_3 VALUES (36);
 INSERT INTO distxact1_3 VALUES (37);
 INSERT INTO distxact1_3 VALUES (38);
+SET debug_dtm_action_segment=1;
 SET debug_dtm_action = "fail_begin_command";
 SET debug_dtm_action_target = "protocol";
 SET debug_dtm_action_protocol = "commit_prepared";
 COMMIT;
 SELECT * FROM distxact1_3;
+RESET debug_dtm_action_segment;
 RESET debug_dtm_action;
 RESET debug_dtm_action_target;
 RESET debug_dtm_action_protocol;
@@ -106,12 +112,14 @@ INSERT INTO distxact1_4 VALUES (45);
 INSERT INTO distxact1_4 VALUES (46);
 INSERT INTO distxact1_4 VALUES (47);
 INSERT INTO distxact1_4 VALUES (48);
+SET debug_dtm_action_segment=1;
 SET debug_abort_after_distributed_prepared = true;
 SET debug_dtm_action = "fail_begin_command";
 SET debug_dtm_action_target = "protocol";
 SET debug_dtm_action_protocol = "abort_prepared";
 COMMIT;
 SELECT * FROM distxact1_4;
+RESET debug_dtm_action_segment;
 RESET debug_abort_after_distributed_prepared;
 RESET debug_dtm_action;
 RESET debug_dtm_action_target;
@@ -126,10 +134,12 @@ RESET debug_dtm_action_protocol;
 -- Invoke a failure during a CREATE TABLE command.  
 --
 --SET debug_print_full_dtm=true;
+SET debug_dtm_action_segment=1;
 SET debug_dtm_action = "fail_begin_command";
 SET debug_dtm_action_target = "sql";
 SET debug_dtm_action_sql_command_tag = "MPPEXEC UTILITY";
 CREATE TABLE distxact2_1 (a int);
+RESET debug_dtm_action_segment;
 RESET debug_dtm_action_sql_command_tag;
 RESET debug_dtm_action;
 RESET debug_dtm_action_target;
@@ -145,11 +155,12 @@ DROP TABLE distxact2_1;
 -- Invoke a failure during a CREATE TABLE command.  
 -- Action_Target = 2 is SQL.
 --
-
+SET debug_dtm_action_segment=1;
 SET debug_dtm_action = "fail_end_command";
 SET debug_dtm_action_target = "sql";
 SET debug_dtm_action_sql_command_tag = "MPPEXEC UTILITY";
 CREATE TABLE distxact2_2 (a int);
+RESET debug_dtm_action_segment;
 RESET debug_dtm_action_sql_command_tag;
 RESET debug_dtm_action;
 RESET debug_dtm_action_target;
@@ -169,6 +180,7 @@ DROP TABLE distxact2_2;
 -- Invoke a failure during a SAVEPOINT command.  
 --
 --SET debug_print_full_dtm=true;
+SET debug_dtm_action_segment=1;
 SET debug_dtm_action = "fail_begin_command";
 SET debug_dtm_action_target = "sql";
 SET debug_dtm_action_sql_command_tag = "SAVEPOINT";
@@ -176,6 +188,7 @@ BEGIN;
 CREATE TABLE distxact3_1 (a int);
 SAVEPOINT s;
 ROLLBACK;
+RESET debug_dtm_action_segment;
 RESET debug_dtm_action_sql_command_tag;
 RESET debug_dtm_action;
 RESET debug_dtm_action_target;
@@ -191,6 +204,7 @@ DROP TABLE distxact3_1;
 -- Invoke a failure during a RELEASE SAVEPOINT command.  
 --
 --SET debug_print_full_dtm=true;
+SET debug_dtm_action_segment=1;
 SET debug_dtm_action = "fail_begin_command";
 SET debug_dtm_action_target = "sql";
 SET debug_dtm_action_sql_command_tag = "RELEASE";
@@ -207,6 +221,7 @@ INSERT INTO distxact3_2 VALUES (27);
 INSERT INTO distxact3_2 VALUES (28);
 RELEASE SAVEPOINT s;
 ROLLBACK;
+RESET debug_dtm_action_segment;
 RESET debug_dtm_action_sql_command_tag;
 RESET debug_dtm_action;
 RESET debug_dtm_action_target;
@@ -223,6 +238,7 @@ DROP TABLE distxact3_2;
 -- Invoke a failure during a ROLLBACK TO SAVEPOINT command.  
 --
 --SET debug_print_full_dtm=true;
+SET debug_dtm_action_segment=1;
 SET debug_dtm_action = "fail_begin_command";
 SET debug_dtm_action_target = "sql";
 SET debug_dtm_action_sql_command_tag = "ROLLBACK";
@@ -239,6 +255,7 @@ INSERT INTO distxact3_3 VALUES (37);
 INSERT INTO distxact3_3 VALUES (38);
 ROLLBACK TO SAVEPOINT s;
 ROLLBACK;
+RESET debug_dtm_action_segment;
 RESET debug_dtm_action_sql_command_tag;
 RESET debug_dtm_action;
 RESET debug_dtm_action_target;
@@ -531,10 +548,63 @@ select count(*) = 5 as passed from subt_reindex_heap;
 select count(*) = 5 as passed from subt_reindex_ao;
 select count(*) = 5 as passed from subt_reindex_co;
 
--- Reindex on pg_class or reindex database hung if encountered ERROR, due to a
--- bug. Lets have coverage to validate doesn't happen now.
+-- GPDB has a limitation on REINDEX of catalog tables: you cannot do it in
+-- a transaction block. Check for that.
 \c postgres
-SET debug_abort_after_distributed_prepared = true;
+begin;
 reindex table pg_class;
-RESET debug_abort_after_distributed_prepared;
+commit;
 \c regression
+
+--
+-- Check that committing a subtransaction releases the lock on the
+-- subtransaction's XID.
+--
+-- It's not too bad if it doesn't, because if anyone wants to wait for the
+-- subtransaction and sees that it's been committed already, they will wait
+-- for the top transaction XID instead. So even though the lock on the sub-XID
+-- is released at RELEASE SAVEPOINT, logically it's held until the end of
+-- the top transaction anyway. But releasing the lock early saves space in
+-- the lock table. (We had a silly bug once upon a time in GPDB where we failed
+-- to release the lock.)
+--
+BEGIN;
+CREATE TEMPORARY TABLE foo (i integer);
+DO $$
+declare
+  i int;
+begin
+  for i in 1..100 loop
+    begin
+      insert into foo values (i);
+    exception
+      when others then raise 'got error';
+    end;
+  end loop;
+end;
+$$;
+SELECT CASE WHEN count(*) < 50 THEN 'not many XID locks'
+            ELSE 'lots of XID locks: ' || count(*) END
+FROM pg_locks WHERE locktype='transactionid';
+ROLLBACK;
+
+-- Test that exported snapshots are cleared upon abort.  In Greenplum,
+-- exported snapshots are cleared earlier than PostgreSQL during
+-- abort.
+begin;
+select count(1) = 1 from pg_catalog.pg_export_snapshot();
+select pg_cancel_backend(pg_backend_pid());
+rollback;
+
+-- Test a bug that a two-phase subtransaction is considered as one-phase.
+set optimizer = off; -- orca optimizes value scan so the output is different between orca and postgres optimizer.
+truncate distxact1_4;
+set test_print_direct_dispatch_info = true;
+begin;
+savepoint sp1;
+insert into distxact1_4 values (2),(1);
+release sp1;
+end;
+reset test_print_direct_dispatch_info;
+reset optimizer;
+select count(gp_segment_id) from distxact1_4 group by gp_segment_id; -- sanity check: tuples should be in > 1 segments

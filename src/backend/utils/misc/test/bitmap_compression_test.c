@@ -3,9 +3,12 @@
 #include <setjmp.h>
 #include "cmockery.h"
 
+#include "postgres.h"
+#include "utils/memutils.h"
+
 #include "../bitmap_compression.c"
 
-void 
+static void 
 test__BitmapCompression__ZeroBitmap(void **state) 
 {
 	uint32 bitmap[4];
@@ -34,7 +37,7 @@ test__BitmapCompression__ZeroBitmap(void **state)
 	assert_memory_equal(bitmap, bitmap2, sizeof(uint32) * 4);
 }
 
-void
+static void
 test__BitmapCompression__Raw(void **state)
 {
 	int blockCount = 4;
@@ -68,7 +71,7 @@ test__BitmapCompression__Raw(void **state)
 	assert_memory_equal(bitmap, bitmap2, sizeof(uint32) * blockCount);
 }
 
-void
+static void
 test__BitmapCompression__ExplicitNoCompression(void **state)
 {
 	int blockCount = 4;
@@ -103,7 +106,7 @@ test__BitmapCompression__ExplicitNoCompression(void **state)
 	assert_memory_equal(bitmap, bitmap2, sizeof(uint32) * blockCount);
 }
 
-void
+static void
 test__BitmapCompression__ExplicitNoCompressionNoBlocks(void **state)
 {
 	int blockCount = 0;
@@ -133,7 +136,7 @@ test__BitmapCompression__ExplicitNoCompressionNoBlocks(void **state)
 		bitmap2, blockCount);
 }
 
-void
+static void
 test__BitmapCompression__ImplicitNoCompression(void **state)
 {
 	int blockCount = 4;
@@ -168,7 +171,7 @@ test__BitmapCompression__ImplicitNoCompression(void **state)
 	assert_memory_equal(bitmap, bitmap2, sizeof(uint32) * blockCount);
 }
 
-void
+static void
 test__BitmapCompression__MultipleTypeBitmap(void **state)
 {
 	uint32 bitmap[16];
@@ -213,7 +216,7 @@ test__BitmapCompression__MultipleTypeBitmap(void **state)
 	assert_memory_equal(bitmap, bitmap2, sizeof(uint32) * 16);
 }
 
-void
+static void
 test__BitmapCompression_ShortDecompress(void **state)
 {
 	uint32 bitmap[16];
@@ -275,7 +278,7 @@ test__BitmapCompression_ShortDecompress(void **state)
 	}
 }
 
-void
+static void
 test__BitmapCompression__IllegalCompressionType(void **state)
 {
 	int blockCount = 0;

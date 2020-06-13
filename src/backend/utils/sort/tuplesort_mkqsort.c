@@ -20,6 +20,7 @@
 
 #include "postgres.h"
 #include "access/genam.h"
+#include "nodes/execnodes.h"
 #include "utils/tuplesort.h"
 #include "utils/tuplesort_mk.h"
 #include "utils/tuplesort_mk_details.h"
@@ -322,7 +323,9 @@ void mk_qsort_impl(MKEntry *a, int left, int right, int lv, bool lvdown, MKConte
 								RelationGetRelationName(ctxt->indexRel)),
 						 errdetail("Key %s is duplicated.",
 								   BuildIndexValueDescription(ctxt->indexRel,
-															  values, isnull))));
+															  values, isnull)),
+						 errtableconstraint(ctxt->heapRel,
+											RelationGetRelationName(ctxt->indexRel))));
 			}
 			else if ( ctxt->unique)
 			{

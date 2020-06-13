@@ -1,13 +1,12 @@
 /*
  * conversion functions between pg_wchar and multibyte streams.
  * Tatsuo Ishii
- * $PostgreSQL: pgsql/src/backend/utils/mb/wchar.c,v 1.74 2010/01/04 20:38:31 adunstan Exp $
+ * src/backend/utils/mb/wchar.c
  *
  */
 /* can be used in either frontend or backend */
 #ifdef FRONTEND
 #include "postgres_fe.h"
-#define Assert(condition)
 #else
 #include "postgres.h"
 #endif
@@ -99,7 +98,7 @@ pg_euc2wchar_with_len(const unsigned char *from, pg_wchar *to, int len)
 			*to |= *from++;
 			len -= 2;
 		}
-		else							/* must be ASCII */
+		else	/* must be ASCII */
 		{
 			*to = *from++;
 			len--;
@@ -213,7 +212,7 @@ pg_euccn2wchar_with_len(const unsigned char *from, pg_wchar *to, int len)
 			*to |= *from++;
 			len -= 3;
 		}
-		else if (*from == SS3 && len >= 3)		/* code set 3 (unsed ?) */
+		else if (*from == SS3 && len >= 3)		/* code set 3 (unused ?) */
 		{
 			from++;
 			*to = (SS3 << 16) | (*from++ << 8);
@@ -514,7 +513,7 @@ pg_wchar2utf_with_len(const pg_wchar *from, unsigned char *to, int len)
 
 	while (len > 0 && *from)
 	{
-		int char_len;
+		int			char_len;
 
 		unicode_to_utf8(*from, to);
 		char_len = pg_utf_mblen(to);
@@ -535,7 +534,7 @@ pg_wchar2utf_with_len(const pg_wchar *from, unsigned char *to, int len)
  * We return "1" for any leading byte that is either flat-out illegal or
  * indicates a length larger than we support.
  *
- * pg_utf2wchar_with_len(), utf2ucs(), pg_utf8_islegal(), and perhaps
+ * pg_utf2wchar_with_len(), utf8_to_unicode(), pg_utf8_islegal(), and perhaps
  * other places would need to be fixed to change this.
  */
 int
@@ -705,13 +704,15 @@ ucs_wcwidth(pg_wchar ucs)
 		  (ucs >= 0x20000 && ucs <= 0x2ffff)));
 }
 
-static pg_wchar
-utf2ucs(const unsigned char *c)
+/*
+ * Convert a UTF-8 character to a Unicode code point.
+ * This is a one-character version of pg_utf2wchar_with_len.
+ *
+ * No error checks here, c must point to a long-enough string.
+ */
+pg_wchar
+utf8_to_unicode(const unsigned char *c)
 {
-	/*
-	 * one char version of pg_utf2wchar_with_len. no control here, c must
-	 * point to a large enough string
-	 */
 	if ((*c & 0x80) == 0)
 		return (pg_wchar) c[0];
 	else if ((*c & 0xe0) == 0xc0)
@@ -734,7 +735,7 @@ utf2ucs(const unsigned char *c)
 static int
 pg_utf_dsplen(const unsigned char *s)
 {
-	return ucs_wcwidth(utf2ucs(s));
+	return ucs_wcwidth(utf8_to_unicode(s));
 }
 
 /*
@@ -883,6 +884,12 @@ static int
 pg_mule_dsplen(const unsigned char *s)
 {
 	int			len;
+
+	/*
+	 * Note: it's not really appropriate to assume that all multibyte charsets
+	 * are double-wide on screen.  But this seems an okay approximation for
+	 * the MULE charsets we currently support.
+	 */
 
 	if (IS_LC1(*s))
 		len = 1;
@@ -1063,9 +1070,9 @@ pg_uhc_dsplen(const unsigned char *s)
 }
 
 /*
- *	* GB18030
- *	 * Added by Bill Huang <bhuang@redhat.com>,<bill_huanghb@ybb.ne.jp>
- *	  */
+ * GB18030
+ *	Added by Bill Huang <bhuang@redhat.com>,<bill_huanghb@ybb.ne.jp>
+ */
 static int
 pg_gb18030_mblen(const unsigned char *s)
 {
@@ -1073,15 +1080,10 @@ pg_gb18030_mblen(const unsigned char *s)
 
 	if (!IS_HIGHBIT_SET(*s))
 		len = 1;				/* ASCII */
+	else if (*(s + 1) >= 0x30 && *(s + 1) <= 0x39)
+		len = 4;
 	else
-	{
-		if ((*(s + 1) >= 0x40 && *(s + 1) <= 0x7e) || (*(s + 1) >= 0x80 && *(s + 1) <= 0xfe))
-			len = 2;
-		else if (*(s + 1) >= 0x30 && *(s + 1) <= 0x39)
-			len = 4;
-		else
-			len = 2;
-	}
+		len = 2;
 	return len;
 }
 
@@ -1396,21 +1398,32 @@ pg_uhc_verifier(const unsigned char *s, int len)
 static int
 pg_gb18030_verifier(const unsigned char *s, int len)
 {
-	int			l,
-				mbl;
+	int			l;
 
-	l = mbl = pg_gb18030_mblen(s);
-
-	if (len < l)
-		return -1;
-
-	while (--l > 0)
+	if (!IS_HIGHBIT_SET(*s))
+		l = 1;					/* ASCII */
+	else if (len >= 4 && *(s + 1) >= 0x30 && *(s + 1) <= 0x39)
 	{
-		if (*++s == '\0')
-			return -1;
+		/* Should be 4-byte, validate remaining bytes */
+		if (*s >= 0x81 && *s <= 0xfe &&
+			*(s + 2) >= 0x81 && *(s + 2) <= 0xfe &&
+			*(s + 3) >= 0x30 && *(s + 3) <= 0x39)
+			l = 4;
+		else
+			l = -1;
 	}
-
-	return mbl;
+	else if (len >= 2 && *s >= 0x81 && *s <= 0xfe)
+	{
+		/* Should be 2-byte, validate */
+		if ((*(s + 1) >= 0x40 && *(s + 1) <= 0x7e) ||
+			(*(s + 1) >= 0x80 && *(s + 1) <= 0xfe))
+			l = 2;
+		else
+			l = -1;
+	}
+	else
+		l = -1;
+	return l;
 }
 
 static int
@@ -1498,14 +1511,223 @@ pg_utf8_islegal(const unsigned char *source, int length)
 	return true;
 }
 
+#ifndef FRONTEND
+
+/*
+ * Generic character incrementer function.
+ *
+ * Not knowing anything about the properties of the encoding in use, we just
+ * keep incrementing the last byte until we get a validly-encoded result,
+ * or we run out of values to try.  We don't bother to try incrementing
+ * higher-order bytes, so there's no growth in runtime for wider characters.
+ * (If we did try to do that, we'd need to consider the likelihood that 255
+ * is not a valid final byte in the encoding.)
+ */
+static bool
+pg_generic_charinc(unsigned char *charptr, int len)
+{
+	unsigned char *lastbyte = charptr + len - 1;
+	mbverifier	mbverify;
+
+	/* We can just invoke the character verifier directly. */
+	mbverify = pg_wchar_table[GetDatabaseEncoding()].mbverify;
+
+	while (*lastbyte < (unsigned char) 255)
+	{
+		(*lastbyte)++;
+		if ((*mbverify) (charptr, len) == len)
+			return true;
+	}
+
+	return false;
+}
+
+/*
+ * UTF-8 character incrementer function.
+ *
+ * For a one-byte character less than 0x7F, we just increment the byte.
+ *
+ * For a multibyte character, every byte but the first must fall between 0x80
+ * and 0xBF; and the first byte must be between 0xC0 and 0xF4.  We increment
+ * the last byte that's not already at its maximum value.  If we can't find a
+ * byte that's less than the maximum allowable value, we simply fail.  We also
+ * need some special-case logic to skip regions used for surrogate pair
+ * handling, as those should not occur in valid UTF-8.
+ *
+ * Note that we don't reset lower-order bytes back to their minimums, since
+ * we can't afford to make an exhaustive search (see make_greater_string).
+ */
+static bool
+pg_utf8_increment(unsigned char *charptr, int length)
+{
+	unsigned char a;
+	unsigned char limit;
+
+	switch (length)
+	{
+		default:
+			/* reject lengths 5 and 6 for now */
+			return false;
+		case 4:
+			a = charptr[3];
+			if (a < 0xBF)
+			{
+				charptr[3]++;
+				break;
+			}
+			/* FALL THRU */
+		case 3:
+			a = charptr[2];
+			if (a < 0xBF)
+			{
+				charptr[2]++;
+				break;
+			}
+			/* FALL THRU */
+		case 2:
+			a = charptr[1];
+			switch (*charptr)
+			{
+				case 0xED:
+					limit = 0x9F;
+					break;
+				case 0xF4:
+					limit = 0x8F;
+					break;
+				default:
+					limit = 0xBF;
+					break;
+			}
+			if (a < limit)
+			{
+				charptr[1]++;
+				break;
+			}
+			/* FALL THRU */
+		case 1:
+			a = *charptr;
+			if (a == 0x7F || a == 0xDF || a == 0xEF || a == 0xF4)
+				return false;
+			charptr[0]++;
+			break;
+	}
+
+	return true;
+}
+
+/*
+ * EUC-JP character incrementer function.
+ *
+ * If the sequence starts with SS2 (0x8e), it must be a two-byte sequence
+ * representing JIS X 0201 characters with the second byte ranging between
+ * 0xa1 and 0xdf.  We just increment the last byte if it's less than 0xdf,
+ * and otherwise rewrite the whole sequence to 0xa1 0xa1.
+ *
+ * If the sequence starts with SS3 (0x8f), it must be a three-byte sequence
+ * in which the last two bytes range between 0xa1 and 0xfe.  The last byte
+ * is incremented if possible, otherwise the second-to-last byte.
+ *
+ * If the sequence starts with a value other than the above and its MSB
+ * is set, it must be a two-byte sequence representing JIS X 0208 characters
+ * with both bytes ranging between 0xa1 and 0xfe.  The last byte is
+ * incremented if possible, otherwise the second-to-last byte.
+ *
+ * Otherwise, the sequence is a single-byte ASCII character. It is
+ * incremented up to 0x7f.
+ */
+static bool
+pg_eucjp_increment(unsigned char *charptr, int length)
+{
+	unsigned char c1,
+				c2;
+	int			i;
+
+	c1 = *charptr;
+
+	switch (c1)
+	{
+		case SS2:				/* JIS X 0201 */
+			if (length != 2)
+				return false;
+
+			c2 = charptr[1];
+
+			if (c2 >= 0xdf)
+				charptr[0] = charptr[1] = 0xa1;
+			else if (c2 < 0xa1)
+				charptr[1] = 0xa1;
+			else
+				charptr[1]++;
+			break;
+
+		case SS3:				/* JIS X 0212 */
+			if (length != 3)
+				return false;
+
+			for (i = 2; i > 0; i--)
+			{
+				c2 = charptr[i];
+				if (c2 < 0xa1)
+				{
+					charptr[i] = 0xa1;
+					return true;
+				}
+				else if (c2 < 0xfe)
+				{
+					charptr[i]++;
+					return true;
+				}
+			}
+
+			/* Out of 3-byte code region */
+			return false;
+
+		default:
+			if (IS_HIGHBIT_SET(c1))		/* JIS X 0208? */
+			{
+				if (length != 2)
+					return false;
+
+				for (i = 1; i >= 0; i--)
+				{
+					c2 = charptr[i];
+					if (c2 < 0xa1)
+					{
+						charptr[i] = 0xa1;
+						return true;
+					}
+					else if (c2 < 0xfe)
+					{
+						charptr[i]++;
+						return true;
+					}
+				}
+
+				/* Out of 2 byte code region */
+				return false;
+			}
+			else
+			{					/* ASCII, single byte */
+				if (c1 > 0x7e)
+					return false;
+				(*charptr)++;
+			}
+			break;
+	}
+
+	return true;
+}
+#endif   /* !FRONTEND */
+
+
 /*
  *-------------------------------------------------------------------
  * encoding info table
  * XXX must be sorted by the same order as enum pg_enc (in mb/pg_wchar.h)
  *-------------------------------------------------------------------
  */
-pg_wchar_tbl pg_wchar_table[] = {
-	{pg_ascii2wchar_with_len, pg_wchar2single_with_len, pg_ascii_mblen, pg_ascii_dsplen, pg_ascii_verifier, 1},	/* PG_SQL_ASCII */
+const pg_wchar_tbl pg_wchar_table[] = {
+	{pg_ascii2wchar_with_len, pg_wchar2single_with_len, pg_ascii_mblen, pg_ascii_dsplen, pg_ascii_verifier, 1}, /* PG_SQL_ASCII */
 	{pg_eucjp2wchar_with_len, pg_wchar2euc_with_len, pg_eucjp_mblen, pg_eucjp_dsplen, pg_eucjp_verifier, 3},	/* PG_EUC_JP */
 	{pg_euccn2wchar_with_len, pg_wchar2euc_with_len, pg_euccn_mblen, pg_euccn_dsplen, pg_euccn_verifier, 2},	/* PG_EUC_CN */
 	{pg_euckr2wchar_with_len, pg_wchar2euc_with_len, pg_euckr_mblen, pg_euckr_dsplen, pg_euckr_verifier, 3},	/* PG_EUC_KR */
@@ -1540,13 +1762,13 @@ pg_wchar_tbl pg_wchar_table[] = {
 	{pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifier, 1},		/* PG_WIN1255 */
 	{pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifier, 1},		/* PG_WIN1257 */
 	{pg_latin12wchar_with_len, pg_wchar2single_with_len, pg_latin1_mblen, pg_latin1_dsplen, pg_latin1_verifier, 1},		/* PG_KOI8U */
-	{0, 0, pg_sjis_mblen, pg_sjis_dsplen, pg_sjis_verifier, 2},	/* PG_SJIS */
-	{0, 0, pg_big5_mblen, pg_big5_dsplen, pg_big5_verifier, 2},	/* PG_BIG5 */
-	{0, 0, pg_gbk_mblen, pg_gbk_dsplen, pg_gbk_verifier, 2},		/* PG_GBK */
-	{0, 0, pg_uhc_mblen, pg_uhc_dsplen, pg_uhc_verifier, 2},		/* PG_UHC */
-	{0, 0, pg_gb18030_mblen, pg_gb18030_dsplen, pg_gb18030_verifier, 4},	/* PG_GB18030 */
-	{0, 0, pg_johab_mblen, pg_johab_dsplen, pg_johab_verifier, 3}, /* PG_JOHAB */
-	{0, 0, pg_sjis_mblen, pg_sjis_dsplen, pg_sjis_verifier, 2}		/* PG_SHIFT_JIS_2004 */
+	{0, 0, pg_sjis_mblen, pg_sjis_dsplen, pg_sjis_verifier, 2}, /* PG_SJIS */
+	{0, 0, pg_big5_mblen, pg_big5_dsplen, pg_big5_verifier, 2}, /* PG_BIG5 */
+	{0, 0, pg_gbk_mblen, pg_gbk_dsplen, pg_gbk_verifier, 2},	/* PG_GBK */
+	{0, 0, pg_uhc_mblen, pg_uhc_dsplen, pg_uhc_verifier, 2},	/* PG_UHC */
+	{0, 0, pg_gb18030_mblen, pg_gb18030_dsplen, pg_gb18030_verifier, 4},		/* PG_GB18030 */
+	{0, 0, pg_johab_mblen, pg_johab_dsplen, pg_johab_verifier, 3},		/* PG_JOHAB */
+	{0, 0, pg_sjis_mblen, pg_sjis_dsplen, pg_sjis_verifier, 2}	/* PG_SHIFT_JIS_2004 */
 };
 
 /* returns the byte length of a word for mule internal code */
@@ -1562,10 +1784,7 @@ pg_mic_mblen(const unsigned char *mbstr)
 int
 pg_encoding_mblen(int encoding, const char *mbstr)
 {
-	Assert(PG_VALID_ENCODING(encoding));
-
-	return ((encoding >= 0 &&
-			 encoding < sizeof(pg_wchar_table) / sizeof(pg_wchar_tbl)) ?
+	return (PG_VALID_ENCODING(encoding) ?
 		((*pg_wchar_table[encoding].mblen) ((const unsigned char *) mbstr)) :
 	((*pg_wchar_table[PG_SQL_ASCII].mblen) ((const unsigned char *) mbstr)));
 }
@@ -1576,10 +1795,7 @@ pg_encoding_mblen(int encoding, const char *mbstr)
 int
 pg_encoding_dsplen(int encoding, const char *mbstr)
 {
-	Assert(PG_VALID_ENCODING(encoding));
-
-	return ((encoding >= 0 &&
-			 encoding < sizeof(pg_wchar_table) / sizeof(pg_wchar_tbl)) ?
+	return (PG_VALID_ENCODING(encoding) ?
 	   ((*pg_wchar_table[encoding].dsplen) ((const unsigned char *) mbstr)) :
 	((*pg_wchar_table[PG_SQL_ASCII].dsplen) ((const unsigned char *) mbstr)));
 }
@@ -1592,10 +1808,7 @@ pg_encoding_dsplen(int encoding, const char *mbstr)
 int
 pg_encoding_verifymb(int encoding, const char *mbstr, int len)
 {
-	Assert(PG_VALID_ENCODING(encoding));
-
-	return ((encoding >= 0 &&
-			 encoding < sizeof(pg_wchar_table) / sizeof(pg_wchar_tbl)) ?
+	return (PG_VALID_ENCODING(encoding) ?
 			((*pg_wchar_table[encoding].mbverify) ((const unsigned char *) mbstr, len)) :
 			((*pg_wchar_table[PG_SQL_ASCII].mbverify) ((const unsigned char *) mbstr, len)));
 }
@@ -1620,6 +1833,29 @@ int
 pg_database_encoding_max_length(void)
 {
 	return pg_wchar_table[GetDatabaseEncoding()].maxmblen;
+}
+
+/*
+ * get the character incrementer for the encoding for the current database
+ */
+mbcharacter_incrementer
+pg_database_encoding_character_incrementer(void)
+{
+	/*
+	 * Eventually it might be best to add a field to pg_wchar_table[], but for
+	 * now we just use a switch.
+	 */
+	switch (GetDatabaseEncoding())
+	{
+		case PG_UTF8:
+			return pg_utf8_increment;
+
+		case PG_EUC_JP:
+			return pg_eucjp_increment;
+
+		default:
+			return pg_generic_charinc;
+	}
 }
 
 /*
@@ -1759,7 +1995,7 @@ void
 report_invalid_encoding(int encoding, const char *mbstr, int len)
 {
 	int			l = pg_encoding_mblen(encoding, mbstr);
-	char		buf[8 * 2 + 1];
+	char		buf[8 * 5 + 1];
 	char	   *p = buf;
 	int			j,
 				jlimit;
@@ -1768,16 +2004,17 @@ report_invalid_encoding(int encoding, const char *mbstr, int len)
 	jlimit = Min(jlimit, 8);	/* prevent buffer overrun */
 
 	for (j = 0; j < jlimit; j++)
-		p += sprintf(p, "%02x", (unsigned char) mbstr[j]);
+	{
+		p += sprintf(p, "0x%02x", (unsigned char) mbstr[j]);
+		if (j < jlimit - 1)
+			p += sprintf(p, " ");
+	}
 
 	ereport(ERROR,
 			(errcode(ERRCODE_CHARACTER_NOT_IN_REPERTOIRE),
-			 errmsg("invalid byte sequence for encoding \"%s\": 0x%s",
+			 errmsg("invalid byte sequence for encoding \"%s\": %s",
 					pg_enc2name_tbl[encoding].name,
-					buf),
-		  errhint("This error can also happen if the byte sequence does not "
-			"match the encoding expected by the server, which is controlled "
-				  "by \"client_encoding\".")));
+					buf)));
 }
 
 /*
@@ -1791,7 +2028,7 @@ report_untranslatable_char(int src_encoding, int dest_encoding,
 						   const char *mbstr, int len)
 {
 	int			l = pg_encoding_mblen(src_encoding, mbstr);
-	char		buf[8 * 2 + 1];
+	char		buf[8 * 5 + 1];
 	char	   *p = buf;
 	int			j,
 				jlimit;
@@ -1800,14 +2037,18 @@ report_untranslatable_char(int src_encoding, int dest_encoding,
 	jlimit = Min(jlimit, 8);	/* prevent buffer overrun */
 
 	for (j = 0; j < jlimit; j++)
-		p += sprintf(p, "%02x", (unsigned char) mbstr[j]);
+	{
+		p += sprintf(p, "0x%02x", (unsigned char) mbstr[j]);
+		if (j < jlimit - 1)
+			p += sprintf(p, " ");
+	}
 
 	ereport(ERROR,
 			(errcode(ERRCODE_UNTRANSLATABLE_CHARACTER),
-			 errmsg("character 0x%s of encoding \"%s\" has no equivalent in \"%s\"",
+			 errmsg("character with byte sequence %s in encoding \"%s\" has no equivalent in encoding \"%s\"",
 					buf,
 					pg_enc2name_tbl[src_encoding].name,
 					pg_enc2name_tbl[dest_encoding].name)));
 }
 
-#endif
+#endif   /* !FRONTEND */

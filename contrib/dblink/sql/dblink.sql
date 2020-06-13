@@ -1,17 +1,7 @@
--- Adjust this setting to control where the objects get created.
-SET search_path = public;
+CREATE EXTENSION dblink;
 
---
--- Define the functions and test data
--- therein.
---
--- Turn off echoing so that expected file does not depend on
--- contents of dblink.sql.
-SET client_min_messages = warning;
-\set ECHO none
-\i dblink.sql
-\set ECHO all
-RESET client_min_messages;
+-- want context for notices
+\set SHOW_CONTEXT always
 
 CREATE TABLE foo(f1 int, f2 text, f3 text[], primary key (f1,f2));
 INSERT INTO foo VALUES (0,'a','{"a0","b0","c0"}');
@@ -68,9 +58,13 @@ SELECT dblink_build_sql_update('"MySchema"."Foo"','1 2',2,'{"0", "a"}','{"99", "
 -- build a delete statement based on a local tuple,
 SELECT dblink_build_sql_delete('"MySchema"."Foo"','1 2',2,'{"0", "a"}');
 
+CREATE FUNCTION connection_parameters() RETURNS text LANGUAGE SQL AS $f$
+       SELECT $$dbname='$$||current_database()||$$' port=$$||current_setting('port');
+$f$;
+
 -- regular old dblink
 SELECT *
-FROM dblink('dbname=contrib_regression','SELECT * FROM foo') AS t(a int, b text, c text[])
+FROM dblink(connection_parameters(),'SELECT * FROM foo') AS t(a int, b text, c text[])
 WHERE t.a > 7;
 
 -- should generate "connection not available" error
@@ -78,8 +72,36 @@ SELECT *
 FROM dblink('SELECT * FROM foo') AS t(a int, b text, c text[])
 WHERE t.a > 7;
 
+-- The first-level connection's backend will crash on exit given OpenLDAP
+-- [2.4.24, 2.4.31].  We won't see evidence of any crash until the victim
+-- process terminates and the postmaster responds.  If process termination
+-- entails writing a core dump, that can take awhile.  Wait for the process to
+-- vanish.  At that point, the postmaster has called waitpid() on the crashed
+-- process, and it will accept no new connections until it has reinitialized
+-- the cluster.  (We can't exploit pg_stat_activity, because the crash happens
+-- after the backend updates shared memory to reflect its impending exit.)
+DO $pl$
+DECLARE
+	detail text;
+BEGIN
+	PERFORM wait_pid(crash_pid)
+	FROM dblink(connection_parameters(), $$
+		SELECT pg_backend_pid() FROM dblink(
+			'service=test_ldap '||connection_parameters(),
+			-- This string concatenation is a hack to shoehorn a
+			-- set_pgservicefile call into the SQL statement.
+			'SELECT 1' || set_pgservicefile('pg_service.conf')
+		) t(c int)
+	$$) AS t(crash_pid int);
+EXCEPTION WHEN OTHERS THEN
+	GET STACKED DIAGNOSTICS detail = PG_EXCEPTION_DETAIL;
+	-- Expected error in a non-LDAP build.
+	IF NOT detail LIKE 'syntax error in service file%' THEN RAISE; END IF;
+END
+$pl$;
+
 -- create a persistent connection
-SELECT dblink_connect('dbname=contrib_regression');
+SELECT dblink_connect(connection_parameters());
 
 -- use the persistent connection
 SELECT *
@@ -140,10 +162,10 @@ WHERE t.a > 7;
 
 -- put more data into our slave table, first using arbitrary connection syntax
 -- but truncate the actual return value so we can use diff to check for success
-SELECT substr(dblink_exec('dbname=contrib_regression','INSERT INTO foo VALUES(10,''k'',''{"a10","b10","c10"}'')'),1,6);
+SELECT substr(dblink_exec(connection_parameters(),'INSERT INTO foo VALUES(10,''k'',''{"a10","b10","c10"}'')'),1,6);
 
 -- create a persistent connection
-SELECT dblink_connect('dbname=contrib_regression');
+SELECT dblink_connect(connection_parameters());
 
 -- put more data into our slave table, using persistent connection syntax
 -- but truncate the actual return value so we can use diff to check for success
@@ -189,7 +211,7 @@ FROM dblink('myconn','SELECT * FROM foo') AS t(a int, b text, c text[])
 WHERE t.a > 7;
 
 -- create a named persistent connection
-SELECT dblink_connect('myconn','dbname=contrib_regression');
+SELECT dblink_connect('myconn',connection_parameters());
 
 -- use the named persistent connection
 SELECT *
@@ -203,10 +225,10 @@ WHERE t.a > 7;
 
 -- create a second named persistent connection
 -- should error with "duplicate connection name"
-SELECT dblink_connect('myconn','dbname=contrib_regression');
+SELECT dblink_connect('myconn',connection_parameters());
 
 -- create a second named persistent connection with a new name
-SELECT dblink_connect('myconn2','dbname=contrib_regression');
+SELECT dblink_connect('myconn2',connection_parameters());
 
 -- use the second named persistent connection
 SELECT *
@@ -292,7 +314,7 @@ FROM dblink('myconn','SELECT * FROM foo') AS t(a int, b text, c text[])
 WHERE t.a > 7;
 
 -- create a named persistent connection
-SELECT dblink_connect('myconn','dbname=contrib_regression');
+SELECT dblink_connect('myconn',connection_parameters());
 
 -- put more data into our slave table, using named persistent connection syntax
 -- but truncate the actual return value so we can use diff to check for success
@@ -325,6 +347,124 @@ SELECT dblink_disconnect('myconn');
 -- should get 'connection "myconn" not available' error
 SELECT dblink_disconnect('myconn');
 
+-- test asynchronous queries
+SELECT dblink_connect('dtest1', connection_parameters());
+-- start_ignore
+-- Async more not supported in GPDB
+SELECT * from
+ dblink_send_query('dtest1', 'select * from foo where f1 < 3') as t1;
+-- end_ignore
+
+SELECT dblink_connect('dtest2', connection_parameters());
+-- start_ignore
+-- Async more not supported in GPDB
+SELECT * from
+ dblink_send_query('dtest2', 'select * from foo where f1 > 2 and f1 < 7') as t1;
+-- end_ignore
+
+SELECT dblink_connect('dtest3', connection_parameters());
+-- start_ignore
+-- Async more not supported in GPDB
+SELECT * from
+ dblink_send_query('dtest3', 'select * from foo where f1 > 6') as t1;
+-- end_ignore
+
+-- test nested query for GPDB
+CREATE TEMPORARY TABLE result AS
+(SELECT * from dblink('dbname=contrib_regression','select * from foo where f1 > 2 and f1 < 7') as t1(f1 int, f2 text, f3 text[]))
+UNION
+(SELECT * from dblink('dbname=contrib_regression','select * from foo where f1 < 3') as t2(f1 int, f2 text, f3 text[]))
+UNION
+(SELECT * from dblink('dbname=contrib_regression','select * from foo where f1 > 2 and f1 < 7') as t3(f1 int, f2 text, f3 text[]))
+ORDER by f1;
+SELECT * FROM result;
+DROP TABLE result;
+CREATE TEMPORARY TABLE result (f1 int, f2 text, f3 text[]);
+INSERT INTO result SELECT * FROM dblink ('dbname=contrib_regression','select * from foo') AS t(f1 int, f2 text, f3 text[]);
+SELECT * FROM result;
+SELECT * FROM (SELECT * FROM dblink('dbname=contrib_regression','select * from foo') AS t(f1 int, f2 text, f3 text[])) AS t1;
+
+-- dblink_get_connections returns an array with elements in a machine-dependent
+-- ordering, so we must resort to unnesting and sorting for a stable result
+create function unnest(anyarray) returns setof anyelement
+language sql strict immutable as $$
+select $1[i] from generate_series(array_lower($1,1), array_upper($1,1)) as i
+$$;
+
+SELECT * FROM unnest(dblink_get_connections()) ORDER BY 1;
+
+-- start_ignore
+-- GPDB: dblink_is_busy() is not supported
+SELECT dblink_is_busy('dtest1');
+-- end_ignore
+
+SELECT dblink_disconnect('dtest1');
+SELECT dblink_disconnect('dtest2');
+SELECT dblink_disconnect('dtest3');
+
+SELECT * from result;
+
+SELECT dblink_connect('dtest1', connection_parameters());
+-- start_ignore
+-- Async more not supported in GPDB
+SELECT * from
+ dblink_send_query('dtest1', 'select * from foo where f1 < 3') as t1;
+-- end_ignore
+
+SELECT dblink_cancel_query('dtest1');
+SELECT dblink_error_message('dtest1');
+SELECT dblink_disconnect('dtest1');
+
+-- test foreign data wrapper functionality
+CREATE ROLE regress_dblink_user;
+DO $d$
+    BEGIN
+        EXECUTE $$CREATE SERVER fdtest FOREIGN DATA WRAPPER dblink_fdw
+            OPTIONS (dbname '$$||current_database()||$$',
+                     port '$$||current_setting('port')||$$'
+            )$$;
+    END;
+$d$;
+
+CREATE USER MAPPING FOR public SERVER fdtest
+  OPTIONS (server 'localhost');  -- fail, can't specify server here
+CREATE USER MAPPING FOR public SERVER fdtest OPTIONS (user :'USER');
+
+GRANT USAGE ON FOREIGN SERVER fdtest TO regress_dblink_user;
+GRANT EXECUTE ON FUNCTION dblink_connect_u(text, text) TO regress_dblink_user;
+
+SET SESSION AUTHORIZATION regress_dblink_user;
+-- should fail
+-- GPDB: We also check for hostname in connection string which is checked first
+SELECT dblink_connect('myconn', 'fdtest');
+-- should succeed
+SELECT dblink_connect_u('myconn', 'fdtest');
+SELECT * FROM dblink('myconn','SELECT * FROM foo') AS t(a int, b text, c text[]);
+
+\c - -
+REVOKE USAGE ON FOREIGN SERVER fdtest FROM regress_dblink_user;
+REVOKE EXECUTE ON FUNCTION dblink_connect_u(text, text) FROM regress_dblink_user;
+DROP USER regress_dblink_user;
+DROP USER MAPPING FOR public SERVER fdtest;
+DROP SERVER fdtest;
+
+-- test asynchronous notifications
+SELECT dblink_connect(connection_parameters());
+
+--should return listen
+SELECT dblink_exec('LISTEN regression');
+--should return listen
+SELECT dblink_exec('LISTEN foobar');
+
+SELECT dblink_exec('NOTIFY regression');
+SELECT dblink_exec('NOTIFY foobar');
+
+SELECT notify_name, be_pid = (select t.be_pid from dblink('select pg_backend_pid()') as t(be_pid int)) AS is_self_notify, extra from dblink_get_notify();
+
+SELECT * from dblink_get_notify();
+
+SELECT dblink_disconnect();
+
 -- test dropped columns in dblink_build_sql_insert, dblink_build_sql_update
 CREATE TEMP TABLE test_dropped
 (
@@ -342,26 +482,117 @@ ALTER TABLE test_dropped
 	ADD COLUMN col3 VARCHAR(10) NOT NULL DEFAULT 'foo',
 	ADD COLUMN col4 INT NOT NULL DEFAULT 42;
 
-SELECT dblink_build_sql_insert('test_dropped', '2', 1,
+SELECT dblink_build_sql_insert('test_dropped', '1', 1,
                                ARRAY['1'::TEXT], ARRAY['2'::TEXT]);
 
-SELECT dblink_build_sql_update('test_dropped', '2', 1,
+SELECT dblink_build_sql_update('test_dropped', '1', 1,
                                ARRAY['1'::TEXT], ARRAY['2'::TEXT]);
 
-SELECT dblink_build_sql_delete('test_dropped', '2', 1,
+SELECT dblink_build_sql_delete('test_dropped', '1', 1,
                                ARRAY['2'::TEXT]);
 
--- test nested query for GPDB 
+-- test local mimicry of remote GUC values that affect datatype I/O
+SET datestyle = ISO, MDY;
+SET intervalstyle = postgres;
+SET timezone = UTC;
+SELECT dblink_connect('myconn',connection_parameters());
+SELECT dblink_exec('myconn', 'SET datestyle = GERMAN, DMY;');
+
+-- single row synchronous case
+SELECT *
+FROM dblink('myconn',
+    'SELECT * FROM (VALUES (''12.03.2013 00:00:00+00'')) t')
+  AS t(a timestamptz);
+
+-- multi-row synchronous case
+SELECT *
+FROM dblink('myconn',
+    'SELECT * FROM
+     (VALUES (''12.03.2013 00:00:00+00''),
+             (''12.03.2013 00:00:00+00'')) t')
+  AS t(a timestamptz);
+
+-- single-row asynchronous case
+-- start_ignore
+-- Async more not supported in GPDB
+SELECT *
+FROM dblink_send_query('myconn',
+    'SELECT * FROM
+     (VALUES (''12.03.2013 00:00:00+00'')) t');
 CREATE TEMPORARY TABLE result AS
-(SELECT * from dblink('dbname=contrib_regression','select * from foo where f1 > 2 and f1 < 7') as t1(f1 int, f2 text, f3 text[]))
-UNION
-(SELECT * from dblink('dbname=contrib_regression','select * from foo where f1 < 3') as t2(f1 int, f2 text, f3 text[]))
-UNION
-(SELECT * from dblink('dbname=contrib_regression','select * from foo where f1 > 2 and f1 < 7') as t3(f1 int, f2 text, f3 text[]))
-ORDER by f1;
-SELECT * FROM result; 
-DROP TABLE result;
-CREATE TEMPORARY TABLE result (f1 int, f2 text, f3 text[]);
-INSERT INTO result SELECT * FROM dblink ('dbname=contrib_regression','select * from foo') AS t(f1 int, f2 text, f3 text[]);
+(SELECT * from dblink_get_result('myconn') as t(t timestamptz))
+UNION ALL
+(SELECT * from dblink_get_result('myconn') as t(t timestamptz));
 SELECT * FROM result;
-SELECT * FROM (SELECT * FROM dblink('dbname=contrib_regression','select * from foo') AS t(f1 int, f2 text, f3 text[])) AS t1;
+DROP TABLE result;
+-- end_ignore
+
+-- multi-row asynchronous case
+-- start_ignore
+-- Async more not supported in GPDB
+SELECT *
+FROM dblink_send_query('myconn',
+    'SELECT * FROM
+     (VALUES (''12.03.2013 00:00:00+00''),
+             (''12.03.2013 00:00:00+00'')) t');
+CREATE TEMPORARY TABLE result AS
+(SELECT * from dblink_get_result('myconn') as t(t timestamptz))
+UNION ALL
+(SELECT * from dblink_get_result('myconn') as t(t timestamptz))
+UNION ALL
+(SELECT * from dblink_get_result('myconn') as t(t timestamptz));
+SELECT * FROM result;
+DROP TABLE result;
+-- end_ignore
+
+-- Try an ambiguous interval
+SELECT dblink_exec('myconn', 'SET intervalstyle = sql_standard;');
+SELECT *
+FROM dblink('myconn',
+    'SELECT * FROM (VALUES (''-1 2:03:04'')) i')
+  AS i(i interval);
+
+-- Try swapping to another format to ensure the GUCs are tracked
+-- properly through a change.
+CREATE TEMPORARY TABLE result (t timestamptz);
+
+-- These don't work correctly in GPDB. The first dblink_exec() is executed
+-- in the QE node, while the second, in the INSERT statement, is executed
+-- in an entrydb worker process. The 'myconn' connection established earlier
+-- is only visible in the QE process.
+SELECT dblink_exec('myconn', 'SET datestyle = ISO, MDY;');
+INSERT INTO result
+  SELECT *
+  FROM dblink('myconn',
+              'SELECT * FROM (VALUES (''03.12.2013 00:00:00+00'')) t')
+    AS t(a timestamptz);
+
+SELECT dblink_exec('myconn', 'SET datestyle = GERMAN, DMY;');
+INSERT INTO result
+  SELECT *
+  FROM dblink('myconn',
+              'SELECT * FROM (VALUES (''12.03.2013 00:00:00+00'')) t')
+    AS t(a timestamptz);
+
+SELECT * FROM result;
+
+DROP TABLE result;
+
+-- Check error throwing in dblink_fetch
+SELECT dblink_open('myconn','error_cursor',
+       'SELECT * FROM (VALUES (''1''), (''not an int'')) AS t(text);');
+SELECT *
+FROM dblink_fetch('myconn','error_cursor', 1) AS t(i int);
+SELECT *
+FROM dblink_fetch('myconn','error_cursor', 1) AS t(i int);
+
+-- Make sure that the local settings have retained their values in spite
+-- of shenanigans on the connection.
+SHOW datestyle;
+SHOW intervalstyle;
+
+-- Clean up GUC-setting tests
+SELECT dblink_disconnect('myconn');
+RESET datestyle;
+RESET intervalstyle;
+RESET timezone;

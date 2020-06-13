@@ -1,12 +1,15 @@
-# $PostgreSQL: pgsql/contrib/pg_trgm/Makefile,v 1.9 2007/11/10 23:59:51 momjian Exp $
+# contrib/pg_trgm/Makefile
 
 MODULE_big = pg_trgm
-OBJS = trgm_op.o trgm_gist.o trgm_gin.o
+OBJS = trgm_op.o trgm_gist.o trgm_gin.o trgm_regexp.o $(WIN32RES)
 
-DATA_built = pg_trgm.sql
-DATA = uninstall_pg_trgm.sql
-REGRESS = pg_trgm
+EXTENSION = pg_trgm
+DATA = pg_trgm--1.3.sql pg_trgm--1.2--1.3.sql pg_trgm--1.1--1.2.sql \
+	pg_trgm--1.0--1.1.sql pg_trgm--unpackaged--1.0.sql
+PGFILEDESC = "pg_trgm - trigram matching"
 
+REGRESS = pg_trgm pg_word_trgm
+REGRESS_OPTS += --init-file=$(top_srcdir)/src/test/regress/init_file
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config

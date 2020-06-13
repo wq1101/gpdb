@@ -4,7 +4,7 @@
  *	  Support getaddrinfo() on platforms that don't have it.
  *
  * We also supply getnameinfo() here, assuming that the platform will have
- * it if and only if it has getaddrinfo().	If this proves false on some
+ * it if and only if it has getaddrinfo().  If this proves false on some
  * platform, we'll need to split this file and provide a separate configure
  * test for getnameinfo().
  *
@@ -13,10 +13,10 @@
  * use the Windows native routines, but if not, we use our own.
  *
  *
- * Copyright (c) 2003-2010, PostgreSQL Global Development Group
+ * Copyright (c) 2003-2016, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/port/getaddrinfo.c,v 1.30 2010/01/02 16:58:13 momjian Exp $
+ *	  src/port/getaddrinfo.c
  *
  *-------------------------------------------------------------------------
  */
@@ -182,7 +182,7 @@ getaddrinfo(const char *node, const char *service,
 		else if (hints.ai_flags & AI_NUMERICHOST)
 		{
 			if (!inet_aton(node, &sin.sin_addr))
-				return EAI_FAIL;
+				return EAI_NONAME;
 		}
 		else
 		{
@@ -328,12 +328,9 @@ gai_strerror(int errcode)
 		case EAI_MEMORY:
 			return "Not enough memory";
 #endif
-#ifdef EAI_NODATA
-#ifndef WIN32_ONLY_COMPILER		/* MSVC complains because another case has the
-								 * same value */
+#if defined(EAI_NODATA) && EAI_NODATA != EAI_NONAME		/* MSVC/WIN64 duplicate */
 		case EAI_NODATA:
 			return "No host data of that type was found";
-#endif
 #endif
 #ifdef EAI_SERVICE
 		case EAI_SERVICE:
@@ -352,8 +349,8 @@ gai_strerror(int errcode)
 /*
  * Convert an ipv4 address to a hostname.
  *
- * Bugs:	- Only supports NI_NUMERICHOST and NI_NUMERICSERV
- *		  It will never resolv a hostname.
+ * Bugs:	- Only supports NI_NUMERICHOST and NI_NUMERICSERV behavior.
+ *		  It will never resolve a hostname.
  *		- No IPv6 support.
  */
 int
@@ -376,28 +373,25 @@ getnameinfo(const struct sockaddr * sa, int salen,
 	if (sa == NULL || (node == NULL && service == NULL))
 		return EAI_FAIL;
 
-	/* We don't support those. */
-	if ((node && !(flags & NI_NUMERICHOST))
-		|| (service && !(flags & NI_NUMERICSERV)))
-		return EAI_FAIL;
-
 #ifdef	HAVE_IPV6
 	if (sa->sa_family == AF_INET6)
 		return EAI_FAMILY;
 #endif
 
+	/* Unsupported flags. */
+	if (flags & NI_NAMEREQD)
+		return EAI_AGAIN;
+
 	if (node)
 	{
-		int			ret = -1;
-
 		if (sa->sa_family == AF_INET)
 		{
-			char	   *p;
-
-			p = inet_ntoa(((struct sockaddr_in *) sa)->sin_addr);
-			ret = snprintf(node, nodelen, "%s", p);
+			if (inet_net_ntop(AF_INET, &((struct sockaddr_in *) sa)->sin_addr,
+							  sa->sa_family == AF_INET ? 32 : 128,
+							  node, nodelen) == NULL)
+				return EAI_MEMORY;
 		}
-		if (ret == -1 || ret > nodelen)
+		else
 			return EAI_MEMORY;
 	}
 
@@ -410,7 +404,7 @@ getnameinfo(const struct sockaddr * sa, int salen,
 			ret = snprintf(service, servicelen, "%d",
 						   ntohs(((struct sockaddr_in *) sa)->sin_port));
 		}
-		if (ret == -1 || ret > servicelen)
+		if (ret < 0 || ret >= servicelen)
 			return EAI_MEMORY;
 	}
 

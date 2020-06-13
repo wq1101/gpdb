@@ -6,12 +6,12 @@ CREATE TYPE casttesttype;
 CREATE FUNCTION casttesttype_in(cstring)
    RETURNS casttesttype
    AS 'textin'
-   LANGUAGE internal STRICT;
+   LANGUAGE internal STRICT IMMUTABLE;
 NOTICE:  return type casttesttype is only a shell
 CREATE FUNCTION casttesttype_out(casttesttype)
    RETURNS cstring
    AS 'textout'
-   LANGUAGE internal STRICT;
+   LANGUAGE internal STRICT IMMUTABLE;
 NOTICE:  argument type casttesttype is only a shell
 CREATE TYPE casttesttype (
    internallength = variable,
@@ -53,13 +53,15 @@ SELECT casttestfunc('foo'::text); -- Should work now
 SELECT 1234::int4::casttesttype; -- No cast yet, should fail
 ERROR:  cannot cast type integer to casttesttype
 LINE 1: SELECT 1234::int4::casttesttype;
-               ^
-/* This will come in PostgreSQL 8.4
+                         ^
 CREATE CAST (int4 AS casttesttype) WITH INOUT;
 SELECT 1234::int4::casttesttype; -- Should work now
+ casttesttype 
+--------------
+ 1234
+(1 row)
 
 DROP CAST (int4 AS casttesttype);
-*/
 -- Try cast with a function
 CREATE FUNCTION int4_casttesttype(int4) RETURNS casttesttype LANGUAGE SQL AS
 $$ SELECT ('foo'::text || $1::text)::casttesttype; $$;

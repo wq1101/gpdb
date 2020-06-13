@@ -4,10 +4,10 @@
  *	  port-specific prototypes for SCO 3.2v5.2
  *
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/backend/port/dynloader/sco.h,v 1.20 2008/01/01 19:45:51 momjian Exp $
+ * src/backend/port/dynloader/sco.h
  *
  *-------------------------------------------------------------------------
  */
@@ -15,7 +15,7 @@
 #define PORT_PROTOS_H
 
 #include <dlfcn.h>
-#include "utils/dynamic_loader.h"
+#include "utils/dynamic_loader.h"		/* pgrminclude ignore */
 
 /*
  * Dynamic Loader on SCO 3.2v5.0.2

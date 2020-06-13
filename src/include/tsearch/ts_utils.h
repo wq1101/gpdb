@@ -3,9 +3,9 @@
  * ts_utils.h
  *	  helper utilities for tsearch
  *
- * Copyright (c) 1998-2008, PostgreSQL Global Development Group
+ * Copyright (c) 1998-2016, PostgreSQL Global Development Group
  *
- * $PostgreSQL: pgsql/src/include/tsearch/ts_utils.h,v 1.12 2008/01/01 19:45:59 momjian Exp $
+ * src/include/tsearch/ts_utils.h
  *
  *-------------------------------------------------------------------------
  */
@@ -42,9 +42,10 @@ typedef struct TSQueryParserStateData *TSQueryParserState;
 
 typedef void (*PushFunction) (Datum opaque, TSQueryParserState state,
 										  char *token, int tokenlen,
-										  int2 tokenweights		/* bitmap as described
+										  int16 tokenweights,	/* bitmap as described
 																 * in QueryOperand
-								  struct */ );
+																 * struct */
+										  bool prefix);
 
 extern TSQuery parse_tsquery(char *buf,
 			  PushFunction pushval,
@@ -52,9 +53,9 @@ extern TSQuery parse_tsquery(char *buf,
 
 /* Functions for use by PushFunction implementations */
 extern void pushValue(TSQueryParserState state,
-		  char *strval, int lenval, int2 weight);
+		  char *strval, int lenval, int16 weight, bool prefix);
 extern void pushStop(TSQueryParserState state);
-extern void pushOperator(TSQueryParserState state, int8 operator);
+extern void pushOperator(TSQueryParserState state, int8 oper, int16 distance);
 
 /*
  * parse plain text and lexize words
@@ -74,6 +75,7 @@ typedef struct
 		 */
 		uint16	   *apos;
 	}			pos;
+	uint16		flags;			/* currently, only TSL_PREFIX */
 	char	   *word;
 	uint32		alen;
 } ParsedWord;
@@ -81,12 +83,12 @@ typedef struct
 typedef struct
 {
 	ParsedWord *words;
-	int4		lenwords;
-	int4		curwords;
-	int4		pos;
+	int32		lenwords;
+	int32		curwords;
+	int32		pos;
 } ParsedText;
 
-extern void parsetext(Oid cfgId, ParsedText *prs, char *buf, int4 buflen);
+extern void parsetext(Oid cfgId, ParsedText *prs, char *buf, int32 buflen);
 
 /*
  * headline framework, flow in common to generate:
@@ -96,26 +98,45 @@ extern void parsetext(Oid cfgId, ParsedText *prs, char *buf, int4 buflen);
  */
 
 extern void hlparsetext(Oid cfgId, HeadlineParsedText *prs, TSQuery query,
-			char *buf, int4 buflen);
+			char *buf, int32 buflen);
 extern text *generateHeadline(HeadlineParsedText *prs);
 
 /*
  * Common check function for tsvector @@ tsquery
  */
-
-extern bool TS_execute(QueryItem *curitem, void *checkval, bool calcnot,
-		   bool (*chkcond) (void *checkval, QueryOperand *val));
+typedef struct ExecPhraseData
+{
+	int			npos;
+	bool		allocated;
+	WordEntryPos *pos;
+} ExecPhraseData;
 
 /*
- * Useful conversion macros
+ * Evaluates tsquery, flags are followe below
  */
-#define TextPGetCString(t) DatumGetCString(DirectFunctionCall1(textout, PointerGetDatum(t)))
-#define CStringGetTextP(c) DatumGetTextP(DirectFunctionCall1(textin, CStringGetDatum(c)))
+extern bool TS_execute(QueryItem *curitem, void *checkval, uint32 flags,
+		   bool (*chkcond) (void *, QueryOperand *, ExecPhraseData *));
+
+#define TS_EXEC_EMPTY			(0x00)
+/*
+ * if TS_EXEC_CALC_NOT is not set then NOT expression evaluated to be true,
+ * used in cases where NOT cannot be accurately computed (GiST) or
+ * it isn't important (ranking)
+ */
+#define TS_EXEC_CALC_NOT		(0x01)
+/*
+ * Treat OP_PHRASE as OP_AND. Used when posiotional information is not
+ * accessible, like in consistent methods of GIN/GiST indexes
+ */
+#define TS_EXEC_PHRASE_AS_AND	(0x02)
+
+extern bool tsquery_requires_match(QueryItem *curitem);
 
 /*
  * to_ts* - text transformation to tsvector, tsquery
  */
 extern TSVector make_tsvector(ParsedText *prs);
+extern int32 tsCompareString(char *a, int lena, char *b, int lenb, bool prefix);
 
 extern Datum to_tsvector_byid(PG_FUNCTION_ARGS);
 extern Datum to_tsvector(PG_FUNCTION_ARGS);
@@ -123,6 +144,8 @@ extern Datum to_tsquery_byid(PG_FUNCTION_ARGS);
 extern Datum to_tsquery(PG_FUNCTION_ARGS);
 extern Datum plainto_tsquery_byid(PG_FUNCTION_ARGS);
 extern Datum plainto_tsquery(PG_FUNCTION_ARGS);
+extern Datum phraseto_tsquery_byid(PG_FUNCTION_ARGS);
+extern Datum phraseto_tsquery(PG_FUNCTION_ARGS);
 
 /*
  * GiST support function
@@ -135,6 +158,7 @@ extern Datum gtsvector_union(PG_FUNCTION_ARGS);
 extern Datum gtsvector_same(PG_FUNCTION_ARGS);
 extern Datum gtsvector_penalty(PG_FUNCTION_ARGS);
 extern Datum gtsvector_picksplit(PG_FUNCTION_ARGS);
+extern Datum gtsvector_consistent_oldsig(PG_FUNCTION_ARGS);
 
 /*
  * IO functions for pseudotype gtsvector
@@ -148,8 +172,16 @@ extern Datum gtsvectorout(PG_FUNCTION_ARGS);
  */
 
 extern Datum gin_extract_tsvector(PG_FUNCTION_ARGS);
+extern Datum gin_cmp_tslexeme(PG_FUNCTION_ARGS);
+extern Datum gin_cmp_prefix(PG_FUNCTION_ARGS);
 extern Datum gin_extract_tsquery(PG_FUNCTION_ARGS);
 extern Datum gin_tsquery_consistent(PG_FUNCTION_ARGS);
+extern Datum gin_tsquery_triconsistent(PG_FUNCTION_ARGS);
+extern Datum gin_extract_tsvector_2args(PG_FUNCTION_ARGS);
+extern Datum gin_extract_tsquery_5args(PG_FUNCTION_ARGS);
+extern Datum gin_tsquery_consistent_6args(PG_FUNCTION_ARGS);
+extern Datum gin_extract_tsquery_oldsig(PG_FUNCTION_ARGS);
+extern Datum gin_tsquery_consistent_oldsig(PG_FUNCTION_ARGS);
 
 /*
  * Possible strategy numbers for indexes
@@ -162,14 +194,14 @@ extern Datum gin_tsquery_consistent(PG_FUNCTION_ARGS);
 /*
  * TSQuery Utilities
  */
-extern QueryItem *clean_NOT(QueryItem *ptr, int4 *len);
-extern QueryItem *clean_fakeval(QueryItem *ptr, int4 *len);
+extern QueryItem *clean_NOT(QueryItem *ptr, int32 *len);
+extern TSQuery cleanup_fakeval_and_phrase(TSQuery in);
 
 typedef struct QTNode
 {
 	QueryItem  *valnode;
 	uint32		flags;
-	int4		nchild;
+	int32		nchild;
 	char	   *word;
 	uint32		sign;
 	struct QTNode **child;
@@ -214,6 +246,7 @@ extern Datum gtsquery_union(PG_FUNCTION_ARGS);
 extern Datum gtsquery_same(PG_FUNCTION_ARGS);
 extern Datum gtsquery_penalty(PG_FUNCTION_ARGS);
 extern Datum gtsquery_picksplit(PG_FUNCTION_ARGS);
+extern Datum gtsquery_consistent_oldsig(PG_FUNCTION_ARGS);
 
 /*
  * Parser interface to SQL

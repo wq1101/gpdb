@@ -36,11 +36,11 @@
  *
  * Portions Copyright (c) 2005-2008, Greenplum inc.
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/executor/nodeResult.c,v 1.42 2008/01/01 19:45:49 momjian Exp $
+ *	  src/backend/executor/nodeResult.c
  *
  *-------------------------------------------------------------------------
  */
@@ -55,12 +55,13 @@
 #include "utils/lsyscache.h"
 
 #include "cdb/cdbhash.h"
+#include "cdb/cdbutil.h"
 #include "cdb/cdbvars.h"
 #include "cdb/memquota.h"
 #include "executor/spi.h"
 
 static TupleTableSlot *NextInputSlot(ResultState *node);
-static bool TupleMatchesHashFilter(Result *resultNode, TupleTableSlot *resultSlot);
+static bool TupleMatchesHashFilter(ResultState *node, TupleTableSlot *resultSlot);
 
 /**
  * Returns the next valid input tuple from the left subtree
@@ -94,7 +95,6 @@ static TupleTableSlot *NextInputSlot(ResultState *node)
 		 */
 		ResetExprContext(econtext);
 
-		node->ps.ps_OuterTupleSlot = candidateInputSlot;
 		econtext->ecxt_outertuple = candidateInputSlot;
 
 		/**
@@ -144,9 +144,7 @@ ExecResult(ResultState *node)
 
 		node->rs_checkqual = false;
 		if (!qualResult)
-		{
 			return NULL;
-		}
 	}
 
 	TupleTableSlot *outputSlot = NULL;
@@ -192,7 +190,6 @@ ExecResult(ResultState *node)
 			 */
 			ResetExprContext(econtext);
 
-			node->ps.ps_OuterTupleSlot = inputSlot;
 			econtext->ecxt_outertuple = inputSlot;
 
 			ExprDoneCond isDone;
@@ -229,8 +226,7 @@ ExecResult(ResultState *node)
 
 		if (!TupIsNull(candidateOutputSlot))
 		{
-			Result *result = (Result *)node->ps.plan;
-			if (TupleMatchesHashFilter(result, candidateOutputSlot))
+			if (TupleMatchesHashFilter(node, candidateOutputSlot))
 			{
 				outputSlot = candidateOutputSlot;
 			}
@@ -255,65 +251,32 @@ ExecResult(ResultState *node)
 /**
  * Returns true if tuple matches hash filter.
  */
-static bool TupleMatchesHashFilter(Result *resultNode, TupleTableSlot *resultSlot)
+static bool
+TupleMatchesHashFilter(ResultState *node, TupleTableSlot *resultSlot)
 {
-	bool res = true;
+	Result	   *resultNode = (Result *)node->ps.plan;
+	bool		res = true;
 
 	Assert(resultNode);
 	Assert(!TupIsNull(resultSlot));
 
-	if (resultNode->hashFilter)
+	if (node->hashFilter)
 	{
-		Assert(resultNode->hashFilter);
-		ListCell	*cell = NULL;
+		int			i;
 
-		Assert(list_length(resultNode->hashList) <= resultSlot->tts_tupleDescriptor->natts);
-
-		CdbHash *hash = makeCdbHash(GpIdentity.numsegments);
-		cdbhashinit(hash);
-		foreach(cell, resultNode->hashList)
+		cdbhashinit(node->hashFilter);
+		for (i = 0; i < resultNode->numHashFilterCols; i++)
 		{
-			/**
-			 * Note that a table may be randomly distributed. The hashList will be empty.
-			 */
+			int			attnum = resultNode->hashFilterColIdx[i];
 			Datum		hAttr;
 			bool		isnull;
-			Oid			att_type;
 
-			int attnum = lfirst_int(cell);
-
-			Assert(attnum > 0);
 			hAttr = slot_getattr(resultSlot, attnum, &isnull);
-			if (!isnull)
-			{
-				att_type = resultSlot->tts_tupleDescriptor->attrs[attnum - 1]->atttypid;
 
-				if (get_typtype(att_type) == 'd')
-					att_type = getBaseType(att_type);
-
-				/* CdbHash treats all array-types as ANYARRAYOID, it doesn't know how to hash
-				 * the individual types (why is this ?) */
-				switch (att_type)
-				{
-					case INT2ARRAYOID:
-					case INT4ARRAYOID:
-					case INT8ARRAYOID:
-					case FLOAT4ARRAYOID:
-					case FLOAT8ARRAYOID:
-					case REGTYPEARRAYOID:
-						att_type = ANYARRAYOID;
-						/* fall through */
-					default:
-						break;
-				}
-				cdbhash(hash, hAttr, att_type);
-			}
-			else
-				cdbhashnull(hash);
+			cdbhash(node->hashFilter, i + 1, hAttr, isnull);
 		}
-		int targetSeg = cdbhashreduce(hash);
 
-		pfree(hash);
+		int targetSeg = cdbhashreduce(node->hashFilter);
 
 		res = (targetSeg == GpIdentity.segindex);
 	}
@@ -350,7 +313,6 @@ ExecResultRestrPos(ResultState *node)
 	else
 		elog(ERROR, "Result nodes do not support mark/restore");
 }
-
 
 /* ----------------------------------------------------------------
  *		ExecInitResult
@@ -390,8 +352,6 @@ ExecInitResult(Result *node, EState *estate, int eflags)
 
 	/*resstate->ps.ps_TupFromTlist = false;*/
 
-#define RESULT_NSLOTS 1
-
 	/*
 	 * tuple table initialization
 	 */
@@ -425,21 +385,26 @@ ExecInitResult(Result *node, EState *estate, int eflags)
 	ExecAssignResultTypeFromTL(&resstate->ps);
 	ExecAssignProjectionInfo(&resstate->ps, NULL);
 
+	/*
+	 * initialize hash filter
+	 */
+	if (node->numHashFilterCols > 0)
+	{
+		int			currentSliceId = estate->currentSliceId;
+		ExecSlice *currentSlice = &estate->es_sliceTable->slices[currentSliceId];
+
+		resstate->hashFilter = makeCdbHash(currentSlice->planNumSegments,
+										   node->numHashFilterCols,
+										   node->hashFilterFuncs);
+	}
+
 	if (!IsResManagerMemoryPolicyNone()
-			&& IsResultMemoryIntesive(node))
+			&& IsResultMemoryIntensive(node))
 	{
 		SPI_ReserveMemory(((Plan *)node)->operatorMemKB * 1024L);
 	}
 
-	initGpmonPktForResult((Plan *)node, &resstate->ps.gpmon_pkt, estate);
-
 	return resstate;
-}
-
-int
-ExecCountSlotsResult(Result *node)
-{
-	return ExecCountSlotsNode(outerPlan(node)) + RESULT_NSLOTS;
 }
 
 /* ----------------------------------------------------------------
@@ -466,12 +431,10 @@ ExecEndResult(ResultState *node)
 	 */
 	ExecEndNode(outerPlanState(node));
 
-	EndPlanStateGpmonPkt(&node->ps);
-
 }
 
 void
-ExecReScanResult(ResultState *node, ExprContext *exprCtxt)
+ExecReScanResult(ResultState *node)
 {
 	node->inputFullyConsumed = false;
 	node->isSRF = false;
@@ -479,19 +442,9 @@ ExecReScanResult(ResultState *node, ExprContext *exprCtxt)
 
 	/*
 	 * If chgParam of subnode is not null then plan will be re-scanned by
-	 * first ExecProcNode.	However, if caller is passing us an exprCtxt then
-	 * forcibly rescan the subnode now, so that we can pass the exprCtxt down
-	 * to the subnode (needed for gated indexscan).
+	 * first ExecProcNode.
 	 */
 	if (node->ps.lefttree &&
-		(node->ps.lefttree->chgParam == NULL || exprCtxt != NULL))
-		ExecReScan(node->ps.lefttree, exprCtxt);
-}
-
-void
-initGpmonPktForResult(Plan *planNode, gpmon_packet_t *gpmon_pkt, EState *estate)
-{
-	Assert(planNode != NULL && gpmon_pkt != NULL && IsA(planNode, Result));
-
-	InitPlanNodeGpmonPkt(planNode, gpmon_pkt, estate);
+		node->ps.lefttree->chgParam == NULL)
+		ExecReScan(node->ps.lefttree);
 }

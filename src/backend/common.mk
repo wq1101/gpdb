@@ -1,7 +1,7 @@
 #
 # Common make rules for backend
 #
-# $PostgreSQL: pgsql/src/backend/common.mk,v 1.6 2008/02/29 10:34:51 petere Exp $
+# src/backend/common.mk
 #
 
 # When including this file, set OBJS to the object files created in
@@ -40,23 +40,15 @@ $(SUBDIROBJS): $(SUBDIRS:%=%-recursive) ;
 $(SUBDIRS:%=%-recursive):
 	$(MAKE) -C $(subst -recursive,,$@) all
 
+$(call recurse,clean)
 clean: clean-local
 clean-local:
-ifdef SUBDIRS
-	for dir in $(SUBDIRS); do $(MAKE) -C $$dir clean || exit; done
-endif
 	rm -f $(subsysfilename) $(OBJS)
 	@if [ -d $(CURDIR)/test ]; then $(MAKE) -C $(CURDIR)/test clean; fi
 
-
-coverage: $(gcda_files:.gcda=.c.gcov) lcov.info
-ifdef SUBDIRS
-	for dir in $(SUBDIRS); do $(MAKE) -C $$dir coverage || exit; done
-endif
-
-.PHONY : unittest-check
-unittest-check:
+$(call recurse,unittest-check)
+unittest-check: unittest-check-local
+unittest-check-local:
 	@if [ -d $(CURDIR)/test ]; then $(MAKE) -C $(CURDIR)/test check; fi
-ifdef SUBDIRS
-	for dir in $(SUBDIRS); do $(MAKE) -C $$dir unittest-check || exit; done
-endif
+
+$(call recurse,coverage)

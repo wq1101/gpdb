@@ -3,7 +3,6 @@ import os
 import shutil
 from gppylib.db import dbconn
 from test.behave_utils.utils import check_schema_exists, check_table_exists, drop_table_if_exists
-from gppylib.operations.backup_utils import get_lines_from_file
 from behave import given, when, then
 
 CREATE_MULTI_PARTITION_TABLE_SQL = """
@@ -173,11 +172,16 @@ def impl(context, qualified_table):
         delete_table_from_state_files(context.dbname, qualified_table)
 
 
+@given('{num_rows} rows are inserted into table "{tablename}" in schema "{schemaname}" with column type list "{column_type_list}"')
+@then('{num_rows} rows are inserted into table "{tablename}" in schema "{schemaname}" with column type list "{column_type_list}"')
+@when('{num_rows} rows are inserted into table "{tablename}" in schema "{schemaname}" with column type list "{column_type_list}"')
+def impl(context, num_rows, tablename, schemaname, column_type_list):
+    insert_data_into_table(context.conn, schemaname, tablename, column_type_list, num_rows)
+
 @given('some data is inserted into table "{tablename}" in schema "{schemaname}" with column type list "{column_type_list}"')
 @when('some data is inserted into table "{tablename}" in schema "{schemaname}" with column type list "{column_type_list}"')
 def impl(context, tablename, schemaname, column_type_list):
     insert_data_into_table(context.conn, schemaname, tablename, column_type_list)
-
 
 @given('some ddl is performed on table "{tablename}" in schema "{schemaname}"')
 def impl(context, tablename, schemaname):
@@ -192,20 +196,41 @@ def impl(context, query, dbname):
     dbconn.execSQL(context.long_lived_conn, 'BEGIN; %s' % query)
 
 
-@given('the user commits transaction')
-@when('the user commits transaction')
-def impl(context):
-    dbconn.execSQL(context.long_lived_conn, 'END;')
-
-
 @given('the user rollsback the transaction')
 @when('the user rollsback the transaction')
 def impl(context):
     dbconn.execSQL(context.long_lived_conn, 'ROLLBACK;')
 
 
+@then('the latest state file should have a mod count of {mod_count} for table "{table}" in "{schema}" schema for database "{dbname}"')
+def impl(context, mod_count, table, schema, dbname):
+    mod_count_in_state_file = get_mod_count_in_state_file(dbname, schema, table)
+    if mod_count_in_state_file != mod_count:
+        raise Exception(
+            "mod_count %s does not match mod_count %s in state file for %s.%s" %
+             (mod_count, mod_count_in_state_file, schema, table))
+
+
+@then('root stats are populated for partition table "{tablename}" for database "{dbname}"')
+def impl(context, tablename, dbname):
+    with dbconn.connect(dbconn.DbURL(dbname=dbname), unsetSearchPath=False) as conn:
+        query = "select count(*) from pg_statistic where starelid='%s'::regclass;" % tablename
+        num_tuples = dbconn.execSQLForSingleton(conn, query)
+        if num_tuples == 0:
+            raise Exception("Expected partition table %s to contain root statistics" % tablename)
+
+def get_mod_count_in_state_file(dbname, schema, table):
+    file = get_latest_aostate_file(dbname)
+    comma_name = ','.join([schema, table])
+    with open(file) as fd:
+        for line in fd:
+            if comma_name in line:
+                return line.split(',')[2].strip()
+    return -1
+
+
 def create_long_lived_conn(context, dbname):
-    context.long_lived_conn = dbconn.connect(dbconn.DbURL(dbname=dbname))
+    context.long_lived_conn = dbconn.connect(dbconn.DbURL(dbname=dbname), unsetSearchPath=False)
 
 
 def table_found_in_state_file(dbname, qualified_table):
@@ -216,20 +241,22 @@ def table_found_in_state_file(dbname, qualified_table):
     state_file = ""
     for state_file in files:
         found = False
-        for line in get_lines_from_file(state_file):
-            if comma_name in line:
-                found = True
-                continue
-        if not found:
-            return False, state_file
+        with open(state_file) as fd:
+            for line in fd:
+                if comma_name in line:
+                    found = True
+                    continue
+            if not found:
+                return False, state_file
     return True, state_file
 
 
 def table_found_in_report_file(dbname, qualified_table):
     report_file = get_latest_analyze_report_file(dbname)
-    for line in get_lines_from_file(report_file):
-        if qualified_table == line:
-            return True, report_file
+    with open(report_file) as fd:
+        for line in fd:
+            if qualified_table == line.strip('\n'):
+                return True, report_file
 
     return False, report_file
 
@@ -243,12 +270,14 @@ def column_found_in_state_file(dbname, qualified_table, col_name_list):
     for state_file in files:
         if "col_state_file" not in state_file:
             continue
-        for line in get_lines_from_file(state_file):
-            if comma_name in line:
-                for column in col_name_list.split(','):
-                    if column not in line.split(',')[2:]:
-                        return False, column, state_file
-                return True, "", state_file
+        with open(state_file) as fd:
+            for line in fd:
+                line = line.strip('\n')
+                if comma_name in line:
+                    for column in col_name_list.split(','):
+                        if column not in line.split(',')[2:]:
+                            return False, column, state_file
+                    return True, "", state_file
         return False, col_name_list, state_file
 
 
@@ -256,7 +285,10 @@ def delete_table_from_state_files(dbname, qualified_table):
     comma_name = ','.join(qualified_table.split('.'))
     files = get_latest_analyze_state_files(dbname)
     for filename in files:
-        lines = get_lines_from_file(filename)
+        lines = []
+        with open(filename) as fd:
+            for line in fd:
+                lines.append(line.strip('\n'))
         f = open(filename, "w")
         for line in lines:
             if comma_name not in line:
@@ -348,10 +380,10 @@ def create_table_with_column_list(conn, storage_type, schemaname, tablename, col
     conn.commit()
 
 
-def insert_data_into_table(conn, schemaname, tablename, col_type_list):
+def insert_data_into_table(conn, schemaname, tablename, col_type_list, num_rows="100"):
     col_type_list = col_type_list.strip().split(',')
     col_str = ','.join(["(random()*i)::%s" % x for x in col_type_list])
-    query = "INSERT INTO " + schemaname + '.' + tablename + " SELECT " + col_str + " FROM generate_series(1,100) i"
+    query = "INSERT INTO " + schemaname + '.' + tablename + " SELECT " + col_str + " FROM generate_series(1," + num_rows + ") i"
     dbconn.execSQL(conn, query)
     conn.commit()
 

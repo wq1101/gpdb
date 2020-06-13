@@ -14,6 +14,8 @@
  */
 #include "postgres.h"
 
+#include "access/appendonlywriter.h"
+#include "access/htup_details.h"
 #include "catalog/gp_fastsequence.h"
 #include "catalog/indexing.h"
 #include "utils/relcache.h"
@@ -22,7 +24,7 @@
 #include "access/htup.h"
 #include "access/heapam.h"
 #include "utils/syscache.h"
-#include "access/appendonlywriter.h"
+#include "utils/tqual.h"
 
 static void insert_or_update_fastsequence(
 	Relation gp_fastsequence_rel,
@@ -122,7 +124,7 @@ InsertFastSequenceEntry(Oid objid, int64 objmod, int64 lastSequence)
 				BTEqualStrategyNumber, F_INT8EQ,
 				Int64GetDatum(objmod));
 	scan = systable_beginscan(gp_fastsequence_rel, FastSequenceObjidObjmodIndexId, true,
-							  SnapshotNow, 2, scankey);
+							  NULL, 2, scankey);
 
 	tuple = systable_getnext(scan);
 	insert_or_update_fastsequence(gp_fastsequence_rel,
@@ -259,7 +261,7 @@ int64 GetFastSequences(Oid objid, int64 objmod,
 				BTEqualStrategyNumber, F_INT8EQ,
 				Int64GetDatum(objmod));
 	scan = systable_beginscan(gp_fastsequence_rel, FastSequenceObjidObjmodIndexId, true,
-							  SnapshotNow, 2, scankey);
+							  NULL, 2, scankey);
 
 	tuple = systable_getnext(scan);
 	if (!HeapTupleIsValid(tuple))
@@ -324,7 +326,7 @@ RemoveFastSequenceEntry(Oid objid)
 				ObjectIdGetDatum(objid));
 
 	sscan = systable_beginscan(rel, FastSequenceObjidObjmodIndexId, true,
-							   SnapshotNow, 1, &scankey);
+							   NULL, 1, &scankey);
 
 	while ((tuple = systable_getnext(sscan)) != NULL)
 	{

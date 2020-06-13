@@ -4,35 +4,34 @@
  * Written by Victor B. Wagner <vitus@cryptocom.ru>, Cryptocom LTD
  * This file is distributed under BSD-style license.
  *
- * $PostgreSQL: pgsql/contrib/sslinfo/sslinfo.c,v 1.6.2.1 2008/11/10 14:57:46 tgl Exp $
+ * contrib/sslinfo/sslinfo.c
  */
 
 #include "postgres.h"
-#include "fmgr.h"
-#include "utils/numeric.h"
+
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+#include <openssl/asn1.h>
+
+#include "access/htup_details.h"
+#include "funcapi.h"
 #include "libpq/libpq-be.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
-#include "mb/pg_wchar.h"
-
-#include <openssl/x509.h>
-#include <openssl/asn1.h>
-
 
 PG_MODULE_MAGIC;
 
+static Datum X509_NAME_field_to_text(X509_NAME *name, text *fieldName);
+static Datum X509_NAME_to_text(X509_NAME *name);
+static Datum ASN1_STRING_to_text(ASN1_STRING *str);
 
-Datum		ssl_is_used(PG_FUNCTION_ARGS);
-Datum		ssl_client_cert_present(PG_FUNCTION_ARGS);
-Datum		ssl_client_serial(PG_FUNCTION_ARGS);
-Datum		ssl_client_dn_field(PG_FUNCTION_ARGS);
-Datum		ssl_issuer_field(PG_FUNCTION_ARGS);
-Datum		ssl_client_dn(PG_FUNCTION_ARGS);
-Datum		ssl_issuer_dn(PG_FUNCTION_ARGS);
-Datum		X509_NAME_field_to_text(X509_NAME *name, text *fieldName);
-Datum		X509_NAME_to_text(X509_NAME *name);
-Datum		ASN1_STRING_to_text(ASN1_STRING *str);
-
+/*
+ * Function context for data persisting over repeated calls.
+ */
+typedef struct
+{
+	TupleDesc	tupdesc;
+} SSLExtensionInfoContext;
 
 /*
  * Indicates whether current session uses SSL
@@ -44,12 +43,38 @@ PG_FUNCTION_INFO_V1(ssl_is_used);
 Datum
 ssl_is_used(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_BOOL(MyProcPort->ssl != NULL);
+	PG_RETURN_BOOL(MyProcPort->ssl_in_use);
 }
 
 
 /*
- * Indicates whether current client have provided a certificate
+ * Returns SSL version currently in use.
+ */
+PG_FUNCTION_INFO_V1(ssl_version);
+Datum
+ssl_version(PG_FUNCTION_ARGS)
+{
+	if (MyProcPort->ssl == NULL)
+		PG_RETURN_NULL();
+	PG_RETURN_TEXT_P(cstring_to_text(SSL_get_version(MyProcPort->ssl)));
+}
+
+
+/*
+ * Returns SSL cipher currently in use.
+ */
+PG_FUNCTION_INFO_V1(ssl_cipher);
+Datum
+ssl_cipher(PG_FUNCTION_ARGS)
+{
+	if (MyProcPort->ssl == NULL)
+		PG_RETURN_NULL();
+	PG_RETURN_TEXT_P(cstring_to_text(SSL_get_cipher(MyProcPort->ssl)));
+}
+
+
+/*
+ * Indicates whether current client provided a certificate
  *
  * Function has no arguments.  Returns bool.  True if current session
  * is SSL session and client certificate is verified, otherwise false.
@@ -104,43 +129,41 @@ ssl_client_serial(PG_FUNCTION_ARGS)
  * current database encoding if possible.  Any invalid characters are
  * replaced by question marks.
  *
- * Parameter: str - OpenSSL ASN1_STRING structure.	Memory managment
+ * Parameter: str - OpenSSL ASN1_STRING structure.  Memory management
  * of this structure is responsibility of caller.
  *
  * Returns Datum, which can be directly returned from a C language SQL
  * function.
  */
-Datum
+static Datum
 ASN1_STRING_to_text(ASN1_STRING *str)
 {
-	BIO		   *membuf = NULL;
-	size_t		size,
-				outlen;
+	BIO		   *membuf;
+	size_t		size;
+	char		nullterm;
 	char	   *sp;
 	char	   *dp;
 	text	   *result;
 
 	membuf = BIO_new(BIO_s_mem());
+	if (membuf == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("could not create OpenSSL BIO structure")));
 	(void) BIO_set_close(membuf, BIO_CLOSE);
 	ASN1_STRING_print_ex(membuf, str,
 						 ((ASN1_STRFLGS_RFC2253 & ~ASN1_STRFLGS_ESC_MSB)
 						  | ASN1_STRFLGS_UTF8_CONVERT));
-
-	outlen = 0;
-	BIO_write(membuf, &outlen, 1);
+	/* ensure null termination of the BIO's content */
+	nullterm = '\0';
+	BIO_write(membuf, &nullterm, 1);
 	size = BIO_get_mem_data(membuf, &sp);
-	dp = (char *) pg_do_encoding_conversion((unsigned char *) sp,
-											size - 1,
-											PG_UTF8,
-											GetDatabaseEncoding());
-	outlen = strlen(dp);
-	result = palloc(VARHDRSZ + outlen);
-	memcpy(VARDATA(result), dp, outlen);
-	SET_VARSIZE(result, VARHDRSZ + outlen);
-
+	dp = pg_any_to_server(sp, size - 1, PG_UTF8);
+	result = cstring_to_text(dp);
 	if (dp != sp)
 		pfree(dp);
-	BIO_free(membuf);
+	if (BIO_free(membuf) != 1)
+		elog(ERROR, "could not free OpenSSL BIO structure");
 
 	PG_RETURN_TEXT_P(result);
 }
@@ -158,24 +181,15 @@ ASN1_STRING_to_text(ASN1_STRING *str)
  * Returns result of ASN1_STRING_to_text applied to appropriate
  * part of name
  */
-Datum
+static Datum
 X509_NAME_field_to_text(X509_NAME *name, text *fieldName)
 {
-	char	   *sp;
 	char	   *string_fieldname;
-	char	   *dp;
-	size_t		name_len = VARSIZE(fieldName) - VARHDRSZ;
 	int			nid,
-				index,
-				i;
+				index;
 	ASN1_STRING *data;
 
-	string_fieldname = palloc(name_len + 1);
-	sp = VARDATA(fieldName);
-	dp = string_fieldname;
-	for (i = 0; i < name_len; i++)
-		*dp++ = *sp++;
-	*dp = '\0';
+	string_fieldname = text_to_cstring(fieldName);
 	nid = OBJ_txt2nid(string_fieldname);
 	if (nid == NID_undef)
 		ereport(ERROR,
@@ -272,7 +286,7 @@ ssl_issuer_field(PG_FUNCTION_ARGS)
  * Returns: text datum which contains string representation of
  * X509_NAME
  */
-Datum
+static Datum
 X509_NAME_to_text(X509_NAME *name)
 {
 	BIO		   *membuf = BIO_new(BIO_s_mem());
@@ -281,45 +295,51 @@ X509_NAME_to_text(X509_NAME *name)
 				count = X509_NAME_entry_count(name);
 	X509_NAME_ENTRY *e;
 	ASN1_STRING *v;
-
 	const char *field_name;
-	size_t		size,
-				outlen;
+	size_t		size;
+	char		nullterm;
 	char	   *sp;
 	char	   *dp;
 	text	   *result;
+
+	if (membuf == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("could not create OpenSSL BIO structure")));
 
 	(void) BIO_set_close(membuf, BIO_CLOSE);
 	for (i = 0; i < count; i++)
 	{
 		e = X509_NAME_get_entry(name, i);
 		nid = OBJ_obj2nid(X509_NAME_ENTRY_get_object(e));
+		if (nid == NID_undef)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("could not get NID for ASN1_OBJECT object")));
 		v = X509_NAME_ENTRY_get_data(e);
 		field_name = OBJ_nid2sn(nid);
-		if (!field_name)
+		if (field_name == NULL)
 			field_name = OBJ_nid2ln(nid);
+		if (field_name == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("could not convert NID %d to an ASN1_OBJECT structure", nid)));
 		BIO_printf(membuf, "/%s=", field_name);
 		ASN1_STRING_print_ex(membuf, v,
 							 ((ASN1_STRFLGS_RFC2253 & ~ASN1_STRFLGS_ESC_MSB)
 							  | ASN1_STRFLGS_UTF8_CONVERT));
 	}
 
-	i = 0;
-	BIO_write(membuf, &i, 1);
+	/* ensure null termination of the BIO's content */
+	nullterm = '\0';
+	BIO_write(membuf, &nullterm, 1);
 	size = BIO_get_mem_data(membuf, &sp);
-
-	dp = (char *) pg_do_encoding_conversion((unsigned char *) sp,
-											size - 1,
-											PG_UTF8,
-											GetDatabaseEncoding());
-	outlen = strlen(dp);
-	result = palloc(VARHDRSZ + outlen);
-	memcpy(VARDATA(result), dp, outlen);
-	SET_VARSIZE(result, VARHDRSZ + outlen);
-
+	dp = pg_any_to_server(sp, size - 1, PG_UTF8);
+	result = cstring_to_text(dp);
 	if (dp != sp)
 		pfree(dp);
-	BIO_free(membuf);
+	if (BIO_free(membuf) != 1)
+		elog(ERROR, "could not free OpenSSL BIO structure");
 
 	PG_RETURN_TEXT_P(result);
 }
@@ -360,4 +380,139 @@ ssl_issuer_dn(PG_FUNCTION_ARGS)
 	if (!(MyProcPort->peer))
 		PG_RETURN_NULL();
 	return X509_NAME_to_text(X509_get_issuer_name(MyProcPort->peer));
+}
+
+
+/*
+ * Returns information about available SSL extensions.
+ *
+ * Returns setof record made of the following values:
+ * - name of the extension.
+ * - value of the extension.
+ * - critical status of the extension.
+ */
+PG_FUNCTION_INFO_V1(ssl_extension_info);
+Datum
+ssl_extension_info(PG_FUNCTION_ARGS)
+{
+	X509	   *cert = MyProcPort->peer;
+	FuncCallContext *funcctx;
+	int			call_cntr;
+	int			max_calls;
+	MemoryContext oldcontext;
+	SSLExtensionInfoContext *fctx;
+
+	if (SRF_IS_FIRSTCALL())
+	{
+
+		TupleDesc	tupdesc;
+
+		/* create a function context for cross-call persistence */
+		funcctx = SRF_FIRSTCALL_INIT();
+
+		/*
+		 * Switch to memory context appropriate for multiple function calls
+		 */
+		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+		/* Create a user function context for cross-call persistence */
+		fctx = (SSLExtensionInfoContext *) palloc(sizeof(SSLExtensionInfoContext));
+
+		/* Construct tuple descriptor */
+		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("function returning record called in context that cannot accept type record")));
+		fctx->tupdesc = BlessTupleDesc(tupdesc);
+
+		/* Set max_calls as a count of extensions in certificate */
+		max_calls = cert != NULL ? X509_get_ext_count(cert) : 0;
+
+		if (max_calls > 0)
+		{
+			/* got results, keep track of them */
+			funcctx->max_calls = max_calls;
+			funcctx->user_fctx = fctx;
+		}
+		else
+		{
+			/* fast track when no results */
+			MemoryContextSwitchTo(oldcontext);
+			SRF_RETURN_DONE(funcctx);
+		}
+
+		MemoryContextSwitchTo(oldcontext);
+	}
+
+	/* stuff done on every call of the function */
+	funcctx = SRF_PERCALL_SETUP();
+
+	/*
+	 * Initialize per-call variables.
+	 */
+	call_cntr = funcctx->call_cntr;
+	max_calls = funcctx->max_calls;
+	fctx = funcctx->user_fctx;
+
+	/* do while there are more left to send */
+	if (call_cntr < max_calls)
+	{
+		Datum		values[3];
+		bool		nulls[3];
+		char	   *buf;
+		HeapTuple	tuple;
+		Datum		result;
+		BIO		   *membuf;
+		X509_EXTENSION *ext;
+		ASN1_OBJECT *obj;
+		int			nid;
+		int			len;
+
+		/* need a BIO for this */
+		membuf = BIO_new(BIO_s_mem());
+		if (membuf == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("could not create OpenSSL BIO structure")));
+
+		/* Get the extension from the certificate */
+		ext = X509_get_ext(cert, call_cntr);
+		obj = X509_EXTENSION_get_object(ext);
+
+		/* Get the extension name */
+		nid = OBJ_obj2nid(obj);
+		if (nid == NID_undef)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			errmsg("unknown OpenSSL extension in certificate at position %d",
+				   call_cntr)));
+		values[0] = CStringGetTextDatum(OBJ_nid2sn(nid));
+		nulls[0] = false;
+
+		/* Get the extension value */
+		if (X509V3_EXT_print(membuf, ext, 0, 0) <= 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("could not print extension value in certificate at position %d",
+							call_cntr)));
+		len = BIO_get_mem_data(membuf, &buf);
+		values[1] = PointerGetDatum(cstring_to_text_with_len(buf, len));
+		nulls[1] = false;
+
+		/* Get critical status */
+		values[2] = BoolGetDatum(X509_EXTENSION_get_critical(ext));
+		nulls[2] = false;
+
+		/* Build tuple */
+		tuple = heap_form_tuple(fctx->tupdesc, values, nulls);
+		result = HeapTupleGetDatum(tuple);
+
+		if (BIO_free(membuf) != 1)
+			elog(ERROR, "could not free OpenSSL BIO structure");
+
+		SRF_RETURN_NEXT(funcctx, result);
+	}
+
+	/* All done */
+	SRF_RETURN_DONE(funcctx);
 }

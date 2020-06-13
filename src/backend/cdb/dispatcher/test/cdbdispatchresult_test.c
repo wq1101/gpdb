@@ -7,11 +7,11 @@
 
 #define UNITTEST_NUM_SEGS 2
 
-struct CdbDispatchResults *
+static struct CdbDispatchResults *
 _init_cdbdisp_makeResult()
 {
 	struct CdbDispatchResults *results =
-		(struct CdbDispatchResults *) palloc0(sizeof(*results));
+	(struct CdbDispatchResults *) palloc0(sizeof(*results));
 
 	results->resultArray = palloc0(UNITTEST_NUM_SEGS * sizeof(results->resultArray[0]));
 	results->resultCapacity = UNITTEST_NUM_SEGS;
@@ -22,14 +22,14 @@ _init_cdbdisp_makeResult()
 /*
  * Test cdbdisp_makeResult would return NULL if OOM happens
  */
-void
+static void
 test__cdbdisp_makeResult__oom(void **state)
 {
 	CdbDispatchResult *result = NULL;
 
 	struct CdbDispatchResults *results = _init_cdbdisp_makeResult();
 	struct SegmentDatabaseDescriptor *segdbDesc =
-		(struct SegmentDatabaseDescriptor *) palloc0(sizeof(struct SegmentDatabaseDescriptor));
+	(struct SegmentDatabaseDescriptor *) palloc0(sizeof(struct SegmentDatabaseDescriptor));
 
 	/*
 	 * createPQExpBuffer is supposed to return NULL in OOM cases
@@ -46,13 +46,13 @@ main(int argc, char *argv[])
 {
 	cmockery_parse_arguments(argc, argv);
 
-    const UnitTest tests[] =
-    {
-        unit_test(test__cdbdisp_makeResult__oom)
-    };
+	const		UnitTest tests[] =
+	{
+		unit_test(test__cdbdisp_makeResult__oom)
+	};
 
 	Gp_role = GP_ROLE_DISPATCH;
 	MemoryContextInit();
 
-    return run_tests(tests);
+	return run_tests(tests);
 }

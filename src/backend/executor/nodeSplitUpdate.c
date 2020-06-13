@@ -17,6 +17,8 @@
 #include "miscadmin.h"
 
 #include "cdb/cdbpartition.h"
+#include "cdb/cdbhash.h"
+#include "cdb/cdbutil.h"
 #include "commands/tablecmds.h"
 #include "executor/execDML.h"
 #include "executor/instrument.h"
@@ -25,31 +27,57 @@
 #include "utils/memutils.h"
 
 /* Splits an update tuple into a DELETE/INSERT tuples. */
-void
-SplitTupleTableSlot(List *targetList, SplitUpdate *plannode, SplitUpdateState *node, Datum *values, bool *nulls);
+static void SplitTupleTableSlot(TupleTableSlot *slot,
+								List *targetList, SplitUpdate *plannode, SplitUpdateState *node,
+								Datum *values, bool *nulls);
 
-/* Number of slots used by SplitUpdate node */
-#define SPLITUPDATE_NSLOTS 3
 /* Memory used by node */
 #define SPLITUPDATE_MEM 1
 
+
 /*
- * Estimated Memory Usage of Split DML Node.
- * */
-void
-ExecSplitUpdateExplainEnd(PlanState *planstate, struct StringInfoData *buf)
+ * Evaluate the hash keys, and compute the target segment ID for the new row.
+ */
+static uint32
+evalHashKey(SplitUpdateState *node, Datum *values, bool *isnulls)
 {
-	/* Add memory size of context */
-	planstate->instrument->execmemused += SPLITUPDATE_MEM;
+	SplitUpdate *plannode = (SplitUpdate *) node->ps.plan;
+	ExprContext *econtext = node->ps.ps_ExprContext;
+	MemoryContext oldContext;
+	unsigned int target_seg;
+	CdbHash	   *h = node->cdbhash;
+
+	ResetExprContext(econtext);
+
+	oldContext = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
+
+	cdbhashinit(h);
+
+	for (int i = 0; i < plannode->numHashAttrs; i++)
+	{
+		AttrNumber	keyattno = plannode->hashAttnos[i];
+
+		/*
+		 * Compute the hash function
+		 */
+		cdbhash(h, i + 1, values[keyattno - 1], isnulls[keyattno - 1]);
+	}
+	target_seg = cdbhashreduce(h);
+
+	MemoryContextSwitchTo(oldContext);
+
+	return target_seg;
 }
 
 /* Split TupleTableSlot into a DELETE and INSERT TupleTableSlot */
-void
-SplitTupleTableSlot(List *targetList, SplitUpdate *plannode, SplitUpdateState *node, Datum *values, bool *nulls)
+static void
+SplitTupleTableSlot(TupleTableSlot *slot,
+					List *targetList, SplitUpdate *plannode, SplitUpdateState *node,
+					Datum *values, bool *nulls)
 {
-	ListCell *element = NULL;
-	ListCell *deleteAtt = plannode->deleteColIdx->head;
-	ListCell *insertAtt = plannode->insertColIdx->head;
+	ListCell *element;
+	ListCell *deleteAtt = list_head(plannode->deleteColIdx);
+	ListCell *insertAtt = list_head(plannode->insertColIdx);
 
 	Datum *delete_values = slot_get_values(node->deleteTuple);
 	bool *delete_nulls = slot_get_isnull(node->deleteTuple);
@@ -60,38 +88,78 @@ SplitTupleTableSlot(List *targetList, SplitUpdate *plannode, SplitUpdateState *n
 	foreach (element, targetList)
 	{
 		TargetEntry *tle = lfirst(element);
-		int resno = tle->resno-1;
+		AttrNumber attno = tle->resno;
 
 		if (IsA(tle->expr, DMLActionExpr))
 		{
 			/* Set the corresponding action to the new tuples. */
-			delete_values[resno] = Int32GetDatum((int)DML_DELETE);
-			delete_nulls[resno] = false;
+			delete_values[attno - 1] = Int32GetDatum((int)DML_DELETE);
+			delete_nulls[attno - 1] = false;
 
-			insert_values[resno] = Int32GetDatum((int)DML_INSERT);
-			insert_nulls[resno] = false;
+			insert_values[attno - 1] = Int32GetDatum((int)DML_INSERT);
+			insert_nulls[attno -1 ] = false;
 		}
-		else if (((int)tle->resno) < plannode->ctidColIdx)
+		else if (attno <= list_length(plannode->insertColIdx))
 		{
 			/* Old and new values */
-			delete_values[resno] = values[deleteAtt->data.int_value-1];
-			delete_nulls[resno] = nulls[deleteAtt->data.int_value-1];
+			int			deleteAttNo = lfirst_int(deleteAtt);
+			int			insertAttNo = lfirst_int(insertAtt);
 
-			insert_values[resno] = values[insertAtt->data.int_value-1];
-			insert_nulls[resno] = nulls[insertAtt->data.int_value-1];
+			if (deleteAttNo == -1)
+			{
+				delete_values[attno - 1] = (Datum) 0;
+				delete_nulls[attno - 1] = true;
+			}
+			else
+			{
+				delete_values[attno - 1] = values[deleteAttNo - 1];
+				delete_nulls[attno - 1] = nulls[deleteAttNo - 1];
+			}
 
-			deleteAtt = deleteAtt->next;
-			insertAtt = insertAtt->next;
+			insert_values[attno - 1] = values[insertAttNo - 1];
+			insert_nulls[attno - 1] = nulls[insertAttNo - 1];
+
+			deleteAtt = lnext(deleteAtt);
+			insertAtt = lnext(insertAtt);
+		}
+		else if (attno == node->output_segid_attno)
+		{
+			Assert(!nulls[node->input_segid_attno - 1]);
+
+			delete_values[attno - 1] = values[node->input_segid_attno - 1];
+			delete_nulls[attno - 1] = false;
+
+			/* compute the new value later, after we have processed all the other columns */
 		}
 		else
 		{
-			/* `Resjunk' values */
-			delete_values[resno] = values[((Var *)tle->expr)->varattno-1];
-			delete_nulls[resno] = nulls[((Var *)tle->expr)->varattno-1];
+			if (IsA(tle->expr, Var))
+			{
+				Var		   *var = (Var *) tle->expr;
 
-			insert_values[resno] = values[((Var *)tle->expr)->varattno-1];
-			insert_nulls[resno] = nulls[((Var *)tle->expr)->varattno-1];
+				Assert(var->varno == OUTER_VAR);
+
+				delete_values[attno - 1] = values[var->varattno - 1];
+				delete_nulls[attno - 1] = nulls[var->varattno - 1];
+
+				insert_values[attno - 1] = values[var->varattno - 1];
+				insert_nulls[attno - 1] = nulls[var->varattno - 1];
+
+				Assert(var->vartype == slot->tts_tupleDescriptor->attrs[var->varattno - 1]->atttypid);
+			}
+			/* `Resjunk' values */
 		}
+	}
+
+	/* Compute segment ID for the new row */
+	if (node->output_segid_attno > 0)
+	{
+		int32		target_seg;
+
+		target_seg = evalHashKey(node, insert_values, insert_nulls);
+
+		insert_values[node->output_segid_attno - 1] = Int32GetDatum(target_seg);
+		insert_nulls[node->output_segid_attno - 1] = false;
 	}
 }
 
@@ -134,7 +202,7 @@ ExecSplitUpdate(SplitUpdateState *node)
 		ExecStoreAllNullTuple(node->deleteTuple);
 		ExecStoreAllNullTuple(node->insertTuple);
 
-		SplitTupleTableSlot(plannode->plan.targetlist, plannode, node, values, nulls);
+		SplitTupleTableSlot(slot, plannode->plan.targetlist, plannode, node, values, nulls);
 
 		result = node->deleteTuple;
 		node->processInsert = false;
@@ -153,6 +221,8 @@ ExecInitSplitUpdate(SplitUpdate *node, EState *estate, int eflags)
 	/* Check for unsupported flags */
 	Assert(!(eflags & (EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK | EXEC_FLAG_REWIND)));
 
+	bool    has_oids = false;
+
 	SplitUpdateState *splitupdatestate;
 
 	splitupdatestate = makeNode(SplitUpdateState);
@@ -166,15 +236,28 @@ ExecInitSplitUpdate(SplitUpdate *node, EState *estate, int eflags)
 	Plan *outerPlan = outerPlan(node);
 	outerPlanState(splitupdatestate) = ExecInitNode(outerPlan, estate, eflags);
 
+	ExecAssignExprContext(estate, &splitupdatestate->ps);
+
 	ExecInitResultTupleSlot(estate, &splitupdatestate->ps);
 
 	splitupdatestate->insertTuple = ExecInitExtraTupleSlot(estate);
 	splitupdatestate->deleteTuple = ExecInitExtraTupleSlot(estate);
 
 	/* New TupleDescriptor for output TupleTableSlots (old_values + new_values, ctid, gp_segment, action).*/
-	TupleDesc tupDesc = ExecTypeFromTL(node->plan.targetlist, false);
+	ExecContextForcesOids((PlanState *) splitupdatestate, &has_oids);
+
+	TupleDesc tupDesc = ExecTypeFromTL(node->plan.targetlist, has_oids);
 	ExecSetSlotDescriptor(splitupdatestate->insertTuple, tupDesc);
 	ExecSetSlotDescriptor(splitupdatestate->deleteTuple, tupDesc);
+
+	/*
+	 * Look up the positions of the gp_segment_id in the subplan's target
+	 * list, and in the result.
+	 */
+	splitupdatestate->input_segid_attno =
+		ExecFindJunkAttributeInTlist(outerPlan->targetlist, "gp_segment_id");
+	splitupdatestate->output_segid_attno =
+		ExecFindJunkAttributeInTlist(node->plan.targetlist, "gp_segment_id");
 
 	/*
 	 * DML nodes do not project.
@@ -182,15 +265,20 @@ ExecInitSplitUpdate(SplitUpdate *node, EState *estate, int eflags)
 	ExecAssignResultTypeFromTL(&splitupdatestate->ps);
 	ExecAssignProjectionInfo(&splitupdatestate->ps, NULL);
 
-	if (estate->es_instrument)
+	/*
+	 * Initialize for computing hash key
+	 */
+	if (node->numHashAttrs > 0)
 	{
-			splitupdatestate->ps.cdbexplainbuf = makeStringInfo();
-
-			/* Request a callback at end of query. */
-			splitupdatestate->ps.cdbexplainfun = ExecSplitUpdateExplainEnd;
+		splitupdatestate->cdbhash = makeCdbHash(node->numHashSegments,
+												node->numHashAttrs,
+												node->hashFuncs);
 	}
 
-	initGpmonPktForSplitUpdate((Plan *)node, &splitupdatestate->ps.gpmon_pkt, estate);
+	if (estate->es_instrument && (estate->es_instrument & INSTRUMENT_CDB))
+	{
+		splitupdatestate->ps.cdbexplainbuf = makeStringInfo();
+	}
 
 	return splitupdatestate;
 }
@@ -204,22 +292,5 @@ ExecEndSplitUpdate(SplitUpdateState *node)
 	ExecClearTuple(node->insertTuple);
 	ExecClearTuple(node->deleteTuple);
 	ExecEndNode(outerPlanState(node));
-	EndPlanStateGpmonPkt(&node->ps);
-}
-
-/* Return number of TupleTableSlots used by SplitUpdate node.*/
-int
-ExecCountSlotsSplitUpdate(SplitUpdate *node)
-{
-	return ExecCountSlotsNode(outerPlan(node)) + SPLITUPDATE_NSLOTS;
-}
-
-/* Tracing execution for GP Monitor. */
-void
-initGpmonPktForSplitUpdate(Plan *planNode, gpmon_packet_t *gpmon_pkt, EState *estate)
-{
-	Assert(planNode != NULL && gpmon_pkt != NULL && IsA(planNode, SplitUpdate));
-
-	InitPlanNodeGpmonPkt(planNode, gpmon_pkt, estate);
 }
 

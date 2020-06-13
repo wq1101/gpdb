@@ -19,7 +19,7 @@
 #define CDBBUFFEREDAPPEND_H
 
 #include "storage/fd.h"
-#include "cdb/cdbmirroredappendonly.h"
+#include "storage/relfilenode.h"
 
 typedef struct BufferedAppend
 {
@@ -31,10 +31,13 @@ typedef struct BufferedAppend
 	/*
 	 * Large-write memory level members.
 	 */
-    int32      			 maxBufferLen;
+
+    /* AO block size plus additional space cost of compression algorithm */
+    int32      			 maxBufferWithCompressionOverrrunLen;
+    /* buffer will be flushed to disk when maxLargeWriteLen is reached  */
     int32      			 maxLargeWriteLen;
 
-	uint8                *memory;
+    uint8                *memory;
     int32                memoryLen;
 
     uint8                *largeWriteMemory;
@@ -70,13 +73,11 @@ typedef struct BufferedAppend
 	 * File level members.
 	 */
 	File 				 file;
+	RelFileNodeBackend	relFileNode;
+	int32				segmentFileNum;
     char				 *filePathName;
     int64                fileLen;
     int64				 fileLen_uncompressed; /* for calculating compress ratio */
-
-	int64				initialSetFilePosition;
-
-	MirroredAppendOnlyOpen		mirroredOpen;
 
 } BufferedAppend;
 
@@ -86,7 +87,7 @@ typedef struct BufferedAppend
  * large write lengths.
  */
 extern int32 BufferedAppendMemoryLen(
-    int32                maxBufferLen,
+    int32                maxBufferWithCompressionOverrrunLen,
     int32                maxLargeWriteLen);
 
 /*
@@ -96,12 +97,12 @@ extern int32 BufferedAppendMemoryLen(
  * determine the amount of memory to supply.
  */
 extern void BufferedAppendInit(
-    BufferedAppend       *bufferedAppend,
-    uint8                *memory,
-    int32                memoryLen,
-    int32                maxBufferLen,
-    int32                maxLargeWriteLen,
-    char				 *relationName);
+	BufferedAppend *bufferedAppend,
+	uint8          *memory,
+	int32          memoryLen,
+	int32          maxBufferWithCompressionOverrrunLen,
+	int32          maxLargeWriteLen,
+	char           *relationName);
 
 /*
  * Takes an open file handle for the next file.
@@ -109,6 +110,8 @@ extern void BufferedAppendInit(
 extern void BufferedAppendSetFile(
     BufferedAppend       *bufferedAppend,
     File 				 file,
+	RelFileNodeBackend	 relfilenode,
+	int32				 segmentFileNum,
     char				 *filePathName,
     int64				 eof,
     int64				 eof_uncompressed);
@@ -162,13 +165,8 @@ extern void BufferedAppendCancelLastBuffer(
 extern void BufferedAppendFinishBuffer(
     BufferedAppend       *bufferedAppend,
     int32                usedLen,
-    int32				 usedLen_uncompressed);
-
-/*
- * Returns the length of the current file.
- */
-extern int64 BufferedAppendFileLen(
-    BufferedAppend *bufferedAppend);
+    int32				 usedLen_uncompressed,
+    bool 				 needsWAL);
 
 /*
  * Flushes the current file for append.  Caller is responsible for closing
@@ -177,7 +175,8 @@ extern int64 BufferedAppendFileLen(
 extern void BufferedAppendCompleteFile(
     BufferedAppend	*bufferedAppend,
     int64 			*fileLen,
-    int64 			*fileLen_uncompressed);
+    int64 			*fileLen_uncompressed,
+    bool 			needsWAL);
 
 
 /*

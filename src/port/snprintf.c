@@ -2,6 +2,7 @@
  * Copyright (c) 1983, 1995, 1996 Eric P. Allman
  * Copyright (c) 1988, 1993
  *	The Regents of the University of California.  All rights reserved.
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -18,7 +19,7 @@
  * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
  * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED.	IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
  * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
  * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
  * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
@@ -27,12 +28,15 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $PostgreSQL: pgsql/src/port/snprintf.c,v 1.35 2008/03/18 01:49:44 tgl Exp $
+ * src/port/snprintf.c
  */
 
 #include "c.h"
 
 #include <ctype.h>
+#ifdef _MSC_VER
+#include <float.h>				/* for _isnan */
+#endif
 #include <limits.h>
 #include <math.h>
 #ifndef WIN32
@@ -40,17 +44,21 @@
 #endif
 #include <sys/param.h>
 
-#ifndef NL_ARGMAX
-#define NL_ARGMAX 16
-#endif
+/*
+ * We used to use the platform's NL_ARGMAX here, but that's a bad idea,
+ * first because the point of this module is to remove platform dependencies
+ * not perpetuate them, and second because some platforms use ridiculously
+ * large values, leading to excessive stack consumption in dopr().
+ */
+#define PG_NL_ARGMAX 31
 
 
 /*
  *	SNPRINTF, VSNPRINTF and friends
  *
  * These versions have been grabbed off the net.  They have been
- * cleaned up to compile properly and support for most of the Single Unix
- * Specification has been added.  Remaining unimplemented features are:
+ * cleaned up to compile properly and support for most of the C99
+ * specification has been added.  Remaining unimplemented features are:
  *
  * 1. No locale support: the radix character is always '.' and the '
  * (single quote) format flag is ignored.
@@ -64,32 +72,31 @@
  * 5. Space and '#' flags are not implemented.
  *
  *
- * The result values of these functions are not the same across different
- * platforms.  This implementation is compatible with the Single Unix Spec:
+ * Historically the result values of sprintf/snprintf varied across platforms.
+ * This implementation now follows the C99 standard:
  *
- * 1. -1 is returned only if processing is abandoned due to an invalid
- * parameter, such as incorrect format string.	(Although not required by
- * the spec, this happens only when no characters have yet been transmitted
- * to the destination.)
+ * 1. -1 is returned if an error is detected in the format string, or if
+ * a write to the target stream fails (as reported by fwrite).  Note that
+ * overrunning snprintf's target buffer is *not* an error.
  *
- * 2. For snprintf and sprintf, 0 is returned if str == NULL or count == 0;
- * no data has been stored.
+ * 2. For successful writes to streams, the actual number of bytes written
+ * to the stream is returned.
  *
- * 3. Otherwise, the number of bytes actually transmitted to the destination
- * is returned (excluding the trailing '\0' for snprintf and sprintf).
+ * 3. For successful sprintf/snprintf, the number of bytes that would have
+ * been written to an infinite-size buffer (excluding the trailing '\0')
+ * is returned.  snprintf will truncate its output to fit in the buffer
+ * (ensuring a trailing '\0' unless count == 0), but this is not reflected
+ * in the function result.
  *
- * For snprintf with nonzero count, the result cannot be more than count-1
- * (a trailing '\0' is always stored); it is not possible to distinguish
- * buffer overrun from exact fit.  This is unlike some implementations that
- * return the number of bytes that would have been needed for the complete
- * result string.
+ * snprintf buffer overrun can be detected by checking for function result
+ * greater than or equal to the supplied count.
  */
 
 /**************************************************************
  * Original:
  * Patrick Powell Tue Apr 11 09:48:21 PDT 1995
  * A bombproof version of doprnt (dopr) included.
- * Sigh.  This sort of thing is always nasty do deal with.	Note that
+ * Sigh.  This sort of thing is always nasty do deal with.  Note that
  * the version here does not include floating point. (now it does ... tgl)
  **************************************************************/
 
@@ -101,15 +108,28 @@
 #undef	fprintf
 #undef	printf
 
-/* Info about where the formatted output is going */
+/*
+ * Info about where the formatted output is going.
+ *
+ * dopr and subroutines will not write at/past bufend, but snprintf
+ * reserves one byte, ensuring it may place the trailing '\0' there.
+ *
+ * In snprintf, we use nchars to count the number of bytes dropped on the
+ * floor due to buffer overrun.  The correct result of snprintf is thus
+ * (bufptr - bufstart) + nchars.  (This isn't as inconsistent as it might
+ * seem: nchars is the number of emitted bytes that are not in the buffer now,
+ * either because we sent them to the stream or because we couldn't fit them
+ * into the buffer to begin with.)
+ */
 typedef struct
 {
 	char	   *bufptr;			/* next buffer output position */
 	char	   *bufstart;		/* first buffer element */
-	char	   *bufend;			/* last buffer element, or NULL */
+	char	   *bufend;			/* last+1 buffer element, or NULL */
 	/* bufend == NULL is for sprintf, where we assume buf is big enough */
 	FILE	   *stream;			/* eventual output destination, or NULL */
-	int			nchars;			/* # chars already sent to stream */
+	int			nchars;			/* # chars sent to stream, or dropped */
+	bool		failed;			/* call is a failure; errno is set */
 } PrintfTarget;
 
 /*
@@ -139,28 +159,35 @@ typedef union
 
 
 static void flushbuffer(PrintfTarget *target);
-static int	dopr(PrintfTarget *target, const char *format, va_list args);
+static void dopr(PrintfTarget *target, const char *format, va_list args);
 
 
 int
 pg_vsnprintf(char *str, size_t count, const char *fmt, va_list args)
 {
 	PrintfTarget target;
+	char		onebyte[1];
 
-	if (str == NULL || count == 0)
-		return 0;
+	/*
+	 * C99 allows the case str == NULL when count == 0.  Rather than
+	 * special-casing this situation further down, we substitute a one-byte
+	 * local buffer.  Callers cannot tell, since the function result doesn't
+	 * depend on count.
+	 */
+	if (count == 0)
+	{
+		str = onebyte;
+		count = 1;
+	}
 	target.bufstart = target.bufptr = str;
 	target.bufend = str + count - 1;
 	target.stream = NULL;
-	/* target.nchars is unused in this case */
-	if (dopr(&target, fmt, args))
-	{
-		*(target.bufptr) = '\0';
-		errno = EINVAL;			/* bad format */
-		return -1;
-	}
+	target.nchars = 0;
+	target.failed = false;
+	dopr(&target, fmt, args);
 	*(target.bufptr) = '\0';
-	return target.bufptr - target.bufstart;
+	return target.failed ? -1 : (target.bufptr - target.bufstart
+								 + target.nchars);
 }
 
 int
@@ -180,20 +207,15 @@ pg_vsprintf(char *str, const char *fmt, va_list args)
 {
 	PrintfTarget target;
 
-	if (str == NULL)
-		return 0;
 	target.bufstart = target.bufptr = str;
 	target.bufend = NULL;
 	target.stream = NULL;
-	/* target.nchars is unused in this case */
-	if (dopr(&target, fmt, args))
-	{
-		*(target.bufptr) = '\0';
-		errno = EINVAL;			/* bad format */
-		return -1;
-	}
+	target.nchars = 0;			/* not really used in this case */
+	target.failed = false;
+	dopr(&target, fmt, args);
 	*(target.bufptr) = '\0';
-	return target.bufptr - target.bufstart;
+	return target.failed ? -1 : (target.bufptr - target.bufstart
+								 + target.nchars);
 }
 
 int
@@ -220,17 +242,14 @@ pg_vfprintf(FILE *stream, const char *fmt, va_list args)
 		return -1;
 	}
 	target.bufstart = target.bufptr = buffer;
-	target.bufend = buffer + sizeof(buffer) - 1;
+	target.bufend = buffer + sizeof(buffer);	/* use the whole buffer */
 	target.stream = stream;
 	target.nchars = 0;
-	if (dopr(&target, fmt, args))
-	{
-		errno = EINVAL;			/* bad format */
-		return -1;
-	}
+	target.failed = false;
+	dopr(&target, fmt, args);
 	/* dump any remaining buffer contents */
 	flushbuffer(&target);
-	return target.nchars;
+	return target.failed ? -1 : target.nchars;
 }
 
 int
@@ -257,14 +276,28 @@ pg_printf(const char *fmt,...)
 	return len;
 }
 
-/* call this only when stream is defined */
+/*
+ * Attempt to write the entire buffer to target->stream; discard the entire
+ * buffer in any case.  Call this only when target->stream is defined.
+ */
 static void
 flushbuffer(PrintfTarget *target)
 {
 	size_t		nc = target->bufptr - target->bufstart;
 
-	if (nc > 0)
-		target->nchars += fwrite(target->bufstart, 1, nc, target->stream);
+	/*
+	 * Don't write anything if we already failed; this is to ensure we
+	 * preserve the original failure's errno.
+	 */
+	if (!target->failed && nc > 0)
+	{
+		size_t		written;
+
+		written = fwrite(target->bufstart, 1, nc, target->stream);
+		target->nchars += written;
+		if (written != nc)
+			target->failed = true;
+	}
 	target->bufptr = target->bufstart;
 }
 
@@ -291,7 +324,7 @@ static void trailing_pad(int *padlen, PrintfTarget *target);
 /*
  * dopr(): poor man's version of doprintf
  */
-static int
+static void
 dopr(PrintfTarget *target, const char *format, va_list args)
 {
 	const char *format_start = format;
@@ -316,8 +349,8 @@ dopr(PrintfTarget *target, const char *format, va_list args)
 	double		fvalue;
 	char	   *strvalue;
 	int			i;
-	PrintfArgType argtypes[NL_ARGMAX + 1];
-	PrintfArgValue argvalues[NL_ARGMAX + 1];
+	PrintfArgType argtypes[PG_NL_ARGMAX + 1];
+	PrintfArgValue argvalues[PG_NL_ARGMAX + 1];
 
 	/*
 	 * Parse the format string to determine whether there are %n$ format
@@ -367,13 +400,13 @@ nextch1:
 				goto nextch1;
 			case '$':
 				have_dollar = true;
-				if (accum <= 0 || accum > NL_ARGMAX)
-					return -1;
+				if (accum <= 0 || accum > PG_NL_ARGMAX)
+					goto bad_format;
 				if (afterstar)
 				{
 					if (argtypes[accum] &&
 						argtypes[accum] != ATYPE_INT)
-						return -1;
+						goto bad_format;
 					argtypes[accum] = ATYPE_INT;
 					last_dollar = Max(last_dollar, accum);
 					afterstar = false;
@@ -387,6 +420,19 @@ nextch1:
 					longlongflag = 1;
 				else
 					longflag = 1;
+				goto nextch1;
+			case 'z':
+#if SIZEOF_SIZE_T == 8
+#ifdef HAVE_LONG_INT_64
+				longflag = 1;
+#elif defined(HAVE_LONG_LONG_INT_64)
+				longlongflag = 1;
+#else
+#error "Don't know how to print 64bit integers"
+#endif
+#else
+				/* assume size_t is same size as int */
+#endif
 				goto nextch1;
 			case 'h':
 			case '\'':
@@ -410,7 +456,7 @@ nextch1:
 						atype = ATYPE_INT;
 					if (argtypes[fmtpos] &&
 						argtypes[fmtpos] != atype)
-						return -1;
+						goto bad_format;
 					argtypes[fmtpos] = atype;
 					last_dollar = Max(last_dollar, fmtpos);
 				}
@@ -422,7 +468,7 @@ nextch1:
 				{
 					if (argtypes[fmtpos] &&
 						argtypes[fmtpos] != ATYPE_INT)
-						return -1;
+						goto bad_format;
 					argtypes[fmtpos] = ATYPE_INT;
 					last_dollar = Max(last_dollar, fmtpos);
 				}
@@ -435,7 +481,7 @@ nextch1:
 				{
 					if (argtypes[fmtpos] &&
 						argtypes[fmtpos] != ATYPE_CHARPTR)
-						return -1;
+						goto bad_format;
 					argtypes[fmtpos] = ATYPE_CHARPTR;
 					last_dollar = Max(last_dollar, fmtpos);
 				}
@@ -451,7 +497,7 @@ nextch1:
 				{
 					if (argtypes[fmtpos] &&
 						argtypes[fmtpos] != ATYPE_DOUBLE)
-						return -1;
+						goto bad_format;
 					argtypes[fmtpos] = ATYPE_DOUBLE;
 					last_dollar = Max(last_dollar, fmtpos);
 				}
@@ -472,7 +518,7 @@ nextch1:
 
 	/* Per spec, you use either all dollar or all not. */
 	if (have_dollar && have_non_dollar)
-		return -1;
+		goto bad_format;
 
 	/*
 	 * In dollar mode, collect the arguments in physical order.
@@ -482,7 +528,7 @@ nextch1:
 		switch (argtypes[i])
 		{
 			case ATYPE_NONE:
-				return -1;		/* invalid format */
+				goto bad_format;
 			case ATYPE_INT:
 				argvalues[i].i = va_arg(args, int);
 				break;
@@ -507,6 +553,9 @@ nextch1:
 	format = format_start;
 	while ((ch = *format++) != '\0')
 	{
+		if (target->failed)
+			break;
+
 		if (ch != '%')
 		{
 			dopr_outch(ch, target);
@@ -620,6 +669,19 @@ nextch2:
 					longlongflag = 1;
 				else
 					longflag = 1;
+				goto nextch2;
+			case 'z':
+#if SIZEOF_SIZE_T == 8
+#ifdef HAVE_LONG_INT_64
+				longflag = 1;
+#elif defined(HAVE_LONG_LONG_INT_64)
+				longlongflag = 1;
+#else
+#error "Don't know how to print 64bit integers"
+#endif
+#else
+				/* assume size_t is same size as int */
+#endif
 				goto nextch2;
 			case 'h':
 			case '\'':
@@ -751,7 +813,11 @@ nextch2:
 		}
 	}
 
-	return 0;
+	return;
+
+bad_format:
+	errno = EINVAL;
+	target->failed = true;
 }
 
 static size_t
@@ -801,8 +867,10 @@ fmtptr(void *value, PrintfTarget *target)
 
 	/* we rely on regular C library's sprintf to do the basic conversion */
 	vallen = sprintf(convert, "%p", value);
-
-	dostr(convert, vallen, target);
+	if (vallen < 0)
+		target->failed = true;
+	else
+		dostr(convert, vallen, target);
 }
 
 static void
@@ -935,16 +1003,19 @@ fmtfloat(double value, char type, int forcesign, int leftjust,
 
 	if (pointflag)
 	{
-		sprintf(fmt, "%%.%d%c", prec, type);
+		if (sprintf(fmt, "%%.%d%c", prec, type) < 0)
+			goto fail;
 		zeropadlen = precision - prec;
 	}
-	else
-		sprintf(fmt, "%%%c", type);
+	else if (sprintf(fmt, "%%%c", type) < 0)
+		goto fail;
 
 	if (!isnan(value) && adjust_sign((value < 0), forcesign, &signvalue))
 		value = -value;
 
 	vallen = sprintf(convert, fmt, value);
+	if (vallen < 0)
+		goto fail;
 
 	/* If it's infinity or NaN, forget about doing any zero-padding */
 	if (zeropadlen > 0 && !isdigit((unsigned char) convert[vallen - 1]))
@@ -984,6 +1055,10 @@ fmtfloat(double value, char type, int forcesign, int leftjust,
 	}
 
 	trailing_pad(&padlen, target);
+	return;
+
+fail:
+	target->failed = true;
 }
 
 static void
@@ -1001,7 +1076,10 @@ dostr(const char *str, int slen, PrintfTarget *target)
 		{
 			/* buffer full, can we dump to stream? */
 			if (target->stream == NULL)
-				return;			/* no, lose the data */
+			{
+				target->nchars += slen; /* no, lose the data */
+				return;
+			}
 			flushbuffer(target);
 			continue;
 		}
@@ -1020,7 +1098,10 @@ dopr_outch(int c, PrintfTarget *target)
 	{
 		/* buffer full, can we dump to stream? */
 		if (target->stream == NULL)
-			return;				/* no, lose the data */
+		{
+			target->nchars++;	/* no, lose the data */
+			return;
+		}
 		flushbuffer(target);
 	}
 	*(target->bufptr++) = c;

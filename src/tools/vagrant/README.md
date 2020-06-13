@@ -12,7 +12,7 @@ Anyone who wants to develop code for GPDB. This guide targets the
 freelance developer who typically has a laptop and wants to develop
 GPDB code on it. In other words, such a typical developer does not necessarily
 have 24x7 access to a cluster, and needs a miminal stand-alone development
-enviroment.
+environment.
 
 The instructions here were verified on the configurations below.
 
@@ -182,7 +182,7 @@ in the picture above) that has the word "master" in the `-D`parameter setting,
 whereas the segment hosts have the word "gpseg" in the `-D` parameter setting.
 
 Next, start ``gdb`` from a guest terminal. Once you get a prompt in gdb, type
-in the following (the pid you specify in the `attach` comnnand will be
+in the following (the pid you specify in the `attach` command will be
 different for you):
 ```gdb
 set follow-fork-mode child

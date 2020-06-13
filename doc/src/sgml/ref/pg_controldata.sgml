@@ -1,11 +1,15 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/pg_controldata.sgml,v 1.11 2008/09/23 09:20:35 heikki Exp $
+doc/src/sgml/ref/pg_controldata.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="APP-PGCONTROLDATA">
+ <indexterm zone="app-pgcontroldata">
+  <primary>pg_controldata</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="APP-PGCONTROLDATA-TITLE"><application>pg_controldata</application></refentrytitle>
+  <refentrytitle><application>pg_controldata</application></refentrytitle>
   <manvolnum>1</manvolnum>
   <refmiscinfo>Application</refmiscinfo>
  </refmeta>
@@ -15,14 +19,11 @@ PostgreSQL documentation
   <refpurpose>display control information of a <productname>PostgreSQL</productname> database cluster</refpurpose>
  </refnamediv>
 
- <indexterm zone="app-pgcontroldata">
-  <primary>pg_controldata</primary>
- </indexterm>
-
  <refsynopsisdiv>
   <cmdsynopsis>
    <command>pg_controldata</command>
-   <arg><replaceable class="parameter">datadir</replaceable></arg>
+   <arg choice="opt"><replaceable class="parameter">option</replaceable></arg>
+   <arg choice="opt"><arg choice="opt"><option>-D</option></arg> <replaceable class="parameter">datadir</replaceable></arg>
   </cmdsynopsis>
  </refsynopsisdiv>
 
@@ -31,7 +32,7 @@ PostgreSQL documentation
   <para>
    <command>pg_controldata</command> prints information initialized during
    <command>initdb</>, such as the catalog version.
-   It also shows information about write-ahead logging and checkpoint 
+   It also shows information about write-ahead logging and checkpoint
    processing.  This information is cluster-wide, and not specific to any one
    database.
   </para>
@@ -39,8 +40,12 @@ PostgreSQL documentation
   <para>
    This utility can only be run by the user who initialized the cluster because
    it requires read access to the data directory.
-   You can specify the data directory on the command line, or use 
-   the environment variable <envar>PGDATA</>.
+   You can specify the data directory on the command line, or use
+   the environment variable <envar>PGDATA</>.  This utility supports the options
+   <option>-V</> and <option>--version</>, which print the
+   <application>pg_controldata</application> version and exit.  It also
+   supports options <option>-?</> and <option>--help</>, which output the
+   supported arguments.
   </para>
  </refsect1>
 

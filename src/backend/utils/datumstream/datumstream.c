@@ -24,11 +24,11 @@
 #include "access/tuptoaster.h"
 
 #include "catalog/pg_attribute_encoding.h"
+#include "cdb/cdbappendonlyam.h"
 #include "cdb/cdbappendonlyblockdirectory.h"
 #include "cdb/cdbappendonlystoragelayer.h"
 #include "cdb/cdbappendonlystorageread.h"
 #include "cdb/cdbappendonlystoragewrite.h"
-#include "cdb/cdbpersistentfilesysobj.h"
 #include "utils/datumstream.h"
 #include "utils/guc.h"
 #include "catalog/pg_compression.h"
@@ -178,6 +178,7 @@ datumstreamread_getlarge(DatumStreamRead * acc, Datum *datum, bool *null)
 			acc->largeObjectState = DatumStreamLargeObjectState_Consumed;
 
 			/* Fall below to ~_Consumed. */
+			/* fallthrough */
 
 		case DatumStreamLargeObjectState_Consumed:
 			{
@@ -370,7 +371,8 @@ init_datumstream_info(
 	/*
 	 * Adjust maxsz for Append-Only Storage.
 	 */
-	*maxAoBlockSize = AppendOnlyStorage_GetUsableBlockSize(maxsz);
+	Assert(maxsz <= MAX_APPENDONLY_BLOCK_SIZE);
+	*maxAoBlockSize = maxsz;
 
 	/*
 	 * Assume the folowing unless modified below.
@@ -478,7 +480,7 @@ determine_datumstream_compression_overflow(
 		 */
 		desiredOverflowBytes =
 			(int) (desiredCompSizeFunc) (maxAoBlockSize) - maxAoBlockSize;
-		Insist(desiredOverflowBytes >= 0);
+		Assert(desiredOverflowBytes >= 0);
 	}
 	ao_attr->overflowSize = desiredOverflowBytes;
 }
@@ -492,7 +494,8 @@ create_datumstreamwrite(
 						int32 maxsz,
 						Form_pg_attribute attr,
 						char *relname,
-						char *title)
+						char *title,
+						bool needsWAL)
 {
 	DatumStreamWrite *acc = palloc0(sizeof(DatumStreamWrite));
 
@@ -560,7 +563,8 @@ create_datumstreamwrite(
 								acc->maxAoBlockSize,
 								relname,
 								title,
-								&acc->ao_attr);
+								&acc->ao_attr,
+								needsWAL);
 
 	acc->ao_write.compression_functions = compressionFunctions;
 	acc->ao_write.compressionState = compressionState;
@@ -771,6 +775,8 @@ destroy_datumstreamread(DatumStreamRead * ds)
 
 	if (ds->large_object_buffer)
 		pfree(ds->large_object_buffer);
+	if (ds->datum_upgrade_buffer)
+		pfree(ds->datum_upgrade_buffer);
 
 	AppendOnlyStorageRead_FinishSession(&ds->ao_read);
 
@@ -783,12 +789,9 @@ destroy_datumstreamread(DatumStreamRead * ds)
 
 
 void
-datumstreamwrite_open_file(DatumStreamWrite * ds, char *fn, int64 eof, int64 eofUncompressed, RelFileNode relFileNode, int32 segmentFileNum, int version)
+datumstreamwrite_open_file(DatumStreamWrite *ds, char *fn, int64 eof, int64 eofUncompressed,
+						   RelFileNodeBackend *relFileNode, int32 segmentFileNum, int version)
 {
-	ItemPointerData persistentTid;
-	int64 persistentSerialNum;
-	int64 appendOnlyNewEof;
-
 	ds->eof = eof;
 	ds->eofUncompress = eofUncompressed;
 
@@ -802,55 +805,9 @@ datumstreamwrite_open_file(DatumStreamWrite * ds, char *fn, int64 eof, int64 eof
 	 */
 	if (segmentFileNum > 0 && eof == 0)
 	{
-		AppendOnlyStorageWrite_TransactionCreateFile(
-													 &ds->ao_write,
-													 fn,
-													 eof,
-													 &relFileNode,
-													 segmentFileNum,
-													 &persistentTid,
-													 &persistentSerialNum);
-	}
-	else
-	{
-		if (!ReadGpRelationNode(
-				(relFileNode.spcNode == MyDatabaseTableSpace) ? 0:relFileNode.spcNode,
-				relFileNode.relNode,
-				segmentFileNum,
-				&persistentTid,
-				&persistentSerialNum))
-		{
-			elog(ERROR, "Did not find gp_relation_node entry for relfilenode %u, segment file #%d, logical eof " INT64_FORMAT,
-				 relFileNode.relNode,
-				 segmentFileNum,
-				 eof);
-		}
-	}
-
-	if (gp_appendonly_verify_eof)
-	{
-		appendOnlyNewEof = PersistentFileSysObj_ReadEof(
-					PersistentFsObjType_RelationFile,
-					&persistentTid);
-		/*
-		 * Verify if EOF from gp_persistent_relation_node < EOF from pg_aocsseg
-		 *
-		 * Note:- EOF from gp_persistent_relation_node has to be less than the
-		 * EOF from pg_aocsseg because inside a transaction the actual EOF where
-		 * the data is inserted has to be greater than or equal to Persistent
-		 * Table (PT) stored EOF as persistent table EOF value is updated at the
-		 * end of the transaction.
-		 */
-		if (eof < appendOnlyNewEof)
-		{
-			elog(ERROR, "Unexpected EOF for relfilenode %u,"
-						" segment file %d: EOF from gp_persistent_relation_node "
-						INT64_FORMAT " greater than current EOF " INT64_FORMAT,
-						relFileNode.relNode,
-						segmentFileNum,
-						appendOnlyNewEof,
-						eof);
-		}
+		AppendOnlyStorageWrite_TransactionCreateFile(&ds->ao_write,
+													 relFileNode,
+													 segmentFileNum);
 	}
 
 	/*
@@ -861,10 +818,8 @@ datumstreamwrite_open_file(DatumStreamWrite * ds, char *fn, int64 eof, int64 eof
 									version,
 									eof,
 									eofUncompressed,
-									&relFileNode,
-									segmentFileNum,
-									&persistentTid,
-									persistentSerialNum);
+									relFileNode,
+									segmentFileNum);
 
 	ds->need_close_file = true;
 }
@@ -1239,7 +1194,7 @@ datumstreamread_block_content(DatumStreamRead * acc)
 					pfree(acc->large_object_buffer);
 					acc->large_object_buffer = NULL;
 
-					SIMPLE_FAULT_INJECTOR(MallocFailure);
+					SIMPLE_FAULT_INJECTOR("malloc_failure");
 				}
 
 				acc->large_object_buffer_size = acc->getBlockInfo.contentLen;
@@ -1634,4 +1589,34 @@ datumstreamread_find_block(DatumStreamRead * datumStream,
 	}
 
 	return true;
+}
+
+/*
+ * Ensures that the stream's datum_upgrade_buffer is at least len bytes long.
+ * Returns a pointer to the (possibly newly allocated) upgrade buffer space. If
+ * additional space is needed, it will be allocated in the stream's memory
+ * context.
+ */
+void *
+datumstreamread_get_upgrade_space(DatumStreamRead *ds, size_t len)
+{
+	if (ds->datum_upgrade_buffer_size < len)
+	{
+		MemoryContext oldcontext = MemoryContextSwitchTo(ds->memctxt);
+
+		/*
+		 * FIXME: looks like at least one realloc() implementation can't handle
+		 * NULL pointers?
+		 */
+		if (ds->datum_upgrade_buffer)
+			ds->datum_upgrade_buffer = repalloc(ds->datum_upgrade_buffer, len);
+		else
+			ds->datum_upgrade_buffer = palloc(len);
+
+		ds->datum_upgrade_buffer_size = len;
+
+		MemoryContextSwitchTo(oldcontext);
+	}
+
+	return ds->datum_upgrade_buffer;
 }

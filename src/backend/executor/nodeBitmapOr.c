@@ -3,12 +3,12 @@
  * nodeBitmapOr.c
  *	  routines to handle BitmapOr nodes.
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/executor/nodeBitmapOr.c,v 1.9 2008/01/01 19:45:49 momjian Exp $
+ *	  src/backend/executor/nodeBitmapOr.c
  *
  *-------------------------------------------------------------------------
  */
@@ -30,7 +30,6 @@
 
 #include "cdb/cdbvars.h"
 #include "executor/execdebug.h"
-#include "executor/instrument.h"
 #include "executor/nodeBitmapOr.h"
 #include "miscadmin.h"
 #include "nodes/tidbitmap.h"
@@ -77,8 +76,6 @@ ExecInitBitmapOr(BitmapOr *node, EState *estate, int eflags)
 	 * ExecQual or ExecProject.  They don't need any tuple slots either.
 	 */
 
-#define BITMAPOR_NSLOTS 0
-
 	/*
 	 * call ExecInitNode on each of the plans to be executed and save the
 	 * results into the array "bitmapplanstates".
@@ -91,20 +88,7 @@ ExecInitBitmapOr(BitmapOr *node, EState *estate, int eflags)
 		i++;
 	}
 
-	initGpmonPktForBitmapOr((Plan *)node, &bitmaporstate->ps.gpmon_pkt, estate);
-	
 	return bitmaporstate;
-}
-
-int
-ExecCountSlotsBitmapOr(BitmapOr *node)
-{
-	ListCell   *plan;
-	int			nSlots = 0;
-
-	foreach(plan, node->bitmapplans)
-		nSlots += ExecCountSlotsNode((Plan *) lfirst(plan));
-	return nSlots + BITMAPOR_NSLOTS;
 }
 
 /* ----------------------------------------------------------------
@@ -125,7 +109,7 @@ MultiExecBitmapOr(BitmapOrState *node)
 	PlanState **bitmapplans;
 	int			nplans;
 	int			i;
-	HashBitmap *hbm = NULL;
+	TIDBitmap  *hbm = NULL;
 
 	/* must provide our own instrumentation support */
 	if (node->ps.instrument)
@@ -150,17 +134,17 @@ MultiExecBitmapOr(BitmapOrState *node)
 		if(subresult == NULL)
 			continue;
 
-		if (!(IsA(subresult, HashBitmap) ||
+		if (!(IsA(subresult, TIDBitmap) ||
 			  IsA(subresult, StreamBitmap)))
 			elog(ERROR, "unrecognized result from subplan");
 
-		if (IsA(subresult, HashBitmap))
+		if (IsA(subresult, TIDBitmap))
 		{
 			if (hbm == NULL)
-				hbm = (HashBitmap *)subresult;
+				hbm = (TIDBitmap *)subresult;
 			else
 			{
-				tbm_union(hbm, (HashBitmap *)subresult);
+				tbm_union(hbm, (TIDBitmap *)subresult);
 			}
 		}
 		else
@@ -223,12 +207,10 @@ ExecEndBitmapOr(BitmapOrState *node)
 		if (bitmapplans[i])
 			ExecEndNode(bitmapplans[i]);
 	}
-
-	EndPlanStateGpmonPkt(&node->ps);
 }
 
 void
-ExecReScanBitmapOr(BitmapOrState *node, ExprContext *exprCtxt)
+ExecReScanBitmapOr(BitmapOrState *node)
 {
 	/*
 	 * For optimizer a rescan call on BitmapIndexScan could free up the bitmap. So,
@@ -251,17 +233,10 @@ ExecReScanBitmapOr(BitmapOrState *node, ExprContext *exprCtxt)
 			UpdateChangedParamSet(subnode, node->ps.chgParam);
 
 		/*
-		 * Always rescan the inputs immediately, to ensure we can pass down
-		 * any outer tuple that might be used in index quals.
+		 * If chgParam of subnode is not null then plan will be re-scanned by
+		 * first ExecProcNode.
 		 */
-		ExecReScan(subnode, exprCtxt);
+		if (subnode->chgParam == NULL)
+			ExecReScan(subnode);
 	}
-}
-
-void
-initGpmonPktForBitmapOr(Plan *planNode, gpmon_packet_t *gpmon_pkt, EState *estate)
-{
-	Assert(planNode != NULL && gpmon_pkt != NULL && IsA(planNode, BitmapOr));
-
-	InitPlanNodeGpmonPkt(planNode, gpmon_pkt, estate);
 }

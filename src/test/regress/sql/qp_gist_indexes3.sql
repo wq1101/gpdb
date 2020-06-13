@@ -136,25 +136,24 @@ SELECT id, property AS "ProperTee" FROM GistTable3
 
 -- Encourage the optimizer to use indexes rather than sequential table scans.
 SET enable_seqscan=False;
+SET optimizer_enable_tablescan=False;
 
 -- Note that "=" for geometric data types means equal AREA, NOT COORDINATES.
 -- The "~=" operator means that the coordinate values, not just the area,
 -- are the same.
 SELECT id, property AS "Property" FROM GistTable3
  WHERE property ~= '( (999,999), (998,998) )';
--- start_ignore
+
 EXPLAIN SELECT id, property AS "Property" FROM GistTable3
  WHERE property ~= '( (999,999), (998,998) )';
--- end_ignore
 
 VACUUM ANALYZE GistTable3;
 
 SELECT id, property AS "ProperTee" FROM GistTable3
  WHERE property ~= '( (999,999), (998,998) )';
--- start_ignore
+
 EXPLAIN SELECT id, property AS "ProperTee" FROM GistTable3
  WHERE property ~= '( (999,999), (998,998) )';
--- end_ignore
 
 -- ----------------------------------------------------------------------
 -- Test: test07Reindex.sql
@@ -173,6 +172,7 @@ EXPLAIN SELECT id, property AS "ProperTee" FROM GistTable3
 
 -- Encourage the optimizer to use indexes rather than sequential table scans.
 SET enable_seqscan=False;
+SET optimizer_enable_tablescan=False;
 
 REINDEX INDEX GistIndex3a;
 REINDEX TABLE GistTable3;
@@ -182,10 +182,9 @@ REINDEX TABLE GistTable3;
 -- are the same.
 SELECT id, property AS "Property" FROM GistTable3
  WHERE property ~= '( (999,999), (998,998) )';
--- start_ignore
+
 EXPLAIN SELECT id, property AS "Property" FROM GistTable3
  WHERE property ~= '( (999,999), (998,998) )';
--- end_ignore
 
 -- ----------------------------------------------------------------------
 -- Test: test08UniqueAndPKey.sql
@@ -212,10 +211,14 @@ CREATE UNIQUE INDEX ShouldNotExist ON gisttable_pktest USING GiST (poli);
 CREATE UNIQUE INDEX ShouldNotExist ON gisttable_pktest USING GiST (bullseye);
 
 
--- Test whether geometric types can be part of a primary key.
+-- Test whether geometric types can be part of a distribution key.
 CREATE TABLE GistTable2 (id INTEGER, property BOX) DISTRIBUTED BY (property);
 CREATE TABLE GistTable2 (id INTEGER, poli POLYGON) DISTRIBUTED BY (poli);
 CREATE TABLE GistTable2 (id INTEGER, bullseye CIRCLE) DISTRIBUTED BY (bullseye);
+
+-- Same with ALTER TABLE.
+CREATE TABLE GistTable2 (id INTEGER, property BOX) DISTRIBUTED RANDOMLY;
+ALTER TABLE GistTable2 SET DISTRIBUTED BY (property);
 
 -- ----------------------------------------------------------------------
 -- Test: test09NegativeTests.sql
@@ -254,6 +257,24 @@ CREATE TABLE GistTable14 (
 -- Try to create a hash index.
 CREATE INDEX GistIndex14a ON GistTable14 USING HASH (id);
 CREATE INDEX GistIndex14b ON GistTable14 USING HASH (property);
+
+-- ----------------------------------------------------------------------
+-- Test GiST index on an AO table
+-- ----------------------------------------------------------------------
+
+------------------------------------------------------------------------------
+-- PURPOSE:
+--     Test the logic in forming TIDs for AO tuples. Before GPDB 6, the
+--     offset numbers in AO tids ran from 32768 to 65535, which collided
+--     with the special offsets used in GiST to mark invalid tuples. This
+--     test reproduced an error with that.
+------------------------------------------------------------------------------
+create table ao_points (i int, p point) with (appendonly=true) distributed by(i);
+create index on ao_points using gist (p);
+
+insert into ao_points select 1, point(g,g) from generate_series(1, 70000) g;
+
+select count(*) from ao_points where p <@ box('(32600,32600)', '(32800,32800)');
 
 
 -- ----------------------------------------------------------------------

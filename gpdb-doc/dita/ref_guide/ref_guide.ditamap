@@ -1,23 +1,29 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE map PUBLIC "-//OASIS//DTD DITA Map//EN" "map.dtd">
 <map>
-	<topicref href="../../homenav.html" scope="external" navtitle="Greenplum Database Docs Home"
-		format="html" otherprops="pivotal"/>
-	<topicref href="ref_guide.xml" navtitle="Reference Guide">
+	<topicref href="../../7-0/homenav.html" scope="external"
+		navtitle="Greenplum Database® 7.0 Beta Documentation" format="html" otherprops="oss-only"/>
+	<topicref href="../../7-0/homenav.html" scope="external"
+		navtitle="Pivotal Greenplum® 7.0 Beta Documentation" format="html" otherprops="pivotal"/>
+	<topicref href="ref_guide.xml">
 		<topicref href="sql_commands/sql_ref.xml">
 			<topicref href="GPReferenceSQLSummaryLOP.xml"/>
 			<topicref href="sql_commands/ABORT.xml"/>
 			<topicref href="sql_commands/ALTER_AGGREGATE.xml"/>
+			<topicref href="sql_commands/ALTER_COLLATION.xml"/>
 			<topicref href="sql_commands/ALTER_CONVERSION.xml"/>
 			<topicref href="sql_commands/ALTER_DATABASE.xml"/>
+			<topicref href="sql_commands/ALTER_DEFAULT_PRIVILEGES.xml"/>
 			<topicref href="sql_commands/ALTER_DOMAIN.xml"/>
 			<topicref href="sql_commands/ALTER_EXTENSION.xml"/>
 			<topicref href="sql_commands/ALTER_EXTERNAL_TABLE.xml"/>
-			<topicref href="sql_commands/ALTER_FILESPACE.xml"/>
+			<topicref href="sql_commands/ALTER_FOREIGN_DATA_WRAPPER.xml"/>
+			<topicref href="sql_commands/ALTER_FOREIGN_TABLE.xml"/>
 			<topicref href="sql_commands/ALTER_FUNCTION.xml"/>
 			<topicref href="sql_commands/ALTER_GROUP.xml"/>
 			<topicref href="sql_commands/ALTER_INDEX.xml"/>
 			<topicref href="sql_commands/ALTER_LANGUAGE.xml"/>
+			<topicref href="sql_commands/ALTER_MATERIALIZED_VIEW.xml"/>
 			<topicref href="sql_commands/ALTER_OPERATOR.xml"/>
 			<topicref href="sql_commands/ALTER_OPERATOR_CLASS.xml"/>
 			<topicref href="sql_commands/ALTER_OPERATOR_FAMILY.xml"/>
@@ -27,11 +33,17 @@
 			<topicref href="sql_commands/ALTER_ROLE.xml"/>
 			<topicref href="sql_commands/ALTER_SCHEMA.xml"/>
 			<topicref href="sql_commands/ALTER_SEQUENCE.xml"/>
+			<topicref href="sql_commands/ALTER_SERVER.xml"/>
 			<topicref href="sql_commands/ALTER_TABLE.xml"/>
 			<topicref href="sql_commands/ALTER_TABLESPACE.xml"/>
+			<topicref href="sql_commands/ALTER_TEXT_SEARCH_CONFIGURATION.xml"/>
+			<topicref href="sql_commands/ALTER_TEXT_SEARCH_DICTIONARY.xml"/>
+			<topicref href="sql_commands/ALTER_TEXT_SEARCH_PARSER.xml"/>
+			<topicref href="sql_commands/ALTER_TEXT_SEARCH_TEMPLATE.xml"/>
 			<topicref href="sql_commands/ALTER_TRIGGER.xml" otherprops="op-hidden"/>
 			<topicref href="sql_commands/ALTER_TYPE.xml"/>
 			<topicref href="sql_commands/ALTER_USER.xml"/>
+			<topicref href="sql_commands/ALTER_USER_MAPPING.xml"/>
 			<topicref href="sql_commands/ALTER_VIEW.xml"/>
 			<topicref href="sql_commands/ANALYZE.xml"/>
 			<topicref href="sql_commands/BEGIN.xml"/>
@@ -43,15 +55,19 @@
 			<topicref href="sql_commands/COPY.xml"/>
 			<topicref href="sql_commands/CREATE_AGGREGATE.xml"/>
 			<topicref href="sql_commands/CREATE_CAST.xml"/>
+			<topicref href="sql_commands/CREATE_COLLATION.xml"/>
 			<topicref href="sql_commands/CREATE_CONVERSION.xml"/>
 			<topicref href="sql_commands/CREATE_DATABASE.xml"/>
 			<topicref href="sql_commands/CREATE_DOMAIN.xml"/>
 			<topicref href="sql_commands/CREATE_EXTENSION.xml"/>
 			<topicref href="sql_commands/CREATE_EXTERNAL_TABLE.xml"/>
+			<topicref href="sql_commands/CREATE_FOREIGN_DATA_WRAPPER.xml"/>
+			<topicref href="sql_commands/CREATE_FOREIGN_TABLE.xml"/>
 			<topicref href="sql_commands/CREATE_FUNCTION.xml"/>
 			<topicref href="sql_commands/CREATE_GROUP.xml"/>
 			<topicref href="sql_commands/CREATE_INDEX.xml"/>
 			<topicref href="sql_commands/CREATE_LANGUAGE.xml"/>
+			<topicref href="sql_commands/CREATE_MATERIALIZED_VIEW.xml"/>
 			<topicref href="sql_commands/CREATE_OPERATOR.xml"/>
 			<topicref href="sql_commands/CREATE_OPERATOR_CLASS.xml"/>
 			<topicref href="sql_commands/CREATE_OPERATOR_FAMILY.xml"/>
@@ -62,12 +78,18 @@
 			<topicref href="sql_commands/CREATE_RULE.xml"/>
 			<topicref href="sql_commands/CREATE_SCHEMA.xml"/>
 			<topicref href="sql_commands/CREATE_SEQUENCE.xml"/>
+			<topicref href="sql_commands/CREATE_SERVER.xml"/>
 			<topicref href="sql_commands/CREATE_TABLE.xml"/>
 			<topicref href="sql_commands/CREATE_TABLE_AS.xml"/>
 			<topicref href="sql_commands/CREATE_TABLESPACE.xml"/>
 			<topicref href="sql_commands/CREATE_TRIGGER.xml" otherprops="op-hidden"/>
+			<topicref href="sql_commands/CREATE_TEXT_SEARCH_CONFIGURATION.xml"/>
+			<topicref href="sql_commands/CREATE_TEXT_SEARCH_DICTIONARY.xml"/>
+			<topicref href="sql_commands/CREATE_TEXT_SEARCH_PARSER.xml"/>
+			<topicref href="sql_commands/CREATE_TEXT_SEARCH_TEMPLATE.xml"/>
 			<topicref href="sql_commands/CREATE_TYPE.xml"/>
 			<topicref href="sql_commands/CREATE_USER.xml"/>
+			<topicref href="sql_commands/CREATE_USER_MAPPING.xml"/>
 			<topicref href="sql_commands/CREATE_VIEW.xml"/>
 			<topicref href="sql_commands/DEALLOCATE.xml"/>
 			<topicref href="sql_commands/DECLARE.xml"/>
@@ -76,16 +98,19 @@
 			<topicref href="sql_commands/DO.xml"/>
 			<topicref href="sql_commands/DROP_AGGREGATE.xml"/>
 			<topicref href="sql_commands/DROP_CAST.xml"/>
+			<topicref href="sql_commands/DROP_COLLATION.xml"/>
 			<topicref href="sql_commands/DROP_CONVERSION.xml"/>
 			<topicref href="sql_commands/DROP_DATABASE.xml"/>
 			<topicref href="sql_commands/DROP_DOMAIN.xml"/>
 			<topicref href="sql_commands/DROP_EXTENSION.xml"/>
 			<topicref href="sql_commands/DROP_EXTERNAL_TABLE.xml"/>
-			<topicref href="sql_commands/DROP_FILESPACE.xml"/>
+			<topicref href="sql_commands/DROP_FOREIGN_DATA_WRAPPER.xml"/>
+			<topicref href="sql_commands/DROP_FOREIGN_TABLE.xml"/>
 			<topicref href="sql_commands/DROP_FUNCTION.xml"/>
 			<topicref href="sql_commands/DROP_GROUP.xml"/>
 			<topicref href="sql_commands/DROP_INDEX.xml"/>
 			<topicref href="sql_commands/DROP_LANGUAGE.xml"/>
+			<topicref href="sql_commands/DROP_MATERIALIZED_VIEW.xml"/>
 			<topicref href="sql_commands/DROP_OPERATOR.xml"/>
 			<topicref href="sql_commands/DROP_OPERATOR_CLASS.xml"/>
 			<topicref href="sql_commands/DROP_OPERATOR_FAMILY.xml"/>
@@ -97,11 +122,17 @@
 			<topicref href="sql_commands/DROP_RULE.xml"/>
 			<topicref href="sql_commands/DROP_SCHEMA.xml"/>
 			<topicref href="sql_commands/DROP_SEQUENCE.xml"/>
+			<topicref href="sql_commands/DROP_SERVER.xml"/>
 			<topicref href="sql_commands/DROP_TABLE.xml"/>
 			<topicref href="sql_commands/DROP_TABLESPACE.xml"/>
+			<topicref href="sql_commands/DROP_TEXT_SEARCH_CONFIGURATION.xml"/>
+			<topicref href="sql_commands/DROP_TEXT_SEARCH_DICTIONARY.xml"/>
+			<topicref href="sql_commands/DROP_TEXT_SEARCH_PARSER.xml"/>
+			<topicref href="sql_commands/DROP_TEXT_SEARCH_TEMPLATE.xml"/>
 			<topicref href="sql_commands/DROP_TRIGGER.xml" otherprops="op-hidden"/>
 			<topicref href="sql_commands/DROP_TYPE.xml"/>
 			<topicref href="sql_commands/DROP_USER.xml"/>
+			<topicref href="sql_commands/DROP_USER_MAPPING.xml"/>
 			<topicref href="sql_commands/DROP_VIEW.xml"/>
 			<topicref href="sql_commands/END.xml"/>
 			<topicref href="sql_commands/EXECUTE.xml"/>
@@ -114,6 +145,7 @@
 			<topicref href="sql_commands/MOVE.xml"/>
 			<topicref href="sql_commands/PREPARE.xml"/>
 			<topicref href="sql_commands/REASSIGN_OWNED.xml"/>
+			<topicref href="sql_commands/REFRESH_MATERIALIZED_VIEW.xml"/>
 			<topicref href="sql_commands/REINDEX.xml"/>
 			<topicref href="sql_commands/RELEASE_SAVEPOINT.xml"/>
 			<topicref href="sql_commands/RESET.xml"/>
@@ -124,6 +156,7 @@
 			<topicref href="sql_commands/SELECT.xml"/>
 			<topicref href="sql_commands/SELECT_INTO.xml"/>
 			<topicref href="sql_commands/SET.xml"/>
+			<topicref href="sql_commands/SET_CONSTRAINTS.xml"/>
 			<topicref href="sql_commands/SET_ROLE.xml"/>
 			<topicref href="sql_commands/SET_SESSION_AUTHORIZATION.xml"/>
 			<topicref href="sql_commands/SET_TRANSACTION.xml"/>
@@ -134,14 +167,27 @@
 			<topicref href="sql_commands/VACUUM.xml"/>
 			<topicref href="sql_commands/VALUES.xml"/>
 		</topicref>
-		<topicref href="SQL2008_support.xml"/>
-		<topicref href="env_var_ref.xml" navtitle="Greenplum Environment Variables" id="env_var_ref"/>
-		<topicref href="system_catalogs/catalog_ref.xml#topic1">
+		<topicref href="data_types.xml" id="data_types">
+			<topicref href="datatype-datetime.xml"/>
+			<topicref href="datatype-pseudo.xml"/>
+			<topicref href="datatype-textsearch.xml"/>
+			<topicref href="datatype-range.xml"/>
+		</topicref>
+		<topicref href="function-summary.xml" id="func_summary"/>
+		<topicref href="modules/modules.ditamap" format="ditamap"/>
+		<topicref href="character_sets.xml" id="character_sets"/>
+		<topicref href="config_params/guc_config.ditamap" id="guc_config" format="ditamap"/>
+		<topicref href="system_catalogs/catalog_ref.xml">
 			<topicref href="system_catalogs/catalog_ref-tables.xml#topic1"/>
 			<topicref href="system_catalogs/catalog_ref-views.xml#topic1"/>
 			<topicref href="system_catalogs/catalog_ref-html.xml#topic1">
+				<topicref href="system_catalogs/foreign_data_wrapper_options.xml"/>
+				<topicref href="system_catalogs/foreign_data_wrappers.xml"/>
+				<topicref href="system_catalogs/foreign_server_options.xml"/>
+				<topicref href="system_catalogs/foreign_servers.xml"/>
+				<topicref href="system_catalogs/foreign_table_options.xml"/>
+				<topicref href="system_catalogs/foreign_tables.xml"/>
 				<topicref href="system_catalogs/gp_configuration_history.xml"/>
-				<topicref href="system_catalogs/gp_db_interfaces.xml"/>
 				<topicref href="system_catalogs/gp_distributed_log.xml"/>
 				<topicref href="system_catalogs/gp_distributed_xacts.xml"/>
 				<topicref href="system_catalogs/gp_distribution_policy.xml"/>
@@ -149,19 +195,14 @@
 				<topicref href="system_catalogs/gp_expansion_status.xml"/>
 				<topicref href="system_catalogs/gp_expansion_tables.xml"/>
 				<topicref href="system_catalogs/gp_fastsequence.xml"/>
-				<topicref href="system_catalogs/gp_fault_strategy.xml"/>
-				<topicref href="system_catalogs/gp_global_sequence.xml"/>
 				<topicref href="system_catalogs/gp_id.xml"/>
-				<topicref href="system_catalogs/gp_interfaces.xml"/>
-				<topicref href="system_catalogs/gp_persistent_database_node.xml"/>
-				<topicref href="system_catalogs/gp_persistent_filespace_node.xml"/>
-				<topicref href="system_catalogs/gp_persistent_relation_node.xml"/>
-				<topicref href="system_catalogs/gp_persistent_tablespace_node.xml"/>
 				<topicref href="system_catalogs/gp_pgdatabase.xml"/>
-				<topicref href="system_catalogs/gp_relation_node.xml"/>
 				<topicref href="system_catalogs/gp_resgroup_config.xml"/>
 				<topicref href="system_catalogs/gp_resgroup_status.xml"/>
+				<topicref href="system_catalogs/gp_resgroup_status_per_host.xml"/>
+				<topicref href="system_catalogs/gp_resgroup_status_per_segment.xml"/>
 				<topicref href="system_catalogs/gp_resqueue_status.xml"/>
+				<topicref href="system_catalogs/gp_stat_replication.xml"/>
 				<topicref href="system_catalogs/gp_segment_configuration.xml"/>
 				<topicref href="system_catalogs/gp_transaction_log.xml"/>
 				<topicref href="system_catalogs/gp_version_at_initdb.xml"/>
@@ -183,23 +224,27 @@
 				<topicref href="system_catalogs/pg_constraint.xml"/>
 				<topicref href="system_catalogs/pg_conversion.xml"/>
 				<topicref href="system_catalogs/pg_database.xml"/>
+				<topicref href="system_catalogs/pg_db_role_setting.xml"/>
 				<topicref href="system_catalogs/pg_depend.xml"/>
 				<topicref href="system_catalogs/pg_description.xml"/>
 				<topicref href="system_catalogs/pg_enum.xml"/>
 				<topicref href="system_catalogs/pg_extension.xml"/>
 				<topicref href="system_catalogs/pg_exttable.xml"/>
-				<topicref href="system_catalogs/pg_filespace.xml"/>
-				<topicref href="system_catalogs/pg_filespace_entry.xml"/>
+				<topicref href="system_catalogs/pg_foreign_data_wrapper.xml"/>
+				<topicref href="system_catalogs/pg_foreign_server.xml"/>
+				<topicref href="system_catalogs/pg_foreign_table.xml"/>
 				<topicref href="system_catalogs/pg_index.xml"/>
 				<topicref href="system_catalogs/pg_inherits.xml"/>
 				<topicref href="system_catalogs/pg_language.xml"/>
 				<topicref href="system_catalogs/pg_largeobject.xml"/>
 				<topicref href="system_catalogs/pg_listener.xml"/>
 				<topicref href="system_catalogs/pg_locks.xml"/>
+				<topicref href="system_catalogs/pg_matviews.xml"/>
 				<topicref href="system_catalogs/pg_max_external_files.xml"/>
 				<topicref href="system_catalogs/pg_namespace.xml"/>
 				<topicref href="system_catalogs/pg_opclass.xml"/>
 				<topicref href="system_catalogs/pg_operator.xml"/>
+				<topicref href="system_catalogs/pg_opfamily.xml"/>
 				<topicref href="system_catalogs/pg_partition.xml"/>
 				<topicref href="system_catalogs/pg_partition_columns.xml"/>
 				<topicref href="system_catalogs/pg_partition_encoding.xml"/>
@@ -216,6 +261,7 @@
 				<topicref href="system_catalogs/pg_resqueuecapability.xml"/>
 				<topicref href="system_catalogs/pg_rewrite.xml"/>
 				<topicref href="system_catalogs/pg_roles.xml"/>
+				<topicref href="system_catalogs/pg_rules.xml"/>
 				<topicref href="system_catalogs/pg_shdepend.xml"/>
 				<topicref href="system_catalogs/pg_shdescription.xml"/>
 				<topicref href="system_catalogs/pg_stat_activity.xml"/>
@@ -231,32 +277,13 @@
 				<topicref href="system_catalogs/pg_type.xml"/>
 				<topicref href="system_catalogs/pg_type_encoding.xml"/>
 				<topicref href="system_catalogs/pg_user_mapping.xml"/>
-				<topicref href="system_catalogs/pg_window.xml"/>
+				<topicref href="system_catalogs/pg_user_mappings.xml"/>
+				<topicref href="system_catalogs/user_mapping_options.xml"/>
+				<topicref href="system_catalogs/user_mappings.xml"/>
 			</topicref>
 		</topicref>
 		<topicref href="gp_toolkit.ditamap" format="ditamap"/>
-		<topicref href="gpperfmon/gpperfmon.ditamap" format="ditamap"/>
-		<topicref href="data_types.xml" navtitle="Greenplum Database Data Types" id="data_types"/>
-		<topicref href="character_sets.xml" navtitle="Character Set Support" id="character_sets"/>
-		<topicref href="config_params/guc_config.ditamap" navtitle="Server Configuration Parameters"
-			id="guc_config" format="ditamap"/>
-		<topicref href="function-summary.xml" id="func_summary"/>
-		<topicref href="yaml_spec.xml" navtitle="Greenplum MapReduce Specification" id="yaml_spec"/>
-		<topicref href="extensions/pl_sql.xml" navtitle="Greenplum PL/pgSQL Extension" id="pl_sql"/>
-		<topicref href="extensions/postGIS.xml" navtitle="Greenplum PostGIS Extension" id="postGIS"
-			otherprops="pivotal"/>
-		<topicref href="extensions/pl_r.xml" navtitle="Greenplum PL/R Language Extension" id="pl_r"/>
-		<topicref href="extensions/pl_python.xml" navtitle="Greenplum PL/Python Language Extension"
-			id="pl_python"/>
-		<topicref href="extensions/pl_java.xml" navtitle="Greenplum PL/Java Language Extension"
-			id="pl_java"/>
-		<topicref href="extensions/pl_perl.xml" navtitle="Greenplum PL/Perl Language Extension"
-			id="pl_perl"/>
-		<topicref href="extensions/madlib.xml" navtitle="Greenplum MADlib Extension for Analytics"
-			id="madlib"/>
-		<topicref href="extensions/fuzzystrmatch.xml"
-			navtitle="Greenplum Fuzzy String Match Extension" id="fuzzystrmatch"/>
-		<topicref href="feature_summary.xml" navtitle="Summary of Greenplum Features"
-			id="feature_summary"/>
+		<topicref href="extensions/serverapi.ditamap" format="ditamap"/>
+		<topicref href="misc.ditamap" format="ditamap"/>
 	</topicref>
 </map>

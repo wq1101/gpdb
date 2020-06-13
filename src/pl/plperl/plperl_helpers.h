@@ -1,6 +1,8 @@
 #ifndef PL_PERL_HELPERS_H
 #define PL_PERL_HELPERS_H
 
+#include "mb/pg_wchar.h"
+
 /*
  * convert from utf8 to database encoding
  *
@@ -9,24 +11,11 @@
 static inline char *
 utf_u2e(char *utf8_str, size_t len)
 {
-	int			enc = GetDatabaseEncoding();
 	char	   *ret;
 
-	/*
-	 * When we are in a PG_UTF8 or SQL_ASCII database
-	 * pg_do_encoding_conversion() will not do any conversion (which is good)
-	 * or verification (not so much), so we need to run the verification step
-	 * separately.
-	 */
-	if (enc == PG_UTF8 || enc == PG_SQL_ASCII)
-	{
-		pg_verify_mbstr_len(enc, utf8_str, len, false);
-		ret = utf8_str;
-	}
-	else
-		ret = (char *) pg_do_encoding_conversion((unsigned char *) utf8_str,
-												 len, PG_UTF8, enc);
+	ret = pg_any_to_server(utf8_str, len, PG_UTF8);
 
+	/* ensure we have a copy even if no conversion happened */
 	if (ret == utf8_str)
 		ret = pstrdup(ret);
 
@@ -41,12 +30,14 @@ utf_u2e(char *utf8_str, size_t len)
 static inline char *
 utf_e2u(const char *str)
 {
-	char	   *ret =
-		(char *) pg_do_encoding_conversion((unsigned char *) str, strlen(str),
-										   GetDatabaseEncoding(), PG_UTF8);
+	char	   *ret;
 
+	ret = pg_server_to_any(str, strlen(str), PG_UTF8);
+
+	/* ensure we have a copy even if no conversion happened */
 	if (ret == str)
 		ret = pstrdup(ret);
+
 	return ret;
 }
 
@@ -59,7 +50,9 @@ utf_e2u(const char *str)
 static inline char *
 sv2cstr(SV *sv)
 {
-	char	   *val, *res;
+	dTHX;
+	char	   *val,
+			   *res;
 	STRLEN		len;
 
 	/*
@@ -70,8 +63,8 @@ sv2cstr(SV *sv)
 	 * SvPVutf8() croaks nastily on certain things, like typeglobs and
 	 * readonly objects such as $^V. That's a perl bug - it's not supposed to
 	 * happen. To avoid crashing the backend, we make a copy of the sv before
-	 * passing it to SvPVutf8(). The copy is garbage collected 
-	 * when we're done with it.
+	 * passing it to SvPVutf8(). The copy is garbage collected when we're done
+	 * with it.
 	 */
 	if (SvREADONLY(sv) ||
 		isGV_with_GP(sv) ||
@@ -88,8 +81,8 @@ sv2cstr(SV *sv)
 
 	/*
 	 * Request the string from Perl, in UTF-8 encoding; but if we're in a
-	 * SQL_ASCII database, just request the byte soup without trying to make it
-	 * UTF8, because that might fail.
+	 * SQL_ASCII database, just request the byte soup without trying to make
+	 * it UTF8, because that might fail.
 	 */
 	if (GetDatabaseEncoding() == PG_SQL_ASCII)
 		val = SvPV(sv, len);
@@ -115,6 +108,7 @@ sv2cstr(SV *sv)
 static inline SV *
 cstr2sv(const char *str)
 {
+	dTHX;
 	SV		   *sv;
 	char	   *utf8_str;
 
@@ -142,6 +136,8 @@ cstr2sv(const char *str)
 static inline void
 croak_cstr(const char *str)
 {
+	dTHX;
+
 #ifdef croak_sv
 	/* Use sv_2mortal() to be sure the transient SV gets freed */
 	croak_sv(sv_2mortal(cstr2sv(str)));

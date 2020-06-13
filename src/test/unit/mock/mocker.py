@@ -18,6 +18,8 @@ class CFile(object):
     # __attribute__((XXX)): it gets difficult to match arguments.
     # Remove it as it's a noisy keyword for us.
     attribute_pat = re.compile(r'__attribute__\s*\(\((format\s*\([^\)]+\)\s*|format_arg\s*\(\d+\)\s*|.+?)\)\)')
+    # #include <filename>.c
+    include_c_pat = re.compile(r'#include ".+\.c"')
 
     # function pattern
     func_pat = re.compile(
@@ -58,9 +60,15 @@ class CFile(object):
         """
         content = CFile.m_comment_pat.sub('', content)
         # backend/libpq/be-secure.c contains private key with '//'
-        if 'be-secure' not in self.path and 'guc.c' not in self.path:
+        if 'be-secure' not in self.path and 'guc_gp.c' not in self.path:
             content = CFile.s_comment_pat.sub('', content)
         content = CFile.attribute_pat.sub('', content)
+        # .c files included in other .c files can generally not be found from
+        # where the mock files are located which leads to compilation failure.
+        # Since we thus far arent interested in handling this anyways, let's
+        # skip this for now except for the guc special case
+        if 'guc' not in self.path:
+            content = CFile.include_c_pat.sub('', content)
         return content
 
     def skip_func_body(self, content, index):
@@ -69,9 +77,6 @@ class CFile(object):
            weird code block based on preprocessor directives.
         """
         pat = re.compile(r'^}\s*$', re.MULTILINE)
-        if 'cdbfilerepconnserver' in self.path:
-            # FIXIT!: some of the files have unpleasant format.
-            pat = re.compile(r'^ ?}', re.MULTILINE)
         m = pat.search(content, index)
         if m:
             if 'cdbgroup' in self.path:
@@ -106,7 +111,8 @@ class CFile(object):
             (modifier, rettype, funcname, args) = m.groups('')
             # 'else if(...){}' looks like a function.  Ignore it.
             if funcname in ['if', 'while', 'switch', 'for', 'foreach',
-                            'yysyntax_error', 'defined']:
+                            'yysyntax_error', 'defined', 'dlist_foreach',
+                            'dlist_foreach_modify']:
                 continue
             if rettype.strip() in ['define', 'select']:
                 continue
@@ -159,7 +165,7 @@ class FuncSignature(object):
     # we need extra space at the end.
     arg_pat = re.compile(
         # argtype.  i.e. 'const unsigned long', 'struct Foo *', 'const char * const'
-        r'((?:register\s+|const\s+|volatile\s+)*(?:enum\s+|struct\s+|unsigned\s+|long\s+)?' +
+        r'((?:register\s+|const\s+|volatile\s+)*(?:enum\s+|struct\s+|unsigned\s+|long\s+long\s+|long\s+)?' +
             r'\w+(?:[\s\*]+)(?:const[\s\*]+)?|\s+)' +
         r'(?:__restrict\s+)?' +
         # argname.  We accept 'arg[]'
@@ -183,6 +189,10 @@ class FuncSignature(object):
         return argtype[-1] == '*'
 
     def is_variadic(self, arg):
+        # This returns true only for "...", not for va_list type arg.
+        # Otherwise, in format_args() the va_list type of arg would get
+        # generated as '...', so the function's definition would conflict with
+        # the function prototype which is declared using the 'va_list' type.
         return arg == FuncSignature.Variadic
 
     def parse_args(self, arg_string):
@@ -193,7 +203,8 @@ class FuncSignature(object):
 
         for (i, arg) in enumerate(arg_string.split(',')):
             arg = arg.strip()
-            # TODO: needs work
+            # TODO: needs work. Also, if arg is va_list, we don't treat it as
+            # variadic. Check comments in is_variadic().
             if arg == '...':
                 args.append(FuncSignature.Variadic)
                 continue
@@ -239,6 +250,10 @@ class FuncSignature(object):
             if self.is_variadic(arg):
                 continue
             argtype = arg[0]
+            # 'va_list' needs to be explicitly checked because is_variadic()
+            # returns true only for '...', not for va_list.
+            if argtype == 'va_list':
+                continue
             argname = arg[1]
             ref = '&' if special.ByValStructs.has(argtype) else ''
             argname = subscript.sub('', argname)

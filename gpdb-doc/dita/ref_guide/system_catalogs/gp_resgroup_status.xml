@@ -5,9 +5,10 @@
   <title id="fp141670">gp_resgroup_status</title>
   <body>
     <p>The <codeph>gp_toolkit.gp_resgroup_status</codeph> view allows administrators to see status
-      and activity for a workload management resource group. It shows how many queries are waiting
+      and activity for a resource group. It shows how many queries are waiting
       to run and how many queries are currently active in the system for each resource
       group. The view also displays current memory and CPU usage for the resource group.</p>
+      <note>The <codeph>gp_resgroup_status</codeph> view is valid only when resource group-based resource management is active.</note>
     <table id="fp141982">
       <title>gp_toolkit.gp_resgroup_status</title>
       <tgroup cols="4">
@@ -85,8 +86,11 @@
               <codeph>cpu_usage</codeph>
             </entry>
             <entry colname="col2">json</entry>
-            <entry colname="col3"></entry>
-            <entry colname="col4">The real-time CPU usage of the resource group on each Greenplum Database segment's host.</entry>
+            <entry colname="col3"/>
+            <entry colname="col4">A set of key-value pairs. For each segment instance (the key), the
+              value is the real-time, per-segment instance CPU core usage by a resource group. The
+              value is the sum of the percentages (as a decimal value) of CPU cores that are used by
+              the resource group for the segment instance.</entry>
           </row>
           <row>
             <entry colname="col1">
@@ -99,5 +103,8 @@
         </tbody>
       </tgroup>
     </table>
+    <p> </p>
+    <p conref="../gp_toolkit.xml#topic31x/json_field_info1"/>
+    <p conref="../gp_toolkit.xml#topic31x/json_field_info2"/>
   </body>
 </topic>

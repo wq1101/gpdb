@@ -14,8 +14,6 @@
 #ifndef CDBLOCALDISTRIBXACT_H
 #define CDBLOCALDISTRIBXACT_H
 
-#include "storage/lock.h"
-
 typedef enum
 {
 	LOCALDISTRIBXACT_STATE_NONE = 0,
@@ -44,19 +42,17 @@ typedef struct LocalDistribXactData
 
 } LocalDistribXactData;
 
-extern void LocalDistribXact_ChangeState(PGPROC *proc,
+extern void LocalDistribXact_ChangeState(int pgprocno,
 	LocalDistribXactState		newState);
 
-extern char* LocalDistribXact_DisplayString(PGPROC *proc);
+extern char* LocalDistribXact_DisplayString(int pgprocno);
 
 extern bool LocalDistribXactCache_CommittedFind(
 	TransactionId						localXid,
-	DistributedTransactionTimeStamp		distribTransactionTimeStamp,
 	DistributedTransactionId			*distribXid);
 
 extern void LocalDistribXactCache_AddCommitted(
 	TransactionId						localXid,
-	DistributedTransactionTimeStamp		distribTransactionTimeStamp,
 	DistributedTransactionId			distribXid);
 
 extern void LocalDistribXactCache_ShowStats(char *nameStr);

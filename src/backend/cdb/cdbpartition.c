@@ -17,17 +17,23 @@
  */
 #include "postgres.h"
 
+#include "access/external.h"
 #include "access/genam.h"
 #include "access/hash.h"
 #include "access/heapam.h"
+#include "access/nbtree.h"
 #include "access/reloptions.h"
+#include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/heap.h"
+#include "catalog/pg_am.h"
 #include "catalog/pg_constraint.h"
-#include "catalog/pg_exttable.h"
+#include "catalog/pg_constraint_fn.h"
 #include "catalog/pg_inherits.h"
+#include "catalog/pg_inherits_fn.h"
 #include "catalog/pg_type.h"
+#include "catalog/pg_opclass.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_partition_encoding.h"
@@ -46,6 +52,7 @@
 #include "parser/parse_relation.h"
 #include "parser/parse_target.h"
 #include "parser/parse_utilcmd.h"
+#include "storage/lmgr.h"
 #include "tcop/utility.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -54,7 +61,9 @@
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/ruleutils.h"
 #include "utils/syscache.h"
+#include "utils/tqual.h"
 
 #define DEFAULT_CONSTRAINT_ESTIMATE 16
 #define MIN_XCHG_CONTEXT_SIZE 4096
@@ -62,16 +71,17 @@
 #define MAX_XCHG_BLOCK_SIZE 4096
 
 typedef struct
-	{
-		char *key;
-		List *table_cons;
-		List *part_cons;
-		List *cand_cons;
-	} ConstraintEntry;
+{
+	char	   *key;
+	bool        indexed_cons;
+	List	   *table_cons;
+	List	   *part_cons;
+	List	   *cand_cons;
+} ConstraintEntry;
 
 typedef struct
 {
-	Node *entry;
+	Node	   *entry;
 } ConNodeEntry;
 
 
@@ -81,31 +91,37 @@ typedef enum
 	PART_PART,
 	PART_CAND
 } PartExchangeRole;
-static void
-record_constraints(Relation pgcon, MemoryContext context,
+static void record_constraints(Relation pgcon, MemoryContext context,
 				   HTAB *hash_tbl, Relation rel,
 				   PartExchangeRole xrole);
 
-static char *
-constraint_names(List *cons);
+static void exchange_constraint_names(Relation part,
+									   Relation cand,
+									   NameData part_name,
+									   NameData cand_name);
 
-static void
-constraint_diffs(List *cons_a, List *cons_b, bool match_names, List **missing, List **extra);
+static void rename_constraint(Relation rel,
+							   char *old_name,
+							   char *new_name);
+
+static char *constraint_names(List *cons);
+
+static void constraint_diffs(List *cons_a, List *cons_b, bool match_inheritance,
+							  List **missing, List **extra);
 
 static void add_template_encoding_clauses(Oid relid, Oid paroid, List *stenc);
 
-static PartitionNode *
-findPartitionNodeEntry(PartitionNode *partitionNode, Oid partOid);
+static PartitionNode *findPartitionNodeEntry(PartitionNode *partitionNode, Oid partOid);
 
 static uint32
-constrNodeHash(const void *keyPtr, Size keysize);
+			constrNodeHash(const void *keyPtr, Size keysize);
 
 static int
-constrNodeMatch(const void *keyPtr1, const void *keyPtr2, Size keysize);
+			constrNodeMatch(const void *keyPtr1, const void *keyPtr2, Size keysize);
 
-static void
-parruleord_open_gap(Oid partid, int2 level, Oid parent,
-					int2 ruleord, int stopkey, bool closegap);
+static void parruleord_open_gap(Oid partid, int16 level, Oid parent,
+					int16 ruleord, int16 stopkey, bool closegap);
+static bool has_external_partition(PartitionNode *n);
 
 /*
  * Hash keys are null-terminated C strings assumed to be stably
@@ -114,106 +130,93 @@ parruleord_open_gap(Oid partid, int2 level, Oid parent,
  */
 
 /* Hash entire string. */
-static uint32 key_string_hash(const void *key, Size keysize)
+static uint32
+key_string_hash(const void *key, Size keysize)
 {
 	Size		s_len = strlen((const char *) key);
 
-	Assert(keysize == sizeof(char*));
+	Assert(keysize == sizeof(char *));
 	return DatumGetUInt32(hash_any((const unsigned char *) key, (int) s_len));
 }
 
 /* Compare entire string. */
-static int key_string_compare(const void *key1, const void *key2, Size keysize)
+static int
+key_string_compare(const void *key1, const void *key2, Size keysize)
 {
-	Assert(keysize == sizeof(char*));
-	return strcmp(((ConstraintEntry*)key1)->key, key2);
+	Assert(keysize == sizeof(char *));
+	return strcmp(((ConstraintEntry *) key1)->key, key2);
 }
 
 /* Copy string by copying pointer. */
-static void *key_string_copy(void *dest, const void *src, Size keysize)
+static void *
+key_string_copy(void *dest, const void *src, Size keysize)
 {
-	Assert(keysize == sizeof(char*));
+	Assert(keysize == sizeof(char *));
 
-	*((char**)dest) = (char*)src; /* trust caller re allocation */
-	return NULL; /* not used */
+	*((char **) dest) = (char *) src;	/* trust caller re allocation */
+	return NULL;				/* not used */
 }
 
 static char parttype_to_char(PartitionByType type);
 static void add_partition(Partition *part);
 static void add_partition_rule(PartitionRule *rule);
-static Oid get_part_oid(Oid rootrelid, int16 parlevel, bool istemplate);
+static Oid	get_part_oid(Oid rootrelid, int16 parlevel, bool istemplate);
 static Datum *magic_expr_to_datum(Relation rel, PartitionNode *partnode,
-								  Node *expr, bool **ppisnull);
-static Oid selectPartitionByRank(PartitionNode *partnode, int rnk);
+					Node *expr, bool **ppisnull);
+static Oid	selectPartitionByRank(PartitionNode *partnode, int rnk);
 static bool compare_partn_opfuncid(PartitionNode *partnode,
-								   char *pub, char *compare_op,
-								   List *colvals,
-								   Datum *values, bool *isnull,
-								   TupleDesc tupdesc);
-static PartitionNode *
-selectListPartition(PartitionNode *partnode, Datum *values, bool *isnull,
+					   char *pub, char *compare_op,
+					   List *colvals,
+					   Datum *values, bool *isnull,
+					   TupleDesc tupdesc);
+static PartitionNode *selectListPartition(PartitionNode *partnode, Datum *values, bool *isnull,
 					TupleDesc tupdesc, PartitionAccessMethods *accessMethods,
 					Oid *foundOid, PartitionRule **prule, Oid exprTypid);
-static Oid get_less_than_oper(Oid lhstypid, Oid rhstypid, bool strictlyless);
-static FmgrInfo *get_less_than_comparator(int keyno, PartitionRangeState *rs, Oid ruleTypeOid, Oid exprTypeOid, bool strictlyless, bool is_direct);
-static int range_test(Datum tupval, Oid ruleTypeOid, Oid exprTypeOid, PartitionRangeState *rs, int keyno,
+static void get_cmp_func(Oid opclass, FmgrInfo *fmgrinfo, Oid lhstypid, Oid rhstypid);
+static int range_test(Datum tupval, FmgrInfo *cmpfuncs, int keyno,
 		   PartitionRule *rule);
-static PartitionNode *
-selectRangePartition(PartitionNode *partnode, Datum *values, bool *isnull,
+static PartitionNode *selectRangePartition(PartitionNode *partnode, Datum *values, bool *isnull,
 					 TupleDesc tupdesc, PartitionAccessMethods *accessMethods,
 					 Oid *foundOid, int *pSearch, PartitionRule **prule, Oid exprTypid);
-static PartitionNode *
-selectHashPartition(PartitionNode *partnode, Datum *values, bool *isnull,
-					TupleDesc tupdesc, PartitionAccessMethods *accessMethods,
-					Oid *found, PartitionRule **prule);
-static Oid
-selectPartition1(PartitionNode *partnode, Datum *values, bool *isnull,
+static Oid selectPartition1(PartitionNode *partnode, Datum *values, bool *isnull,
 				 TupleDesc tupdesc, PartitionAccessMethods *accessMethods,
 				 int *pSearch,
 				 PartitionNode **ppn_out);
-static int
-atpxPart_validate_spec(
-					   PartitionBy			*pBy,
-					   CreateStmtContext	*pcxt,
-					   Relation					 rel,
-					   CreateStmt				*ct,
-					   PartitionElem			*pelem,
-					   PartitionNode			*pNode,
-					   char						*partName,
-					   bool						 isDefault,
-					   PartitionByType			 part_type,
-					   char						*partDesc);
+static int atpxPart_validate_spec(
+					   PartitionBy *pBy,
+					   Relation rel,
+					   CreateStmt *ct,
+					   PartitionElem *pelem,
+					   PartitionNode *pNode,
+					   char *partName,
+					   bool isDefault,
+					   PartitionByType part_type,
+					   char *partDesc);
 
 static void atpxSkipper(PartitionNode *pNode, int *skipped);
 
-static List *
-build_rename_part_recurse(PartitionRule *rule, const char *old_parentname,
+static List *build_rename_part_recurse(PartitionRule *rule, const char *old_parentname,
 						  const char *new_parentname,
 						  int *skipped);
 static Oid
-get_opfuncid_by_opname(List *opname, Oid lhsid, Oid rhsid);
+			get_opfuncid_by_opname(List *opname, Oid lhsid, Oid rhsid);
 
-static PgPartRule *
-get_pprule_from_ATC(Relation rel, AlterTableCmd *cmd);
+static PgPartRule *get_pprule_from_ATC(Relation rel, AlterTableCmd *cmd);
 
-static List*
-get_partition_rules(PartitionNode *pn);
+static List *get_partition_rules(PartitionNode *pn);
 
 static bool
-relation_has_supers(Oid relid);
+			relation_has_supers(Oid relid);
 
-static NewConstraint *
-constraint_apply_mapped(HeapTuple tuple, AttrMap *map, Relation cand,
-						bool validate, bool is_split, Relation pgcon);
+static NewConstraint *constraint_apply_mapped(HeapTuple tuple, TupleConversionMap *map, Relation cand,
+						bool validate, Relation pgcon);
 
-static char *
-ChooseConstraintNameForPartitionCreate(const char *rname,
+static char *ChooseConstraintNameForPartitionCreate(const char *rname,
 									   const char *cname,
 									   const char *label,
 									   List *used_names);
 
-static Bitmapset *
-get_partition_key_bitmapset(Oid relid);
+static Bitmapset *get_partition_key_bitmapset(Oid relid);
 
 static List *get_deparsed_partition_encodings(Oid relid, Oid paroid);
 static List *rel_get_leaf_relids_from_rule(Oid ruleOid);
@@ -230,11 +233,12 @@ rel_is_default_partition(Oid relid)
 	ScanKeyData scankey;
 	SysScanDesc sscan;
 
-	/* Though pg_partition and pg_partition_rule are only populated
-	 * on the entry database, we accept calls from QEs running a
-	 * segment, but return false.
+	/*
+	 * Though pg_partition and pg_partition_rule are only populated on the
+	 * entry database, we accept calls from QEs running a segment, but return
+	 * false.
 	 */
-	if (Gp_segment != -1)
+	if (!IS_QUERY_DISPATCHER())
 		return false;
 
 	partrulerel = heap_open(PartitionRuleRelationId, AccessShareLock);
@@ -244,12 +248,12 @@ rel_is_default_partition(Oid relid)
 				ObjectIdGetDatum(relid));
 
 	sscan = systable_beginscan(partrulerel, PartitionRuleParchildrelidIndexId, true,
-							   SnapshotNow, 1, &scankey);
+							   NULL, 1, &scankey);
 	tuple = systable_getnext(sscan);
 
 	Insist(HeapTupleIsValid(tuple));
 
-	parisdefault = ((Form_pg_partition_rule)GETSTRUCT(tuple))->parisdefault;
+	parisdefault = ((Form_pg_partition_rule) GETSTRUCT(tuple))->parisdefault;
 
 	systable_endscan(sscan);
 	heap_close(partrulerel, AccessShareLock);
@@ -270,17 +274,17 @@ rel_is_default_partition(Oid relid)
 bool
 rel_is_partitioned(Oid relid)
 {
-	ScanKeyData	scankey;
+	ScanKeyData scankey;
 	Relation	rel;
 	SysScanDesc sscan;
 	bool		result;
 
 	/*
-	 * Though pg_partition and pg_partition_rule are only populated
-	 * on the entry database, we accept calls from QEs running a
-	 * segment, but return false.
+	 * Though pg_partition and pg_partition_rule are only populated on the
+	 * entry database, we accept calls from QEs running a segment, but return
+	 * false.
 	 */
-	if (Gp_segment != -1)
+	if (!IS_QUERY_DISPATCHER())
 		return false;
 
 	ScanKeyInit(&scankey, Anum_pg_partition_parrelid,
@@ -289,7 +293,7 @@ rel_is_partitioned(Oid relid)
 
 	rel = heap_open(PartitionRelationId, AccessShareLock);
 	sscan = systable_beginscan(rel, PartitionParrelidIndexId, true,
-							   SnapshotNow, 1, &scankey);
+							   NULL, 1, &scankey);
 
 	result = (systable_getnext(sscan) != NULL);
 
@@ -315,18 +319,14 @@ rel_is_partitioned(Oid relid)
 List *
 rel_partition_key_attrs(Oid relid)
 {
-	Relation rel;
+	Relation	rel;
 	ScanKeyData key;
 	SysScanDesc scan;
-	HeapTuple tuple;
-	List *pkeys = NIL;
+	HeapTuple	tuple;
+	List	   *pkeys = NIL;
 
-	/* Table pg_partition is only populated on the entry database,
-	 * however, we disable calls from outside dispatch to foil use
-	 * of utility mode.  (Full UCS may may this test obsolete.)
-	 */
-	if (Gp_session_role != GP_ROLE_DISPATCH )
-		elog(ERROR, "mode not dispatch");
+	if (!IS_QUERY_DISPATCHER())
+		elog(ERROR, "pg_partition is only accessible on entry database");
 
 	rel = heap_open(PartitionRelationId, AccessShareLock);
 
@@ -337,13 +337,13 @@ rel_partition_key_attrs(Oid relid)
 
 
 	scan = systable_beginscan(rel, PartitionParrelidIndexId, true,
-							  SnapshotNow, 1, &key);
+							  NULL, 1, &key);
 
 	tuple = systable_getnext(scan);
 
-	while ( HeapTupleIsValid(tuple) )
+	while (HeapTupleIsValid(tuple))
 	{
-		Index i;
+		Index		i;
 		Form_pg_partition p = (Form_pg_partition) GETSTRUCT(tuple);
 
 		if (p->paristemplate)
@@ -352,9 +352,9 @@ rel_partition_key_attrs(Oid relid)
 			continue;
 		}
 
-		for ( i = 0; i < p->parnatts; i++ )
+		for (i = 0; i < p->parnatts; i++)
 		{
-			pkeys = lappend_int(pkeys, (Oid)p->paratts.values[i]);
+			pkeys = lappend_int(pkeys, (Oid) p->paratts.values[i]);
 		}
 
 		tuple = systable_getnext(scan);
@@ -381,7 +381,8 @@ rel_partition_key_attrs(Oid relid)
 List *
 rel_partition_keys_ordered(Oid relid)
 {
-	List *pkeys = NIL;
+	List	   *pkeys = NIL;
+
 	rel_partition_keys_kinds_ordered(relid, &pkeys, NULL);
 	return pkeys;
 }
@@ -397,11 +398,11 @@ rel_partition_keys_kinds_ordered(Oid relid, List **pkeys, List **pkinds)
 	Relation	partrel;
 	ScanKeyData scankey;
 	SysScanDesc sscan;
-	List *levels = NIL;
-	List *keysUnordered = NIL;
-	List *kindsUnordered = NIL;
-	int nlevels = 0;
-	HeapTuple tuple = NULL;
+	List	   *levels = NIL;
+	List	   *keysUnordered = NIL;
+	List	   *kindsUnordered = NIL;
+	int			nlevels = 0;
+	HeapTuple	tuple = NULL;
 
 	partrel = heap_open(PartitionRelationId, AccessShareLock);
 
@@ -411,7 +412,7 @@ rel_partition_keys_kinds_ordered(Oid relid, List **pkeys, List **pkinds)
 				ObjectIdGetDatum(relid));
 
 	sscan = systable_beginscan(partrel, PartitionParrelidIndexId, true,
-							   SnapshotNow, 1, &scankey);
+							   NULL, 1, &scankey);
 	while (HeapTupleIsValid(tuple = systable_getnext(sscan)))
 	{
 		Form_pg_partition p = (Form_pg_partition) GETSTRUCT(tuple);
@@ -421,10 +422,11 @@ rel_partition_keys_kinds_ordered(Oid relid, List **pkeys, List **pkinds)
 			continue;
 		}
 
-		List *levelkeys = NIL;
-		for (int i = 0; i < p->parnatts; i++ )
+		List	   *levelkeys = NIL;
+
+		for (int i = 0; i < p->parnatts; i++)
 		{
-			levelkeys = lappend_int(levelkeys, (Oid)p->paratts.values[i]);
+			levelkeys = lappend_int(levelkeys, (Oid) p->paratts.values[i]);
 		}
 
 		nlevels++;
@@ -452,8 +454,8 @@ rel_partition_keys_kinds_ordered(Oid relid, List **pkeys, List **pkinds)
 		return;
 	}
 
-	// now order the keys and kinds by level
-	for (int i = 0; i< nlevels; i++)
+	/* now order the keys and kinds by level */
+	for (int i = 0; i < nlevels; i++)
 	{
 		ListCell   *cell;
 		int			pos = 0;
@@ -465,7 +467,7 @@ rel_partition_keys_kinds_ordered(Oid relid, List **pkeys, List **pkinds)
 				break;
 			++pos;
 		}
-		Assert (cell != NULL);
+		Assert(cell != NULL);
 
 		if (pkeys != NULL)
 			*pkeys = lappend(*pkeys, list_nth(keysUnordered, pos));
@@ -479,35 +481,20 @@ rel_partition_keys_kinds_ordered(Oid relid, List **pkeys, List **pkinds)
 }
 
  /*
- * Does relation have a external partition?
- * Returns true only when the input is the root partition
- * of a partitioned table and it has external partitions.
- */
+  * Does relation have a external partition? Returns true only when the input
+  * is the root partition of a partitioned table and it has external
+  * partitions.
+  */
 bool
 rel_has_external_partition(Oid relid)
 {
-	ListCell *lc = NULL;
-	PartitionNode *n = get_parts(relid, 0 /*level*/ ,
-							0 /*parent*/, false /* inctemplate */, false /*includesubparts*/);
+	PartitionNode *n = get_parts(relid, 0 /* level */ ,
+								 0 /* parent */ , false /* inctemplate */ , true /* includesubparts */ );
 
-	if (n == NULL || n->rules == NULL)
+	if (n == NULL)
 		return false;
 
-	foreach(lc, n->rules)
-	{
-		PartitionRule *rule = lfirst(lc);
-		Relation rel = heap_open(rule->parchildrelid, NoLock);
-
-		if (RelationIsExternal(rel))
-		{
-			heap_close(rel, NoLock);
-			return true;
-		}
-
-		heap_close(rel, NoLock);
-	}
-
-	return false;
+	return has_external_partition(n);
 }
 
 /*
@@ -518,25 +505,26 @@ rel_has_external_partition(Oid relid)
 bool
 rel_has_appendonly_partition(Oid relid)
 {
-	ListCell *lc = NULL;
+	ListCell   *lc = NULL;
 	List	   *leaf_oid_list = NIL;
-	PartitionNode *n = get_parts(relid, 0 /*level*/ ,
-								 0 /*parent*/, false /* inctemplate */, true /*includesubparts*/);
+	PartitionNode *n = get_parts(relid, 0 /* level */ ,
+								 0 /* parent */ , false /* inctemplate */ , true /* includesubparts */ );
 
-	if (n == NULL || n->rules == NULL)
+	if (n == NULL || n->num_rules == 0)
 		return false;
 
-	leaf_oid_list = all_leaf_partition_relids(n); /* all leaves */
+	leaf_oid_list = all_leaf_partition_relids(n);	/* all leaves */
 
 	foreach(lc, leaf_oid_list)
 	{
-		Relation rel = heap_open(lfirst_oid(lc), NoLock);
-		heap_close(rel, NoLock);
+		Relation	rel = heap_open(lfirst_oid(lc), NoLock);
 
-		if (RelationIsAoRows(rel) || RelationIsAoCols(rel))
+		if (RelationIsAppendOptimized(rel))
 		{
+			heap_close(rel, NoLock);
 			return true;
 		}
+		heap_close(rel, NoLock);
 	}
 
 	return false;
@@ -556,15 +544,17 @@ rel_has_appendonly_partition(Oid relid)
 bool
 rel_is_child_partition(Oid relid)
 {
-	ScanKeyData	scankey;
+	ScanKeyData scankey;
 	Relation	rel;
 	SysScanDesc sscan;
 	bool		result;
 
-	/* Though pg_partition and  pg_partition_rule are populated only on the
+	/*
+	 * Though pg_partition and  pg_partition_rule are populated only on the
 	 * entry database, are some unguarded calles that may come from segments,
-	 * so we return false, even though we don't actually know. */
-	if (Gp_segment != -1)
+	 * so we return false, even though we don't actually know.
+	 */
+	if (!IS_QUERY_DISPATCHER())
 		return false;
 
 	ScanKeyInit(&scankey, Anum_pg_partition_rule_parchildrelid,
@@ -573,7 +563,7 @@ rel_is_child_partition(Oid relid)
 
 	rel = heap_open(PartitionRuleRelationId, AccessShareLock);
 	sscan = systable_beginscan(rel, PartitionRuleParchildrelidIndexId, true,
-							   SnapshotNow, 1, &scankey);
+							   NULL, 1, &scankey);
 
 	result = (systable_getnext(sscan) != NULL);
 
@@ -585,32 +575,30 @@ rel_is_child_partition(Oid relid)
 }
 
 /*
- * Is relid a leaf node of a partitioning hierarchy? If no, it does not follow
- * that it is the root.
+ * Is relid an interior node of a partitioning hierarchy?
  *
- * To determine if it is a leaf or not, we need to find the depth of our
- * partition and compare this to the maximum depth of the partition set itself.
- * If they're equal, we have a leaf, otherwise, something else.
+ * To determine if it is an interior node or not, we need to find the depth of
+ * our partition and check if there is at least one more level below us.
  *
  * Call only on entry database.
  */
 bool
-rel_is_leaf_partition(Oid relid)
+rel_is_interior_partition(Oid relid)
 {
-	HeapTuple tuple;
-	Oid paroid = InvalidOid;
-	int maxdepth = 0;
-	int mylevel = 0;
+	HeapTuple	tuple;
+	Oid			paroid = InvalidOid;
+	bool		is_interior = false;
+	int			mylevel = 0;
 	Relation	partrulerel;
 	Relation	partrel;
 	ScanKeyData scankey;
 	SysScanDesc sscan;
-	Oid partitioned_rel = InvalidOid; /* OID of the root table of the
-									   * partition set
-									   */
+	Oid			partitioned_rel = InvalidOid;	/* OID of the root table of
+												 * the partition set */
+
 	/*
-	 * Find the pg_partition_rule entry to see if this is a child at
-	 * all and, if so, to locate the OID for the pg_partition entry.
+	 * Find the pg_partition_rule entry to see if this is a child at all and,
+	 * if so, to locate the OID for the pg_partition entry.
 	 *
 	 * SELECT paroid FROM pg_partition_rule WHERE parchildrelid = :1
 	 */
@@ -620,7 +608,7 @@ rel_is_leaf_partition(Oid relid)
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(relid));
 	sscan = systable_beginscan(partrulerel, PartitionRuleParchildrelidIndexId, true,
-							   SnapshotNow, 1, &scankey);
+							   NULL, 1, &scankey);
 	tuple = systable_getnext(sscan);
 
 	if (tuple)
@@ -638,8 +626,95 @@ rel_is_leaf_partition(Oid relid)
 
 	Insist(HeapTupleIsValid(tuple));
 
-	mylevel = ((Form_pg_partition)GETSTRUCT(tuple))->parlevel;
-	partitioned_rel = ((Form_pg_partition)GETSTRUCT(tuple))->parrelid;
+	mylevel = ((Form_pg_partition) GETSTRUCT(tuple))->parlevel;
+	partitioned_rel = ((Form_pg_partition) GETSTRUCT(tuple))->parrelid;
+	ReleaseSysCache(tuple);
+
+	/* SELECT * FROM pg_partition WHERE parrelid = :1 */
+	partrel = heap_open(PartitionRelationId, AccessShareLock);
+
+	ScanKeyInit(&scankey, Anum_pg_partition_parrelid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(partitioned_rel));
+	sscan = systable_beginscan(partrel, PartitionParrelidIndexId, true,
+							   NULL, 1, &scankey);
+
+	while (HeapTupleIsValid(tuple = systable_getnext(sscan)))
+	{
+		/* not interested in templates */
+		if (((Form_pg_partition) GETSTRUCT(tuple))->paristemplate == false)
+		{
+			int			depth = ((Form_pg_partition) GETSTRUCT(tuple))->parlevel;
+			if (depth > mylevel)
+			{
+				is_interior = true;
+				break;
+			}
+		}
+	}
+
+	systable_endscan(sscan);
+	heap_close(partrel, AccessShareLock);
+
+	return is_interior;
+}
+
+/*
+ * Is relid a leaf node of a partitioning hierarchy? If no, it does not follow
+ * that it is the root.
+ *
+ * To determine if it is a leaf or not, we need to find the depth of our
+ * partition and compare this to the maximum depth of the partition set itself.
+ * If they're equal, we have a leaf, otherwise, something else.
+ *
+ * Call only on entry database.
+ */
+bool
+rel_is_leaf_partition(Oid relid)
+{
+	HeapTuple	tuple;
+	Oid			paroid = InvalidOid;
+	int			maxdepth = 0;
+	int			mylevel = 0;
+	Relation	partrulerel;
+	Relation	partrel;
+	ScanKeyData scankey;
+	SysScanDesc sscan;
+	Oid			partitioned_rel = InvalidOid;	/* OID of the root table of
+												 * the partition set */
+
+	/*
+	 * Find the pg_partition_rule entry to see if this is a child at all and,
+	 * if so, to locate the OID for the pg_partition entry.
+	 *
+	 * SELECT paroid FROM pg_partition_rule WHERE parchildrelid = :1
+	 */
+	partrulerel = heap_open(PartitionRuleRelationId, AccessShareLock);
+
+	ScanKeyInit(&scankey, Anum_pg_partition_rule_parchildrelid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(relid));
+	sscan = systable_beginscan(partrulerel, PartitionRuleParchildrelidIndexId, true,
+							   NULL, 1, &scankey);
+	tuple = systable_getnext(sscan);
+
+	if (tuple)
+		paroid = ((Form_pg_partition_rule) GETSTRUCT(tuple))->paroid;
+	else
+		paroid = InvalidOid;
+
+	systable_endscan(sscan);
+	heap_close(partrulerel, AccessShareLock);
+
+	if (!OidIsValid(paroid))
+		return false;
+
+	tuple = SearchSysCache1(PARTOID, ObjectIdGetDatum(paroid));
+
+	Insist(HeapTupleIsValid(tuple));
+
+	mylevel = ((Form_pg_partition) GETSTRUCT(tuple))->parlevel;
+	partitioned_rel = ((Form_pg_partition) GETSTRUCT(tuple))->parrelid;
 	ReleaseSysCache(tuple);
 
 
@@ -650,19 +725,19 @@ rel_is_leaf_partition(Oid relid)
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(partitioned_rel));
 	sscan = systable_beginscan(partrel, PartitionParrelidIndexId, true,
-							   SnapshotNow, 1, &scankey);
+							   NULL, 1, &scankey);
 
 	/*
-	 * Of course, we could just maxdepth++ but this seems safer -- we
-	 * don't have to worry about the starting depth being 0, 1 or
-	 * something else.
+	 * Of course, we could just maxdepth++ but this seems safer -- we don't
+	 * have to worry about the starting depth being 0, 1 or something else.
 	 */
 	while (HeapTupleIsValid(tuple = systable_getnext(sscan)))
 	{
 		/* not interested in templates */
-		if (((Form_pg_partition)GETSTRUCT(tuple))->paristemplate == false)
+		if (((Form_pg_partition) GETSTRUCT(tuple))->paristemplate == false)
 		{
-			int depth = ((Form_pg_partition)GETSTRUCT(tuple))->parlevel;
+			int			depth = ((Form_pg_partition) GETSTRUCT(tuple))->parlevel;
+
 			maxdepth = Max(maxdepth, depth);
 		}
 	}
@@ -679,7 +754,8 @@ rel_is_leaf_partition(Oid relid)
  * table or when called other then on the entry database, i.e., only meaningful
  * on  the entry database.
  */
-PartStatus rel_part_status(Oid relid)
+PartStatus
+rel_part_status(Oid relid)
 {
 	if (Gp_role != GP_ROLE_DISPATCH)
 	{
@@ -688,17 +764,17 @@ PartStatus rel_part_status(Oid relid)
 		return PART_STATUS_NONE;
 	}
 
-	if ( rel_is_partitioned(relid) )
+	if (rel_is_partitioned(relid))
 	{
-		Assert( !rel_is_child_partition(relid) && !rel_is_leaf_partition(relid) );
+		Assert(!rel_is_child_partition(relid) && !rel_is_leaf_partition(relid));
 		return PART_STATUS_ROOT;
 	}
-	else /* not an actual partitioned table root */
+	else						/* not an actual partitioned table root */
 	{
-		if ( rel_is_child_partition(relid) )
+		if (rel_is_child_partition(relid))
 			return rel_is_leaf_partition(relid) ? PART_STATUS_LEAF : PART_STATUS_INTERIOR;
-		else /* not a part of a partitioned table */
-			Assert( !rel_is_child_partition(relid) );
+		else					/* not a part of a partitioned table */
+			Assert(!rel_is_child_partition(relid));
 	}
 	return PART_STATUS_NONE;
 }
@@ -710,17 +786,18 @@ PartStatus rel_part_status(Oid relid)
 static List *
 sorted_insert_list(List *list, HeapTuple tuple)
 {
-	ListCell *lc;
-	ListCell *lc_prev = NULL;
-	HeapTuple list_tup;
-	List *ret_list = list;
+	ListCell   *lc;
+	ListCell   *lc_prev = NULL;
+	HeapTuple	list_tup;
+	List	   *ret_list = list;
+
 	foreach(lc, ret_list)
 	{
 		list_tup = lfirst(lc);
 		if (HeapTupleGetOid(list_tup) >
 			HeapTupleGetOid(tuple))
 		{
-				break;
+			break;
 		}
 		lc_prev = lc;
 	}
@@ -757,7 +834,7 @@ sorted_insert_list(List *list, HeapTuple tuple)
  * is all associated with the hash table and is allocated in the given
  * memory context, so it will be easy to free in bulk.
  */
-void
+static void
 record_constraints(Relation pgcon,
 				   MemoryContext context,
 				   HTAB *hash_tbl,
@@ -765,22 +842,21 @@ record_constraints(Relation pgcon,
 				   PartExchangeRole xrole)
 {
 	HeapTuple	tuple;
-	Relation	conRel;
-	Oid conid;
-	char *condef;
+	Oid			conid;
+	char	   *condef;
 	ConstraintEntry *entry;
-	bool found;
+	bool		found;
 	MemoryContext oldcontext;
 	ScanKeyData scankey;
 	SysScanDesc sscan;
+	Form_pg_constraint con;
 
-	conRel = heap_open(ConstraintRelationId, AccessShareLock);
 
 	ScanKeyInit(&scankey, Anum_pg_constraint_conrelid,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(RelationGetRelid(rel)));
-	sscan = systable_beginscan(conRel, ConstraintRelidIndexId, true,
-							   SnapshotNow, 1, &scankey);
+	sscan = systable_beginscan(pgcon, ConstraintRelidIndexId, true,
+							   NULL, 1, &scankey);
 
 	/* For each constraint on rel: */
 	while (HeapTupleIsValid(tuple = systable_getnext(sscan)))
@@ -790,35 +866,57 @@ record_constraints(Relation pgcon,
 		conid = HeapTupleGetOid(tuple);
 
 		condef = pg_get_constraintexpr_string(conid);
-		entry = (ConstraintEntry*)hash_search(hash_tbl,
-											  (void*) condef,
-											  HASH_ENTER,
-											  &found);
+		entry = (ConstraintEntry *) hash_search(hash_tbl,
+												(void *) condef,
+												HASH_ENTER,
+												&found);
 
-		/* A tuple isn't a Node, but we'll stick it in a List
-		 * anyway, and just be careful.
+		/*
+		 * A tuple isn't a Node, but we'll stick it in a List anyway, and just
+		 * be careful.
 		 */
-		if ( !found )
+		if (!found)
 		{
 			entry->key = condef;
+			entry->indexed_cons = false;
 			entry->table_cons = NIL;
 			entry->part_cons = NIL;
 			entry->cand_cons = NIL;
 		}
+
+		con = (Form_pg_constraint) GETSTRUCT(tuple);
+
+		switch (con->contype)
+		{
+			case CONSTRAINT_PRIMARY:
+			case CONSTRAINT_UNIQUE:
+				entry->indexed_cons = true;
+				break;
+			/*
+			 * Other types of constraints should not need special treatment
+			 */
+			case CONSTRAINT_CHECK:
+			case CONSTRAINT_FOREIGN:
+			case CONSTRAINT_TRIGGER:
+				break;
+			default:
+				Assert(false);
+		}
+
 		tuple = heap_copytuple(tuple);
-		switch(xrole)
+		switch (xrole)
 		{
 			case PART_TABLE:
 				entry->table_cons = sorted_insert_list(
-						entry->table_cons, tuple);
+													   entry->table_cons, tuple);
 				break;
 			case PART_PART:
 				entry->part_cons = sorted_insert_list(
-						entry->part_cons, tuple);
+													  entry->part_cons, tuple);
 				break;
 			case PART_CAND:
 				entry->cand_cons = sorted_insert_list(
-						entry->cand_cons, tuple);
+													  entry->cand_cons, tuple);
 				break;
 			default:
 				Assert(FALSE);
@@ -827,7 +925,6 @@ record_constraints(Relation pgcon,
 		MemoryContextSwitchTo(oldcontext);
 	}
 	systable_endscan(sscan);
-	heap_close(conRel, AccessShareLock);
 }
 
 /* Subroutine of ATPExecPartExchange used to swap constraints on existing
@@ -842,35 +939,37 @@ record_constraints(Relation pgcon,
  */
 List *
 cdb_exchange_part_constraints(Relation table,
-						  Relation part,
-						  Relation cand,
-						  bool validate,
-						  bool is_split,
-						  AlterPartitionCmd *pc)
+							  Relation part,
+							  Relation cand,
+							  bool validate,
+							  bool is_split,
+							  AlterPartitionCmd *pc)
 {
-	HTAB *hash_tbl;
-	HASHCTL hash_ctl;
+	HTAB	   *hash_tbl;
+	HASHCTL		hash_ctl;
 	HASH_SEQ_STATUS hash_seq;
-	Relation pgcon;
+	Relation	pgcon;
 	MemoryContext context;
 	MemoryContext oldcontext;
 	ConstraintEntry *entry;
-	AttrMap *p2t = NULL;
-	AttrMap *c2t = NULL;
+	TupleConversionMap *p2t = NULL;
+	TupleConversionMap *c2t = NULL;
 
-	HeapTuple tuple;
+	HeapTuple	tuple;
 	Form_pg_constraint con;
 
-	List *excess_constraints = NIL;
-	List *missing_constraints = NIL;
-	List *missing_part_constraints = NIL;
-	List *validation_list = NIL;
-	int delta_checks = 0;
+	List	   *excess_constraints = NIL;
+	List	   *missing_constraints = NIL;
+	List	   *missing_inherited_constraints = NIL;
+	List	   *missing_part_constraints = NIL;
+	List	   *indexed_constraints = NIL;
+	List	   *validation_list = NIL;
+	int			delta_checks = 0;
 
 
 	/*
-	 * Setup an empty hash table mapping constraint definition
-	 * strings to ConstraintEntry structures.
+	 * Setup an empty hash table mapping constraint definition strings to
+	 * ConstraintEntry structures.
 	 */
 	context = AllocSetContextCreate(CurrentMemoryContext,
 									"Constraint Exchange Context",
@@ -879,7 +978,7 @@ cdb_exchange_part_constraints(Relation table,
 									MAX_XCHG_BLOCK_SIZE);
 
 	memset(&hash_ctl, 0, sizeof(hash_ctl));
-	hash_ctl.keysize = sizeof(char*);
+	hash_ctl.keysize = sizeof(char *);
 	hash_ctl.entrysize = sizeof(ConstraintEntry);
 	hash_ctl.hash = key_string_hash;
 	hash_ctl.match = key_string_compare;
@@ -895,10 +994,11 @@ cdb_exchange_part_constraints(Relation table,
 	/* Open pg_constraint here for use in the subroutine and below. */
 	pgcon = heap_open(ConstraintRelationId, AccessShareLock);
 
-	/* We need attribute numbers normalized to the partitioned table.
-	 * Note that these maps are inverse to the usual table-to-part maps.
+	/*
+	 * We need attribute numbers normalized to the partitioned table. Note
+	 * that these maps are inverse to the usual table-to-part maps.
 	 */
-	oldcontext =  MemoryContextSwitchTo(context);
+	oldcontext = MemoryContextSwitchTo(context);
 	map_part_attrs(part, table, &p2t, TRUE);
 	map_part_attrs(cand, table, &c2t, TRUE);
 	MemoryContextSwitchTo(oldcontext);
@@ -909,7 +1009,8 @@ cdb_exchange_part_constraints(Relation table,
 	record_constraints(pgcon, context, hash_tbl, cand, PART_CAND);
 	hash_freeze(hash_tbl);
 
-	/* Each entry in the hash table represents a single logically equivalent
+	/*
+	 * Each entry in the hash table represents a single logically equivalent
 	 * constraint which may appear zero or more times (under different names)
 	 * on each of the three involved relations.  By construction, it will
 	 * appear on at least one list.
@@ -919,24 +1020,85 @@ cdb_exchange_part_constraints(Relation table,
 	hash_seq_init(&hash_seq, hash_tbl);
 	while ((entry = hash_seq_search(&hash_seq)))
 	{
-		if ( list_length(entry->table_cons) > 0 )
+		if (entry->indexed_cons)
 		{
-			/* REGULAR CONSTRAINT
+			/*
+			 * INDEX BACKED CONSTRAINTS
 			 *
-			 * Constraints on the whole partitioned table are regular (in
-			 * the sense that they do not enforce partitioning rules and
+			 * Index backed constraints may inherit from a parent partition,
+			 * so they need to have the pg_inherits and pg_depend relationships
+			 * swapped.
+			 *
+			 * Unlike other constraints, because they are backed by indexes,
+			 * they must have a unique name, so the constraint name on the partition must be
+			 * swapped with the constraint name on the new table.
+			 */
+			List	   *missing = NIL;
+			List	   *extra = NIL;
+
+			if (list_length(entry->table_cons) > 0)
+			{
+				/*
+				 * Find any constraints that are missing from the partition that
+				 * exist on the parent. The missing constraints will need to be
+				 * added to the partition before we will allow a partition
+				 * exchange.
+				 */
+				constraint_diffs(entry->table_cons, entry->part_cons, true, &missing, &extra);
+				missing_inherited_constraints = list_concat(missing_inherited_constraints, missing);
+				excess_constraints = list_concat(excess_constraints, extra);
+			}
+
+			missing = NIL;
+			extra = NIL;
+
+			/*
+			 * Compare indexes between the existing and the incoming partition.
+			 */
+			constraint_diffs(entry->part_cons, entry->cand_cons, false, &missing, &extra);
+			missing_constraints = list_concat(missing_constraints, missing);
+			excess_constraints = list_concat(excess_constraints, extra);
+
+			ListCell *lc;
+
+			/*
+			 * Pop off any constraints that were added to either missing
+			 * or extra. What remains are the matching constraint pairs
+			 * for name exchange.
+			 */
+			foreach(lc, missing)
+			{
+				list_delete_ptr(entry->table_cons, lfirst(lc));
+			}
+
+			foreach(lc, extra)
+			{
+				list_delete_ptr(entry->cand_cons, lfirst(lc));
+			}
+
+			if (list_length(entry->part_cons) > 0 && list_length(entry->cand_cons) > 0)
+				indexed_constraints = lappend(indexed_constraints, entry);
+		}
+		else if (list_length(entry->table_cons) > 0)
+		{
+			/*
+			 * REGULAR CONSTRAINT
+			 *
+			 * Constraints on the whole partitioned table are regular (in the
+			 * sense that they do not enforce partitioning rules and
 			 * corresponding constraints must occur on every part).
 			 */
 
-			List *missing = NIL;
-			List *extra = NIL;
+			List	   *missing = NIL;
+			List	   *extra = NIL;
 
-			if ( list_length(entry->part_cons) == 0 )
+			if (list_length(entry->part_cons) == 0)
 			{
-				/* The regular constraint is missing from the existing part,
+				/*
+				 * The regular constraint is missing from the existing part,
 				 * so there is a database anomaly.  Warn rather than issuing
-				 * an error, because this may be an attempt to use EXCHANGE
-				 * to correct the problem.  There may be multiple constraints
+				 * an error, because this may be an attempt to use EXCHANGE to
+				 * correct the problem.  There may be multiple constraints
 				 * with different names, but report only the first name since
 				 * the constraint expression itself is all that matters.
 				 */
@@ -945,58 +1107,62 @@ cdb_exchange_part_constraints(Relation table,
 
 				ereport(WARNING,
 						(errcode(ERRCODE_WARNING),
-						 errmsg("ignoring inconsistency: \"%s\" "
-								"has no constraint corresponding to \"%s\" "
-								"on \"%s\"",
+						 errmsg("ignoring inconsistency: \"%s\" has no constraint corresponding to \"%s\" on \"%s\"",
 								RelationGetRelationName(part),
 								NameStr(con->conname),
 								RelationGetRelationName(table))));
 			}
 
-			/* The regular constraint should ultimately appear on the candidate
-			 * part the same number of times and with the same name as it appears
-			 * on the partitioned table. The call to constraint_diff will find
-			 * matching names and we'll be left with occurrences of the constraint
-			 * that must be added to the candidate (missing) and occurrences that
-			 * must be dropped from the candidate (extra).
+			/*
+			 * The regular constraint should ultimately appear on the
+			 * candidate part the same number of times and with the same name
+			 * as it appears on the partitioned table. The call to
+			 * constraint_diff will find matching names and we'll be left with
+			 * occurrences of the constraint that must be added to the
+			 * candidate (missing) and occurrences that must be dropped from
+			 * the candidate (extra).
 			 */
-			constraint_diffs(entry->table_cons, entry->cand_cons, true, &missing, &extra);
+			constraint_diffs(entry->table_cons, entry->cand_cons, false, &missing, &extra);
 			missing_constraints = list_concat(missing_constraints, missing);
 			excess_constraints = list_concat(excess_constraints, extra);
 		}
-		else if ( list_length(entry->part_cons) > 0 ) /* and none on whole */
+		else if (list_length(entry->part_cons) > 0) /* and none on whole */
 		{
-			/* PARTITION CONSTRAINT
+			/*
+			 * PARTITION CONSTRAINT
 			 *
-			 * Constraints on the part and not the whole must guard a partition
-			 * rule, so they must be CHECK constraints on partitioning columns.
-			 * They are managed internally, so there must be only one of them.
-			 * (Though a part will have a partition constraint for each partition
-			 * level, a given constraint should appear only once per part.)
+			 * Constraints on the part and not the whole must guard a
+			 * partition rule, so they must be CHECK constraints on
+			 * partitioning columns. They are managed internally, so there
+			 * must be only one of them. (Though a part will have a partition
+			 * constraint for each partition level, a given constraint should
+			 * appear only once per part.)
 			 *
 			 * They should either already occur on the candidate or be added.
 			 * Partition constraint names are not carefully managed so they
 			 * shouldn't be regarded as meaningful.
 			 *
 			 * Since we use the partition constraint of the part to check or
-			 * construct the partition constraint of the candidate, we insist it
-			 * is in good working order, and issue an error, if not.
+			 * construct the partition constraint of the candidate, we insist
+			 * it is in good working order, and issue an error, if not.
 			 */
-			int n = list_length(entry->part_cons);
+			int			n = list_length(entry->part_cons);
 
-			if ( n > 1 )
+			if (n > 1)
 			{
 				elog(ERROR,
 					 "multiple partition constraints (same key) on \"%s\"",
 					 RelationGetRelationName(part));
 			}
 
-			/* Get the model partition constraint.
+			/*
+			 * Get the model partition constraint.
 			 */
 			tuple = linitial(entry->part_cons);
 			con = (Form_pg_constraint) GETSTRUCT(tuple);
 
-			/* Check it, though this is cursory in that we don't check that
+			/*
+			 * Check it, though this is cursory in that we don't check that
 			 * the right attributes are involved and that the semantics are
 			 * right.
 			 */
@@ -1009,44 +1175,49 @@ cdb_exchange_part_constraints(Relation table,
 
 			n = list_length(entry->cand_cons);
 
-			if ( n == 0 )
+			if (n == 0)
 			{
-				/* The partition constraint is missing from the candidate and
+				/*
+				 * The partition constraint is missing from the candidate and
 				 * must be added.
 				 */
 				missing_part_constraints = lappend(missing_part_constraints,
-												   (HeapTuple)linitial(entry->part_cons));
+												   (HeapTuple) linitial(entry->part_cons));
 			}
-			else if ( n == 1 )
+			else if (n == 1)
 			{
-				/* One instance of the partition constraint exists on the
+				/*
+				 * One instance of the partition constraint exists on the
 				 * candidate, so let's not worry about name drift.  All is
-				 * well. */
+				 * well.
+				 */
 			}
 			else
 			{
-				/* Several instances of the partition constraint exist on
-				 * the candidate. If one has a matching name, prefer it.
-				 * Else, just chose the first (arbitrary).
+				/*
+				 * Several instances of the partition constraint exist on the
+				 * candidate. If one has a matching name, prefer it. Else,
+				 * just chose the first (arbitrary).
 				 */
-				List *missing = NIL;
-				List *extra = NIL;
+				List	   *missing = NIL;
+				List	   *extra = NIL;
 
 				constraint_diffs(entry->part_cons, entry->cand_cons, false, &missing, &extra);
 
-				if ( list_length(missing) == 0 )
+				if (list_length(missing) == 0)
 				{
 					excess_constraints = list_concat(excess_constraints, extra);
 				}
-				else /* missing */
+				else			/* missing */
 				{
-					ListCell *lc;
-					bool skip = TRUE;
+					ListCell   *lc;
+					bool		skip = TRUE;
 
 					foreach(lc, entry->cand_cons)
 					{
-						HeapTuple tuple = (HeapTuple)lfirst(lc);
-						if ( skip )
+						HeapTuple	tuple = (HeapTuple) lfirst(lc);
+
+						if (skip)
 						{
 							skip = FALSE;
 						}
@@ -1058,90 +1229,139 @@ cdb_exchange_part_constraints(Relation table,
 				}
 			}
 		}
-		else if ( list_length(entry->cand_cons) > 0 ) /* and none on whole or part */
+		else if (list_length(entry->cand_cons) > 0) /* and none on whole or
+													 * part */
 		{
-			/* MAVERICK CONSTRAINT
+			/*
+			 * MAVERICK CONSTRAINT
 			 *
-			 * Constraints on only the candidate are extra and must be
-			 * dropped before the candidate can replace the part.
+			 * Constraints on only the candidate are extra and must be dropped
+			 * before the candidate can replace the part.
 			 */
 			excess_constraints = list_concat(excess_constraints,
 											 entry->cand_cons);
 		}
-		else /* Defensive: Can't happen that no constraints are set. */
+		else					/* Defensive: Can't happen that no constraints
+								 * are set. */
 		{
 			elog(ERROR, "constraint hash table inconsistent");
 		}
 	}
 
 
-	if ( excess_constraints )
+	if (excess_constraints)
 	{
-		/* Disallow excess constraints.  We could drop them automatically, but they
-		 * may carry semantic information about the candidate that is important to
-		 * the user, so make the user decide whether to drop them.
+		/*
+		 * Disallow excess constraints.  We could drop them automatically, but
+		 * they may carry semantic information about the candidate that is
+		 * important to the user, so make the user decide whether to drop
+		 * them.
 		 */
 		ereport(ERROR,
 				(errcode(ERRCODE_INTEGRITY_CONSTRAINT_VIOLATION),
 				 errmsg("invalid constraint(s) found on \"%s\": %s",
 						RelationGetRelationName(cand),
 						constraint_names(excess_constraints)),
-				 errhint("drop the invalid constraints and retry")));
+				 errhint("Drop the invalid constraints and retry.")));
 	}
 
-	if ( missing_part_constraints )
+	if (missing_inherited_constraints)
 	{
-		ListCell *lc;
+		/*
+		 * If the parent table has an extra constraint that is not
+		 * inherited by the existing partition, then don't allow the echange
+		 * to occur until that has been corrected.
+		 */
+		ereport(ERROR,
+				(errcode(ERRCODE_INTEGRITY_CONSTRAINT_VIOLATION),
+					errmsg("Inherited constraints(s) found on \"%s\" that do not exist on \"%s\": %s",
+						RelationGetRelationName(table),
+						RelationGetRelationName(part),
+						constraint_names(missing_inherited_constraints)),
+					errhint("Attach missing constraints and retry.")));
+	}
+
+	if (missing_part_constraints)
+	{
+		ListCell   *lc;
 
 		foreach(lc, missing_part_constraints)
 		{
-			HeapTuple missing_part_constraint = (HeapTuple)lfirst(lc);
-			/* We need a constraint like the missing one for the part, but translated
-			 * for the candidate.
-			 */
-			AttrMap *map;
-			struct NewConstraint *nc;
-			Form_pg_constraint mcon = (Form_pg_constraint)GETSTRUCT(missing_part_constraint);
+			HeapTuple	missing_part_constraint = (HeapTuple) lfirst(lc);
 
-			if ( mcon->contype != CONSTRAINT_CHECK )
-				elog(ERROR,"Invalid partition constration, not CHECK type");
+			/*
+			 * We need a constraint like the missing one for the part, but
+			 * translated for the candidate.
+			 */
+			TupleConversionMap *map;
+			struct NewConstraint *nc;
+			Form_pg_constraint mcon = (Form_pg_constraint) GETSTRUCT(missing_part_constraint);
+
+			if (mcon->contype != CONSTRAINT_CHECK)
+				elog(ERROR, "Invalid partition constraint, not CHECK type");
 
 			map_part_attrs(part, cand, &map, TRUE);
 			nc = constraint_apply_mapped(missing_part_constraint, map, cand,
-										 validate, is_split, pgcon);
-			if ( nc )
+										 validate, pgcon);
+			if (nc)
 				validation_list = lappend(validation_list, nc);
 
 			delta_checks++;
 		}
 	}
 
-	if ( missing_constraints )
+	if (missing_constraints)
 	{
-		/* We need constraints like the missing ones for the whole, but
+		/*
+		 * We need constraints like the missing ones for the whole, but
 		 * translated for the candidate.
 		 */
-		AttrMap *map;
+		TupleConversionMap *map;
 		struct NewConstraint *nc;
-		ListCell *lc;
+		ListCell   *lc;
 
 		map_part_attrs(table, cand, &map, TRUE);
 		foreach(lc, missing_constraints)
 		{
-			HeapTuple tuple = (HeapTuple)lfirst(lc);
-			Form_pg_constraint mcon = (Form_pg_constraint)GETSTRUCT(tuple);
+			HeapTuple	tuple = (HeapTuple) lfirst(lc);
+			Form_pg_constraint mcon = (Form_pg_constraint) GETSTRUCT(tuple);
 
 			nc = constraint_apply_mapped(tuple, map, cand,
-										 validate, is_split, pgcon);
-			if ( nc )
+										 validate, pgcon);
+			if (nc)
 				validation_list = lappend(validation_list, nc);
 
-			if ( mcon->contype == CONSTRAINT_CHECK )
+			if (mcon->contype == CONSTRAINT_CHECK)
 				delta_checks++;
 		}
 	}
 
-	if ( delta_checks )
+	if (indexed_constraints)
+	{
+		ListCell   *lcentry;
+
+		foreach(lcentry, indexed_constraints)
+		{
+			ListCell   *lcpart;
+			ListCell   *lccand;
+
+			entry = (ConstraintEntry *) lfirst(lcentry);
+
+			forboth(lcpart, entry->part_cons, lccand, entry->cand_cons)
+			{
+				HeapTuple	parttuple = (HeapTuple) lfirst(lcpart);
+				Form_pg_constraint part_constraint = (Form_pg_constraint) GETSTRUCT(parttuple);
+
+				HeapTuple	candtuple = (HeapTuple) lfirst(lccand);
+				Form_pg_constraint cand_constraint = (Form_pg_constraint) GETSTRUCT(candtuple);
+
+				exchange_constraint_names(part, cand, part_constraint->conname, cand_constraint->conname);
+			}
+		}
+	}
+
+
+	if (delta_checks)
 	{
 		SetRelationNumChecks(cand, cand->rd_rel->relchecks + delta_checks);
 	}
@@ -1153,6 +1373,42 @@ cdb_exchange_part_constraints(Relation table,
 	return validation_list;
 }
 
+static void
+exchange_constraint_names(Relation part, Relation cand, NameData part_name, NameData cand_name)
+{
+	char		temp_name[NAMEDATALEN];
+
+	elog(DEBUG1, "Exchanging names for %s and %s", NameStr(part_name),
+		NameStr(cand_name));
+
+	snprintf(temp_name, NAMEDATALEN, "pg_temp_exchange_%u_%i", RelationGetRelid(part), MyBackendId);
+
+	/*
+	 * Since index names are unique within a namespace, assign a constraint a
+	 * temporary name to help with the exchange.
+	 */
+	rename_constraint(part, NameStr(part_name), temp_name);
+	rename_constraint(cand, NameStr(cand_name), NameStr(part_name));
+	rename_constraint(part, temp_name, NameStr(cand_name));
+}
+
+static void
+rename_constraint(Relation rel, char *old_name, char *new_name)
+{
+	RenameStmt renamestmt;
+
+	renamestmt.renameType = OBJECT_TABCONSTRAINT;
+	renamestmt.relationType = OBJECT_TABLE;
+	renamestmt.relation = makeRangeVar(get_namespace_name(rel->rd_rel->relnamespace),
+									   RelationGetRelationName(rel), -1);
+	renamestmt.subname = old_name;
+	renamestmt.newname = new_name;
+	renamestmt.behavior = DROP_RESTRICT;
+
+	RenameConstraint(&renamestmt);
+
+	CommandCounterIncrement();
+}
 /*
  * Return a string of comma-delimited names of the constraints in the
  * argument list of pg_constraint tuples.  This is primarily for use
@@ -1168,9 +1424,9 @@ constraint_names(List *cons)
 	initStringInfo(&str);
 
 	p = "";
-	foreach (lc, cons)
+	foreach(lc, cons)
 	{
-		HeapTuple tuple = lfirst(lc);
+		HeapTuple	tuple = lfirst(lc);
 		Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tuple);
 
 		appendStringInfo(&str, "%s\"%s\"", p, NameStr(con->conname));
@@ -1203,97 +1459,104 @@ constraint_names(List *cons)
  * the other list.
  */
 static void
-constraint_diffs(List *cons_a, List *cons_b, bool match_names, List **missing, List **extra)
+constraint_diffs(List *cons_a, List *cons_b, bool match_inheritance, List **missing, List **extra)
 {
-	ListCell *cell_a, *cell_b;
-	Index pos_a, pos_b;
-	int *match_a, *match_b;
-	int n;
+	ListCell   *cell_a,
+			   *cell_b;
+	Index		pos_a,
+				pos_b;
+	int		   *match_a,
+			   *match_b;
+	int			n;
 
-	int len_a = list_length(cons_a);
-	int len_b = list_length(cons_b);
+	int			len_a = list_length(cons_a);
+	int			len_b = list_length(cons_b);
 
 	Assert(missing != NULL);
 	Assert(extra != NULL);
 
-	if ( len_a == 0 )
+	if (len_a == 0)
 	{
 		*extra = list_copy(cons_b);
 		*missing = NIL;
 		return;
 	}
 
-	if ( len_b == 0 )
+	if (len_b == 0)
 	{
 		*extra = NIL;
 		*missing = list_copy(cons_a);
 		return;
 	}
 
-	match_a = (int*)palloc(len_a * sizeof(int));
-	for ( pos_a = 0; pos_a < len_a; pos_a++ )
+	match_a = (int *) palloc(len_a * sizeof(int));
+	for (pos_a = 0; pos_a < len_a; pos_a++)
 		match_a[pos_a] = -1;
 
-	match_b = (int*)palloc(len_b * sizeof(int));
-	for ( pos_b = 0; pos_b < len_b; pos_b++ )
+	match_b = (int *) palloc(len_b * sizeof(int));
+	for (pos_b = 0; pos_b < len_b; pos_b++)
 		match_b[pos_b] = -1;
 
-	pos_b = 0;
-	foreach (cell_b, cons_b)
+	if(match_inheritance)
 	{
-		HeapTuple tuple_b = (HeapTuple)lfirst(cell_b);
-		Form_pg_constraint b = (Form_pg_constraint) GETSTRUCT(tuple_b);
-
-
-		pos_a = 0;
-		foreach (cell_a, cons_a)
+		pos_b = 0;
+		foreach(cell_b, cons_b)
 		{
-			HeapTuple tuple_a = lfirst(cell_a);
-			Form_pg_constraint a = (Form_pg_constraint) GETSTRUCT(tuple_a);
+			HeapTuple tuple_b = (HeapTuple) lfirst(cell_b);
+			Form_pg_constraint b = (Form_pg_constraint) GETSTRUCT(tuple_b);
+			pos_a = 0;
 
-			if ( strncmp(NameStr(a->conname), NameStr(b->conname), NAMEDATALEN) == 0 )
+			foreach(cell_a, cons_a)
 			{
-				/* No duplicate names on either list. */
-				Assert(match_a[pos_a] == -1 && match_b[pos_b] == -1);
+				HeapTuple tuple_a = lfirst(cell_a);
+				Form_pg_constraint a = (Form_pg_constraint) GETSTRUCT(tuple_a);
 
-				match_b[pos_b] = pos_a;
-				match_a[pos_a] = pos_b;
-				break;
+				List *inheritors = find_inheritance_children(a->conindid, NoLock);
+
+				if (list_member_oid(inheritors, b->conindid))
+				{
+					/* No duplicate inheritors on either list. */
+					Assert(match_a[pos_a] == -1 && match_b[pos_b] == -1);
+
+					match_b[pos_b] = pos_a;
+					match_a[pos_a] = pos_b;
+					break;
+				}
+				pos_a++;
 			}
-			pos_a++;
+			pos_b++;
 		}
-		pos_b++;
 	}
 
 	*missing = NIL;
 	*extra = NIL;
 
 	n = len_a - len_b;
-	if ( n > 0 || match_names )
+	if (n > 0 || match_inheritance)
 	{
 		pos_a = 0;
-		foreach (cell_a, cons_a)
+		foreach(cell_a, cons_a)
 		{
-			if ( match_a[pos_a] == -1 )
+			if (match_a[pos_a] == -1)
 				*missing = lappend(*missing, lfirst(cell_a));
 			pos_a++;
 			n--;
-			if ( n <= 0 && !match_names)
+			if (n <= 0 && !match_inheritance)
 				break;
 		}
 	}
 
 	n = len_b - len_a;
-	if ( n > 0 || match_names )
+	if (n > 0 || match_inheritance)
 	{
 		pos_b = 0;
-		foreach (cell_b, cons_b)
+		foreach(cell_b, cons_b)
 		{
-			if ( match_b[pos_b] == -1 )
+			if (match_b[pos_b] == -1)
 				*extra = lappend(*extra, lfirst(cell_b));
 			pos_b++;
 			n--;
-			if ( n <= 0 && !match_names )
+			if (n <= 0 && !match_inheritance)
 				break;
 		}
 	}
@@ -1304,20 +1567,23 @@ constraint_diffs(List *cons_a, List *cons_b, bool match_names, List **missing, L
 
 /*
  * Translate internal representation to catalog partition type indication
- * ('r', 'h' or 'l').
+ * ('r' or 'l').
  */
 static char
 parttype_to_char(PartitionByType type)
 {
-	char c;
+	char		c;
 
 	switch (type)
 	{
-		case PARTTYP_HASH: c = 'h'; break;
-		case PARTTYP_RANGE: c = 'r'; break;
-		case PARTTYP_LIST: c = 'l'; break;
+		case PARTTYP_RANGE:
+			c = 'r';
+			break;
+		case PARTTYP_LIST:
+			c = 'l';
+			break;
 		default:
-			c = 0; /* quieten compiler */
+			c = 0;				/* quieten compiler */
 			elog(ERROR, "unknown partitioning type %i", type);
 
 	}
@@ -1325,7 +1591,7 @@ parttype_to_char(PartitionByType type)
 }
 
 /*
- * Translate a catalog partition type indication ('r', 'h' or 'l') to the
+ * Translate a catalog partition type indication ('r' or 'l') to the
  * internal representation.
  */
 PartitionByType
@@ -1333,15 +1599,12 @@ char_to_parttype(char c)
 {
 	PartitionByType pt = PARTTYP_RANGE; /* just to shut GCC up */
 
-	switch(c)
+	switch (c)
 	{
-		case 'h': /* hash */
-			pt = PARTTYP_HASH;
-			break;
-		case 'r': /* range */
+		case 'r':
 			pt = PARTTYP_RANGE;
 			break;
-		case 'l': /* list */
+		case 'l':				/* list */
 			pt = PARTTYP_LIST;
 			break;
 		default:
@@ -1349,7 +1612,7 @@ char_to_parttype(char c)
 				 c);
 			Assert(false);
 			break;
-	} /* end switch */
+	}							/* end switch */
 
 	return pt;
 }
@@ -1360,12 +1623,12 @@ char_to_parttype(char c)
 static void
 add_partition(Partition *part)
 {
-	Datum		 values[Natts_pg_partition];
-	bool		 isnull[Natts_pg_partition];
-	Relation	 partrel;
-	HeapTuple	 tup;
-	oidvector	*opclass;
-	int2vector	*attnums;
+	Datum		values[Natts_pg_partition];
+	bool		isnull[Natts_pg_partition];
+	Relation	partrel;
+	HeapTuple	tup;
+	oidvector  *opclass;
+	int2vector *attnums;
 
 	MemSet(isnull, 0, sizeof(bool) * Natts_pg_partition);
 
@@ -1373,7 +1636,7 @@ add_partition(Partition *part)
 	values[Anum_pg_partition_parkind - 1] = CharGetDatum(part->parkind);
 	values[Anum_pg_partition_parlevel - 1] = Int16GetDatum(part->parlevel);
 	values[Anum_pg_partition_paristemplate - 1] =
-									BoolGetDatum(part->paristemplate);
+		BoolGetDatum(part->paristemplate);
 	values[Anum_pg_partition_parnatts - 1] = Int16GetDatum(part->parnatts);
 
 	attnums = buildint2vector(part->paratts, part->parnatts);
@@ -1400,53 +1663,57 @@ add_partition(Partition *part)
 static void
 add_partition_rule(PartitionRule *rule)
 {
-	Datum		 values[Natts_pg_partition_rule];
-	bool		 isnull[Natts_pg_partition_rule];
-	Relation	 rulerel;
-	HeapTuple	 tup;
-	NameData	 name;
+	Datum		values[Natts_pg_partition_rule];
+	bool		isnull[Natts_pg_partition_rule];
+	Relation	rulerel;
+	HeapTuple	tup;
+	NameData	name;
 
 	MemSet(isnull, 0, sizeof(bool) * Natts_pg_partition_rule);
 
 	values[Anum_pg_partition_rule_paroid - 1] = ObjectIdGetDatum(rule->paroid);
 	values[Anum_pg_partition_rule_parchildrelid - 1] =
-							ObjectIdGetDatum(rule->parchildrelid);
+		ObjectIdGetDatum(rule->parchildrelid);
 	values[Anum_pg_partition_rule_parparentrule - 1] =
-							ObjectIdGetDatum(rule->parparentoid);
+		ObjectIdGetDatum(rule->parparentoid);
 
 	name.data[0] = '\0';
 	namestrcpy(&name, rule->parname);
 	values[Anum_pg_partition_rule_parname - 1] = NameGetDatum(&name);
 
 	values[Anum_pg_partition_rule_parisdefault - 1] =
-							BoolGetDatum(rule->parisdefault);
+		BoolGetDatum(rule->parisdefault);
 	values[Anum_pg_partition_rule_parruleord - 1] =
-							Int16GetDatum(rule->parruleord);
+		Int16GetDatum(rule->parruleord);
 	values[Anum_pg_partition_rule_parrangestartincl - 1] =
-							BoolGetDatum(rule->parrangestartincl);
+		BoolGetDatum(rule->parrangestartincl);
 	values[Anum_pg_partition_rule_parrangeendincl - 1] =
-							BoolGetDatum(rule->parrangeendincl);
+		BoolGetDatum(rule->parrangeendincl);
 
 	values[Anum_pg_partition_rule_parrangestart - 1] =
-			DirectFunctionCall1(textin,
-						CStringGetDatum(nodeToString(rule->parrangestart)));
+		CStringGetTextDatum(nodeToString(rule->parrangestart));
 	values[Anum_pg_partition_rule_parrangeend - 1] =
-			DirectFunctionCall1(textin,
-						CStringGetDatum(nodeToString(rule->parrangeend)));
+			CStringGetTextDatum(nodeToString(rule->parrangeend));
 	values[Anum_pg_partition_rule_parrangeevery - 1] =
-			DirectFunctionCall1(textin,
-						CStringGetDatum(nodeToString(rule->parrangeevery)));
+			CStringGetTextDatum(nodeToString(rule->parrangeevery));
 	values[Anum_pg_partition_rule_parlistvalues - 1] =
-			DirectFunctionCall1(textin,
-						CStringGetDatum(nodeToString(rule->parlistvalues)));
-	if (rule->parreloptions)
-		values[Anum_pg_partition_rule_parreloptions - 1] =
-				transformRelOptions((Datum) 0, rule->parreloptions, true, false);
-	else
+			CStringGetTextDatum(nodeToString(rule->parlistvalues));
+
+	/*
+	 * If rule->parreloptions is NIL, the function `transformRelOptions`
+	 * will return the first argument.
+	 */
+	values[Anum_pg_partition_rule_parreloptions - 1] =
+		transformRelOptions((Datum) 0, rule->parreloptions, NULL, NULL, true, false);
+	/*
+	 * There some cases that transformRelOptions in the above will return a NULL.
+	 * Add a check here.
+	 */
+	if (!values[Anum_pg_partition_rule_parreloptions - 1])
 		isnull[Anum_pg_partition_rule_parreloptions - 1] = true;
 
-	values[Anum_pg_partition_rule_partemplatespace -1] =
-							ObjectIdGetDatum(rule->partemplatespaceId);
+	values[Anum_pg_partition_rule_partemplatespace - 1] =
+		ObjectIdGetDatum(rule->partemplatespaceId);
 
 	rulerel = heap_open(PartitionRuleRelationId, RowExclusiveLock);
 
@@ -1471,17 +1738,16 @@ get_part_oid(Oid rootrelid, int16 parlevel, bool istemplate)
 	HeapTuple	tuple;
 	Oid			paroid;
 
-	/* select oid
-	 * from pg_partition
-	 * where
-	 *     parrelid = :rootrelid and
-	 *     parlevel = :parlevel and
-	 *     paristemplate = :istemplate;
+	/*
+	 * select oid from pg_partition where parrelid = :rootrelid and parlevel =
+	 * :parlevel and paristemplate = :istemplate;
 	 */
 
-	/* pg_partition and  pg_partition_rule are populated only on the
-	 * entry database, so our result is only meaningful there. */
-	Insist(Gp_segment == -1);
+	/*
+	 * pg_partition and  pg_partition_rule are populated only on the entry
+	 * database, so our result is only meaningful there.
+	 */
+	Insist(IS_QUERY_DISPATCHER());
 
 	partrel = heap_open(PartitionRelationId, AccessShareLock);
 	ScanKeyInit(&scankey[0], Anum_pg_partition_parrelid,
@@ -1520,7 +1786,7 @@ del_part_template(Oid rootrelid, int16 parlevel, Oid parent)
 	bool		istemplate = true;
 	Oid			paroid = InvalidOid;
 	ItemPointerData tid;
-	ScanKeyData	scankey[3];
+	ScanKeyData scankey[3];
 	Relation	part_rel;
 	Relation	part_rule_rel;
 	SysScanDesc sscan;
@@ -1539,7 +1805,7 @@ del_part_template(Oid rootrelid, int16 parlevel, Oid parent)
 				BoolGetDatum(istemplate));
 
 	sscan = systable_beginscan(part_rel, PartitionParrelidParlevelParistemplateIndexId, true,
-							   SnapshotNow, 3, scankey);
+							   NULL, 3, scankey);
 
 	tuple = systable_getnext(sscan);
 	if (tuple == NULL)
@@ -1576,7 +1842,7 @@ del_part_template(Oid rootrelid, int16 parlevel, Oid parent)
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(parent));
 	sscan = systable_beginscan(part_rule_rel, PartitionRuleParoidParparentruleParruleordIndexId, true,
-							   SnapshotNow, 2, scankey);
+							   NULL, 2, scankey);
 
 	while ((tuple = systable_getnext(sscan)) != NULL)
 	{
@@ -1592,7 +1858,7 @@ del_part_template(Oid rootrelid, int16 parlevel, Oid parent)
 	CommandCounterIncrement();
 
 	return 1;
-} /* end del_part_template */
+}								/* end del_part_template */
 
 
 /*
@@ -1604,17 +1870,18 @@ del_part_template(Oid rootrelid, int16 parlevel, Oid parent)
  */
 void
 add_part_to_catalog(Oid relid, PartitionBy *pby,
-					bool bTemplate_Only /* = false */)
+					bool bTemplate_Only /* = false */ )
 {
-	char pt = parttype_to_char(pby->partType);
-	ListCell *lc;
+	char		pt = parttype_to_char(pby->partType);
+	ListCell   *lc;
 	PartitionSpec *spec;
-	Oid paroid = InvalidOid;
-	Oid rootrelid = InvalidOid;
-	Relation rel;
-	Oid parttemplid = InvalidOid;
-	bool add_temp = bTemplate_Only; /* normally false */
-	spec = (PartitionSpec *)pby->partSpec;
+	Oid			paroid = InvalidOid;
+	Oid			rootrelid = InvalidOid;
+	Relation	rel;
+	Oid			parttemplid = InvalidOid;
+	bool		add_temp = bTemplate_Only;	/* normally false */
+
+	spec = (PartitionSpec *) pby->partSpec;
 
 	/* only create partition catalog entries on the master */
 	if (Gp_role == GP_ROLE_EXECUTE)
@@ -1623,24 +1890,24 @@ add_part_to_catalog(Oid relid, PartitionBy *pby,
 	/*
 	 * Get the partitioned table relid.
 	 */
-	rootrelid = RangeVarGetRelid(pby->parentRel, false);
+	rootrelid = RangeVarGetRelid(pby->parentRel, NoLock, false);
 	paroid = get_part_oid(rootrelid, pby->partDepth,
-						  bTemplate_Only /* = false */);
+						  bTemplate_Only /* = false */ );
 
 	/* create a partition for this level, if one doesn't exist */
 	if (!OidIsValid(paroid))
 	{
 		AttrNumber *attnums;
-		Oid *parclass;
-		Partition *part = makeNode(Partition);
-		int i = 0;
+		Oid		   *parclass;
+		Partition  *part = makeNode(Partition);
+		int			i = 0;
 
 		part->parrelid = rootrelid;
 		part->parkind = pt;
 		part->parlevel = pby->partDepth;
 
 		if (pby->partSpec)
-			part->paristemplate = ((PartitionSpec *)pby->partSpec)->istemplate;
+			part->paristemplate = ((PartitionSpec *) pby->partSpec)->istemplate;
 		else
 			part->paristemplate = false;
 
@@ -1650,7 +1917,7 @@ add_part_to_catalog(Oid relid, PartitionBy *pby,
 
 		foreach(lc, pby->keys)
 		{
-			int colnum = lfirst_int(lc);
+			int			colnum = lfirst_int(lc);
 
 			attnums[i++] = colnum;
 		}
@@ -1662,7 +1929,7 @@ add_part_to_catalog(Oid relid, PartitionBy *pby,
 		i = 0;
 		foreach(lc, pby->keyopclass)
 		{
-			Oid opclass = lfirst_oid(lc);
+			Oid			opclass = lfirst_oid(lc);
 
 			parclass[i++] = opclass;
 		}
@@ -1696,23 +1963,23 @@ add_part_to_catalog(Oid relid, PartitionBy *pby,
 		paroid = part->partid;
 	}
 	else
-	/* oid of the template accompanying the real partition */
+		/* oid of the template accompanying the real partition */
 		parttemplid = get_part_oid(rootrelid, pby->partDepth, true);
 
 	/* create partition rule */
 	if (spec)
 	{
-		Node *listvalues = NULL;
-		Node *rangestart = NULL;
-		Node *rangeend = NULL;
-		Node *rangeevery = NULL;
-		bool rangestartinc = false;
-		bool rangeendinc = false;
-		int2 parruleord = 0;
+		Node	   *listvalues = NULL;
+		Node	   *rangestart = NULL;
+		Node	   *rangeend = NULL;
+		Node	   *rangeevery = NULL;
+		bool		rangestartinc = false;
+		bool		rangeendinc = false;
+		int16		parruleord = 0;
 		PartitionRule *rule = makeNode(PartitionRule);
 		PartitionElem *el;
-		char *parname = NULL;
-		Oid parentoid = InvalidOid;
+		char	   *parname = NULL;
+		Oid			parentoid = InvalidOid;
 
 		Assert(list_length(spec->partElem) == 1);
 
@@ -1725,56 +1992,55 @@ add_part_to_catalog(Oid relid, PartitionBy *pby,
 
 		switch (pby->partType)
 		{
-			case PARTTYP_HASH: break;
 			case PARTTYP_LIST:
-			{
-				PartitionValuesSpec *vspec =
-				(PartitionValuesSpec *)el->boundSpec;
+				{
+					PartitionValuesSpec *vspec =
+					(PartitionValuesSpec *) el->boundSpec;
 
-				/* might be NULL if this is a default spec */
-				if (vspec)
-					listvalues = (Node *)vspec->partValues;
-			}
+					/* might be NULL if this is a default spec */
+					if (vspec)
+						listvalues = (Node *) vspec->partValues;
+				}
 				break;
 			case PARTTYP_RANGE:
-			{
-				PartitionBoundSpec *bspec =
-				(PartitionBoundSpec *)el->boundSpec;
-				PartitionRangeItem *ri;
-
-				/* remember, could be a default clause */
-				if (bspec)
 				{
-					Assert(IsA(bspec, PartitionBoundSpec));
-					ri = (PartitionRangeItem *)bspec->partStart;
-					if (ri)
+					PartitionBoundSpec *bspec =
+					(PartitionBoundSpec *) el->boundSpec;
+					PartitionRangeItem *ri;
+
+					/* remember, could be a default clause */
+					if (bspec)
 					{
-						Assert(ri->partedge == PART_EDGE_INCLUSIVE ||
-							   ri->partedge == PART_EDGE_EXCLUSIVE);
+						Assert(IsA(bspec, PartitionBoundSpec));
+						ri = (PartitionRangeItem *) bspec->partStart;
+						if (ri)
+						{
+							Assert(ri->partedge == PART_EDGE_INCLUSIVE ||
+								   ri->partedge == PART_EDGE_EXCLUSIVE);
 
-						rangestartinc = ri->partedge == PART_EDGE_INCLUSIVE;
-						rangestart = (Node *)ri->partRangeVal;
+							rangestartinc = ri->partedge == PART_EDGE_INCLUSIVE;
+							rangestart = (Node *) ri->partRangeVal;
+						}
+
+						ri = (PartitionRangeItem *) bspec->partEnd;
+						if (ri)
+						{
+							Assert(ri->partedge == PART_EDGE_INCLUSIVE ||
+								   ri->partedge == PART_EDGE_EXCLUSIVE);
+
+							rangeendinc = ri->partedge == PART_EDGE_INCLUSIVE;
+							rangeend = (Node *) ri->partRangeVal;
+						}
+
+						if (bspec->partEvery)
+						{
+							ri = (PartitionRangeItem *) bspec->partEvery;
+							rangeevery = (Node *) ri->partRangeVal;
+						}
+						else
+							rangeevery = NULL;
 					}
-
-					ri = (PartitionRangeItem *)bspec->partEnd;
-					if (ri)
-					{
-						Assert(ri->partedge == PART_EDGE_INCLUSIVE ||
-							   ri->partedge == PART_EDGE_EXCLUSIVE);
-
-						rangeendinc = ri->partedge == PART_EDGE_INCLUSIVE;
-						rangeend = (Node *)ri->partRangeVal;
-					}
-
-					if (bspec->partEvery)
-					{
-						ri = (PartitionRangeItem *)bspec->partEvery;
-						rangeevery = (Node *)ri->partRangeVal;
-					}
-					else
-						rangeevery = NULL;
 				}
-			}
 				break;
 			default:
 				elog(ERROR, "unknown partitioning type %i", pby->partType);
@@ -1785,9 +2051,9 @@ add_part_to_catalog(Oid relid, PartitionBy *pby,
 		if (!bTemplate_Only && (pby->partDepth > 0))
 		{
 			Oid			inhoid;
-			ScanKeyData	scankey;
+			ScanKeyData scankey;
 			SysScanDesc sscan;
-			HeapTuple tuple;
+			HeapTuple	tuple;
 
 			rel = heap_open(InheritsRelationId, AccessShareLock);
 
@@ -1830,7 +2096,7 @@ add_part_to_catalog(Oid relid, PartitionBy *pby,
 		/* we still might have to add template rules */
 		if (!add_temp && OidIsValid(parttemplid))
 		{
-			ScanKeyData	scankey[3];
+			ScanKeyData scankey[3];
 			SysScanDesc sscan;
 			Relation	partrulerel;
 			HeapTuple	tuple;
@@ -1838,10 +2104,8 @@ add_part_to_catalog(Oid relid, PartitionBy *pby,
 			partrulerel = heap_open(PartitionRuleRelationId, AccessShareLock);
 
 			/*
-			 * SELECT parchildrelid FROM pg_partition_rule
-			 * WHERE paroid = :1
-			 * AND parparentrule = :2
-			 * AND parruleord = :3
+			 * SELECT parchildrelid FROM pg_partition_rule WHERE paroid = :1
+			 * AND parparentrule = :2 AND parruleord = :3
 			 */
 			ScanKeyInit(&scankey[0], Anum_pg_partition_rule_paroid,
 						BTEqualStrategyNumber, F_OIDEQ,
@@ -1879,8 +2143,8 @@ add_part_to_catalog(Oid relid, PartitionBy *pby,
 		rule->parrangeendincl = rangeendinc;
 		rule->parrangeend = rangeend;
 		rule->parrangeevery = rangeevery;
-		rule->parlistvalues = (List *)listvalues;
-		rule->partemplatespaceId = InvalidOid; /* only valid for template */
+		rule->parlistvalues = (List *) listvalues;
+		rule->partemplatespaceId = InvalidOid;	/* only valid for template */
 
 		if (!bTemplate_Only)
 			add_partition_rule(rule);
@@ -1893,16 +2157,16 @@ add_part_to_catalog(Oid relid, PartitionBy *pby,
 
 			if (el->storeAttr)
 			{
-				if (((AlterPartitionCmd *)el->storeAttr)->arg1)
+				if (((AlterPartitionCmd *) el->storeAttr)->arg1)
 					rule->parreloptions =
-					(List *)((AlterPartitionCmd *)el->storeAttr)->arg1;
-				if (((AlterPartitionCmd *)el->storeAttr)->arg2)
+						(List *) ((AlterPartitionCmd *) el->storeAttr)->arg1;
+				if (((AlterPartitionCmd *) el->storeAttr)->arg2)
 				{
 					Oid			tablespaceId;
 
 					tablespaceId =
-					get_settable_tablespace_oid(
-												strVal(((AlterPartitionCmd *)el->storeAttr)->arg2));
+						get_settable_tablespace_oid(
+													strVal(((AlterPartitionCmd *) el->storeAttr)->arg2));
 
 					/* get_settable_tablespace_oid will error out for us */
 					Assert(OidIsValid(tablespaceId));
@@ -1917,7 +2181,7 @@ add_part_to_catalog(Oid relid, PartitionBy *pby,
 
 	/* allow subsequent callers to see our work */
 	CommandCounterIncrement();
-} /* end add_part_to_catalog */
+}								/* end add_part_to_catalog */
 
 /*
  * parruleord_open_gap
@@ -1933,14 +2197,24 @@ add_part_to_catalog(Oid relid, PartitionBy *pby,
  * gap in parruleord sequence.
  */
 static void
-parruleord_open_gap(Oid partid, int2 level, Oid parent, int2 ruleord,
-					int stopkey, bool closegap)
+parruleord_open_gap(Oid partid, int16 level, Oid parent, int16 ruleord,
+					int16 stopkey, bool closegap)
 {
 	Relation	rel;
 	Relation	irel;
-	HeapTuple tuple;
+	HeapTuple	tuple;
 	ScanKeyData scankey[3];
-	IndexScanDesc sd;
+	SysScanDesc sd;
+
+	/*
+	 * Ensure that ruleord argument did not wrap around due to int2
+	 * typecast. We check if ruleord is less than 1 to also ensure that 0
+	 * (default partition) is not given as an argument.
+	 */
+	if (ruleord < 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+				 errmsg("too many partitions, parruleord overflow")));
 
 	/*---
 	 * This is equivalent to:
@@ -1958,19 +2232,18 @@ parruleord_open_gap(Oid partid, int2 level, Oid parent, int2 ruleord,
 	rel = heap_open(PartitionRuleRelationId, RowExclusiveLock);
 	irel = index_open(PartitionRuleParoidParparentruleParruleordIndexId, RowExclusiveLock);
 
-	ScanKeyInit(&scankey[0], 1,
+	ScanKeyInit(&scankey[0], Anum_pg_partition_rule_paroid,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(partid));
-	ScanKeyInit(&scankey[1], 2,
+	ScanKeyInit(&scankey[1], Anum_pg_partition_rule_parparentrule,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(parent));
-	ScanKeyInit(&scankey[2], 3,
+	ScanKeyInit(&scankey[2], Anum_pg_partition_rule_parruleord,
 				BTLessEqualStrategyNumber, F_INT2LE,
 				Int16GetDatum(ruleord));
-	sd = index_beginscan(rel, irel, SnapshotNow, 3, scankey);
-	while (HeapTupleIsValid(tuple = index_getnext(sd, BackwardScanDirection)))
+	sd = systable_beginscan_ordered(rel, irel, NULL, 3, scankey);
+	while (HeapTupleIsValid(tuple = systable_getnext_ordered(sd, BackwardScanDirection)))
 	{
-		int old_ruleord;
 		Form_pg_partition_rule rule_desc;
 
 		Insist(HeapTupleIsValid(tuple));
@@ -1978,24 +2251,23 @@ parruleord_open_gap(Oid partid, int2 level, Oid parent, int2 ruleord,
 		tuple = heap_copytuple(tuple);
 
 		rule_desc =
-		(Form_pg_partition_rule)GETSTRUCT(tuple);
+			(Form_pg_partition_rule) GETSTRUCT(tuple);
 
-		old_ruleord = rule_desc->parruleord;
+		if (rule_desc->parruleord < stopkey)
+			break;
+
 		closegap ? rule_desc->parruleord-- : rule_desc->parruleord++;
 
 		simple_heap_update(rel, &tuple->t_self, tuple);
 		CatalogUpdateIndexes(rel, tuple);
 
 		heap_freetuple(tuple);
-
-		if (old_ruleord <= stopkey)
-			break;
 	}
-	index_endscan(sd);
+	systable_endscan_ordered(sd);
 	heap_close(irel, RowExclusiveLock);
 	heap_close(rel, RowExclusiveLock);
 
-} /* end parruleord_open_gap */
+}								/* end parruleord_open_gap */
 
 /*
  * Build up a PartitionRule based on a tuple from pg_partition_rule
@@ -2005,11 +2277,11 @@ PartitionRule *
 ruleMakePartitionRule(HeapTuple tuple)
 {
 	Form_pg_partition_rule rule_desc =
-	(Form_pg_partition_rule)GETSTRUCT(tuple);
-	text *rule_text;
+		(Form_pg_partition_rule)GETSTRUCT(tuple);
 	char *rule_str;
 	Datum rule_datum;
 	bool isnull;
+
 	PartitionRule *rule;
 
 	rule = makeNode(PartitionRule);
@@ -2031,9 +2303,7 @@ ruleMakePartitionRule(HeapTuple tuple)
 								 Anum_pg_partition_rule_parrangestart,
 								 &isnull);
 	Assert(!isnull);
-	rule_text = DatumGetTextP(rule_datum);
-	rule_str = DatumGetCString(DirectFunctionCall1(textout,
-												   PointerGetDatum(rule_text)));
+	rule_str = TextDatumGetCString(rule_datum);
 
 	rule->parrangestart = stringToNode(rule_str);
 
@@ -2044,9 +2314,7 @@ ruleMakePartitionRule(HeapTuple tuple)
 								 Anum_pg_partition_rule_parrangeend,
 								 &isnull);
 	Assert(!isnull);
-	rule_text = DatumGetTextP(rule_datum);
-	rule_str = DatumGetCString(DirectFunctionCall1(textout,
-												   PointerGetDatum(rule_text)));
+	rule_str = TextDatumGetCString(rule_datum);
 
 	rule->parrangeend = stringToNode(rule_str);
 
@@ -2057,9 +2325,7 @@ ruleMakePartitionRule(HeapTuple tuple)
 								 Anum_pg_partition_rule_parrangeevery,
 								 &isnull);
 	Assert(!isnull);
-	rule_text = DatumGetTextP(rule_datum);
-	rule_str = DatumGetCString(DirectFunctionCall1(textout,
-												   PointerGetDatum(rule_text)));
+	rule_str = TextDatumGetCString(rule_datum);
 
 	rule->parrangeevery = stringToNode(rule_str);
 
@@ -2068,9 +2334,7 @@ ruleMakePartitionRule(HeapTuple tuple)
 								 Anum_pg_partition_rule_parlistvalues,
 								 &isnull);
 	Assert(!isnull);
-	rule_text = DatumGetTextP(rule_datum);
-	rule_str = DatumGetCString(DirectFunctionCall1(textout,
-												   PointerGetDatum(rule_text)));
+	rule_str = TextDatumGetCString(rule_datum);
 
 	rule->parlistvalues = stringToNode(rule_str);
 
@@ -2091,7 +2355,7 @@ ruleMakePartitionRule(HeapTuple tuple)
 		Datum	   *options;
 		int			noptions;
 		List	   *opts = NIL;
-		int i;
+		int			i;
 
 		/* XXX XXX: why not use untransformRelOptions ? */
 
@@ -2103,9 +2367,9 @@ ruleMakePartitionRule(HeapTuple tuple)
 		/* key/value pairs for storage clause */
 		for (i = 0; i < noptions; i++)
 		{
-			char *n = DatumGetCString(DirectFunctionCall1(textout, options[i]));
-			Value *v = NULL;
-			char *s;
+			char	   *n = TextDatumGetCString(options[i]);
+			Value	   *v = NULL;
+			char	   *s;
 
 			s = strchr(n, '=');
 
@@ -2117,7 +2381,7 @@ ruleMakePartitionRule(HeapTuple tuple)
 					v = makeString(s);
 			}
 
-			opts = lappend(opts, makeDefElem(n, (Node *)v));
+			opts = lappend(opts, makeDefElem(n, (Node *) v));
 		}
 		rule->parreloptions = opts;
 
@@ -2141,11 +2405,11 @@ ruleMakePartitionRule(HeapTuple tuple)
 Partition *
 partMakePartition(HeapTuple tuple)
 {
-	oidvector *oids;
+	oidvector  *oids;
 	int2vector *atts;
-	bool isnull;
-	Form_pg_partition partrow = (Form_pg_partition)GETSTRUCT(tuple);
-	Partition *p;
+	bool		isnull;
+	Form_pg_partition partrow = (Form_pg_partition) GETSTRUCT(tuple);
+	Partition  *p;
 
 	p = makeNode(Partition);
 
@@ -2157,18 +2421,18 @@ partMakePartition(HeapTuple tuple)
 	p->parnatts = partrow->parnatts;
 
 	atts = (int2vector *) DatumGetPointer(SysCacheGetAttr(PARTOID, tuple,
-										   Anum_pg_partition_paratts,
-										   &isnull));
+														  Anum_pg_partition_paratts,
+														  &isnull));
 	Assert(!isnull);
 	oids = (oidvector *) DatumGetPointer(SysCacheGetAttr(PARTOID, tuple,
-										   Anum_pg_partition_parclass,
-										   &isnull));
+														 Anum_pg_partition_parclass,
+														 &isnull));
 	Assert(!isnull);
 
-	p->paratts = palloc(sizeof(int2) * p->parnatts);
+	p->paratts = palloc(sizeof(int16) * p->parnatts);
 	p->parclass = palloc(sizeof(Oid) * p->parnatts);
 
-	memcpy(p->paratts, atts->values, sizeof(int2) * p->parnatts);
+	memcpy(p->paratts, atts->values, sizeof(int16) * p->parnatts);
 	memcpy(p->parclass, oids->values, sizeof(Oid) * p->parnatts);
 
 	return p;
@@ -2188,29 +2452,31 @@ partMakePartition(HeapTuple tuple)
  *    includesubparts	--	whether or not to include sub partitions
  */
 PartitionNode *
-get_parts(Oid relid, int2 level, Oid parent, bool inctemplate,
+get_parts(Oid relid, int16 level, Oid parent, bool inctemplate,
 		  bool includesubparts)
 {
 	PartitionNode *pnode = NULL;
-	HeapTuple tuple;
-	Relation rel;
-	List *rules = NIL;
+	HeapTuple	tuple;
+	Relation	rel;
+	List	   *rules = NIL;
+	ListCell   *lc;
+	int			num_rules;
+	int			ruleno;
 	ScanKeyData scankey[3];
 	SysScanDesc sscan;
 
-	/* Though pg_partition and  pg_partition_rule are populated only
-	 * on the entry database, we accept calls from QEs running on a
-	 * segment database, but always return NULL; so our result is
-	 * only meaningful on the entry database. */
-	if (Gp_segment != -1)
+	/*
+	 * Though pg_partition and  pg_partition_rule are populated only on the
+	 * entry database, we accept calls from QEs running on a segment database,
+	 * but always return NULL; so our result is only meaningful on the entry
+	 * database.
+	 */
+	if (!IS_QUERY_DISPATCHER())
 		return pnode;
 
-	/* select oid as partid, *
-	 * from pg_partition
-	 * where
-	 *     parrelid = :relid and
-	 *     parlevel = :level and
-	 *     paristemplate = :inctemplate;
+	/*
+	 * select oid as partid, * from pg_partition where parrelid = :relid and
+	 * parlevel = :level and paristemplate = :inctemplate;
 	 */
 	rel = heap_open(PartitionRelationId, AccessShareLock);
 
@@ -2227,7 +2493,7 @@ get_parts(Oid relid, int2 level, Oid parent, bool inctemplate,
 				BTEqualStrategyNumber, F_BOOLEQ,
 				BoolGetDatum(inctemplate));
 	sscan = systable_beginscan(rel, PartitionParrelidParlevelParistemplateIndexId, true,
-							   SnapshotNow, 3, scankey);
+							   NULL, 3, scankey);
 	tuple = systable_getnext(sscan);
 	if (HeapTupleIsValid(tuple))
 	{
@@ -2238,14 +2504,12 @@ get_parts(Oid relid, int2 level, Oid parent, bool inctemplate,
 	systable_endscan(sscan);
 	heap_close(rel, AccessShareLock);
 
-	if ( ! pnode )
+	if (!pnode)
 		return pnode;
 
-	/* select *
-	 * from pg_partition_rule
-	 * where
-	 *     paroid = :pnode->part->partid and -- pg_partition.oid
-	 *     parparentrule = :parent;
+	/*
+	 * select * from pg_partition_rule where paroid = :pnode->part->partid and
+	 * -- pg_partition.oid parparentrule = :parent;
 	 */
 	rel = heap_open(PartitionRuleRelationId, AccessShareLock);
 
@@ -2260,7 +2524,7 @@ get_parts(Oid relid, int2 level, Oid parent, bool inctemplate,
 					BTEqualStrategyNumber, F_OIDEQ,
 					ObjectIdGetDatum(parent));
 		sscan = systable_beginscan(rel, PartitionRuleParoidParparentruleParruleordIndexId, true,
-								   SnapshotNow, 2, scankey);
+								   NULL, 2, scankey);
 	}
 	else
 	{
@@ -2269,7 +2533,7 @@ get_parts(Oid relid, int2 level, Oid parent, bool inctemplate,
 					BTEqualStrategyNumber, F_OIDEQ,
 					ObjectIdGetDatum(pnode->part->partid));
 		sscan = systable_beginscan(rel, PartitionRuleParoidParparentruleParruleordIndexId, true,
-								   SnapshotNow, 1, scankey);
+								   NULL, 1, scankey);
 	}
 
 	while (HeapTupleIsValid(tuple = systable_getnext(sscan)))
@@ -2280,7 +2544,7 @@ get_parts(Oid relid, int2 level, Oid parent, bool inctemplate,
 		if (includesubparts)
 		{
 			rule->children = get_parts(relid, level + 1, rule->parruleid,
-									   inctemplate, true /*includesubparts*/);
+									   inctemplate, true /* includesubparts */ );
 		}
 
 		if (rule->parisdefault)
@@ -2290,13 +2554,26 @@ get_parts(Oid relid, int2 level, Oid parent, bool inctemplate,
 			rules = lappend(rules, rule);
 		}
 	}
-	/* NOTE: this assert is valid, except for the case of splitting
-	 * the very last partition of a table.  For that case, we must
-	 * drop the last partition before re-adding the new pieces, which
-	 * violates this invariant
+
+	/*
+	 * NOTE: this assert is valid, except for the case of splitting the very
+	 * last partition of a table.  For that case, we must drop the last
+	 * partition before re-adding the new pieces, which violates this
+	 * invariant
 	 */
-	/*	Assert(inctemplate || list_length(rules) || pnode->default_part); */
-	pnode->rules = rules;
+	/* Assert(inctemplate || list_length(rules) || pnode->default_part); */
+
+	num_rules = list_length(rules);
+	pnode->rules = palloc(num_rules * sizeof(PartitionRule *));
+	pnode->num_rules = num_rules;
+	ruleno = 0;
+	foreach(lc, rules)
+	{
+		PartitionRule *rule = (PartitionRule *) lfirst(lc);
+
+		pnode->rules[ruleno++] = rule;
+	}
+	list_free(rules);
 
 	systable_endscan(sscan);
 	heap_close(rel, AccessShareLock);
@@ -2314,7 +2591,7 @@ RelationBuildPartitionDescByOid(Oid relid, bool inctemplate)
 {
 	PartitionNode *n;
 
-	n = get_parts(relid, 0, 0, inctemplate, true /*includesubparts*/);
+	n = get_parts(relid, 0, 0, inctemplate, true /* includesubparts */ );
 
 	return n;
 }
@@ -2332,24 +2609,22 @@ RelationBuildPartitionDescByOid(Oid relid, bool inctemplate)
 Bitmapset *
 get_partition_key_bitmapset(Oid relid)
 {
-	Relation rel;
-	HeapTuple tuple;
-	TupleDesc tupledesc;
+	Relation	rel;
+	HeapTuple	tuple;
+	TupleDesc	tupledesc;
 	ScanKeyData scankey;
 	SysScanDesc sscan;
-	Bitmapset *partition_key = NULL;
+	Bitmapset  *partition_key = NULL;
 
-	/* Reject calls from QEs running on a segment database, since
-	 * pg_partition and  pg_partition_rule are populated only
-	 * on the entry database.
+	/*
+	 * Reject calls from QEs running on a segment database, since pg_partition
+	 * and  pg_partition_rule are populated only on the entry database.
 	 */
-	Insist(Gp_segment == -1);
+	Insist(IS_QUERY_DISPATCHER());
 
-	/* select paratts
-	 * from pg_partition
-	 * where
-	 *     parrelid = :relid and
-	 *     not paristemplate;
+	/*
+	 * select paratts from pg_partition where parrelid = :relid and not
+	 * paristemplate;
 	 */
 	rel = heap_open(PartitionRelationId, AccessShareLock);
 	tupledesc = RelationGetDescr(rel);
@@ -2359,26 +2634,26 @@ get_partition_key_bitmapset(Oid relid)
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(relid));
 	sscan = systable_beginscan(rel, PartitionParrelidIndexId, true,
-							   SnapshotNow, 1, &scankey);
+							   NULL, 1, &scankey);
 
 	while (HeapTupleIsValid(tuple = systable_getnext(sscan)))
 	{
-		int i;
-		int2 natts;
+		int			i;
+		int16		natts;
 		int2vector *atts;
-		bool isnull;
-		Form_pg_partition partrow = (Form_pg_partition)GETSTRUCT(tuple);
+		bool		isnull;
+		Form_pg_partition partrow = (Form_pg_partition) GETSTRUCT(tuple);
 
 		if (partrow->paristemplate)
-			continue;  /* no interest in template parts */
+			continue;			/* no interest in template parts */
 
 		natts = partrow->parnatts;
 		atts = (int2vector *) DatumGetPointer(
-			heap_getattr(tuple, Anum_pg_partition_paratts,
-						 tupledesc, &isnull));
+											  heap_getattr(tuple, Anum_pg_partition_paratts,
+														   tupledesc, &isnull));
 		Insist(!isnull);
 
-		for ( i = 0; i < natts; i++ )
+		for (i = 0; i < natts; i++)
 			partition_key = bms_add_member(partition_key, atts->values[i]);
 	}
 
@@ -2396,8 +2671,8 @@ get_partition_key_bitmapset(Oid relid)
 List *
 get_partition_attrs(PartitionNode *pn)
 {
-	List *attrs = NIL;
-	int i;
+	List	   *attrs = NIL;
+	int			i;
 
 	if (!pn)
 		return NIL;
@@ -2406,65 +2681,14 @@ get_partition_attrs(PartitionNode *pn)
 		attrs = lappend_int(attrs, pn->part->paratts[i]);
 
 	/* We don't want duplicates, do just go down a single branch */
-	if (list_length(pn->rules))
+	if (pn->num_rules > 0)
 	{
-		PartitionRule *rule = linitial(pn->rules);
+		PartitionRule *rule = pn->rules[0];
 
 		return list_concat_unique_int(attrs, get_partition_attrs(rule->children));
 	}
 	else
 		return attrs;
-}
-
-void
-partition_get_policies_attrs(PartitionNode *pn, GpPolicy *master_policy,
-							 List **cols)
-{
-	if (!pn)
-		return;
-	else
-	{
-		ListCell *lc;
-
-		/*
-		 * We use master_policy as a fast path. The assumption is that most
-		 * child partitions look like the master so we don't want to enter
-		 * the O(N^2) loop below if we can avoid it. Firstly, though, we must
-		 * copy the master policy into the list.
-		 */
-		if (*cols == NIL && master_policy->nattrs)
-		{
-			int attno;
-
-			for (attno = 0; attno < master_policy->nattrs; attno++)
-				*cols = lappend_int(*cols, master_policy->attrs[attno]);
-		}
-
-		foreach(lc, pn->rules)
-		{
-			PartitionRule *rule = lfirst(lc);
-			Relation rel = heap_open(rule->parchildrelid, NoLock);
-
-			if (master_policy->nattrs != rel->rd_cdbpolicy->nattrs ||
-				memcmp(master_policy->attrs, rel->rd_cdbpolicy->attrs,
-					   (master_policy->nattrs * sizeof(AttrNumber))))
-			{
-				int attno;
-
-				for (attno = 0; attno < rel->rd_cdbpolicy->nattrs; attno++)
-				{
-					if (!list_member_int(*cols,
-										 rel->rd_cdbpolicy->attrs[attno]))
-						*cols = lappend_int(*cols,
-											rel->rd_cdbpolicy->attrs[attno]);
-				}
-			}
-			heap_close(rel, NoLock);
-
-			partition_get_policies_attrs(rule->children, master_policy,
-										 cols);
-		}
-	}
 }
 
 bool
@@ -2473,39 +2697,34 @@ partition_policies_equal(GpPolicy *p, PartitionNode *pn)
 	if (!pn)
 		return true;
 
-	if (pn->rules)
+	for (int i = 0; i < pn->num_rules; i++)
 	{
-		ListCell *lc;
+		PartitionRule *rule = pn->rules[i];
+		Relation	rel = heap_open(rule->parchildrelid, NoLock);
 
-		foreach(lc, pn->rules)
+		if (p->nattrs != rel->rd_cdbpolicy->nattrs)
 		{
-			PartitionRule *rule = lfirst(lc);
-			Relation rel = heap_open(rule->parchildrelid, NoLock);
-
-			if (p->nattrs != rel->rd_cdbpolicy->nattrs)
-			{
-				heap_close(rel, NoLock);
-				return false;
-			}
-			else
-			{
-				if (p->attrs == 0)
-				/* random policy, skip */
-					;
-				if (memcmp(p->attrs, rel->rd_cdbpolicy->attrs,
-						   (sizeof(AttrNumber) * p->nattrs)))
-				{
-					heap_close(rel, NoLock);
-					return false;
-				}
-			}
-			if (!partition_policies_equal(p, rule->children))
-			{
-				heap_close(rel, NoLock);
-				return false;
-			}
 			heap_close(rel, NoLock);
+			return false;
 		}
+		else
+		{
+			if (p->attrs == 0)
+				/* random policy, skip */
+				;
+			if (memcmp(p->attrs, rel->rd_cdbpolicy->attrs,
+					   (sizeof(AttrNumber) * p->nattrs)))
+			{
+				heap_close(rel, NoLock);
+				return false;
+			}
+		}
+		if (!partition_policies_equal(p, rule->children))
+		{
+			heap_close(rel, NoLock);
+			return false;
+		}
+		heap_close(rel, NoLock);
 	}
 	return true;
 }
@@ -2513,16 +2732,16 @@ partition_policies_equal(GpPolicy *p, PartitionNode *pn)
 AttrNumber
 max_partition_attr(PartitionNode *pn)
 {
-	AttrNumber n = 0;
-	List *l = get_partition_attrs(pn);
+	AttrNumber	n = 0;
+	List	   *l = get_partition_attrs(pn);
 
 	if (l)
 	{
-		ListCell *lc;
+		ListCell   *lc;
 
 		foreach(lc, l)
 		{
-			AttrNumber att = lfirst_int(lc);
+			AttrNumber	att = lfirst_int(lc);
 
 			n = Max(att, n);
 		}
@@ -2535,7 +2754,7 @@ int
 num_partition_levels(PartitionNode *pn)
 {
 	PartitionNode *tmp;
-	int level = 0;
+	int			level = 0;
 
 	tmp = pn;
 
@@ -2543,14 +2762,16 @@ num_partition_levels(PartitionNode *pn)
 	while (tmp)
 	{
 		level++;
-		if (tmp->rules)
+		if (tmp->num_rules > 0)
 		{
-			PartitionRule *rule = linitial(tmp->rules);
+			PartitionRule *rule = tmp->rules[0];
+
 			tmp = rule->children;
 		}
 		else if (tmp->default_part)
 		{
 			PartitionRule *rule = tmp->default_part;
+
 			tmp = rule->children;
 		}
 		else
@@ -2570,12 +2791,11 @@ all_partition_relids(PartitionNode *pn)
 		return NIL;
 	else
 	{
-		ListCell *lc;
-		List *out = NIL;
+		List	   *out = NIL;
 
-		foreach(lc, pn->rules)
+		for (int i = 0; i < pn->num_rules; i++)
 		{
-			PartitionRule *rule = lfirst(lc);
+			PartitionRule *rule = pn->rules[i];
 
 			Assert(OidIsValid(rule->parchildrelid));
 			out = lappend_oid(out, rule->parchildrelid);
@@ -2601,22 +2821,22 @@ all_partition_relids(PartitionNode *pn)
 static Node *
 getPartConstraintsContainsKeys(Oid partOid, Oid rootOid, List *partKey)
 {
-	ScanKeyData	scankey;
+	ScanKeyData scankey;
 	SysScanDesc sscan;
-	Relation        conRel;
-	HeapTuple       conTup;
-	Node            *conExpr;
-	Node            *result = NULL;
-	Datum           conBinDatum;
-	Datum			conKeyDatum;
-	char            *conBin;
-	bool            conbinIsNull = false;
-	bool			conKeyIsNull = false;
-	AttrMap		*map;
+	Relation	conRel;
+	HeapTuple	conTup;
+	Node	   *conExpr;
+	Node	   *result = NULL;
+	Datum		conBinDatum;
+	Datum		conKeyDatum;
+	char	   *conBin;
+	bool		conbinIsNull = false;
+	bool		conKeyIsNull = false;
+	TupleConversionMap *map;
 
 	/* create the map needed for mapping attnums */
-	Relation rootRel = heap_open(rootOid, AccessShareLock);
-	Relation partRel = heap_open(partOid, AccessShareLock);
+	Relation	rootRel = heap_open(rootOid, AccessShareLock);
+	Relation	partRel = heap_open(partOid, AccessShareLock);
 
 	map_part_attrs(partRel, rootRel, &map, false);
 
@@ -2630,39 +2850,44 @@ getPartConstraintsContainsKeys(Oid partOid, Oid rootOid, List *partKey)
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(partOid));
 	sscan = systable_beginscan(conRel, ConstraintRelidIndexId, true,
-							   SnapshotNow, 1, &scankey);
+							   NULL, 1, &scankey);
 
 	while (HeapTupleIsValid(conTup = systable_getnext(sscan)))
 	{
-		/* we defer the filter on contype to here in order to take advantage of
-		 * the index on conrelid in the scan */
+		/*
+		 * we defer the filter on contype to here in order to take advantage
+		 * of the index on conrelid in the scan
+		 */
 		Form_pg_constraint conEntry = (Form_pg_constraint) GETSTRUCT(conTup);
+
 		if (conEntry->contype != 'c')
 		{
 			continue;
 		}
 		/* Fetch the constraint expression in parsetree form */
 		conBinDatum = heap_getattr(conTup, Anum_pg_constraint_conbin,
-				RelationGetDescr(conRel), &conbinIsNull);
+								   RelationGetDescr(conRel), &conbinIsNull);
 
-		Assert (!conbinIsNull);
+		Assert(!conbinIsNull);
 		/* map the attnums in constraint expression to root attnums */
 		conBin = TextDatumGetCString(conBinDatum);
 		conExpr = stringToNode(conBin);
 		conExpr = attrMapExpr(map, conExpr);
 
-		// fetch the key associated with this constraint
+		/* fetch the key associated with this constraint */
 		conKeyDatum = heap_getattr(conTup, Anum_pg_constraint_conkey,
-				RelationGetDescr(conRel), &conKeyIsNull);
-		Datum *dats = NULL;
-		int numKeys = 0;
+								   RelationGetDescr(conRel), &conKeyIsNull);
+		Datum	   *dats = NULL;
+		int			numKeys = 0;
 
-		bool found = false;
-		// extract key elements
+		bool		found = false;
+
+		/* extract key elements */
 		deconstruct_array(DatumGetArrayTypeP(conKeyDatum), INT2OID, 2, true, 's', &dats, NULL, &numKeys);
 		for (int i = 0; i < numKeys; i++)
 		{
-			int16 key_elem =  DatumGetInt16(dats[i]);
+			int16		key_elem = DatumGetInt16(dats[i]);
+
 			if (list_member_int(partKey, key_elem))
 			{
 				found = true;
@@ -2673,7 +2898,7 @@ getPartConstraintsContainsKeys(Oid partOid, Oid rootOid, List *partKey)
 		if (found)
 		{
 			if (result)
-				result = (Node *)make_andclause(list_make2(result, conExpr));
+				result = (Node *) make_andclause(list_make2(result, conExpr));
 			else
 				result = conExpr;
 		}
@@ -2696,13 +2921,14 @@ getPartConstraintsContainsKeys(Oid partOid, Oid rootOid, List *partKey)
  * Outout:
  *	a pointer to the created hash table
  */
-static HTAB*
+static HTAB *
 createConstraintHashTable(unsigned int nEntries)
 {
-	HASHCTL	hash_ctl;
+	HASHCTL		hash_ctl;
+
 	MemSet(&hash_ctl, 0, sizeof(hash_ctl));
 
-	hash_ctl.keysize = sizeof(Node**);
+	hash_ctl.keysize = sizeof(Node **);
 	hash_ctl.entrysize = sizeof(ConNodeEntry);
 	hash_ctl.hash = constrNodeHash;
 	hash_ctl.match = constrNodeMatch;
@@ -2721,12 +2947,14 @@ createConstraintHashTable(unsigned int nEntries)
 static uint32
 constrNodeHash(const void *keyPtr, Size keysize)
 {
-	uint32 result = 0;
-	Node *constr = *((Node **) keyPtr);
-	int con_len = 0;
+	uint32		result = 0;
+	Node	   *constr = *((Node **) keyPtr);
+	int			con_len = 0;
+
 	if (constr)
 	{
-		char* constr_bin = nodeToBinaryStringFast(constr, &con_len);
+		char	   *constr_bin = nodeToBinaryStringFast(constr, &con_len);
+
 		Assert(con_len > 0);
 		result = tag_hash(constr_bin, con_len);
 		pfree(constr_bin);
@@ -2746,8 +2974,9 @@ constrNodeHash(const void *keyPtr, Size keysize)
 static int
 constrNodeMatch(const void *keyPtr1, const void *keyPtr2, Size keysize)
 {
-	Node *left = *((Node **) keyPtr1);
-	Node *right = *((Node **) keyPtr2);
+	Node	   *left = *((Node **) keyPtr1);
+	Node	   *right = *((Node **) keyPtr2);
+
 	return equal(left, right) ? 0 : 1;
 }
 
@@ -2765,49 +2994,57 @@ rel_partitioning_is_uniform(Oid rootOid)
 	Assert(OidIsValid(rootOid));
 	Assert(rel_is_partitioned(rootOid));
 
-	bool result = true;
+	bool		result = true;
 
 	MemoryContext uniformityMemoryContext = AllocSetContextCreate(CurrentMemoryContext,
-			"PartitioningIsUniform",
-			ALLOCSET_DEFAULT_MINSIZE,
-			ALLOCSET_DEFAULT_INITSIZE,
-			ALLOCSET_DEFAULT_MAXSIZE);
+																  "PartitioningIsUniform",
+																  ALLOCSET_DEFAULT_MINSIZE,
+																  ALLOCSET_DEFAULT_INITSIZE,
+																  ALLOCSET_DEFAULT_MAXSIZE);
 	MemoryContext callerMemoryContext = MemoryContextSwitchTo(uniformityMemoryContext);
 
-	PartitionNode *pnRoot = RelationBuildPartitionDescByOid(rootOid, false /*inctemplate*/);
-	List *queue = list_make1(pnRoot);
+	PartitionNode *pnRoot = RelationBuildPartitionDescByOid(rootOid, false /* inctemplate */ );
+	List	   *queue = list_make1(pnRoot);
 
 	while (result)
 	{
-		/* we process the partitioning tree level by level, each outer loop corresponds to one level */
-		int size = list_length(queue);
+		/*
+		 * we process the partitioning tree level by level, each outer loop
+		 * corresponds to one level
+		 */
+		int			size = list_length(queue);
+
 		if (0 == size)
 		{
 			break;
 		}
 
-		/* Look ahead to get the number of children of the first partition node in this level.
-		 * This allows us to initialize a hash table on the constraints which each partition node
-		 * in this level will be compared to.
+		/*
+		 * Look ahead to get the number of children of the first partition
+		 * node in this level. This allows us to initialize a hash table on
+		 * the constraints which each partition node in this level will be
+		 * compared to.
 		 */
-		PartitionNode *pn_ahead = (PartitionNode*) linitial(queue);
-		int nChildren = list_length(pn_ahead->rules) + (pn_ahead->default_part ? 1 : 0);
-		HTAB* conHash = createConstraintHashTable(nChildren);
+		PartitionNode *pn_ahead = (PartitionNode *) linitial(queue);
+		int			nChildren = pn_ahead->num_rules + (pn_ahead->default_part ? 1 : 0);
+		HTAB	   *conHash = createConstraintHashTable(nChildren);
 
 		/* get the list of part keys for this level */
-		List *lpartkey = NIL;
+		List	   *lpartkey = NIL;
+
 		for (int i = 0; i < pn_ahead->part->parnatts; i++)
 		{
 			lpartkey = lappend_int(lpartkey, pn_ahead->part->paratts[i]);
 		}
 
 		/* now iterate over all partition nodes on this level */
-		bool fFirstNode = true;
+		bool		fFirstNode = true;
+
 		while (size > 0 && result)
 		{
-			PartitionNode *pn = (PartitionNode*) linitial(queue);
-			List *lrules = get_partition_rules(pn);
-			int curr_nChildren = list_length(lrules);
+			PartitionNode *pn = (PartitionNode *) linitial(queue);
+			List	   *lrules = get_partition_rules(pn);
+			int			curr_nChildren = list_length(lrules);
 
 			if (curr_nChildren != nChildren)
 			{
@@ -2816,27 +3053,31 @@ rel_partitioning_is_uniform(Oid rootOid)
 			}
 
 			/* loop over the children's constraints of this node */
-			ListCell *lc = NULL;
+			ListCell   *lc = NULL;
+
 			foreach(lc, lrules)
 			{
-				PartitionRule *pr = (PartitionRule*) lfirst(lc);
-				Node *curr_con = getPartConstraintsContainsKeys(pr->parchildrelid, rootOid, lpartkey);
-				bool found = false;
+				PartitionRule *pr = (PartitionRule *) lfirst(lc);
+				Node	   *curr_con = getPartConstraintsContainsKeys(pr->parchildrelid, rootOid, lpartkey);
+				bool		found = false;
 
-				/* we populate the hash table with the constraints of the children of the
-				 * first node in this level */
+				/*
+				 * we populate the hash table with the constraints of the
+				 * children of the first node in this level
+				 */
 				if (fFirstNode)
 				{
 					/* add current constraint to hash table */
-					void *con_entry = hash_search(conHash, &curr_con, HASH_ENTER, &found);
-					if (con_entry == NULL)
-					{
-						ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY), errmsg("out of memory")));
-					}
-					((ConNodeEntry*) con_entry)->entry = curr_con;
+					void	   *con_entry;
+
+					con_entry = hash_search(conHash, &curr_con, HASH_ENTER, &found);
+					((ConNodeEntry *) con_entry)->entry = curr_con;
 				}
 
-				/* starting from the second node in this level, we probe the children's constraints */
+				/*
+				 * starting from the second node in this level, we probe the
+				 * children's constraints
+				 */
 				else
 				{
 					hash_search(conHash, &curr_con, HASH_FIND, &found);
@@ -2883,12 +3124,11 @@ all_leaf_partition_relids(PartitionNode *pn)
 		return NIL;
 	}
 
-	ListCell *lc;
-	List *leaf_relids = NIL;
-
-	foreach(lc, pn->rules)
+	List	   *leaf_relids = NIL;
+	for (int i = 0; i < pn->num_rules; i++)
 	{
-		PartitionRule *rule = lfirst(lc);
+		PartitionRule *rule = pn->rules[i];
+
 		if (NULL != rule->children)
 		{
 			leaf_relids = list_concat(leaf_relids, all_leaf_partition_relids(rule->children));
@@ -2904,7 +3144,7 @@ all_leaf_partition_relids(PartitionNode *pn)
 		if (NULL != pn->default_part->children)
 		{
 			leaf_relids = list_concat(leaf_relids,
-							  all_leaf_partition_relids(pn->default_part->children));
+									  all_leaf_partition_relids(pn->default_part->children));
 		}
 		else
 		{
@@ -2926,7 +3166,7 @@ all_leaf_partition_relids(PartitionNode *pn)
 static List *
 rel_get_leaf_relids_from_rule(Oid ruleOid)
 {
-	ScanKeyData	scankey;
+	ScanKeyData scankey;
 	Relation	part_rule_rel;
 	SysScanDesc sscan;
 	bool		hasChildren = false;
@@ -2946,11 +3186,11 @@ rel_get_leaf_relids_from_rule(Oid ruleOid)
 
 	/* No suitable index */
 	sscan = systable_beginscan(part_rule_rel, InvalidOid, false,
-							   SnapshotNow, 1, &scankey);
+							   NULL, 1, &scankey);
 
 	/*
-	 * If we are still in mid-level, recursively call this function on children rules of
-	 * the given rule.
+	 * If we are still in mid-level, recursively call this function on
+	 * children rules of the given rule.
 	 */
 	while ((tuple = systable_getnext(sscan)) != NULL)
 	{
@@ -2958,12 +3198,13 @@ rel_get_leaf_relids_from_rule(Oid ruleOid)
 		lChildrenOid = list_concat(lChildrenOid, rel_get_leaf_relids_from_rule(HeapTupleGetOid(tuple)));
 	}
 
-	/* if ruleOid is not parent of any rule, we have reached the leaf level and
-	 * we need to append parchildrelid of this entry to the output
+	/*
+	 * if ruleOid is not parent of any rule, we have reached the leaf level
+	 * and we need to append parchildrelid of this entry to the output
 	 */
 	if (!hasChildren)
 	{
-		HeapTuple tuple;
+		HeapTuple	tuple;
 		Form_pg_partition_rule rule_desc;
 
 		tuple = SearchSysCache1(PARTRULEOID, ObjectIdGetDatum(ruleOid));
@@ -2989,16 +3230,17 @@ rel_get_leaf_relids_from_rule(Oid ruleOid)
 List *
 rel_get_leaf_children_relids(Oid relid)
 {
-	PartStatus ps = rel_part_status(relid);
-	List *leaf_relids = NIL;
+	PartStatus	ps = rel_part_status(relid);
+	List	   *leaf_relids = NIL;
+
 	Assert(PART_STATUS_INTERIOR == ps || PART_STATUS_ROOT == ps);
 
 	if (PART_STATUS_ROOT == ps)
 	{
 		PartitionNode *pn;
 
-		pn = get_parts(relid, 0 /*level*/, 0 /*parent*/, false /*inctemplate*/,
-					   true /*includesubparts*/);
+		pn = get_parts(relid, 0 /* level */ , 0 /* parent */ , false /* inctemplate */ ,
+					   true /* includesubparts */ );
 		leaf_relids = all_leaf_partition_relids(pn);
 		pfree(pn);
 	}
@@ -3007,7 +3249,7 @@ rel_get_leaf_children_relids(Oid relid)
 		Relation	partrulerel;
 		ScanKeyData scankey;
 		SysScanDesc sscan;
-		HeapTuple tuple;
+		HeapTuple	tuple;
 
 		/* SELECT * FROM pg_partition_rule WHERE parchildrelid = :1 */
 		partrulerel = heap_open(PartitionRuleRelationId, AccessShareLock);
@@ -3017,7 +3259,7 @@ rel_get_leaf_children_relids(Oid relid)
 					ObjectIdGetDatum(relid));
 
 		sscan = systable_beginscan(partrulerel, PartitionRuleParchildrelidIndexId, true,
-								   SnapshotNow, 1, &scankey);
+								   NULL, 1, &scankey);
 		tuple = systable_getnext(sscan);
 		if (HeapTupleIsValid(tuple))
 		{
@@ -3047,12 +3289,12 @@ all_interior_partition_relids(PartitionNode *pn)
 		return NIL;
 	}
 
-	ListCell *lc;
-	List *interior_relids = NIL;
+	List	   *interior_relids = NIL;
 
-	foreach(lc, pn->rules)
+	for (int i = 0; i < pn->num_rules; i++)
 	{
-		PartitionRule *rule = lfirst(lc);
+		PartitionRule *rule = pn->rules[i];
+
 		if (rule->children)
 		{
 			interior_relids = lappend_oid(interior_relids, rule->parchildrelid);
@@ -3066,7 +3308,7 @@ all_interior_partition_relids(PartitionNode *pn)
 		{
 			interior_relids = lappend_oid(interior_relids, pn->default_part->parchildrelid);
 			interior_relids = list_concat(interior_relids,
-							  all_interior_partition_relids(pn->default_part->children));
+										  all_interior_partition_relids(pn->default_part->children));
 		}
 	}
 
@@ -3079,14 +3321,16 @@ all_interior_partition_relids(PartitionNode *pn)
 int
 countLeafPartTables(Oid rootOid)
 {
-	Assert (rel_is_partitioned(rootOid));
+	Assert(rel_is_partitioned(rootOid));
 
-	PartitionNode *pn = get_parts(rootOid, 0 /* level */, 0 /* parent */, false /* inctemplate */,
-								  true /* include subparts */);
+	PartitionNode *pn = get_parts(rootOid, 0 /* level */ , 0 /* parent */ , false /* inctemplate */ ,
+								  true /* include subparts */ );
 
-	List *lRelOids = all_leaf_partition_relids(pn);
-	Assert (list_length(lRelOids) > 0);
-	int count = list_length(lRelOids);
+	List	   *lRelOids = all_leaf_partition_relids(pn);
+
+	Assert(list_length(lRelOids) > 0);
+	int			count = list_length(lRelOids);
+
 	list_free(lRelOids);
 	pfree(pn);
 	return count;
@@ -3102,22 +3346,22 @@ countLeafPartTables(Oid rootOid)
 List *
 all_prule_relids(PartitionRule *prule)
 {
-	ListCell *lcr;
-	PartitionNode *pnode = NULL;
+	PartitionNode *pnode;
 
-	List *oids = NIL; /* of pg_class Oid */
+	List	   *oids = NIL;		/* of pg_class Oid */
 
-	if ( prule )
+	if (prule)
 	{
 		oids = lappend_oid(oids, prule->parchildrelid);
 
 		pnode = prule->children;
-		if ( pnode )
+		if (pnode)
 		{
 			oids = list_concat(oids, all_prule_relids(pnode->default_part));
-			foreach (lcr, pnode->rules)
+			for (int i = 0; i < pnode->num_rules; i++)
 			{
-				PartitionRule *child = (PartitionRule*)lfirst(lcr);
+				PartitionRule *child = pnode->rules[i];
+
 				oids = list_concat(oids, all_prule_relids(child));
 			}
 		}
@@ -3144,7 +3388,7 @@ rel_partition_get_root(Oid relid)
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(relid));
 	sscan = systable_beginscan(inhrel, InheritsRelidSeqnoIndexId, true,
-							   SnapshotNow, 1, &scankey);
+							   NULL, 1, &scankey);
 	tuple = systable_getnext(sscan);
 	if (!tuple)
 		masteroid = InvalidOid;
@@ -3177,9 +3421,11 @@ rel_partition_get_master(Oid relid)
 	Oid			paroid;
 	Oid			masteroid;
 
-	/* pg_partition and  pg_partition_rule are populated only on the
-	 * entry database, so our result is only meaningful there. */
-	Insist(Gp_segment == -1);
+	/*
+	 * pg_partition and  pg_partition_rule are populated only on the entry
+	 * database, so our result is only meaningful there.
+	 */
+	Insist(IS_QUERY_DISPATCHER());
 
 	partrulerel = heap_open(PartitionRuleRelationId, AccessShareLock);
 
@@ -3189,7 +3435,7 @@ rel_partition_get_master(Oid relid)
 				ObjectIdGetDatum(relid));
 
 	sscan = systable_beginscan(partrulerel, PartitionRuleParchildrelidIndexId, true,
-							   SnapshotNow, 1, &scankey);
+							   NULL, 1, &scankey);
 	tuple = systable_getnext(sscan);
 	if (tuple)
 		paroid = ((Form_pg_partition_rule) GETSTRUCT(tuple))->paroid;
@@ -3212,7 +3458,7 @@ rel_partition_get_master(Oid relid)
 
 	return masteroid;
 
-} /* end rel_partition_get_master */
+}								/* end rel_partition_get_master */
 
 /* given a relid, build a path list from the master tablename down to
  * the partition for that relation, using partition names if possible,
@@ -3229,9 +3475,11 @@ rel_get_part_path1(Oid relid)
 	Oid			parparentrule = InvalidOid;
 	List	   *lrelid = NIL;
 
-	/* pg_partition and  pg_partition_rule are populated only on the
-	 * entry database, so our result is only meaningful there. */
-	Insist(Gp_segment == -1);
+	/*
+	 * pg_partition and  pg_partition_rule are populated only on the entry
+	 * database, so our result is only meaningful there.
+	 */
+	Insist(IS_QUERY_DISPATCHER());
 
 	partrulerel = heap_open(PartitionRuleRelationId, AccessShareLock);
 
@@ -3244,13 +3492,13 @@ rel_get_part_path1(Oid relid)
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(relid));
 	sscan = systable_beginscan(partrulerel, PartitionRuleParchildrelidIndexId, true,
-							   SnapshotNow, 1, &scankey);
+							   NULL, 1, &scankey);
 	tuple = systable_getnext(sscan);
 
 	if (HeapTupleIsValid(tuple))
 	{
 		Form_pg_partition_rule rule_desc =
-			(Form_pg_partition_rule) GETSTRUCT(tuple);
+		(Form_pg_partition_rule) GETSTRUCT(tuple);
 
 		paroid = rule_desc->paroid;
 		parparentrule = rule_desc->parparentrule;
@@ -3273,7 +3521,7 @@ rel_get_part_path1(Oid relid)
 		if (HeapTupleIsValid(tuple))
 		{
 			Form_pg_partition_rule rule_desc =
-				(Form_pg_partition_rule) GETSTRUCT(tuple);
+			(Form_pg_partition_rule) GETSTRUCT(tuple);
 
 			paroid = rule_desc->paroid;
 			parparentrule = rule_desc->parparentrule;
@@ -3289,17 +3537,18 @@ rel_get_part_path1(Oid relid)
 
 	return lrelid;
 
-} /* end rel_get_part_path1 */
+}								/* end rel_get_part_path1 */
 
-static List *rel_get_part_path(Oid relid)
+static List *
+rel_get_part_path(Oid relid)
 {
-	PartitionNode		*pNode	   = NULL;
-	Partition			*part	   = NULL;
-	List				*lrelid	   = NIL;
-	List				*lnamerank = NIL;
-	List				*lnrv	   = NIL;
-	ListCell			*lc, *lc2;
-	Oid					 masteroid = InvalidOid;
+	PartitionNode *pNode = NULL;
+	Partition  *part = NULL;
+	List	   *lrelid = NIL;
+	List	   *lnamerank = NIL;
+	List	   *lnrv = NIL;
+	ListCell   *lc;
+	Oid			masteroid = InvalidOid;
 
 	masteroid = rel_partition_get_master(relid);
 
@@ -3307,7 +3556,7 @@ static List *rel_get_part_path(Oid relid)
 		return NIL;
 
 	/* call the guts of RelationBuildPartitionDesc */
-	pNode = get_parts(masteroid, 0, 0, false, true /*includesubparts*/);
+	pNode = get_parts(masteroid, 0, 0, false, true /* includesubparts */ );
 
 	if (!pNode)
 	{
@@ -3316,19 +3565,21 @@ static List *rel_get_part_path(Oid relid)
 
 	part = pNode->part;
 
-	/* get the relids for each table that corresponds to the partition
+	/*
+	 * get the relids for each table that corresponds to the partition
 	 * heirarchy from the master to the specified partition
 	 */
 	lrelid = rel_get_part_path1(relid);
 
-	/* walk the partition tree, finding the partition for each relid,
-	 * and extract useful information (name, rank, value)
+	/*
+	 * walk the partition tree, finding the partition for each relid, and
+	 * extract useful information (name, rank, value)
 	 */
 	foreach(lc, lrelid)
 	{
-		Oid parrelid = lfirst_oid(lc);
+		Oid			parrelid = lfirst_oid(lc);
 		PartitionRule *prule;
-		int rulerank = 1;
+		int			rulerank = 1;
 
 		Assert(pNode);
 
@@ -3336,9 +3587,9 @@ static List *rel_get_part_path(Oid relid)
 
 		rulerank = 1;
 
-		foreach (lc2, pNode->rules)
+		for (int i = 0; i < pNode->num_rules; i++)
 		{
-			prule = (PartitionRule *)lfirst(lc2);
+			prule = pNode->rules[i];
 
 			if (parrelid == prule->parchildrelid)
 			{
@@ -3354,69 +3605,68 @@ static List *rel_get_part_path(Oid relid)
 		Assert(parrelid == prule->parchildrelid);
 
 		/* default partition must have a name (and no rank) */
-		Assert (prule->parname && strlen(prule->parname));
+		Assert(prule->parname && strlen(prule->parname));
 
 		pNode = prule->children;
 		rulerank = 0;
 
-	L_rel_get_part_path_match:
+L_rel_get_part_path_match:
 
-		if (!rulerank) /* must be default, so it has a name, but no
-						* rank or value */
+		if (!rulerank)			/* must be default, so it has a name, but no
+								 * rank or value */
 		{
 			lnrv = list_make3(prule->parname, NULL, NULL);
 		}
-		else if (part->parkind == 'l') /* list partition by value */
+		else if (part->parkind == 'l')	/* list partition by value */
 		{
-			char				*idval	= NULL;
-			ListCell			*lc3;
-			List				*l1		= (List *)prule->parlistvalues;
-			StringInfoData       sid1;
-			int2				 nkeys  = part->parnatts;
-			int2				 parcol = 0;
+			char	   *idval = NULL;
+			ListCell   *lc3;
+			List	   *l1 = (List *) prule->parlistvalues;
+			StringInfoData sid1;
+			int16		nkeys = part->parnatts;
+			int16		parcol = 0;
 
 			initStringInfo(&sid1);
 
-			/*			foreach(lc3, l1) */
+			/* foreach(lc3, l1) */
 			/* don't loop -- just need first set of values */
 
 			lc3 = list_head(l1);
 
 			if (lc3)
 			{
-				List		*vals = lfirst(lc3);
-				ListCell	*lcv  = list_head(vals);
+				List	   *vals = lfirst(lc3);
+				ListCell   *lcv = list_head(vals);
 
-				/* Note: similar code in
-				 * ruleutils.c:partition_rule_def_worker
+				/*
+				 * Note: similar code in ruleutils.c:partition_rule_def_worker
 				 */
 
 				for (parcol = 0; parcol < nkeys; parcol++)
 				{
-					Const *con = lfirst(lcv);
+					Const	   *con = lfirst(lcv);
 
 					if (lcv != list_head(vals))
 						appendStringInfoString(&sid1, ", ");
 
 					idval =
-					deparse_expression((Node*)con,
-									   deparse_context_for(get_rel_name(relid),
-														   relid),
-									   false, false);
+						deparse_expression((Node *) con,
+										   deparse_context_for(get_rel_name(relid),
+															   relid),
+										   false, false);
 
 					appendStringInfo(&sid1, "%s", idval);
 
 					lcv = lnext(lcv);
-				} /* end for parcol */
+				}				/* end for parcol */
 			}
 			/* list - no rank */
 			lnrv = list_make3(prule->parname, NULL, sid1.data);
 		}
-		else /* range (or hash) - use rank (though rank is not really
-			  * appropriate for hash)
-			  */
+		else					/* range (or hash) - use rank (though rank is
+								 * not really appropriate for hash) */
 		{
-			char *rtxt = palloc(NAMEDATALEN);
+			char	   *rtxt = palloc(NAMEDATALEN);
 
 			sprintf(rtxt, "%d", rulerank);
 
@@ -3427,21 +3677,23 @@ static List *rel_get_part_path(Oid relid)
 		/* build the list of (lists of name, rank, value) for each level */
 		lnamerank = lappend(lnamerank, lnrv);
 
-	} /* end foreach lc (walking list of relids) */
+	}							/* end foreach lc (walking list of relids) */
 
 	return lnamerank;
-} /* end rel_get_part_path */
+}								/* end rel_get_part_path */
 
 char *
 rel_get_part_path_pretty(Oid relid,
-									  char *separator,
-									  char *lastsep)
+						 char *separator,
+						 char *lastsep)
 {
-	List				*lnamerank = NIL;
-	List				*lnrv	   = NIL;
-	ListCell			*lc, *lc2;
-	int maxlen;
-	StringInfoData			 sid1, sid2;
+	List	   *lnamerank = NIL;
+	List	   *lnrv = NIL;
+	ListCell   *lc,
+			   *lc2;
+	int			maxlen;
+	StringInfoData sid1,
+				sid2;
 
 	lnamerank = rel_get_part_path(relid);
 
@@ -3458,9 +3710,9 @@ rel_get_part_path_pretty(Oid relid,
 
 	foreach(lc, lnamerank)
 	{
-		int lcnt = 0;
+		int			lcnt = 0;
 
-		lnrv = (List *)lfirst(lc);
+		lnrv = (List *) lfirst(lc);
 
 		maxlen--;
 
@@ -3468,13 +3720,13 @@ rel_get_part_path_pretty(Oid relid,
 
 		lcnt = 0;
 
-		foreach (lc2, lnrv)
+		foreach(lc2, lnrv)
 		{
-			char *str = (char *)lfirst(lc2);
+			char	   *str = (char *) lfirst(lc2);
 
-			truncateStringInfo(&sid2, 0);
+			resetStringInfo(&sid2);
 
-			switch(lcnt)
+			switch (lcnt)
 			{
 				case 0:
 					if (str && strlen(str))
@@ -3505,13 +3757,13 @@ rel_get_part_path_pretty(Oid relid,
 			lcnt++;
 		}
 
-	l_pretty:
+l_pretty:
 
 		appendStringInfo(&sid1, "%s", sid2.data);
 	}
 
 	return sid1.data;
-} /* end rel_get_part_path_pretty */
+}								/* end rel_get_part_path_pretty */
 
 
 /*
@@ -3528,16 +3780,16 @@ char *
 ChoosePartitionName(const char *tablename, int partDepth,
 					const char *partname, Oid namespaceId)
 {
-	char	*relname;
-	char	 depthstr[NAMEDATALEN];
-	char     prtstr[NAMEDATALEN];
+	char	   *relname;
+	char		depthstr[NAMEDATALEN];
+	char		prtstr[NAMEDATALEN];
 
 	/* build a relation name (see transformPartitionBy */
-	snprintf(depthstr, sizeof(depthstr), "%d", partDepth+1);
+	snprintf(depthstr, sizeof(depthstr), "%d", partDepth + 1);
 	snprintf(prtstr, sizeof(prtstr), "prt_%s", partname);
 
 	relname = ChooseRelationName(tablename,
-								 depthstr, /* depth */
+								 depthstr,	/* depth */
 								 prtstr,	/* part spec */
 								 namespaceId);
 	CommandCounterIncrement();
@@ -3559,7 +3811,8 @@ magic_expr_to_datum(Relation rel, PartitionNode *partnode,
 	TupleDesc	tupleDesc;
 	Datum	   *values;
 	bool	   *isnull;
-	int ii, jj;
+	int			ii,
+				jj;
 
 	Assert(rel);
 
@@ -3574,9 +3827,9 @@ magic_expr_to_datum(Relation rel, PartitionNode *partnode,
 
 	*ppisnull = isnull;
 
-	Assert (IsA(expr, List));
+	Assert(IsA(expr, List));
 
-	jj = list_length((List *)expr);
+	jj = list_length((List *) expr);
 
 	if (jj > ii)
 		ereport(ERROR,
@@ -3592,29 +3845,29 @@ magic_expr_to_datum(Relation rel, PartitionNode *partnode,
 
 	{
 		ListCell   *lc;
-		int i = 0;
+		int			i = 0;
 
-		foreach(lc, (List *)expr)
+		foreach(lc, (List *) expr)
 		{
-			Node *n1 = (Node *) lfirst(lc);
-			Const *c1;
-			AttrNumber attno = part->paratts[i++];
+			Node	   *n1 = (Node *) lfirst(lc);
+			Const	   *c1;
+			AttrNumber	attno = part->paratts[i++];
 			Form_pg_attribute attribute = tupleDesc->attrs[attno - 1];
-			Oid lhsid = attribute->atttypid;
+			Oid			lhsid = attribute->atttypid;
 
 			if (!IsA(n1, Const))
 				ereport(ERROR,
 						(errcode(ERRCODE_DATATYPE_MISMATCH),
-						 errmsg("Not a constant expression")));
+						 errmsg("not a constant expression")));
 
-			c1 = (Const *)n1;
+			c1 = (Const *) n1;
 
 			if (lhsid != c1->consttype)
 			{
 				/* see coerce_partition_value */
-				Node *out;
+				Node	   *out;
 
-				out = coerce_partition_value(n1, lhsid, attribute->atttypmod,
+				out = coerce_partition_value(NULL, n1, lhsid, attribute->atttypmod,
 											 char_to_parttype(partnode->part->parkind));
 				if (!out)
 					ereport(ERROR,
@@ -3625,7 +3878,7 @@ magic_expr_to_datum(Relation rel, PartitionNode *partnode,
 
 				Assert(IsA(out, Const));
 
-				c1 = (Const *)out;
+				c1 = (Const *) out;
 			}
 
 			/* XXX: cache */
@@ -3635,7 +3888,7 @@ magic_expr_to_datum(Relation rel, PartitionNode *partnode,
 	}
 
 	return values;
-} /* end magic_expr_to_datum */
+}								/* end magic_expr_to_datum */
 
 /*
  * Assume the partition rules are in the "correct" order and return
@@ -3645,49 +3898,49 @@ magic_expr_to_datum(Relation rel, PartitionNode *partnode,
 static Oid
 selectPartitionByRank(PartitionNode *partnode, int rnk)
 {
-	Oid   relid = InvalidOid;
-	List *rules = partnode->rules;
+	Oid			relid = InvalidOid;
 	PartitionRule *rule;
 
 	Assert(partnode->part->parkind == 'r');
 
-	if (rnk > list_length(rules))
+	if (rnk > partnode->num_rules)
 		return relid;
 
 	if (rnk == 0)
 		return relid;
 
 	if (rnk > 0)
-		rnk--; /* list_nth is zero-based, not one-based */
+		rnk--;					/* list_nth is zero-based, not one-based */
 	else if (rnk < 0)
 	{
-		rnk = list_length(rules) + rnk; /* if negative go from end */
+		rnk = partnode->num_rules + rnk; /* if negative go from end */
 
 		/* mpp-3265 */
-		if (rnk < 0) /* oops -- too negative */
+		if (rnk < 0)			/* oops -- too negative */
 			return relid;
 	}
 
-	rule = (PartitionRule *)list_nth(rules, rnk);
+	rule = partnode->rules[rnk];
 
 	return rule->parchildrelid;
-} /* end selectPartitionByRank */
+}								/* end selectPartitionByRank */
 
-static bool compare_partn_opfuncid(PartitionNode *partnode,
-								   char *pub, char *compare_op,
-								   List *colvals,
-								   Datum *values, bool *isnull,
-								   TupleDesc tupdesc)
+static bool
+compare_partn_opfuncid(PartitionNode *partnode,
+					   char *pub, char *compare_op,
+					   List *colvals,
+					   Datum *values, bool *isnull,
+					   TupleDesc tupdesc)
 
 {
-	Partition	*part		 = partnode->part;
-	List		*last_opname = list_make2(makeString(pub),
-										  makeString(compare_op));
-	List		*opname		 = NIL;
-	ListCell	*lc;
-	int			 numCols	 = 0;
-	int			 colCnt		 = 0;
-	int			 ii			 = 0;
+	Partition  *part = partnode->part;
+	List	   *last_opname = list_make2(makeString(pub),
+										 makeString(compare_op));
+	List	   *opname = NIL;
+	ListCell   *lc;
+	int			numCols = 0;
+	int			colCnt = 0;
+	int			ii = 0;
 
 	if (1 == strlen(compare_op))
 	{
@@ -3697,13 +3950,13 @@ static bool compare_partn_opfuncid(PartitionNode *partnode,
 		if (0 == strcmp(">", compare_op))
 			compare_op = ">=";
 
-		/* for a list of values, when performing less than or greater
-		 * than comparison, only the final value is compared using
-		 * less than or greater.  All prior values must be compared
-		 * with LTE/GTE.  For example, comparing the list (1,2,3) to
-		 * see if it is less than (1,2,4), we see that 1 <= 1, 2 <= 2,
-		 * and 3 < 4.  So the last_opname is the specified compare_op,
-		 * and the prior opnames are LTE or GTE.
+		/*
+		 * for a list of values, when performing less than or greater than
+		 * comparison, only the final value is compared using less than or
+		 * greater.  All prior values must be compared with LTE/GTE.  For
+		 * example, comparing the list (1,2,3) to see if it is less than
+		 * (1,2,4), we see that 1 <= 1, 2 <= 2, and 3 < 4.  So the last_opname
+		 * is the specified compare_op, and the prior opnames are LTE or GTE.
 		 */
 
 	}
@@ -3714,8 +3967,8 @@ static bool compare_partn_opfuncid(PartitionNode *partnode,
 
 	foreach(lc, colvals)
 	{
-		Const *c = lfirst(lc);
-		AttrNumber attno = part->paratts[ii];
+		Const	   *c = lfirst(lc);
+		AttrNumber	attno = part->paratts[ii];
 
 		if (isnull && isnull[attno - 1])
 		{
@@ -3724,11 +3977,11 @@ static bool compare_partn_opfuncid(PartitionNode *partnode,
 		}
 		else
 		{
-			Oid lhsid = tupdesc->attrs[attno - 1]->atttypid;
-			Oid rhsid = lhsid;
-			Oid opfuncid;
-			Datum res;
-			Datum d = values[attno - 1];
+			Oid			lhsid = tupdesc->attrs[attno - 1]->atttypid;
+			Oid			rhsid = lhsid;
+			Oid			opfuncid;
+			Datum		res;
+			Datum		d = values[attno - 1];
 
 			if (1 == colCnt)
 			{
@@ -3736,7 +3989,7 @@ static bool compare_partn_opfuncid(PartitionNode *partnode,
 			}
 
 			opfuncid = get_opfuncid_by_opname(opname, lhsid, rhsid);
-			res = OidFunctionCall2(opfuncid, c->constvalue, d);
+			res = OidFunctionCall2Coll(opfuncid, c->constcollid, c->constvalue, d);
 
 			if (!DatumGetBool(res))
 				return false;
@@ -3744,10 +3997,10 @@ static bool compare_partn_opfuncid(PartitionNode *partnode,
 
 		ii++;
 		colCnt--;
-	} /* end foreach */
+	}							/* end foreach */
 
 	return true;
-} /* end compare_partn_opfuncid */
+}								/* end compare_partn_opfuncid */
 
 /*
  *	Given a partition-by-list PartitionNode, search for
@@ -3767,24 +4020,53 @@ selectListPartition(PartitionNode *partnode, Datum *values, bool *isnull,
 					TupleDesc tupdesc, PartitionAccessMethods *accessMethods, Oid *foundOid, PartitionRule **prule,
 					Oid exprTypeOid)
 {
-	ListCell *lc;
-	Partition *part = partnode->part;
+	Partition  *part = partnode->part;
 	MemoryContext oldcxt = NULL;
-	PartitionListState *ls;
+	FmgrInfo   *cmpfuncs;
 
-	if (accessMethods && accessMethods->amstate[partnode->part->parlevel])
-		ls = (PartitionListState *)accessMethods->amstate[partnode->part->parlevel];
+	if (accessMethods && accessMethods->cmpfuncs[partnode->part->parlevel])
+		cmpfuncs = accessMethods->cmpfuncs[partnode->part->parlevel];
 	else
 	{
-		int natts = partnode->part->parnatts;
+		int			natts = partnode->part->parnatts;
 
-		ls = palloc(sizeof(PartitionListState));
+		cmpfuncs = (FmgrInfo *) palloc0(sizeof(FmgrInfo) * natts);
 
-		ls->eqfuncs = palloc(sizeof(FmgrInfo) * natts);
-		ls->eqinit = palloc0(sizeof(bool) * natts);
+		for (int keyno = 0; keyno < natts; keyno++)
+		{
+			AttrNumber	attno = part->paratts[keyno];
+
+			/*
+			 * Compute the type of the LHS and RHS for the
+			 * equality comparator. The way we call the comparator
+			 * is comp(expr, rule) So lhstypid = type(expr) and
+			 * rhstypeid = type(rule)
+			 */
+
+			/*
+			 * The tupdesc tuple descriptor matches the table
+			 * schema, so it has the rule type
+			 */
+			Oid			rhstypid = tupdesc->attrs[attno - 1]->atttypid;
+
+			/*
+			 * exprTypeOid is passed to us from our caller which
+			 * evaluated the expression. In some cases (e.g legacy
+			 * optimizer doing explicit casting), we don't compute
+			 * specify exprTypeOid. Assume lhstypid = rhstypid in
+			 * those cases
+			 */
+			Oid			lhstypid = exprTypeOid;
+
+			if (!OidIsValid(lhstypid))
+				lhstypid = rhstypid;
+
+			get_cmp_func(partnode->part->parclass[keyno], &cmpfuncs[keyno],
+						 lhstypid, rhstypid);
+		}
 
 		if (accessMethods)
-			accessMethods->amstate[partnode->part->parlevel] = (void *)ls;
+			accessMethods->cmpfuncs[partnode->part->parlevel] = cmpfuncs;
 	}
 
 	if (accessMethods && accessMethods->part_cxt)
@@ -3793,21 +4075,20 @@ selectListPartition(PartitionNode *partnode, Datum *values, bool *isnull,
 	*foundOid = InvalidOid;
 
 	/* With LIST, we have no choice at the moment except to be exhaustive */
-	foreach(lc, partnode->rules)
+	for (int ruleno = 0; ruleno < partnode->num_rules; ruleno++)
 	{
-		PartitionRule *rule = lfirst(lc);
-		List *vals = rule->parlistvalues;
-		ListCell *lc2;
-		bool matched = false;
+		PartitionRule *rule = partnode->rules[ruleno];
+		List	   *vals = rule->parlistvalues;
+		ListCell   *lc2;
+		bool		matched = false;
 
 		/*
 		 * list values are stored in a list of lists to support multi column
 		 * partitions.
 		 *
 		 * At this level, we're processing the list of possible values for the
-		 * given rule, for example:
-		 *     values(1, 2, 3)
-		 *     values((1, '2005-01-01'), (2, '2006-01-01'))
+		 * given rule, for example: values(1, 2, 3) values((1, '2005-01-01'),
+		 * (2, '2006-01-01'))
 		 *
 		 * Each iteraction is one element of the values list. In the first
 		 * example, we iterate '1', '2' then '3'. For the second, we iterate
@@ -3816,16 +4097,16 @@ selectListPartition(PartitionNode *partnode, Datum *values, bool *isnull,
 		 */
 		foreach(lc2, vals)
 		{
-			ListCell *lc3;
-			List *colvals = (List *)lfirst(lc2);
-			int i = 0;
+			ListCell   *lc3;
+			List	   *colvals = (List *) lfirst(lc2);
+			int			i = 0;
 
-			matched = true; /* prove untrue */
+			matched = true;		/* prove untrue */
 
 			foreach(lc3, colvals)
 			{
-				Const *c = lfirst(lc3);
-				AttrNumber attno = part->paratts[i];
+				Const	   *c = lfirst(lc3);
+				AttrNumber	attno = part->paratts[i];
 
 				if (isnull[attno - 1])
 				{
@@ -3843,48 +4124,14 @@ selectListPartition(PartitionNode *partnode, Datum *values, bool *isnull,
 				}
 				else
 				{
-					Datum res;
-					Datum d = values[attno - 1];
-					FmgrInfo *finfo;
+					int			res;
+					Datum		d = values[attno - 1];
+					FmgrInfo   *finfo = &cmpfuncs[i];
 
-					if (!ls->eqinit[i])
+					res = DatumGetInt32(FunctionCall2Coll(finfo, c->constcollid, d, c->constvalue));
+
+					if (res != 0)
 					{
-
-						/*
-						 * Compute the type of the LHS and RHS for the equality comparator.
-						 * The way we call the comparator is comp(expr, rule)
-						 * So lhstypid = type(expr) and rhstypeid = type(rule)
-						 */
-
-						/* The tupdesc tuple descriptor matches the table schema, so it has the rule type */
-						Oid rhstypid = tupdesc->attrs[attno - 1]->atttypid;
-
-						/*
-						 * exprTypeOid is passed to us from our caller which evaluated the expression.
-						 * In some cases (e.g legacy optimizer doing explicit casting), we don't compute
-						 * specify exprTypeOid.
-						 * Assume lhstypid = rhstypid in those cases
-						 */
-						Oid lhstypid = exprTypeOid;
-						if (!OidIsValid(lhstypid))
-						{
-							lhstypid = rhstypid;
-						}
-
-						List *opname = list_make2(makeString("pg_catalog"),
-												  makeString("="));
-
-						Oid opfuncid = get_opfuncid_by_opname(opname, lhstypid, rhstypid);
-						fmgr_info(opfuncid, &(ls->eqfuncs[i]));
-						ls->eqinit[i] = true;
-					}
-
-					finfo = &(ls->eqfuncs[i]);
-					res = FunctionCall2(finfo, d, c->constvalue);
-
-					if (!DatumGetBool(res))
-					{
-						/* found it */
 						matched = false;
 						break;
 					}
@@ -3915,93 +4162,52 @@ selectListPartition(PartitionNode *partnode, Datum *values, bool *isnull,
 }
 
 /*
- * get_less_than_oper()
+ * Look up comparison function between types 'lhstypid' and 'rhstypid'.
  *
- * Retrieves the appropriate comparator that knows how to handle
- * the two types lhsid, rhsid.
- *
- * Input parameters:
- * lhstypid: Type oid of the LHS of the comparator
- * rhstypid: Type oid of the RHS of the comparator
- * strictlyless: If true, requests the 'strictly less than' operator instead of 'less or equal than'
- *
- * Returns: The Oid of the appropriate comparator; throws an ERROR if no such comparator exists
- *
+ * If either type ID is InvalidOid, the operator class's opcintype is used
+ * in its place. If either type is a binary-coercible to opcintype, the
+ * function for opcintype is looked up instaed.
  */
-static Oid
-get_less_than_oper(Oid lhstypid, Oid rhstypid, bool strictlyless)
+static void
+get_cmp_func(Oid opclass, FmgrInfo *fmgrinfo, Oid lhstypid, Oid rhstypid)
 {
-	Value *str = strictlyless ? makeString("<") : makeString("<=");
-	Value *pub = makeString("pg_catalog");
-	List *opname = list_make2(pub, str);
+	HeapTuple	opclasstup;
+	Form_pg_opclass opclassform;
+	Oid			funcid;
 
-	Oid funcid = get_opfuncid_by_opname(opname, lhstypid, rhstypid);
-	list_free_deep(opname);
+	opclasstup = SearchSysCache1(CLAOID,
+								 ObjectIdGetDatum(opclass));
+	if (!HeapTupleIsValid(opclasstup))
+		elog(ERROR, "cache lookup failed for opclass %u", opclass);
 
-	return funcid;
-}
+	opclassform = (Form_pg_opclass) GETSTRUCT(opclasstup);
 
-/*
- * get_comparator
- *   Retrieves the comparator function between the expression and the partition rules
- *
- *  Input:
- *   keyno: Index in the key array of the partitioning key considered
- *   rs: the current PartitionRangeState
- *   ruleTypeOid: Oid for the type of the partition rules
- *   exprTypeOid: Oid for the type of the expressions
- *   strictlyless: If true, the operator for strictly less than (LT) is retrieved. Otherwise,
- *     it's less or equal than (LE)
- *   is_direct: If true, then the "direct" comparison (expression OP rule) is retrieved.
- *     Otherwise, it's the "inverse" comparison (rule OP expression)
- *
- */
-static FmgrInfo *
-get_less_than_comparator(int keyno, PartitionRangeState *rs, Oid ruleTypeOid, Oid exprTypeOid, bool strictlyless, bool is_direct)
-{
+	if (lhstypid == InvalidOid)
+		lhstypid = opclassform->opcintype;
+	if (lhstypid != opclassform->opcintype && IsBinaryCoercible(lhstypid, opclassform->opcintype))
+		lhstypid = opclassform->opcintype;
 
-	Assert(NULL != rs);
+	if (rhstypid == InvalidOid)
+		rhstypid = opclassform->opcintype;
+	if (rhstypid != opclassform->opcintype && IsBinaryCoercible(rhstypid, opclassform->opcintype))
+		rhstypid = opclassform->opcintype;
 
-	Oid lhsOid = InvalidOid;
-	Oid rhsOid = InvalidOid;
-	FmgrInfo *funcInfo = NULL;
+	/* Get a support function for the specified opfamily and datatypes */
+	funcid = get_opfamily_proc(opclassform->opcfamily,
+							   lhstypid,
+							   rhstypid,
+							   BTORDER_PROC);
+	if (!OidIsValid(funcid))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+				 errmsg("operator class \"%s\" of access method btree is missing comparison support function between types %s and %s",
+						NameStr(opclassform->opcname),
+						format_type_be(lhstypid),
+						format_type_be(rhstypid))));
 
-	if (is_direct && strictlyless) {
-		/* Looking for expr < partRule comparator */
-		funcInfo = &rs->ltfuncs_direct[keyno];
-	} else if (is_direct && !strictlyless) {
-		/* Looking for expr <= partRule comparator */
-		funcInfo = &rs->lefuncs_direct[keyno];
-	} else if (!is_direct && strictlyless) {
-		/* Looking for partRule < expr comparator */
-		funcInfo = &rs->ltfuncs_inverse[keyno];
-	} else if (!is_direct && !strictlyless) {
-		/* Looking for partRule <= expr comparator */
-		funcInfo = &rs->lefuncs_inverse[keyno];
-	}
+	fmgr_info(funcid, fmgrinfo);
 
-	Assert(NULL != funcInfo);
-
-	if (!OidIsValid(funcInfo->fn_oid)) {
-		/* We haven't looked up this comparator before, let's do it now */
-
-		if (is_direct) {
-			/* Looking for "direct" comparators (expr OP partRule ) */
-			lhsOid = exprTypeOid;
-			rhsOid = ruleTypeOid;
-		}
-		else {
-			/* Looking for "inverse" comparators (partRule OP expr ) */
-			lhsOid = ruleTypeOid;
-			rhsOid = exprTypeOid;
-		}
-
-		Oid funcid = get_less_than_oper(lhsOid, rhsOid, strictlyless);
-		fmgr_info(funcid, funcInfo);
-	}
-
-	Assert(OidIsValid(funcInfo->fn_oid));
-	return funcInfo;
+	ReleaseSysCache(opclasstup);
 }
 
 /*
@@ -4010,21 +4216,18 @@ get_less_than_comparator(int keyno, PartitionRangeState *rs, Oid ruleTypeOid, Oi
  *
  *  Input parameters:
  *    tupval: The value of the expression
- *    ruleTypeOid: The type of the partition rule boundaries
- *    exprTypeOid: The type of the expression (can be different from ruleTypeOid
- *      if types can be directly compared with each other)
- *    rs: The partition range state
+ *    cmpfuncs: Comparison functions
  *    keyno: The index of the partitioning key considered (for composite partitioning keys)
  *    rule: The rule whose boundaries we're testing
  *
  */
 static int
-range_test(Datum tupval, Oid ruleTypeOid, Oid exprTypeOid, PartitionRangeState *rs, int keyno,
+range_test(Datum tupval, FmgrInfo *cmpfuncs, int keyno,
 		   PartitionRule *rule)
 {
-	Const *c = NULL;
-	FmgrInfo *finfo;
-	Datum res;
+	Const	   *c;
+	FmgrInfo   *finfo  = &cmpfuncs[keyno];
+	int32		res;
 
 	Assert(PointerIsValid(rule->parrangestart) ||
 		   PointerIsValid(rule->parrangeend));
@@ -4034,20 +4237,19 @@ range_test(Datum tupval, Oid ruleTypeOid, Oid exprTypeOid, PartitionRangeState *
 	{
 		Assert(IsA(rule->parrangestart, List));
 #if NOT_YET
-		c = (Const *)list_nth((List *)rule->parrangestart, keyno);
+		c = (Const *) list_nth((List *) rule->parrangestart, keyno);
 #else
-		c = (Const *)linitial((List *)rule->parrangestart);
+		c = (Const *) linitial((List *) rule->parrangestart);
 #endif
 
 		/*
 		 * Is the value in the range?
-		 *   If rule->parrangestartincl, we request for comparator ruleVal <= exprVal ( ==> strictly_less = false)
-		 *   Otherwise, we request comparator ruleVal < exprVal ( ==> strictly_less = true)
 		 */
-		finfo = get_less_than_comparator(keyno, rs, ruleTypeOid, exprTypeOid, !rule->parrangestartincl /* strictly_less */, false /* is_direct */);
-		res = FunctionCall2(finfo, c->constvalue, tupval);
+		res = DatumGetInt32(FunctionCall2Coll(finfo, c->constcollid, tupval, c->constvalue));
 
-		if (!DatumGetBool(res))
+		if (res < 0)
+			return -1;
+		else if (res == 0 && !rule->parrangestartincl)
 			return -1;
 	}
 
@@ -4055,23 +4257,23 @@ range_test(Datum tupval, Oid ruleTypeOid, Oid exprTypeOid, PartitionRangeState *
 	if (PointerIsValid(rule->parrangeend))
 	{
 #if NOT_YET
-		c = (Const *)list_nth((List *)rule->parrangeend, keyno);
+		c = (Const *) list_nth((List *) rule->parrangeend, keyno);
 #else
-		c = (Const *)linitial((List *)rule->parrangeend);
+		c = (Const *) linitial((List *) rule->parrangeend);
 #endif
 
 		/*
-		 * Is the value in the range?
-		 *   If rule->parrangeendincl, we request for comparator exprVal <= ruleVal ( ==> strictly_less = false)
-		 *   Otherwise, we request comparator exprVal < ruleVal ( ==> strictly_less = true)
+		 * Is the value in the range? If rule->parrangeendincl, we request for
+		 * comparator exprVal <= ruleVal ( ==> strictly_less = false)
+		 * Otherwise, we request comparator exprVal < ruleVal ( ==>
+		 * strictly_less = true)
 		 */
-		finfo = get_less_than_comparator(keyno, rs, ruleTypeOid, exprTypeOid, !rule->parrangeendincl /* strictly_less */, true /* is_direct */);
-		res = FunctionCall2(finfo, tupval, c->constvalue);
+		res = DatumGetInt32(FunctionCall2Coll(finfo, c->constcollid, tupval, c->constvalue));
 
-		if (!DatumGetBool(res))
-		{
+		if (res > 0)
 			return 1;
-		}
+		else if (res == 0 && !rule->parrangeendincl)
+			return 1;
 	}
 	return 0;
 }
@@ -4085,65 +4287,50 @@ selectRangePartition(PartitionNode *partnode, Datum *values, bool *isnull,
 					 TupleDesc tupdesc, PartitionAccessMethods *accessMethods,
 					 Oid *foundOid, int *pSearch, PartitionRule **prule, Oid exprTypeOid)
 {
-	List *rules = partnode->rules;
-	int high = list_length(rules) - 1;
-	int low = 0;
-	int searchpoint = 0;
-	int mid = 0;
-	bool matched = false;
+	PartitionRule **rules = partnode->rules;
+	int			num_rules = partnode->num_rules;
+	int			high = num_rules - 1;
+	int			low = 0;
+	int			searchpoint = 0;
+	int			mid = 0;
+	bool		matched = false;
 	PartitionRule *rule = NULL;
 	PartitionNode *pNode = NULL;
-	PartitionRangeState *rs = NULL;
+	FmgrInfo   *cmpfuncs;
 	MemoryContext oldcxt = NULL;
 
 	Assert(partnode->part->parkind == 'r');
-	/* For composite partitioning keys, exprTypeOid should always be InvalidOid */
+
+	/*
+	 * For composite partitioning keys, exprTypeOid should always be
+	 * InvalidOid
+	 */
 	AssertImply(partnode->part->parnatts > 1, !OidIsValid(exprTypeOid));
 
-	if (accessMethods && accessMethods->amstate[partnode->part->parlevel])
-		rs = (PartitionRangeState *)accessMethods->amstate[partnode->part->parlevel];
+	if (accessMethods && accessMethods->cmpfuncs[partnode->part->parlevel])
+		cmpfuncs = accessMethods->cmpfuncs[partnode->part->parlevel];
 	else
 	{
-		int natts = partnode->part->parnatts;
+		int			natts = partnode->part->parnatts;
 
 		/*
-		 * We're still in our caller's memory context so
-		 * the memory will persist long enough for us.
+		 * We're still in our caller's memory context so the memory will
+		 * persist long enough for us.
 		 */
-		rs = palloc(sizeof(PartitionRangeState));
-		rs->lefuncs_direct = palloc0(sizeof(FmgrInfo) * natts);
-		rs->ltfuncs_direct = palloc0(sizeof(FmgrInfo) * natts);
-		rs->lefuncs_inverse = palloc0(sizeof(FmgrInfo) * natts);
-		rs->ltfuncs_inverse = palloc0(sizeof(FmgrInfo) * natts);
+		cmpfuncs = (FmgrInfo *) palloc0(sizeof(FmgrInfo) * natts);
 
-		/*
-		 * Set the function Oid to InvalidOid to signal that we
-		 * haven't looked up this function yet
-		 */
 		for (int keyno = 0; keyno < natts; keyno++)
 		{
-			rs->lefuncs_direct[keyno].fn_oid = InvalidOid;
-			rs->ltfuncs_direct[keyno].fn_oid = InvalidOid;
-			rs->lefuncs_inverse[keyno].fn_oid = InvalidOid;
-			rs->lefuncs_inverse[keyno].fn_oid = InvalidOid;
+			AttrNumber	attno = partnode->part->paratts[keyno];
+			Oid			rhstypid = tupdesc->attrs[attno - 1]->atttypid;
+			Oid			lhstypid = exprTypeOid;
+
+			if (!OidIsValid(lhstypid))
+				lhstypid = rhstypid;
+
+			get_cmp_func(partnode->part->parclass[keyno], &cmpfuncs[keyno],
+						 lhstypid, rhstypid);
 		}
-
-		/*
-		 * Unrolling the rules into an array currently works for the
-		 * top level partition only
-		 */
-		if (partnode->part->parlevel == 0)
-		{
-			int i = 0;
-			ListCell *lc;
-
-			rs->rules = palloc(sizeof(PartitionRule *) * list_length(rules));
-
-			foreach(lc, rules)
-			rs->rules[i++] = (PartitionRule *)lfirst(lc);
-		}
-		else
-			rs->rules = NULL;
 	}
 
 	if (accessMethods && accessMethods->part_cxt)
@@ -4162,28 +4349,23 @@ selectRangePartition(PartitionNode *partnode, Datum *values, bool *isnull,
 	 *
 	 * Consider the following intervals:
 	 *
-	 * 1. start( 1, 8)   end( 10,  9)
-	 * 2. start( 1, 9)   end( 15, 10)
-	 * 3. start( 1, 11)  end(100, 12)
-	 * 4. start(15, 10)  end( 30, 11)
+	 * 1. start( 1, 8)   end( 10,  9) 2. start( 1, 9)   end( 15, 10) 3. start(
+	 * 1, 11)  end(100, 12) 4. start(15, 10)  end( 30, 11)
 	 *
-	 * If we were to try and find the partition for a tuple (25, 10), using the
-	 * binary search for the first element, we'd select partition 3 but
+	 * If we were to try and find the partition for a tuple (25, 10), using
+	 * the binary search for the first element, we'd select partition 3 but
 	 * partition 4 is also a candidate. It is only when we look at the second
 	 * element that we find the single definitive rule.
 	 */
 	while (low <= high)
 	{
-		AttrNumber attno = partnode->part->paratts[0];
-		Datum exprValue = values[attno - 1];
-		int ret;
+		AttrNumber	attno = partnode->part->paratts[0];
+		Datum		exprValue = values[attno - 1];
+		int			ret;
 
-		mid = low + (high - low)/2;
+		mid = low + (high - low) / 2;
 
-		if (rs->rules)
-			rule = rs->rules[mid];
-		else
-			rule = (PartitionRule *)list_nth(rules, mid);
+		rule = rules[mid];
 
 		if (isnull[attno - 1])
 		{
@@ -4191,18 +4373,17 @@ selectRangePartition(PartitionNode *partnode, Datum *values, bool *isnull,
 			goto l_fin_range;
 		}
 
-		Oid ruleTypeOid = tupdesc->attrs[attno - 1]->atttypid;
 		if (OidIsValid(exprTypeOid))
 		{
-			ret = range_test(exprValue, ruleTypeOid, exprTypeOid, rs, 0, rule);
+			ret = range_test(exprValue, cmpfuncs, 0, rule);
 		}
 		else
 		{
 			/*
-			 * In some cases, we don't have an expression type oid. In those cases, the expression and
-			 * partition rules have the same type.
+			 * In some cases, we don't have an expression type oid. In those
+			 * cases, the expression and partition rules have the same type.
 			 */
-			ret = range_test(exprValue, ruleTypeOid, ruleTypeOid, rs, 0, rule);
+			ret = range_test(exprValue, cmpfuncs, 0, rule);
 		}
 
 		if (ret > 0)
@@ -4225,7 +4406,7 @@ selectRangePartition(PartitionNode *partnode, Datum *values, bool *isnull,
 
 	if (matched)
 	{
-		int j;
+		int			j;
 
 		/* Non-composite partition key, we matched so we're done */
 		if (partnode->part->parnatts == 1)
@@ -4237,22 +4418,25 @@ selectRangePartition(PartitionNode *partnode, Datum *values, bool *isnull,
 			goto l_fin_range;
 		}
 
-		/* We have more than one partition key.. Must match on the other keys as well */
+		/*
+		 * We have more than one partition key.. Must match on the other keys
+		 * as well
+		 */
 		j = mid;
 		do
 		{
-			int i;
-			bool matched = true;
-			bool first_fail = false;
+			int			i;
+			bool		matched = true;
+			bool		first_fail = false;
 
 			for (i = 0; i < partnode->part->parnatts; i++)
 			{
-				AttrNumber attno = partnode->part->paratts[i];
-				Datum d = values[attno - 1];
-				int ret;
+				AttrNumber	attno = partnode->part->paratts[i];
+				Datum		d = values[attno - 1];
+				int			ret;
 
 				if (j != mid)
-					rule = (PartitionRule *)list_nth(rules, j);
+					rule = rules[j];
 
 				if (isnull[attno - 1])
 				{
@@ -4260,11 +4444,12 @@ selectRangePartition(PartitionNode *partnode, Datum *values, bool *isnull,
 					goto l_fin_range;
 				}
 
-				Oid ruleTypeOid = tupdesc->attrs[attno - 1]->atttypid;
-				/* For composite partition keys, we don't support casting comparators, so both sides must be of identical types */
+				/*
+				 * For composite partition keys, we don't support casting
+				 * comparators, so both sides must be of identical types
+				 */
 				Assert(!OidIsValid(exprTypeOid));
-				ret = range_test(d, ruleTypeOid, ruleTypeOid,
-								 rs, i, rule);
+				ret = range_test(d, cmpfuncs, i, rule);
 				if (ret != 0)
 				{
 					matched = false;
@@ -4298,17 +4483,17 @@ selectRangePartition(PartitionNode *partnode, Datum *values, bool *isnull,
 		j = mid;
 		do
 		{
-			int i;
-			bool matched = true;
-			bool first_fail = false;
+			int			i;
+			bool		matched = true;
+			bool		first_fail = false;
 
 			for (i = 0; i < partnode->part->parnatts; i++)
 			{
-				AttrNumber attno = partnode->part->paratts[i];
-				Datum d = values[attno - 1];
-				int ret;
+				AttrNumber	attno = partnode->part->paratts[i];
+				Datum		d = values[attno - 1];
+				int			ret;
 
-				rule = (PartitionRule *)list_nth(rules, j);
+				rule = rules[j];
 
 				if (isnull[attno - 1])
 				{
@@ -4316,10 +4501,12 @@ selectRangePartition(PartitionNode *partnode, Datum *values, bool *isnull,
 					goto l_fin_range;
 				}
 
-				Oid ruleTypeOid = tupdesc->attrs[attno - 1]->atttypid;
-				/* For composite partition keys, we don't support casting comparators, so both sides must be of identical types */
+				/*
+				 * For composite partition keys, we don't support casting
+				 * comparators, so both sides must be of identical types
+				 */
 				Assert(!OidIsValid(exprTypeOid));
-				ret = range_test(d, ruleTypeOid, ruleTypeOid, rs, i, rule);
+				ret = range_test(d, cmpfuncs, i, rule);
 				if (ret != 0)
 				{
 					matched = false;
@@ -4347,8 +4534,8 @@ selectRangePartition(PartitionNode *partnode, Datum *values, bool *isnull,
 			}
 
 		}
-		while (++j < list_length(rules));
-	} /* end if matched */
+		while (++j < num_rules);
+	}							/* end if matched */
 
 	pNode = NULL;
 
@@ -4360,66 +4547,11 @@ l_fin_range:
 		MemoryContextSwitchTo(oldcxt);
 
 	if (accessMethods)
-		accessMethods->amstate[partnode->part->parlevel] = (void *)rs;
+		accessMethods->cmpfuncs[partnode->part->parlevel] = cmpfuncs;
 
 	return pNode;
-} /* end selectrangepartition */
+}								/* end selectrangepartition */
 
-
-/* select partition via hash */
-static PartitionNode *
-selectHashPartition(PartitionNode *partnode, Datum *values, bool *isnull,
-					TupleDesc tupdesc, PartitionAccessMethods *accessMethods, Oid *found, PartitionRule **prule)
-{
-	uint32 hash = 0;
-	int i;
-	int part;
-	PartitionRule *rule;
-	MemoryContext oldcxt = NULL;
-
-	if (partnode->rules == NIL)
-		return NULL;
-
-	if (accessMethods && accessMethods->part_cxt)
-		oldcxt = MemoryContextSwitchTo(accessMethods->part_cxt);
-
-	for (i = 0; i < partnode->part->parnatts; i++)
-	{
-		AttrNumber attnum = partnode->part->paratts[i];
-
-		/* rotate hash left 1 bit at each step */
-		hash = (hash << 1) | ((hash & 0x80000000) ? 1 : 0);
-
-		/*
-		 * If we found a NULL, just pretend it has a hashcode of 0 (like the
-		 * hash join code does.
-		 */
-		if (isnull[attnum - 1])
-			continue;
-		else
-		{
-			Oid opclass = partnode->part->parclass[i];
-			Oid inctype = get_opclass_input_type(opclass);
-			Oid opfamily = get_opclass_family(opclass);
-
-			Oid hashfunc = get_opfamily_proc(opfamily, inctype, inctype, HASHPROC);
-			Datum d = values[attnum - 1];
-			hash ^= DatumGetUInt32(OidFunctionCall1(hashfunc, d));
-		}
-	}
-
-	part = hash % list_length(partnode->rules);
-
-	rule = (PartitionRule *)list_nth(partnode->rules, part);
-
-	*found = rule->parchildrelid;
-	*prule = rule;
-
-	if (oldcxt)
-		MemoryContextSwitchTo(oldcxt);
-
-	return rule->children;
-}
 
 /*
  * selectPartition1()
@@ -4435,8 +4567,8 @@ selectPartition1(PartitionNode *partnode, Datum *values, bool *isnull,
 				 int *pSearch,
 				 PartitionNode **ppn_out)
 {
-	Oid relid = InvalidOid;
-	Partition *part = partnode->part;
+	Oid			relid = InvalidOid;
+	Partition  *part = partnode->part;
 	PartitionNode *pn = NULL;
 	PartitionRule *prule = NULL;
 
@@ -4446,15 +4578,11 @@ selectPartition1(PartitionNode *partnode, Datum *values, bool *isnull,
 	/* what kind of partition? */
 	switch (part->parkind)
 	{
-		case 'r': /* range */
+		case 'r':				/* range */
 			pn = selectRangePartition(partnode, values, isnull, tupdesc,
 									  accessMethods, &relid, pSearch, &prule, InvalidOid);
 			break;
-		case 'h': /* hash */
-			pn = selectHashPartition(partnode, values, isnull, tupdesc,
-									 accessMethods, &relid, &prule);
-			break;
-		case 'l': /* list */
+		case 'l':				/* list */
 			pn = selectListPartition(partnode, values, isnull, tupdesc,
 									 accessMethods, &relid, &prule, InvalidOid);
 			break;
@@ -4485,8 +4613,9 @@ selectPartition1(PartitionNode *partnode, Datum *values, bool *isnull,
 				{
 					*ppn_out = partnode->default_part->children;
 
-					/* don't return the relid, it is invalid -- return
-					 * the relid of the default partition instead
+					/*
+					 * don't return the relid, it is invalid -- return the
+					 * relid of the default partition instead
 					 */
 					return partnode->default_part->parchildrelid;
 				}
@@ -4526,23 +4655,23 @@ selectPartition(PartitionNode *partnode, Datum *values, bool *isnull,
  *
  * return: PartitionRule of which constraints match the input key
  */
-PartitionRule*
+PartitionRule *
 get_next_level_matched_partition(PartitionNode *partnode, Datum *values, bool *isnull,
-								TupleDesc tupdesc, PartitionAccessMethods *accessMethods,
-								Oid exprTypid)
+								 TupleDesc tupdesc, PartitionAccessMethods *accessMethods,
+								 Oid exprTypid)
 {
-	Oid relid = InvalidOid;
-	Partition *part = partnode->part;
+	Oid			relid = InvalidOid;
+	Partition  *part = partnode->part;
 	PartitionRule *prule = NULL;
 
 	/* what kind of partition? */
 	switch (part->parkind)
 	{
-		case 'r': /* range */
+		case 'r':				/* range */
 			selectRangePartition(partnode, values, isnull, tupdesc,
-								accessMethods, &relid, NULL, &prule, exprTypid);
+								 accessMethods, &relid, NULL, &prule, exprTypid);
 			break;
-		case 'l': /* list */
+		case 'l':				/* list */
 			selectListPartition(partnode, values, isnull, tupdesc,
 								accessMethods, &relid, &prule, exprTypid);
 			break;
@@ -4579,7 +4708,7 @@ get_next_level_matched_partition(PartitionNode *partnode, Datum *values, bool *i
  * 'relation "foo"' or 'partition "baz" of relation "foo"'.
  *
  */
-PgPartRule*
+PgPartRule *
 get_part_rule1(Relation rel,
 			   AlterPartitionId *pid,
 			   bool bExistError,
@@ -4588,85 +4717,82 @@ get_part_rule1(Relation rel,
 			   PartitionNode *pNode,
 			   char *relname,
 			   PartitionNode **ppNode
-			   )
+)
 {
-	char		   namBuf[NAMEDATALEN]; /* the real partition name */
+	char		namBuf[NAMEDATALEN];	/* the real partition name */
 
 	/* a textual representation of the partition id (for error msgs) */
-	char		   partIdStr[(NAMEDATALEN * 2)];
+	char		partIdStr[(NAMEDATALEN * 2)];
 
-	PgPartRule			*prule	   = NULL;
+	PgPartRule *prule = NULL;
 
-	Oid					 partrelid = InvalidOid;
-	int					 idrank    = 0;	/* only set for range partns by rank */
+	Oid			partrelid = InvalidOid;
+	int			idrank = 0;		/* only set for range partns by rank */
 
 	if (!pid)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("No partition id specified for %s",
+				 errmsg("no partition id specified for \"%s\"",
 						relname)));
 
 	namBuf[0] = 0;
 
-	/* build the partition "id string" for error messages as a
-	 * partition name, value, or rank.
+	/*
+	 * build the partition "id string" for error messages as a partition name,
+	 * value, or rank.
 	 *
-	 * Later on, if we discover
-	 *   (the partition exists) and
-	 *   (it has a name)
+	 * Later on, if we discover (the partition exists) and (it has a name)
 	 * then we update the partIdStr to the name
 	 */
 	switch (pid->idtype)
 	{
-		case AT_AP_IDNone:				/* no ID */
+		case AT_AP_IDNone:		/* no ID */
 			/* should never happen */
 			partIdStr[0] = 0;
 
 			break;
-		case AT_AP_IDName:				/* IDentify by Name */
+		case AT_AP_IDName:		/* IDentify by Name */
 			snprintf(partIdStr, sizeof(partIdStr), " \"%s\"",
 					 strVal(pid->partiddef));
 			snprintf(namBuf, sizeof(namBuf), "%s",
 					 strVal(pid->partiddef));
 			break;
-		case AT_AP_IDValue:				/* IDentifier FOR Value */
+		case AT_AP_IDValue:		/* IDentifier FOR Value */
 			snprintf(partIdStr, sizeof(partIdStr), " for specified value");
 			break;
-		case AT_AP_IDRank:				/* IDentifier FOR Rank */
-		{
-			snprintf(partIdStr, sizeof(partIdStr), " for specified rank");
+		case AT_AP_IDRank:		/* IDentifier FOR Rank */
+			{
+				snprintf(partIdStr, sizeof(partIdStr), " for specified rank");
 
-#ifdef WIN32
-#define round(x) (x+0.5)
-#endif
-			if (IsA(pid->partiddef, Integer))
-				idrank = intVal(pid->partiddef);
-			else if (IsA(pid->partiddef, Float))
-				idrank = floor(floatVal(pid->partiddef));
-			else
-				Assert(false);
+				if (IsA(pid->partiddef, Integer))
+					idrank = intVal(pid->partiddef);
+				else if (IsA(pid->partiddef, Float))
+					idrank = floor(floatVal(pid->partiddef));
+				else
+					Assert(false);
 
-			snprintf(partIdStr, sizeof(partIdStr),
-					 " for rank %d",
-					 idrank);
-		}
+				snprintf(partIdStr, sizeof(partIdStr),
+						 " for rank %d",
+						 idrank);
+			}
 			break;
-		case AT_AP_ID_oid:				/* IDentifier by oid */
+		case AT_AP_ID_oid:		/* IDentifier by oid */
 			snprintf(partIdStr, sizeof(partIdStr), " for oid %u",
-					 *((Oid *)(pid->partiddef)));
+					 *((Oid *) (pid->partiddef)));
 			break;
-		case AT_AP_IDDefault:			/* IDentify DEFAULT partition */
+		case AT_AP_IDDefault:	/* IDentify DEFAULT partition */
 			snprintf(partIdStr, sizeof(partIdStr), " for DEFAULT");
 			break;
 		case AT_AP_IDRule:
-		{
-			PgPartRule *p = linitial((List *)pid->partiddef);
-			snprintf(partIdStr, sizeof(partIdStr), "%s",
-					 p->partIdStr);
-			return p;
-			break;
-		}
-		default: /* XXX XXX */
+			{
+				PgPartRule *p = linitial((List *) pid->partiddef);
+
+				snprintf(partIdStr, sizeof(partIdStr), "%s",
+						 p->partIdStr);
+				return p;
+				break;
+			}
+		default:				/* XXX XXX */
 			Assert(false);
 
 	}
@@ -4677,22 +4803,23 @@ get_part_rule1(Relation rel,
 				 errmsg("%s is not partitioned",
 						relname)));
 
-	/* if id is a value or rank, get the relid of the partition if
-	 * it exists */
+	/*
+	 * if id is a value or rank, get the relid of the partition if it exists
+	 */
 	if (pNode)
 	{
 		if (pid->idtype == AT_AP_IDValue)
 		{
-			TupleDesc			 tupledesc = RelationGetDescr(rel);
-			bool				*isnull;
-			PartitionNode		*pNode2	   = NULL;
-			Datum	*d	= magic_expr_to_datum(rel, pNode,
-											  pid->partiddef, &isnull);
+			TupleDesc	tupledesc = RelationGetDescr(rel);
+			bool	   *isnull;
+			PartitionNode *pNode2 = NULL;
+			Datum	   *d = magic_expr_to_datum(rel, pNode,
+												pid->partiddef, &isnull);
 
-			/* MPP-4011: get right pid for FOR(value).  pass a pNode
-			 * ptr down to prevent recursion in selectPartition -- we
-			 * only want the top-most partition for the value in this
-			 * case
+			/*
+			 * MPP-4011: get right pid for FOR(value).  pass a pNode ptr down
+			 * to prevent recursion in selectPartition -- we only want the
+			 * top-most partition for the value in this case
 			 */
 			if (ppNode)
 				partrelid = selectPartition1(pNode, d, isnull, tupledesc, NULL,
@@ -4703,20 +4830,21 @@ get_part_rule1(Relation rel,
 
 			/* build a string rep for the value */
 			{
-				ParseState		*pstate = make_parsestate(NULL);
-				Node			*pval	= (Node *)pid->partiddef;
-				char			*idval	= NULL;
+				ParseState *pstate = make_parsestate(NULL);
+				Node	   *pval = (Node *) pid->partiddef;
+				char	   *idval = NULL;
 
-				pval = (Node *)transformExpressionList(pstate,
-													   (List *)pval);
+				pval = (Node *) transformExpressionList(pstate,
+														(List *) pval,
+														EXPR_KIND_PARTITION_EXPRESSION);
 
 				free_parsestate(pstate);
 
 				idval =
-				deparse_expression(pval,
-								   deparse_context_for(RelationGetRelationName(rel),
-													   RelationGetRelid(rel)),
-								   false, false);
+					deparse_expression(pval,
+									   deparse_context_for(RelationGetRelationName(rel),
+														   RelationGetRelid(rel)),
+									   false, false);
 
 				if (idval)
 					snprintf(partIdStr, sizeof(partIdStr),
@@ -4727,48 +4855,30 @@ get_part_rule1(Relation rel,
 		}
 		else if (pid->idtype == AT_AP_IDRank)
 		{
-			char *parTypName = "UNKNOWN";
-
-			if (pNode->part->parkind != 'r')
-			{
-				switch (pNode->part->parkind)
-				{
-					case 'h': /* hash */
-						parTypName = "HASH";
-						break;
-					case 'l': /* list */
-						parTypName = "LIST";
-						break;
-				} /* end switch */
-
+			if (pNode->part->parkind == 'l')
 				ereport(ERROR,
 						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-						 errmsg("cannot find partition by RANK -- "
-								"%s is %s partitioned",
-								relname,
-								parTypName)));
+						 errmsg("cannot find partition by RANK -- \"%s\" is LIST partitioned",
+								relname)));
 
-			}
-
-			partrelid =	selectPartitionByRank(pNode, idrank);
+			partrelid = selectPartitionByRank(pNode, idrank);
 		}
 	}
 
 	/* check thru the list of partition rules to match by relid or name */
 	if (pNode)
 	{
-		ListCell *lc;
-		int rulerank = 1;
+		int			rulerank = 1;
 
 		/* set up the relid for the default partition if necessary */
 		if ((pid->idtype == AT_AP_IDDefault)
 			&& pNode->default_part)
 			partrelid = pNode->default_part->parchildrelid;
 
-		foreach(lc, pNode->rules)
+		for (int i = 0; i < pNode->num_rules; i++)
 		{
-			PartitionRule *rule = lfirst(lc);
-			bool foundit = false;
+			PartitionRule *rule = pNode->rules[i];
+			bool		foundit = false;
 
 			if ((pid->idtype == AT_AP_IDValue)
 				|| (pid->idtype == AT_AP_IDRank))
@@ -4799,18 +4909,18 @@ get_part_rule1(Relation rel,
 
 				prule->pNode = pNode;
 				prule->topRule = rule;
-				prule->topRuleRank = rulerank; /* 1-based */
+				prule->topRuleRank = rulerank;	/* 1-based */
 				prule->relname = relname;
 				break;
 			}
 			rulerank++;
-		} /* end foreach */
+		}						/* end foreach */
 
 		/* if cannot find, check default partition */
 		if (!prule && pNode->default_part)
 		{
 			PartitionRule *rule = pNode->default_part;
-			bool foundit = false;
+			bool		foundit = false;
 
 			if ((pid->idtype == AT_AP_IDValue)
 				|| (pid->idtype == AT_AP_IDRank)
@@ -4846,12 +4956,13 @@ get_part_rule1(Relation rel,
 				prule->relname = relname;
 			}
 		}
-	} /* end if pnode */
+	}							/* end if pnode */
 
-	/* if the partition exists, set the "id string" in prule and
-	 * indicate whether it is the partition name.  The ATPExec
-	 * commands will notify users of the "real" name if the original
-	 * specification was by value or rank
+	/*
+	 * if the partition exists, set the "id string" in prule and indicate
+	 * whether it is the partition name.  The ATPExec commands will notify
+	 * users of the "real" name if the original specification was by value or
+	 * rank
 	 */
 	if (prule)
 	{
@@ -4870,13 +4981,9 @@ get_part_rule1(Relation rel,
 		if (bMustExist)
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-					 errmsg("FOR expression matches "
-							"DEFAULT partition%s of %s",
-							prule->isName ?
-							partIdStr : "",
-							relname),
-					 errhint("FOR expression may only specify "
-							 "a non-default partition in this context.")));
+					 errmsg("FOR expression matches DEFAULT partition%s of %s",
+							prule->isName ? partIdStr : "", relname),
+					 errhint("FOR expression may only specify a non-default partition in this context.")));
 
 	}
 
@@ -4884,27 +4991,26 @@ get_part_rule1(Relation rel,
 	{
 		switch (pid->idtype)
 		{
-			case AT_AP_IDNone:				/* no ID */
+			case AT_AP_IDNone:	/* no ID */
 				/* should never happen */
 				Assert(false);
 				break;
-			case AT_AP_IDName:				/* IDentify by Name */
-			case AT_AP_IDValue:				/* IDentifier FOR Value */
-			case AT_AP_IDRank:				/* IDentifier FOR Rank */
-			case AT_AP_ID_oid:				/* IDentifier by oid */
+			case AT_AP_IDName:	/* IDentify by Name */
+			case AT_AP_IDValue: /* IDentifier FOR Value */
+			case AT_AP_IDRank:	/* IDentifier FOR Rank */
+			case AT_AP_ID_oid:	/* IDentifier by oid */
 				ereport(ERROR,
 						(errcode(ERRCODE_UNDEFINED_OBJECT),
 						 errmsg("partition%s of %s does not exist",
-								partIdStr,
-								relname)));
+								partIdStr, relname)));
 				break;
-			case AT_AP_IDDefault:			/* IDentify DEFAULT partition */
+			case AT_AP_IDDefault:	/* IDentify DEFAULT partition */
 				ereport(ERROR,
 						(errcode(ERRCODE_UNDEFINED_OBJECT),
 						 errmsg("DEFAULT partition of %s does not exist",
 								relname)));
 				break;
-			default: /* XXX XXX */
+			default:			/* XXX XXX */
 				Assert(false);
 
 		}
@@ -4913,29 +5019,26 @@ get_part_rule1(Relation rel,
 	{
 		switch (pid->idtype)
 		{
-			case AT_AP_IDNone:				/* no ID */
+			case AT_AP_IDNone:	/* no ID */
 				/* should never happen */
 				Assert(false);
 				break;
-			case AT_AP_IDName:				/* IDentify by Name */
-			case AT_AP_IDValue:				/* IDentifier FOR Value */
-			case AT_AP_IDRank:				/* IDentifier FOR Rank */
-			case AT_AP_ID_oid:				/* IDentifier by oid */
+			case AT_AP_IDName:	/* IDentify by Name */
+			case AT_AP_IDValue: /* IDentifier FOR Value */
+			case AT_AP_IDRank:	/* IDentifier FOR Rank */
+			case AT_AP_ID_oid:	/* IDentifier by oid */
 				ereport(ERROR,
 						(errcode(ERRCODE_DUPLICATE_OBJECT),
 						 errmsg("partition%s of %s already exists",
-								partIdStr,
-								relname)));
+								partIdStr, relname)));
 				break;
-			case AT_AP_IDDefault:			/* IDentify DEFAULT partition */
+			case AT_AP_IDDefault:	/* IDentify DEFAULT partition */
 				ereport(ERROR,
 						(errcode(ERRCODE_DUPLICATE_OBJECT),
 						 errmsg("DEFAULT partition%s of %s already exists",
-								prule->isName ?
-								partIdStr : "",
-								relname)));
+								prule->isName ? partIdStr : "", relname)));
 				break;
-			default: /* XXX XXX */
+			default:			/* XXX XXX */
 				Assert(false);
 
 		}
@@ -4945,7 +5048,7 @@ get_part_rule1(Relation rel,
 L_fin_partrule:
 
 	return prule;
-} /* end get_part_rule1 */
+}								/* end get_part_rule1 */
 
 PgPartRule *
 get_part_rule(Relation rel,
@@ -4955,10 +5058,13 @@ get_part_rule(Relation rel,
 			  int *pSearch,
 			  bool inctemplate)
 {
-	PartitionNode		*pNode	= NULL;
-	PartitionNode		*pNode2 = NULL;
-	char				relnamBuf[(NAMEDATALEN * 2)];
-	char *relname;
+	PartitionNode *pNode = NULL;
+	PartitionNode *pNode2 = NULL;
+	char		relnamBuf[(NAMEDATALEN * 2)];
+	char	   *relname;
+
+	if (!pid)
+		return NULL;
 
 	snprintf(relnamBuf, sizeof(relnamBuf), "relation \"%s\"",
 			 RelationGetRelationName(rel));
@@ -4974,48 +5080,34 @@ get_part_rule(Relation rel,
 							  bExistError, bMustExist,
 							  pSearch, pNode, relname, NULL);
 
-	if (!pid)
-		return NULL;
-
 	if (pid->idtype == AT_AP_IDRule)
 	{
-		List					*l1		= (List *)pid->partiddef;
-		ListCell				*lc;
-		AlterPartitionId		*pid2	= NULL;
-		PgPartRule*				 prule2 = NULL;
+		List	   *l1 = (List *) pid->partiddef;
+		ListCell   *lc;
+		AlterPartitionId *pid2 = NULL;
+		PgPartRule *prule2 = NULL;
 
 		lc = list_head(l1);
-		prule2 = (PgPartRule*) lfirst(lc);
+		prule2 = (PgPartRule *) lfirst(lc);
 		if (prule2 && prule2->topRule && prule2->topRule->children)
 			pNode = prule2->topRule->children;
 
 		lc = lnext(lc);
 
-		pid2 = (AlterPartitionId *)lfirst(lc);
+		pid2 = (AlterPartitionId *) lfirst(lc);
 
-		prule2 = get_part_rule1(rel,
-								pid2,
-								bExistError, bMustExist,
-								pSearch, pNode, pstrdup(prule2->relname), &pNode2);
-
-		pNode = pNode2;
-
-		if (!pNode)
-		{
-			if (prule2 && prule2->topRule && prule2->topRule->children)
-				pNode = prule2->topRule->children;
-		}
-
-		return prule2;
+		return get_part_rule1(rel, pid2, bExistError, bMustExist, pSearch,
+							  pNode, pstrdup(prule2->relname), &pNode2);
 	}
 
 	if (pid->idtype == AT_AP_IDList)
 	{
-		List					*l1		= (List *)pid->partiddef;
-		ListCell				*lc;
-		AlterPartitionId		*pid2	= NULL;
-		PgPartRule*				 prule2 = NULL;
-		StringInfoData			 sid1, sid2;
+		List	   *l1 = (List *) pid->partiddef;
+		ListCell   *lc;
+		AlterPartitionId *pid2 = NULL;
+		PgPartRule *prule2 = NULL;
+		StringInfoData sid1,
+					sid2;
 
 		initStringInfo(&sid1);
 		initStringInfo(&sid2);
@@ -5024,7 +5116,7 @@ get_part_rule(Relation rel,
 		foreach(lc, l1)
 		{
 
-			pid2 = (AlterPartitionId *)lfirst(lc);
+			pid2 = (AlterPartitionId *) lfirst(lc);
 
 			prule2 = get_part_rule1(rel,
 									pid2,
@@ -5041,15 +5133,15 @@ get_part_rule(Relation rel,
 
 			appendStringInfo(&sid2, "partition%s of %s",
 							 prule2->partIdStr, sid1.data);
-			truncateStringInfo(&sid1, 0);
+			resetStringInfo(&sid1);
 			appendStringInfo(&sid1, "%s", sid2.data);
-			truncateStringInfo(&sid2, 0);
-		} /* end foreach */
+			resetStringInfo(&sid2);
+		}						/* end foreach */
 
 		return prule2;
 	}
 	return NULL;
-} /* end get_part_rule */
+}								/* end get_part_rule */
 
 static void
 fixup_table_storage_options(CreateStmt *ct)
@@ -5057,9 +5149,9 @@ fixup_table_storage_options(CreateStmt *ct)
 	if (!ct->options)
 	{
 		ct->options = list_make2(makeDefElem("appendonly",
-											 (Node *)makeString("true")),
+											 (Node *) makeString("true")),
 								 makeDefElem("orientation",
-											 (Node *)makeString("column")));
+											 (Node *) makeString("column")));
 	}
 }
 
@@ -5074,13 +5166,13 @@ static void
 apply_template_storage_encodings(CreateStmt *ct, Oid relid, Oid paroid,
 								 PartitionSpec *tmpl)
 {
-	List *encs = get_deparsed_partition_encodings(relid, paroid);
+	List	   *encs = get_deparsed_partition_encodings(relid, paroid);
 
 	if (encs)
 	{
 		/*
-		 * If the user didn't specify WITH (...) at create time,
-		 * we need to force the new partitions to be AO/CO.
+		 * If the user didn't specify WITH (...) at create time, we need to
+		 * force the new partitions to be AO/CO.
 		 */
 		fixup_table_storage_options(ct);
 		tmpl->partElem = list_concat(tmpl->partElem,
@@ -5095,39 +5187,27 @@ apply_template_storage_encodings(CreateStmt *ct, Oid relid, Oid paroid,
  */
 
 static int
-atpxPart_validate_spec(
-					   PartitionBy			*pBy,
-					   CreateStmtContext	*pcxt,
-					   Relation					 rel,
-					   CreateStmt				*ct,
-					   PartitionElem			*pelem,
-					   PartitionNode			*pNode,
-					   char						*partName,
-					   bool						 isDefault,
-					   PartitionByType			 part_type,
-					   char						*partDesc)
+atpxPart_validate_spec(PartitionBy *pBy,
+					   Relation rel,
+					   CreateStmt *ct,
+					   PartitionElem *pelem,
+					   PartitionNode *pNode,
+					   char *partName,
+					   bool isDefault,
+					   PartitionByType part_type,
+					   char *partDesc)
 {
-	PartitionSpec		*spec	= makeNode(PartitionSpec);
-	ParseState			*pstate = NULL;
-	List				*schema = NIL;
-	List				*inheritOids;
-	List				*old_constraints;
-	int					 parentOidCount;
-	int                  result;
-	PartitionNode		*pNode_tmpl = NULL;
+	PartitionSpec *spec = makeNode(PartitionSpec);
+	List	   *schema = NIL;
+	List *constraints = NIL;
+	RangeVar *parent_rv = makeRangeVar(
+		get_namespace_name(RelationGetNamespace(rel)),
+		pstrdup(RelationGetRelationName(rel)),
+		-1);
+	SetSchemaAndConstraints(parent_rv, &schema, &constraints);
 
-	/* get the table column defs */
-	schema =
-	MergeAttributes(schema,
-					list_make1(
-							   makeRangeVar(
-											get_namespace_name(
-															   RelationGetNamespace(rel)),
-											pstrdup(RelationGetRelationName(rel)), -1)),
-					false, true /* isPartitioned */,
-					&inheritOids, &old_constraints, &parentOidCount, NULL);
-
-	pcxt->columns = schema;
+	int			result;
+	PartitionNode *pNode_tmpl = NULL;
 
 	spec->partElem = list_make1(pelem);
 
@@ -5142,64 +5222,62 @@ atpxPart_validate_spec(
 		pelem->rrand = random();
 
 	pBy->partType = part_type;
-	pBy->keys     = NULL;
-	pBy->partNum  = 0;
-	pBy->subPart  = NULL;
-	pBy->partSpec = (Node *)spec;
+	pBy->keys = NULL;
+	pBy->subPart = NULL;
+	pBy->partSpec = (Node *) spec;
 	pBy->partDepth = pNode->part->parlevel;
 	/* Note: pBy->partQuiet already set by caller */
 	pBy->parentRel =
-	makeRangeVar(get_namespace_name(RelationGetNamespace(rel)),
-				 pstrdup(RelationGetRelationName(rel)), -1);
-	pBy->location  = -1;
+		makeRangeVar(get_namespace_name(RelationGetNamespace(rel)),
+					 pstrdup(RelationGetRelationName(rel)), -1);
+	pBy->location = -1;
 	pBy->partDefault = NULL;
-	pBy->bKeepMe = true; /* nefarious: we need to keep the "top"
-						  * partition by statement because
-						  * analyze.c:do_parse_analyze needs to find
-						  * it to re-order the ALTER statements
-						  */
+	pBy->bKeepMe = true;		/* nefarious: we need to keep the "top"
+								 * partition by statement because
+								 * analyze.c:do_parse_analyze needs to find it
+								 * to re-order the ALTER statements */
 
 	/* fixup the pnode_tmpl to get the right parlevel */
-	if (pNode && (pNode->rules || pNode->default_part))
+	if (pNode && (pNode->num_rules > 0 || pNode->default_part))
 	{
 		pNode_tmpl = get_parts(pNode->part->parrelid,
 							   pNode->part->parlevel + 1,
-							   InvalidOid, /* no parent for template */
+							   InvalidOid,	/* no parent for template */
 							   true,
-							   true /*includesubparts*/
-							   );
+							   true /* includesubparts */
+			);
 	}
 
-	{ /* find the partitioning keys (recursively) */
+	{							/* find the partitioning keys (recursively) */
 
-		PartitionBy				*pBy2 = pBy;
-		PartitionBy				*parent_pBy2 = NULL;
-		PartitionNode			*pNode2 = pNode;
+		PartitionBy *pBy2 = pBy;
+		PartitionBy *parent_pBy2 = NULL;
+		PartitionNode *pNode2 = pNode;
 
-		int				 ii;
-		TupleDesc		 tupleDesc		= RelationGetDescr(rel);
-		List			*pbykeys		= NIL;
-		List			*pbyopclass		= NIL;
-		Oid				 accessMethodId = BTREE_AM_OID;
+		int			ii;
+		TupleDesc	tupleDesc = RelationGetDescr(rel);
+		List	   *pbykeys = NIL;
+		List	   *pbyopclass = NIL;
+		Oid			accessMethodId = BTREE_AM_OID;
 
 		while (pNode2)
 		{
-			pbykeys    = NIL;
+			pbykeys = NIL;
 			pbyopclass = NIL;
 
 			for (ii = 0; ii < pNode2->part->parnatts; ii++)
 			{
-				AttrNumber			 attno		   =
+				AttrNumber	attno =
 				pNode2->part->paratts[ii];
-				Form_pg_attribute	 attribute	   =
+				Form_pg_attribute attribute =
 				tupleDesc->attrs[attno - 1];
-				char				*attributeName =
+				char	   *attributeName =
 				NameStr(attribute->attname);
-				Oid					 opclass	   =
+				Oid			opclass =
 				InvalidOid;
 
 				opclass =
-				GetDefaultOpClass(attribute->atttypid, accessMethodId);
+					GetDefaultOpClass(attribute->atttypid, accessMethodId);
 
 				if (pbykeys)
 				{
@@ -5211,53 +5289,46 @@ atpxPart_validate_spec(
 					pbykeys = list_make1(makeString(attributeName));
 					pbyopclass = list_make1_oid(opclass);
 				}
-			} /* end for */
+			}					/* end for */
 
 			pBy2->keys = pbykeys;
 			pBy2->keyopclass = pbyopclass;
 
 			if (parent_pBy2)
-				parent_pBy2->subPart = (Node *)pBy2;
+				parent_pBy2->subPart = (Node *) pBy2;
 
 			parent_pBy2 = pBy2;
 
-			if (pNode2 && (pNode2->rules || pNode2->default_part))
+			if (pNode2 && (pNode2->num_rules > 0 || pNode2->default_part))
 			{
 				PartitionRule *prule;
-				PartitionElem *el = NULL; /* for the subpartn template */
+				PartitionElem *el = NULL;	/* for the subpartn template */
 
 				if (pNode2->default_part)
 					prule = pNode2->default_part;
 				else
-					prule = linitial(pNode2->rules);
+					prule = pNode2->rules[0];
 
 				if (prule && prule->children)
 				{
 					pNode2 = prule->children;
 
-					/* XXX XXX: make this work for HASH at some point */
-
-					Assert(
-						   ('l' == pNode2->part->parkind) ||
+					Assert(('l' == pNode2->part->parkind) ||
 						   ('r' == pNode2->part->parkind));
 
 					pBy2 = makeNode(PartitionBy);
-					pBy2->partType	=
-					('r' == pNode2->part->parkind) ?
-					PARTTYP_RANGE :
-					PARTTYP_LIST;
-					pBy2->keys		= NULL;
-					pBy2->partNum	= 0;
-					pBy2->subPart	= NULL;
-					pBy2->partSpec	= NULL;
+					pBy2->partType = char_to_parttype(pNode2->part->parkind);
+					pBy2->keys = NULL;
+					pBy2->subPart = NULL;
+					pBy2->partSpec = NULL;
 					pBy2->partDepth = pNode2->part->parlevel;
 					pBy2->partQuiet = pBy->partQuiet;
 					pBy2->parentRel =
-					makeRangeVar(
-								 get_namespace_name(
-													RelationGetNamespace(rel)),
-								 pstrdup(RelationGetRelationName(rel)), -1);
-					pBy2->location  = -1;
+						makeRangeVar(
+									 get_namespace_name(
+														RelationGetNamespace(rel)),
+									 pstrdup(RelationGetRelationName(rel)), -1);
+					pBy2->location = -1;
 					pBy2->partDefault = NULL;
 
 					el = NULL;
@@ -5266,14 +5337,13 @@ atpxPart_validate_spec(
 					if (pNode_tmpl)
 					{
 						PartitionSpec *spec_tmpl = makeNode(PartitionSpec);
-						ListCell *lc;
 
 						spec_tmpl->istemplate = true;
 
 						/* add entries for rules at current level */
-						foreach(lc, pNode_tmpl->rules)
+						for (int i = 0; i < pNode_tmpl->num_rules; i++)
 						{
-							PartitionRule *rule_tmpl = lfirst(lc);
+							PartitionRule *rule_tmpl = pNode_tmpl->rules[i];
 
 							el = makeNode(PartitionElem);
 
@@ -5286,22 +5356,22 @@ atpxPart_validate_spec(
 							if (rule_tmpl->parreloptions ||
 								rule_tmpl->partemplatespaceId)
 							{
-								Node *tspaceName = NULL;
+								Node	   *tspaceName = NULL;
 								AlterPartitionCmd *apc =
 								makeNode(AlterPartitionCmd);
 
-								el->storeAttr = (Node *)apc;
+								el->storeAttr = (Node *) apc;
 
 								if (rule_tmpl->partemplatespaceId)
 									tspaceName =
-									(Node*)makeString(
-													  get_tablespace_name(
-																		  rule_tmpl->partemplatespaceId
-																		  ));
+										(Node *) makeString(
+															get_tablespace_name(
+																				rule_tmpl->partemplatespaceId
+																				));
 
 								apc->partid = NULL;
-								apc->arg2	= tspaceName;
-								apc->arg1	= (Node *)rule_tmpl->parreloptions;
+								apc->arg2 = tspaceName;
+								apc->arg1 = (Node *) rule_tmpl->parreloptions;
 
 							}
 
@@ -5311,7 +5381,7 @@ atpxPart_validate_spec(
 								PartitionValuesSpec *vspec =
 								makeNode(PartitionValuesSpec);
 
-								el->boundSpec = (Node*)vspec;
+								el->boundSpec = (Node *) vspec;
 
 								vspec->partValues = rule_tmpl->parlistvalues;
 							}
@@ -5327,54 +5397,54 @@ atpxPart_validate_spec(
 								if (rule_tmpl->parrangestart)
 								{
 									ri =
-									makeNode(PartitionRangeItem);
+										makeNode(PartitionRangeItem);
 
 									ri->partedge =
-									rule_tmpl->parrangestartincl ?
-									PART_EDGE_INCLUSIVE :
-									PART_EDGE_EXCLUSIVE ;
+										rule_tmpl->parrangestartincl ?
+										PART_EDGE_INCLUSIVE :
+										PART_EDGE_EXCLUSIVE;
 
 									ri->partRangeVal =
-									(List *)rule_tmpl->parrangestart;
+										(List *) rule_tmpl->parrangestart;
 
-									bspec->partStart = (Node*)ri;
+									bspec->partStart = (Node *) ri;
 
 								}
 								if (rule_tmpl->parrangeend)
 								{
 									ri =
-									makeNode(PartitionRangeItem);
+										makeNode(PartitionRangeItem);
 
 									ri->partedge =
-									rule_tmpl->parrangeendincl ?
-									PART_EDGE_INCLUSIVE :
-									PART_EDGE_EXCLUSIVE ;
+										rule_tmpl->parrangeendincl ?
+										PART_EDGE_INCLUSIVE :
+										PART_EDGE_EXCLUSIVE;
 
 									ri->partRangeVal =
-									(List *)rule_tmpl->parrangeend;
+										(List *) rule_tmpl->parrangeend;
 
-									bspec->partEnd = (Node*)ri;
+									bspec->partEnd = (Node *) ri;
 
 								}
 								if (rule_tmpl->parrangeevery)
 								{
 									ri =
-									makeNode(PartitionRangeItem);
+										makeNode(PartitionRangeItem);
 
 									ri->partRangeVal =
-									(List *)rule_tmpl->parrangeevery;
+										(List *) rule_tmpl->parrangeevery;
 
-									bspec->partEvery = (Node*)ri;
+									bspec->partEvery = (Node *) ri;
 
 								}
 
-								el->boundSpec = (Node*)bspec;
+								el->boundSpec = (Node *) bspec;
 
-							} /* end if RANGE */
+							}	/* end if RANGE */
 
 							spec_tmpl->partElem = lappend(spec_tmpl->partElem,
 														  el);
-						} /* end foreach */
+						}		/* end foreach */
 
 						/* MPP-4725 */
 						/* and the default partition */
@@ -5397,29 +5467,30 @@ atpxPart_validate_spec(
 
 						/* apply storage encoding for this template */
 						apply_template_storage_encodings(ct,
-												 RelationGetRelid(rel),
-												 pNode_tmpl->part->partid,
-												 spec_tmpl);
+														 RelationGetRelid(rel),
+														 pNode_tmpl->part->partid,
+														 spec_tmpl);
 
-						/* the PartitionElem should hang off the pby
-						 * partspec, and subsequent templates should
-						 * hang off the subspec for the prior
-						 * PartitionElem.
+						/*
+						 * the PartitionElem should hang off the pby partspec,
+						 * and subsequent templates should hang off the
+						 * subspec for the prior PartitionElem.
 						 */
 
-						pBy2->partSpec	= (Node *)spec_tmpl;
+						pBy2->partSpec = (Node *) spec_tmpl;
 
-					} /* end if pNode_tmpl */
+					}			/* end if pNode_tmpl */
 
 					/* fixup the pnode_tmpl to get the right parlevel */
-					if (pNode2 && (pNode2->rules || pNode2->default_part))
+					if (pNode2 && (pNode2->num_rules > 0 || pNode2->default_part))
 					{
 						pNode_tmpl = get_parts(pNode2->part->parrelid,
 											   pNode2->part->parlevel + 1,
-											   InvalidOid, /* no parent for template */
+											   InvalidOid,	/* no parent for
+															 * template */
 											   true,
-											   true /*includesubparts*/
-											   );
+											   true /* includesubparts */
+							);
 					}
 
 				}
@@ -5429,55 +5500,59 @@ atpxPart_validate_spec(
 			else
 				pNode2 = NULL;
 
-		} /* end while */
+		}						/* end while */
 	}
 
-	pstate = make_parsestate(NULL);
-	result = validate_partition_spec(pstate, pcxt, ct, pBy, "", -1);
-	free_parsestate(pstate);
+	CreateStmtContext cxt;
+
+	MemSet(&cxt, 0, sizeof(cxt));
+
+	cxt.pstate = make_parsestate(NULL);
+	cxt.columns = schema;
+
+	result = validate_partition_spec(&cxt, ct, pBy, "", -1);
+	free_parsestate(cxt.pstate);
 
 	return result;
-} /* end atpxPart_validate_spec */
+}								/* end atpxPart_validate_spec */
 
 Node *
 atpxPartAddList(Relation rel,
 				bool is_split,
 				List *colencs,
-				PartitionNode  *pNode,
+				PartitionNode *pNode,
 				char *partName, /* pid->partiddef (or NULL) */
 				bool isDefault,
 				PartitionElem *pelem,
 				PartitionByType part_type,
-				PgPartRule* par_prule,
+				PgPartRule *par_prule,
 				char *lrelname,
 				bool bSetTemplate,
 				Oid ownerid)
 {
-	DestReceiver		*dest	   = None_Receiver;
-	int					 maxpartno = 0;
-	typedef enum {
-		FIRST = 0,  /* New partition lies before first. */
-		MIDDLE,     /* New partition lies in the middle. */
-		LAST        /* New partition lies after last. */
+	DestReceiver *dest = None_Receiver;
+	int			maxpartno = 0;
+	typedef enum
+	{
+		FIRST = 0,				/* New partition lies before first. */
+		MIDDLE,					/* New partition lies in the middle. */
+		LAST					/* New partition lies after last. */
 	} NewPosition;
 	NewPosition newPos = MIDDLE;
-	bool				 bOpenGap  = false;
-	PartitionBy			*pBy;
-	CreateStmtContext    cxt;
-	Node				*pSubSpec  = NULL;	/* return the subpartition spec */
-	Relation			 par_rel   = rel;
-	PartitionNode		 pNodebuf;
-	PartitionNode		*pNode2 = &pNodebuf;
+	bool		bOpenGap = false;
+	PartitionBy *pBy;
+	Node	   *pSubSpec = NULL;	/* return the subpartition spec */
+	Relation	par_rel = rel;
+	PartitionNode pNodebuf;
+	PartitionNode *pNode2 = &pNodebuf;
 	CreateStmt *ct;
 
 	/* get the relation for the parent of the new partition */
 	if (par_prule && par_prule->topRule)
 		par_rel =
-		heap_open(par_prule->topRule->parchildrelid, AccessShareLock);
+			heap_open(par_prule->topRule->parchildrelid, AccessShareLock);
 
-	MemSet(&cxt, 0, sizeof(cxt));
-
-	Assert( (PARTTYP_LIST == part_type) || (PARTTYP_RANGE == part_type) );
+	Assert((PARTTYP_LIST == part_type) || (PARTTYP_RANGE == part_type));
 
 	/* XXX XXX: handle case of missing boundary spec for range with EVERY */
 
@@ -5485,45 +5560,43 @@ atpxPartAddList(Relation rel,
 	{
 		if (PARTTYP_RANGE == part_type)
 		{
-			PartitionBoundSpec	*pbs	   = NULL;
-			PgPartRule			*prule	   = NULL;
-			AlterPartitionId	 pid;
-			ParseState			*pstate    = make_parsestate(NULL);
-			TupleDesc			 tupledesc = RelationGetDescr(rel);
+			PartitionBoundSpec *pbs = NULL;
+			PgPartRule *prule = NULL;
+			AlterPartitionId pid;
+			ParseState *pstate = make_parsestate(NULL);
+			TupleDesc	tupledesc = RelationGetDescr(rel);
 
 			MemSet(&pid, 0, sizeof(AlterPartitionId));
 
 			pid.idtype = AT_AP_IDRank;
-			pid.location  = -1;
+			pid.location = -1;
 
-			Assert (IsA(pelem->boundSpec, PartitionBoundSpec));
+			Assert(IsA(pelem->boundSpec, PartitionBoundSpec));
 
-			pbs = (PartitionBoundSpec *)pelem->boundSpec;
-			pSubSpec = pelem->subSpec; /* look for subpartition spec */
+			pbs = (PartitionBoundSpec *) pelem->boundSpec;
+			pSubSpec = pelem->subSpec;	/* look for subpartition spec */
 
 			/* no EVERY */
 			if (pbs->partEvery)
 				ereport(ERROR,
 						(errcode(ERRCODE_UNDEFINED_OBJECT),
-						 errmsg("cannot specify EVERY when adding "
-								"RANGE partition to %s",
+						 errmsg("cannot specify EVERY when adding RANGE partition to %s",
 								lrelname)));
 
-			if (!(pbs->partStart || pbs->partEnd ))
+			if (!(pbs->partStart || pbs->partEnd))
 				ereport(ERROR,
 						(errcode(ERRCODE_UNDEFINED_OBJECT),
-						 errmsg("Need START or END when adding "
-								"RANGE partition to %s",
+						 errmsg("need START or END when adding RANGE partition to %s",
 								lrelname)));
 
 			/* if no START, then START after last partition */
 			if (!(pbs->partStart))
 			{
-				Datum					*d_end	   = NULL;
-				bool					*isnull;
-				bool					 bstat;
+				Datum	   *d_end = NULL;
+				bool	   *isnull;
+				bool		bstat;
 
-				pid.partiddef = (Node *)makeInteger(-1);
+				pid.partiddef = (Node *) makeInteger(-1);
 
 				prule = get_part_rule1(rel, &pid, false, false,
 									   NULL,
@@ -5531,9 +5604,9 @@ atpxPartAddList(Relation rel,
 									   lrelname,
 									   &pNode2);
 
-				/* ok if no prior -- just means this is first
-				 * partition (XXX XXX though should always have 1
-				 * partition in the table...)
+				/*
+				 * ok if no prior -- just means this is first partition (XXX
+				 * XXX though should always have 1 partition in the table...)
 				 */
 
 				if (!(prule && prule->topRule))
@@ -5544,45 +5617,48 @@ atpxPartAddList(Relation rel,
 				}
 
 				{
-					Node *n1;
+					Node	   *n1;
 
-					if ( !IsA(pbs->partEnd, PartitionRangeItem) )
+					if (!IsA(pbs->partEnd, PartitionRangeItem))
 					{
-						/* pbs->partEnd isn't a PartitionRangeItem!  This probably means
-						 * an invalid split of a default part, but we aren't really sure.
-						 * See MPP-14613.
+						/*
+						 * pbs->partEnd isn't a PartitionRangeItem!  This
+						 * probably means an invalid split of a default part,
+						 * but we aren't really sure. See MPP-14613.
 						 */
 						ereport(ERROR,
 								(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
-								 errmsg("invalid partition range specification.")));
+								 errmsg("invalid partition range specification")));
 					}
 
 					PartitionRangeItem *ri =
-					(PartitionRangeItem *)pbs->partEnd;
+					(PartitionRangeItem *) pbs->partEnd;
+
 					PartitionRangeItemIsValid(NULL, ri);
 
-					n1 = (Node *)copyObject(ri->partRangeVal);
-					n1 = (Node *)transformExpressionList(pstate,
-														 (List *)n1);
+					n1 = (Node *) copyObject(ri->partRangeVal);
+					n1 = (Node *) transformExpressionList(pstate,
+														  (List *) n1,
+														  EXPR_KIND_PARTITION_EXPRESSION);
 
 					d_end =
-					magic_expr_to_datum(rel, pNode,
-										n1, &isnull);
+						magic_expr_to_datum(rel, pNode,
+											n1, &isnull);
 				}
 
 				if (prule && prule->topRule && prule->topRule->parrangeend
-					&& list_length((List *)prule->topRule->parrangeend))
+					&& list_length((List *) prule->topRule->parrangeend))
 				{
 					bstat =
-					compare_partn_opfuncid(pNode,
-										   "pg_catalog",
-										   "<",
-										   (List *)prule->topRule->parrangeend,
-										   d_end, isnull, tupledesc);
+						compare_partn_opfuncid(pNode,
+											   "pg_catalog",
+											   "<",
+											   (List *) prule->topRule->parrangeend,
+											   d_end, isnull, tupledesc);
 
-					/* if the current end is less than the new end
-					 * then use it as the start of the new
-					 * partition
+					/*
+					 * if the current end is less than the new end then use it
+					 * as the start of the new partition
 					 */
 
 					if (bstat)
@@ -5592,27 +5668,28 @@ atpxPartAddList(Relation rel,
 						ri->location = -1;
 
 						ri->partRangeVal =
-						copyObject(prule->topRule->parrangeend);
+							copyObject(prule->topRule->parrangeend);
 
 						/* invert the inclusive/exclusive */
 						ri->partedge = prule->topRule->parrangeendincl ?
-						PART_EDGE_EXCLUSIVE :
-						PART_EDGE_INCLUSIVE;
+							PART_EDGE_EXCLUSIVE :
+							PART_EDGE_INCLUSIVE;
 
 						/* should be final partition */
 						maxpartno = prule->topRule->parruleord + 1;
 						newPos = LAST;
-						pbs->partStart = (Node *)ri;
+						pbs->partStart = (Node *) ri;
 						goto L_fin_no_start;
 					}
 				}
 
-				/* if the last partition doesn't have an end, or the
-				 * end isn't less than the new end, check if new end
-				 * is less than current start
+				/*
+				 * if the last partition doesn't have an end, or the end isn't
+				 * less than the new end, check if new end is less than
+				 * current start
 				 */
 
-				pid.partiddef = (Node *)makeInteger(1);
+				pid.partiddef = (Node *) makeInteger(1);
 
 				prule = get_part_rule1(rel, &pid, false, false,
 									   NULL,
@@ -5621,18 +5698,18 @@ atpxPartAddList(Relation rel,
 									   &pNode2);
 
 				if (!(prule && prule->topRule && prule->topRule->parrangestart
-					  && list_length((List *)prule->topRule->parrangestart)))
+					  && list_length((List *) prule->topRule->parrangestart)))
 					ereport(ERROR,
 							(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
 							 errmsg("new partition overlaps existing "
 									"partition")));
 
 				bstat =
-				compare_partn_opfuncid(pNode,
-									   "pg_catalog",
-									   ">",
-									   (List *)prule->topRule->parrangestart,
-									   d_end, isnull, tupledesc);
+					compare_partn_opfuncid(pNode,
+										   "pg_catalog",
+										   ">",
+										   (List *) prule->topRule->parrangestart,
+										   d_end, isnull, tupledesc);
 
 
 				if (!bstat)
@@ -5643,15 +5720,15 @@ atpxPartAddList(Relation rel,
 					 *
 					 * We can proceed if we have the following:
 					 *
-					 * END (R) EXCLUSIVE ; START (R) INCLUSIVE
-					 * END (R) INCLUSIVE ; START (R) EXCLUSIVE
+					 * END (R) EXCLUSIVE ; START (R) INCLUSIVE END (R)
+					 * INCLUSIVE ; START (R) EXCLUSIVE
 					 *
 					 * XXX: this should be refactored into a single generic
 					 * function that can be used here and in the unbounded end
-					 * case, checked further down. That said, a lot of this code
-					 * should be refactored.
+					 * case, checked further down. That said, a lot of this
+					 * code should be refactored.
 					 */
-					PartitionRangeItem *ri = (PartitionRangeItem *)pbs->partEnd;
+					PartitionRangeItem *ri = (PartitionRangeItem *) pbs->partEnd;
 
 					if ((ri->partedge == PART_EDGE_EXCLUSIVE &&
 						 prule->topRule->parrangestartincl) ||
@@ -5659,7 +5736,7 @@ atpxPartAddList(Relation rel,
 						 !prule->topRule->parrangestartincl))
 					{
 						bstat = compare_partn_opfuncid(pNode, "pg_catalog", "=",
-													   (List *)prule->topRule->parrangestart,
+													   (List *) prule->topRule->parrangestart,
 													   d_end, isnull, tupledesc);
 					}
 
@@ -5682,20 +5759,20 @@ atpxPartAddList(Relation rel,
 							 errmsg("new partition overlaps existing "
 									"partition")));
 
-			L_fin_no_start:
-				bstat = false; /* fix warning */
+		L_fin_no_start:
+				bstat = false;	/* fix warning */
 
 			}
 			else if (!(pbs->partEnd))
-			{ /* if no END, then END before first partition
-			   **ONLY IF**
-			   * START of this partition is before first partition ... */
+			{					/* if no END, then END before first partition
+								 * *ONLY IF** START of this partition is
+								 * before first partition ... */
 
-				Datum					*d_start   = NULL;
-				bool					*isnull;
-				bool					 bstat;
+				Datum	   *d_start = NULL;
+				bool	   *isnull;
+				bool		bstat;
 
-				pid.partiddef = (Node *)makeInteger(1);
+				pid.partiddef = (Node *) makeInteger(1);
 
 				prule = get_part_rule1(rel, &pid, false, false,
 									   NULL,
@@ -5705,10 +5782,11 @@ atpxPartAddList(Relation rel,
 
 				/* NOTE: invert all the logic of case of missing partStart */
 
-				/* ok if no successor [?] -- just means this is first
-				 * partition (XXX XXX though should always have 1
-				 * partition in the table... [XXX XXX unless did a
-				 * SPLIT of a single partition !! ])
+				/*
+				 * ok if no successor [?] -- just means this is first
+				 * partition (XXX XXX though should always have 1 partition in
+				 * the table... [XXX XXX unless did a SPLIT of a single
+				 * partition !! ])
 				 */
 
 				if (!(prule && prule->topRule))
@@ -5719,34 +5797,35 @@ atpxPartAddList(Relation rel,
 				}
 
 				{
-					Node *n1;
+					Node	   *n1;
 					PartitionRangeItem *ri =
-					(PartitionRangeItem *)pbs->partStart;
+					(PartitionRangeItem *) pbs->partStart;
 
 					PartitionRangeItemIsValid(NULL, ri);
-					n1 = (Node *)copyObject(ri->partRangeVal);
-					n1 = (Node *)transformExpressionList(pstate,
-														 (List *)n1);
+					n1 = (Node *) copyObject(ri->partRangeVal);
+					n1 = (Node *) transformExpressionList(pstate,
+														  (List *) n1,
+														  EXPR_KIND_PARTITION_EXPRESSION);
 
 					d_start =
-					magic_expr_to_datum(rel, pNode,
-										n1, &isnull);
+						magic_expr_to_datum(rel, pNode,
+											n1, &isnull);
 				}
 
 
 				if (prule && prule->topRule && prule->topRule->parrangestart
-					&& list_length((List *)prule->topRule->parrangestart))
+					&& list_length((List *) prule->topRule->parrangestart))
 				{
 					bstat =
-					compare_partn_opfuncid(pNode,
-										   "pg_catalog",
-										   ">",
-										   (List *)prule->topRule->parrangestart,
-										   d_start, isnull, tupledesc);
+						compare_partn_opfuncid(pNode,
+											   "pg_catalog",
+											   ">",
+											   (List *) prule->topRule->parrangestart,
+											   d_start, isnull, tupledesc);
 
-					/* if the current start is greater than the new start
-					 * then use the current start as the end of the new
-					 * partition
+					/*
+					 * if the current start is greater than the new start then
+					 * use the current start as the end of the new partition
 					 */
 
 					if (bstat)
@@ -5756,12 +5835,12 @@ atpxPartAddList(Relation rel,
 						ri->location = -1;
 
 						ri->partRangeVal =
-						copyObject(prule->topRule->parrangestart);
+							copyObject(prule->topRule->parrangestart);
 
 						/* invert the inclusive/exclusive */
 						ri->partedge = prule->topRule->parrangestartincl ?
-						PART_EDGE_EXCLUSIVE :
-						PART_EDGE_INCLUSIVE;
+							PART_EDGE_EXCLUSIVE :
+							PART_EDGE_INCLUSIVE;
 
 						/* should be first partition */
 						maxpartno = prule->topRule->parruleord - 1;
@@ -5771,17 +5850,18 @@ atpxPartAddList(Relation rel,
 							bOpenGap = true;
 						}
 						newPos = FIRST;
-						pbs->partEnd = (Node *)ri;
+						pbs->partEnd = (Node *) ri;
 						goto L_fin_no_end;
 					}
 				}
 
-				/* if the first partition doesn't have an start, or the
-				 * start isn't greater than the new start, check if new start
-				 * is greater than current end
+				/*
+				 * if the first partition doesn't have an start, or the start
+				 * isn't greater than the new start, check if new start is
+				 * greater than current end
 				 */
 
-				pid.partiddef = (Node *)makeInteger(-1);
+				pid.partiddef = (Node *) makeInteger(-1);
 
 				prule = get_part_rule1(rel, &pid, false, false,
 									   NULL,
@@ -5790,18 +5870,18 @@ atpxPartAddList(Relation rel,
 									   &pNode2);
 
 				if (!(prule && prule->topRule && prule->topRule->parrangeend
-					  && list_length((List *)prule->topRule->parrangeend)))
+					  && list_length((List *) prule->topRule->parrangeend)))
 					ereport(ERROR,
 							(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
 							 errmsg("new partition overlaps existing "
 									"partition")));
 
 				bstat =
-				compare_partn_opfuncid(pNode,
-									   "pg_catalog",
-									   "<",
-									   (List *)prule->topRule->parrangeend,
-									   d_start, isnull, tupledesc);
+					compare_partn_opfuncid(pNode,
+										   "pg_catalog",
+										   "<",
+										   (List *) prule->topRule->parrangeend,
+										   d_start, isnull, tupledesc);
 				if (bstat)
 				{
 					/* should be final partition */
@@ -5811,21 +5891,21 @@ atpxPartAddList(Relation rel,
 				else
 				{
 					PartitionRangeItem *ri =
-					(PartitionRangeItem *)pbs->partStart;
+					(PartitionRangeItem *) pbs->partStart;
 
 					/* check for equality */
 					bstat =
-					compare_partn_opfuncid(pNode,
-										   "pg_catalog",
-										   "=",
-										   (List *)prule->topRule->parrangeend,
-										   d_start, isnull, tupledesc);
+						compare_partn_opfuncid(pNode,
+											   "pg_catalog",
+											   "=",
+											   (List *) prule->topRule->parrangeend,
+											   d_start, isnull, tupledesc);
 
-					/* if new start not >= to current end, then
-					 * new start < current end, so it overlaps. Or if
-					 * new start == current end, but the
-					 * inclusivity is not opposite for the boundaries
-					 * (eg inclusive end abuts inclusive start for
+					/*
+					 * if new start not >= to current end, then new start <
+					 * current end, so it overlaps. Or if new start == current
+					 * end, but the inclusivity is not opposite for the
+					 * boundaries (eg inclusive end abuts inclusive start for
 					 * same start/end value) then it overlaps
 					 */
 					if (!bstat ||
@@ -5842,32 +5922,33 @@ atpxPartAddList(Relation rel,
 					maxpartno = prule->topRule->parruleord + 1;
 
 				}
-			L_fin_no_end:
-				bstat = false; /* fix warning */
+		L_fin_no_end:
+				bstat = false;	/* fix warning */
 
 			}
 			else
 			{					/* both start and end are specified */
-				PartitionRangeItem		*ri;
-				bool					 bOverlap  = false;
-				bool					*isnull;
-				int						 startSearchpoint;
-				int						 endSearchpoint;
-				Datum					*d_start   = NULL;
-				Datum					*d_end	   = NULL;
+				PartitionRangeItem *ri;
+				bool		bOverlap = false;
+				bool	   *isnull;
+				int			startSearchpoint;
+				int			endSearchpoint;
+				Datum	   *d_start = NULL;
+				Datum	   *d_end = NULL;
 
 				/* see if start or end overlaps */
 				pid.idtype = AT_AP_IDValue;
 
 				/* check the start */
 
-				ri = (PartitionRangeItem *)pbs->partStart;
+				ri = (PartitionRangeItem *) pbs->partStart;
 				PartitionRangeItemIsValid(NULL, ri);
 
-				pid.partiddef = (Node *)copyObject(ri->partRangeVal);
+				pid.partiddef = (Node *) copyObject(ri->partRangeVal);
 				pid.partiddef =
-				(Node *)transformExpressionList(pstate,
-												(List *)pid.partiddef);
+					(Node *) transformExpressionList(pstate,
+													 (List *) pid.partiddef,
+													 EXPR_KIND_PARTITION_EXPRESSION);
 
 				prule = get_part_rule1(rel, &pid, false, false,
 									   &startSearchpoint,
@@ -5878,13 +5959,15 @@ atpxPartAddList(Relation rel,
 				/* found match for start value in rules */
 				if (prule && !(prule->topRule->parisdefault && is_split))
 				{
-					bool bstat;
+					bool		bstat;
 					PartitionRule *a_rule = prule->topRule;
-					d_start =
-					magic_expr_to_datum(rel, pNode,
-										pid.partiddef, &isnull);
 
-					/* if start value was inclusive then it definitely
+					d_start =
+						magic_expr_to_datum(rel, pNode,
+											pid.partiddef, &isnull);
+
+					/*
+					 * if start value was inclusive then it definitely
 					 * overlaps
 					 */
 					if (ri->partedge == PART_EDGE_INCLUSIVE)
@@ -5893,12 +5976,12 @@ atpxPartAddList(Relation rel,
 						goto L_end_overlap;
 					}
 
-					/* not inclusive -- check harder if START really
-					 * overlaps
+					/*
+					 * not inclusive -- check harder if START really overlaps
 					 */
 
 					if (0 ==
-						list_length((List *)a_rule->parrangeend))
+						list_length((List *) a_rule->parrangeend))
 					{
 						/* infinite end > new start - overlap */
 						bOverlap = true;
@@ -5906,11 +5989,11 @@ atpxPartAddList(Relation rel,
 					}
 
 					bstat =
-					compare_partn_opfuncid(pNode,
-										   "pg_catalog",
-										   ">",
-										   (List *)a_rule->parrangeend,
-										   d_start, isnull, tupledesc);
+						compare_partn_opfuncid(pNode,
+											   "pg_catalog",
+											   ">",
+											   (List *) a_rule->parrangeend,
+											   d_start, isnull, tupledesc);
 					if (bstat)
 					{
 						/* end > new start - overlap */
@@ -5918,67 +6001,69 @@ atpxPartAddList(Relation rel,
 						goto L_end_overlap;
 					}
 
-					/* Must be the case that new start == end of
-					 * a_rule (because if the end < new start then how
-					 * could we find it in the interval for prule ?)
-					 * This is ok if they have opposite
-					 * INCLUSIVE/EXCLUSIVE ->  New partition does not
+					/*
+					 * Must be the case that new start == end of a_rule
+					 * (because if the end < new start then how could we find
+					 * it in the interval for prule ?) This is ok if they have
+					 * opposite INCLUSIVE/EXCLUSIVE ->  New partition does not
 					 * overlap.
 					 */
 
-					Assert (compare_partn_opfuncid(pNode,
-												   "pg_catalog",
-												   "=",
-												   (List *)a_rule->parrangeend,
-												   d_start, isnull, tupledesc));
+					Assert(compare_partn_opfuncid(pNode,
+												  "pg_catalog",
+												  "=",
+												  (List *) a_rule->parrangeend,
+												  d_start, isnull, tupledesc));
 
 					if (a_rule->parrangeendincl ==
 						(ri->partedge == PART_EDGE_INCLUSIVE))
 					{
-						/* start and end must be of opposite
-						 * types, else they overlap
+						/*
+						 * start and end must be of opposite types, else they
+						 * overlap
 						 */
 						bOverlap = true;
 						goto L_end_overlap;
 					}
 
-					/* opposite inclusive/exclusive, so in middle of
-					 * range of existing partitions
+					/*
+					 * opposite inclusive/exclusive, so in middle of range of
+					 * existing partitions
 					 */
 					newPos = MIDDLE;
 					goto L_check_end;
-				} /* end if prule */
+				}				/* end if prule */
 
 				/* check for basic case of START > last partition */
-				if (pNode && pNode->rules && list_length(pNode->rules))
+				if (pNode && pNode->rules && pNode->num_rules > 0)
 				{
-					bool bstat;
+					bool		bstat;
 					PartitionRule *a_rule = /* get last rule */
-					(PartitionRule *)list_nth(pNode->rules,
-											  list_length(pNode->rules) - 1);
+						pNode->rules[pNode->num_rules - 1];
+
 					d_start =
-					magic_expr_to_datum(rel, pNode,
-										pid.partiddef, &isnull);
+						magic_expr_to_datum(rel, pNode,
+											pid.partiddef, &isnull);
 
 					if (0 ==
-						list_length((List *)a_rule->parrangeend))
+						list_length((List *) a_rule->parrangeend))
 					{
 						/* infinite end > new start */
 						bstat = false;
 					}
 					else
 						bstat =
-						compare_partn_opfuncid(pNode,
-											   "pg_catalog",
-											   "<",
-											   (List *)a_rule->parrangeend,
-											   d_start, isnull, tupledesc);
+							compare_partn_opfuncid(pNode,
+												   "pg_catalog",
+												   "<",
+												   (List *) a_rule->parrangeend,
+												   d_start, isnull, tupledesc);
 
-					/* if the new partition start > end of the last
-					 * partition then it is the new final partition.
-					 * Don't bother checking the new end for overlap
-					 * (just check if end > start in validation
-					 * phase
+					/*
+					 * if the new partition start > end of the last partition
+					 * then it is the new final partition. Don't bother
+					 * checking the new end for overlap (just check if end >
+					 * start in validation phase
 					 */
 					if (bstat)
 					{
@@ -5989,32 +6074,34 @@ atpxPartAddList(Relation rel,
 						goto L_end_overlap;
 					}
 
-					/* could be the case that new start == end of
-					 * last.  This is ok if they have opposite
-					 * INCLUSIVE/EXCLUSIVE.  New partition is still
-					 * final partition for this case
+					/*
+					 * could be the case that new start == end of last.  This
+					 * is ok if they have opposite INCLUSIVE/EXCLUSIVE.  New
+					 * partition is still final partition for this case
 					 */
 
 					if (0 ==
-						list_length((List *)a_rule->parrangeend))
+						list_length((List *) a_rule->parrangeend))
 					{
 						/* infinite end > new start */
 						bstat = false;
 					}
 					else
 						bstat =
-						compare_partn_opfuncid(pNode,
-											   "pg_catalog",
-											   "=",
-											   (List *)a_rule->parrangeend,
-											   d_start, isnull, tupledesc);
+							compare_partn_opfuncid(pNode,
+												   "pg_catalog",
+												   "=",
+												   (List *) a_rule->parrangeend,
+												   d_start, isnull, tupledesc);
 					if (bstat)
 					{
 						if (a_rule->parrangeendincl ==
 							(ri->partedge == PART_EDGE_INCLUSIVE))
 						{
-							/* start and end must be of opposite
-							 * types, else they overlap */
+							/*
+							 * start and end must be of opposite types, else
+							 * they overlap
+							 */
 							bOverlap = true;
 							goto L_end_overlap;
 						}
@@ -6027,37 +6114,36 @@ atpxPartAddList(Relation rel,
 					}
 					else
 					{
-						/* tricky case: the new start is less than the
-						 * end of the final partition, but it does not
-						 * intersect any existing partitions.  So we
-						 * are trying to add a partition in the middle
-						 * of the existing partitions or before the
-						 * first partition.
+						/*
+						 * tricky case: the new start is less than the end of
+						 * the final partition, but it does not intersect any
+						 * existing partitions.  So we are trying to add a
+						 * partition in the middle of the existing partitions
+						 * or before the first partition.
 						 */
-						a_rule = /* get first rule */
-						(PartitionRule *)list_nth(pNode->rules, 0);
+						a_rule = pNode->rules[0]; 	/* get first rule */
 
 						if (0 ==
-							list_length((List *)a_rule->parrangestart))
+							list_length((List *) a_rule->parrangestart))
 						{
 							/* new start > negative infinite start */
 							bstat = false;
 						}
 						else
 							bstat =
-							compare_partn_opfuncid(pNode,
-												   "pg_catalog",
-												   ">",
-												   (List *)a_rule->parrangestart,
-												   d_start, isnull, tupledesc);
+								compare_partn_opfuncid(pNode,
+													   "pg_catalog",
+													   ">",
+													   (List *) a_rule->parrangestart,
+													   d_start, isnull, tupledesc);
 
-						/* if the new partition start < start of the
-						 * first partition then it is the new first
-						 * partition.  Check the new end for overlap.
+						/*
+						 * if the new partition start < start of the first
+						 * partition then it is the new first partition.
+						 * Check the new end for overlap.
 						 *
-						 * NOTE: ignore the case where
-						 * new start == 1st start and
-						 * inclusive vs exclusive because that is just
+						 * NOTE: ignore the case where new start == 1st start
+						 * and inclusive vs exclusive because that is just
 						 * stupid.
 						 *
 						 */
@@ -6090,18 +6176,22 @@ atpxPartAddList(Relation rel,
 					goto L_end_overlap;
 				}
 
-			L_check_end:
+		L_check_end:
 				/* check the end */
-				/* check for basic case of END < first partition (the
-				 opposite of START > last partition) */
 
-				ri = (PartitionRangeItem *)pbs->partEnd;
+				/*
+				 * check for basic case of END < first partition (the opposite
+				 * of START > last partition)
+				 */
+
+				ri = (PartitionRangeItem *) pbs->partEnd;
 				PartitionRangeItemIsValid(NULL, ri);
 
-				pid.partiddef = (Node *)copyObject(ri->partRangeVal);
+				pid.partiddef = (Node *) copyObject(ri->partRangeVal);
 				pid.partiddef =
-				(Node *)transformExpressionList(pstate,
-												(List *)pid.partiddef);
+					(Node *) transformExpressionList(pstate,
+													 (List *) pid.partiddef,
+													 EXPR_KIND_PARTITION_EXPRESSION);
 
 				prule = get_part_rule1(rel, &pid, false, false,
 									   &endSearchpoint,
@@ -6113,14 +6203,15 @@ atpxPartAddList(Relation rel,
 				if (prule && !(prule->topRule->parisdefault &&
 							   is_split))
 				{
-					bool bstat;
+					bool		bstat;
 					PartitionRule *a_rule = prule->topRule;
-					d_end =
-					magic_expr_to_datum(rel, pNode,
-										pid.partiddef, &isnull);
 
-					/* if end value was inclusive then it definitely
-					 * overlaps
+					d_end =
+						magic_expr_to_datum(rel, pNode,
+											pid.partiddef, &isnull);
+
+					/*
+					 * if end value was inclusive then it definitely overlaps
 					 */
 					if (ri->partedge == PART_EDGE_INCLUSIVE)
 					{
@@ -6128,11 +6219,11 @@ atpxPartAddList(Relation rel,
 						goto L_end_overlap;
 					}
 
-					/* not inclusive -- check harder if END really
-					 * overlaps
+					/*
+					 * not inclusive -- check harder if END really overlaps
 					 */
 					if (0 ==
-						list_length((List *)a_rule->parrangestart))
+						list_length((List *) a_rule->parrangestart))
 					{
 						/* -infinite start < new end - overlap */
 						bOverlap = true;
@@ -6140,11 +6231,11 @@ atpxPartAddList(Relation rel,
 					}
 
 					bstat =
-					compare_partn_opfuncid(pNode,
-										   "pg_catalog",
-										   "<",
-										   (List *)a_rule->parrangestart,
-										   d_end, isnull, tupledesc);
+						compare_partn_opfuncid(pNode,
+											   "pg_catalog",
+											   "<",
+											   (List *) a_rule->parrangestart,
+											   d_end, isnull, tupledesc);
 					if (bstat)
 					{
 						/* start < new end - overlap */
@@ -6152,57 +6243,59 @@ atpxPartAddList(Relation rel,
 						goto L_end_overlap;
 					}
 
-					/* Must be the case that new end = start of
-					 * a_rule (because if the start > new end then how
-					 * could we find it in the interval for prule ?)
-					 * This is ok if they have opposite
-					 * INCLUSIVE/EXCLUSIVE ->  New partition does not
+					/*
+					 * Must be the case that new end = start of a_rule
+					 * (because if the start > new end then how could we find
+					 * it in the interval for prule ?) This is ok if they have
+					 * opposite INCLUSIVE/EXCLUSIVE ->  New partition does not
 					 * overlap.
 					 */
 
-					Assert (compare_partn_opfuncid(pNode,
-												   "pg_catalog",
-												   "=",
-												   (List *)a_rule->parrangestart,
-												   d_end, isnull, tupledesc));
+					Assert(compare_partn_opfuncid(pNode,
+												  "pg_catalog",
+												  "=",
+												  (List *) a_rule->parrangestart,
+												  d_end, isnull, tupledesc));
 
 					if (a_rule->parrangestartincl ==
 						(ri->partedge == PART_EDGE_INCLUSIVE))
 					{
-						/* start and end must be of opposite
-						 * types, else they overlap
+						/*
+						 * start and end must be of opposite types, else they
+						 * overlap
 						 */
 						bOverlap = true;
 						goto L_end_overlap;
 					}
-				} /* end if prule */
+				}				/* end if prule */
 
 				/* check for case of END < first partition */
-				if (pNode && pNode->rules && list_length(pNode->rules))
+				if (pNode && pNode->rules && pNode->num_rules > 0)
 				{
-					bool bstat;
-					PartitionRule *a_rule = /* get first rule */
-					(PartitionRule *)list_nth(pNode->rules, 0);
+					bool		bstat;
+					PartitionRule *a_rule = pNode->rules[0];	/* get first rule */
+
 					d_end =
-					magic_expr_to_datum(rel, pNode,
-										pid.partiddef, &isnull);
+						magic_expr_to_datum(rel, pNode,
+											pid.partiddef, &isnull);
 
 					if (0 ==
-						list_length((List *)a_rule->parrangestart))
+						list_length((List *) a_rule->parrangestart))
 					{
 						/* new end > negative infinite start */
 						bstat = false;
 					}
 					else
 						bstat =
-						compare_partn_opfuncid(pNode,
-											   "pg_catalog",
-											   ">",
-											   (List *)a_rule->parrangestart,
-											   d_end, isnull, tupledesc);
+							compare_partn_opfuncid(pNode,
+												   "pg_catalog",
+												   ">",
+												   (List *) a_rule->parrangestart,
+												   d_end, isnull, tupledesc);
 
-					/* if the new partition end < start of the first
-					 * partition then it is the new first partition.
+					/*
+					 * if the new partition end < start of the first partition
+					 * then it is the new first partition.
 					 */
 					if (bstat)
 					{
@@ -6210,9 +6303,10 @@ atpxPartAddList(Relation rel,
 						switch (newPos)
 						{
 							case FIRST:
-								/* since new start < first start and
-								 * new end < first start should be
-								 * first.
+
+								/*
+								 * since new start < first start and new end <
+								 * first start should be first.
 								 */
 
 								/* should be first partition */
@@ -6227,41 +6321,44 @@ atpxPartAddList(Relation rel,
 							case MIDDLE:
 							case LAST:
 							default:
-								/* new end is less than first
-								 * partition start but new start isn't
-								 * -- must be end < start
+
+								/*
+								 * new end is less than first partition start
+								 * but new start isn't -- must be end < start
 								 */
 								break;
 						}
 						goto L_end_overlap;
 					}
 
-					/* could be the case that new end == start of
-					 * first.  This is ok if they have opposite
-					 * INCLUSIVE/EXCLUSIVE.  New partition is still
-					 * first partition for this case
+					/*
+					 * could be the case that new end == start of first.  This
+					 * is ok if they have opposite INCLUSIVE/EXCLUSIVE.  New
+					 * partition is still first partition for this case
 					 */
 
 					if (0 ==
-						list_length((List *)a_rule->parrangestart))
+						list_length((List *) a_rule->parrangestart))
 					{
 						/* new end > negative infinite start */
 						bstat = false;
 					}
 					else
 						bstat =
-						compare_partn_opfuncid(pNode,
-											   "pg_catalog",
-											   "=",
-											   (List *)a_rule->parrangestart,
-											   d_end, isnull, tupledesc);
+							compare_partn_opfuncid(pNode,
+												   "pg_catalog",
+												   "=",
+												   (List *) a_rule->parrangestart,
+												   d_end, isnull, tupledesc);
 					if (bstat)
 					{
 						if (a_rule->parrangestartincl ==
 							(ri->partedge == PART_EDGE_INCLUSIVE))
 						{
-							/* start and end must be of opposite
-							 * types, else they overlap */
+							/*
+							 * start and end must be of opposite types, else
+							 * they overlap
+							 */
 							bOverlap = true;
 							goto L_end_overlap;
 						}
@@ -6269,9 +6366,10 @@ atpxPartAddList(Relation rel,
 						switch (newPos)
 						{
 							case FIRST:
-								/* since new start < first start and
-								 * new end < first start should be
-								 * first.
+
+								/*
+								 * since new start < first start and new end <
+								 * first start should be first.
 								 */
 
 								/* should be first partition */
@@ -6286,9 +6384,10 @@ atpxPartAddList(Relation rel,
 							case MIDDLE:
 							case LAST:
 							default:
-								/* new end is less than first
-								 * partition start but new start isn't
-								 * -- must be end < start
+
+								/*
+								 * new end is less than first partition start
+								 * but new start isn't -- must be end < start
 								 */
 								break;
 						}
@@ -6296,18 +6395,16 @@ atpxPartAddList(Relation rel,
 					}
 					else
 					{
-						/* tricky case: the new end is greater than the
-						 * start of the first partition, but it does not
-						 * intersect any existing partitions.  So we
-						 * are trying to add a partition in the middle
-						 * of the existing partitions or after the
-						 * last partition.
+						/*
+						 * tricky case: the new end is greater than the start
+						 * of the first partition, but it does not intersect
+						 * any existing partitions.  So we are trying to add a
+						 * partition in the middle of the existing partitions
+						 * or after the last partition.
 						 */
-						a_rule = /* get last rule */
-						(PartitionRule *)list_nth(pNode->rules,
-												  list_length(pNode->rules) - 1);
+						a_rule = pNode->rules[pNode->num_rules - 1];	/* get last rule */
 						if (0 ==
-							list_length((List *)a_rule->parrangeend))
+							list_length((List *) a_rule->parrangeend))
 						{
 							/* new end < infinite end */
 							bstat = false;
@@ -6315,20 +6412,18 @@ atpxPartAddList(Relation rel,
 						else
 
 							bstat =
-							compare_partn_opfuncid(pNode,
-												   "pg_catalog",
-												   "<",
-												   (List *)a_rule->parrangeend,
-												   d_end, isnull, tupledesc);
+								compare_partn_opfuncid(pNode,
+													   "pg_catalog",
+													   "<",
+													   (List *) a_rule->parrangeend,
+													   d_end, isnull, tupledesc);
 
-						/* if the new partition end > end of the
-						 * last partition then it is the new last
-						 * partition (maybe)
+						/*
+						 * if the new partition end > end of the last
+						 * partition then it is the new last partition (maybe)
 						 *
-						 * NOTE: ignore the case where
-						 * new end == last end and
-						 * inclusive vs exclusive because that is just
-						 * stupid.
+						 * NOTE: ignore the case where new end == last end and
+						 * inclusive vs exclusive because that is just stupid.
 						 *
 						 */
 						if (bstat)
@@ -6336,9 +6431,10 @@ atpxPartAddList(Relation rel,
 							switch (newPos)
 							{
 								case LAST:
-									/* since new start > last end and
-									 * new end > last end should be
-									 * last.
+
+									/*
+									 * since new start > last end and new end
+									 * > last end should be last.
 									 */
 
 									/* should be last partition */
@@ -6346,22 +6442,28 @@ atpxPartAddList(Relation rel,
 
 									break;
 								case FIRST:
-									/* since new start < first start
-									 * and new end > last end we would
-									 * overlap all partitions!!!
+
+									/*
+									 * since new start < first start and new
+									 * end > last end we would overlap all
+									 * partitions!!!
 									 */
 								case MIDDLE:
-									/* since new start < last end
-									 * and new end > last end we would
-									 * overlap last partition
+
+									/*
+									 * since new start < last end and new end
+									 * > last end we would overlap last
+									 * partition
 									 */
 									bOverlap = true;
 									goto L_end_overlap;
 									break;
 								default:
-									/* new end is less than last
-									 * partition end but new start isn't
-									 * -- must be end < start
+
+									/*
+									 * new end is less than last partition end
+									 * but new start isn't -- must be end <
+									 * start
 									 */
 									break;
 							}
@@ -6371,8 +6473,10 @@ atpxPartAddList(Relation rel,
 							switch (newPos)
 							{
 								case FIRST:
-									/* since new start < first start
-									 * and new end in middle we overlap
+
+									/*
+									 * since new start < first start and new
+									 * end in middle we overlap
 									 */
 									bOverlap = true;
 									goto L_end_overlap;
@@ -6383,9 +6487,10 @@ atpxPartAddList(Relation rel,
 									break;
 								case LAST:
 								default:
-									/* since new start > last end and
-									 * new end in middle
-									 * -- must be end < start
+
+									/*
+									 * since new start > last end and new end
+									 * in middle -- must be end < start
 									 */
 									break;
 							}
@@ -6404,75 +6509,70 @@ atpxPartAddList(Relation rel,
 				}
 
 
-				/* if the individual start and end values don't
-				 * intersect an existing partition, make sure they
-				 * don't define a range which contains an existing
-				 * partition, ie new start < existing start and new
-				 * end > existing end
+				/*
+				 * if the individual start and end values don't intersect an
+				 * existing partition, make sure they don't define a range
+				 * which contains an existing partition, ie new start <
+				 * existing start and new end > existing end
 				 */
 
 				if (!bOverlap && (newPos == MIDDLE))
 				{
 					bOpenGap = true;
-					int prev_partno = 0;
+					int			prev_partno = 0;
 
 					/*
-					 hmm, not always true.  see MPP-3667, MPP-3636, MPP-3593
-
-					 if (startSearchpoint != endSearchpoint)
-					 {
-					 bOverlap = true;
-					 goto L_end_overlap;
-					 }
-
+					 * hmm, not always true.  see MPP-3667, MPP-3636, MPP-3593
+					 *
+					 * if (startSearchpoint != endSearchpoint) { bOverlap =
+					 * true; goto L_end_overlap; }
+					 *
 					 */
 					while (1)
 					{
-						bool bstat;
-						PartitionRule *a_rule = /* get the rule */
-						(PartitionRule *)list_nth(pNode->rules,
-												  startSearchpoint);
+						bool		bstat;
+						PartitionRule *a_rule = pNode->rules[startSearchpoint];	/* get the rule */
 
 						/* MPP-3621: fix ADD for open intervals */
 
 						if (0 ==
-							list_length((List *)a_rule->parrangeend))
+							list_length((List *) a_rule->parrangeend))
 						{
 							/* new end < infinite end */
 							bstat = false;
 						}
 						else
 							bstat =
-							compare_partn_opfuncid(pNode,
-												   "pg_catalog",
-												   "<=",
-												   (List *)a_rule->parrangeend,
-												   d_start, isnull, tupledesc);
+								compare_partn_opfuncid(pNode,
+													   "pg_catalog",
+													   "<=",
+													   (List *) a_rule->parrangeend,
+													   d_start, isnull, tupledesc);
 
 						if (bstat)
 						{
 							startSearchpoint++;
-							Assert(startSearchpoint
-								   <= list_length(pNode->rules));
+							Assert(startSearchpoint <= pNode->num_rules);
 							prev_partno = a_rule->parruleord;
 							continue;
 						}
 
-						/* if previous partition was less than
-						 current, then this one should be larger.
-						 if not, then it overlaps...
+						/*
+						 * if previous partition was less than current, then
+						 * this one should be larger. if not, then it
+						 * overlaps...
 						 */
 						if (
 							(0 ==
-							 list_length((List *)a_rule->parrangestart))
+							 list_length((List *) a_rule->parrangestart))
 							||
 							!compare_partn_opfuncid(pNode,
 													"pg_catalog",
 													">=",
-													(List *)a_rule->parrangestart,
+													(List *) a_rule->parrangestart,
 													d_end, isnull, tupledesc))
 						{
-							prule = NULL; /* could get the right prule... */
+							prule = NULL;	/* could get the right prule... */
 							bOverlap = true;
 							goto L_end_overlap;
 						}
@@ -6488,11 +6588,11 @@ atpxPartAddList(Relation rel,
 							maxpartno = a_rule->parruleord;
 
 						break;
-					} /* end while */
+					}			/* end while */
 
-				} /* end 0 == middle */
+				}				/* end 0 == middle */
 
-			L_end_overlap:
+		L_end_overlap:
 				if (bOverlap)
 					ereport(ERROR,
 							(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
@@ -6504,37 +6604,37 @@ atpxPartAddList(Relation rel,
 			}
 
 			free_parsestate(pstate);
-		} /* end if parttype_range */
-	} /* end if pelem && pelem->boundspec */
+		}						/* end if parttype_range */
+	}							/* end if pelem && pelem->boundspec */
 
 	/*
-	 * Create a phony CREATE TABLE statement for the parent table.
-	 * The parse_analyze call later expands it, and we extract just the constituent
-	 * commands we need to create the new partition, and ignore the commands for
-	 * the already-existing parent table
+	 * Create a phony CREATE TABLE statement for the parent table. The
+	 * parse_analyze call later expands it, and we extract just the
+	 * constituent commands we need to create the new partition, and ignore
+	 * the commands for the already-existing parent table
 	 */
 	ct = makeNode(CreateStmt);
 	ct->relation = makeRangeVar(get_namespace_name(RelationGetNamespace(par_rel)),
 								RelationGetRelationName(par_rel), -1);
+	ct->relation->relpersistence = rel->rd_rel->relpersistence;
 
 	/*
-	 * in analyze.c, fill in tableelts with a list of inhrelation of
-	 * the partition parent table, and fill in inhrelations with copy
-	 * of rangevar for parent table
+	 * in analyze.c, fill in tableelts with a list of TableLikeClause of the
+	 * partition parent table, and fill in TableLikeClauses with copy of rangevar
+	 * for parent table
 	 */
-	InhRelation			*inh = makeNode(InhRelation);
-	inh->relation = copyObject(ct->relation);
-	inh->options = list_make3_int(
-		CREATE_TABLE_LIKE_INCLUDING_DEFAULTS,
-		CREATE_TABLE_LIKE_INCLUDING_CONSTRAINTS,
-		CREATE_TABLE_LIKE_INCLUDING_INDEXES);
+	TableLikeClause *tlc = makeNode(TableLikeClause);
+
+	tlc->relation = copyObject(ct->relation);
+	tlc->options = CREATE_TABLE_LIKE_DEFAULTS
+		| CREATE_TABLE_LIKE_CONSTRAINTS
+		| CREATE_TABLE_LIKE_INDEXES;
 
 	/*
-	 * fill in remaining fields from parse time (gram.y):
-	 * the new partition is LIKE the parent and it
-	 * inherits from it
+	 * fill in remaining fields from parse time (gram.y): the new partition is
+	 * LIKE the parent and it inherits from it
 	 */
-	ct->tableElts = lappend(ct->tableElts, inh);
+	ct->tableElts = lappend(ct->tableElts, tlc);
 	ct->constraints = NIL;
 
 	if (pelem->storeAttr)
@@ -6549,12 +6649,12 @@ atpxPartAddList(Relation rel,
 		ct->tablespacename = NULL;
 
 	pBy = makeNode(PartitionBy);
-	if (pelem->subSpec) /* treat subspec as partition by... */
+	if (pelem->subSpec)			/* treat subspec as partition by... */
 	{
 		pBy->partSpec = pelem->subSpec;
 		pBy->partDepth = 0;
 		pBy->partQuiet = PART_VERBO_NODISTRO;
-		pBy->location  = -1;
+		pBy->location = -1;
 		pBy->partDefault = NULL;
 		pBy->parentRel = copyObject(ct->relation);
 	}
@@ -6570,46 +6670,46 @@ atpxPartAddList(Relation rel,
 	}
 
 	ct->distributedBy = NULL;
-	ct->partitionBy = (Node *)pBy;
+	ct->partitionBy = (Node *) pBy;
 	ct->relKind = RELKIND_RELATION;
-	ct->policy = 0;
-	ct->postCreate = NULL;
 
-	ct->is_add_part = true; /* subroutines need to know this */
+	ct->is_add_part = true;		/* subroutines need to know this */
 	ct->ownerid = ownerid;
 
 	if (!ct->distributedBy)
-		ct->distributedBy = make_dist_clause(rel);
+		ct->distributedBy = make_distributedby_for_rel(rel);
 
+	/* for ADD PARTITION or SPLIT PARTITION, there should be no case where the rel is temporary */
+	Assert(rel->rd_rel->relpersistence != RELPERSISTENCE_TEMP);
 	/* this function does transformExpr on the boundary specs */
-	(void) atpxPart_validate_spec(pBy, &cxt, rel, ct, pelem, pNode, partName,
+	(void) atpxPart_validate_spec(pBy, rel, ct, pelem, pNode, partName,
 								  isDefault, part_type, "");
 
 	if (pelem && pelem->boundSpec)
 	{
 		if (PARTTYP_LIST == part_type)
 		{
-			ListCell			*lc;
+			ListCell   *lc;
 			PartitionValuesSpec *spec;
-			AlterPartitionId	 pid;
+			AlterPartitionId pid;
 
-			Assert (IsA(pelem->boundSpec, PartitionValuesSpec));
+			Assert(IsA(pelem->boundSpec, PartitionValuesSpec));
 
 			MemSet(&pid, 0, sizeof(AlterPartitionId));
 
-			spec = (PartitionValuesSpec *)pelem->boundSpec;
+			spec = (PartitionValuesSpec *) pelem->boundSpec;
 
 			/* only check this if we aren't doing split */
 			if (1)
 			{
 				foreach(lc, spec->partValues)
 				{
-					List			*vals  = lfirst(lc);
-					PgPartRule		*prule = NULL;
+					List	   *vals = lfirst(lc);
+					PgPartRule *prule = NULL;
 
 					pid.idtype = AT_AP_IDValue;
-					pid.partiddef = (Node *)vals;
-					pid.location  = -1;
+					pid.partiddef = (Node *) vals;
+					pid.location = -1;
 
 					prule = get_part_rule1(rel, &pid, false, false,
 										   NULL,
@@ -6625,19 +6725,18 @@ atpxPartAddList(Relation rel,
 										prule->partIdStr,
 										lrelname)));
 
-				} /* end foreach */
+				}				/* end foreach */
 			}
 
 			/* give a new maxpartno for the list partition */
-			if (pNode && pNode->rules && list_length(pNode->rules))
+			if (pNode && pNode->rules && pNode->num_rules > 0)
 			{
-				ListCell *lc;
-				PartitionRule *rule = NULL;
 				maxpartno = 1;
 
-				foreach(lc, pNode->rules)
+				for (int i = 0; i < pNode->num_rules; i++)
 				{
-					rule = lfirst(lc);
+					PartitionRule *rule = pNode->rules[i];
+
 					if (rule->parruleord > maxpartno)
 						break;
 					++maxpartno;
@@ -6646,58 +6745,62 @@ atpxPartAddList(Relation rel,
 		}
 	}
 
-	if (maxpartno < 0)
+	if (maxpartno < 0 || maxpartno > PG_INT16_MAX)
 	{
-		elog(ERROR, "too many partitions, parruleord overflow");
+		ereport(ERROR,
+			(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+			errmsg("too many partitions, parruleord overflow")));
 	}
 
-	if (newPos == FIRST && pNode && list_length(pNode->rules) > 0)
+	if (newPos == FIRST && pNode && pNode->num_rules > 0)
 	{
 		/*
-		 * Adding new partition at the beginning.  Find a hole in
-		 * existing parruleord sequence by scanning rules list.	 Open
-		 * gap only until the hole to accommodate the new rule at
-		 * parruleord = 1.
+		 * Adding new partition at the beginning.  Find a hole in existing
+		 * parruleord sequence by scanning rules list.	 Open gap only until
+		 * the hole to accommodate the new rule at parruleord = 1.
 		 */
-		ListCell *lc;
 		PartitionRule *rule = NULL;
-		int hole = 1;
-		foreach(lc, pNode->rules)
+		int			hole = 1;
+
+		for (int i = 0; i < pNode->num_rules; i++)
 		{
-			rule = lfirst(lc);
+			rule = pNode->rules[i];
+
 			if (rule->parruleord > hole)
 			{
 				break;
 			}
 			++hole;
 		}
+
 		/*
-		 * Open gap only if hole found in the middle.  If hole exists
-		 * right at the beginning (first partition's parruleord > 1),
-		 * the gap is already open for us.
+		 * Open gap only if hole found in the middle.  If hole exists right at
+		 * the beginning (first partition's parruleord > 1), the gap is
+		 * already open for us.
 		 */
 		if (hole > 1)
 		{
 			parruleord_open_gap(
-					pNode->part->partid, pNode->part->parlevel,
-					rule->parparentoid, --hole, 1,
-					false /* closegap */);
+								pNode->part->partid, pNode->part->parlevel,
+								rule->parparentoid, --hole, 1,
+								false /* closegap */ );
 		}
 	}
-	else if (newPos == LAST && pNode && list_length(pNode->rules) > 0)
+	else if (newPos == LAST && pNode && pNode->num_rules > 0)
 	{
 		/*
-		 * Adding the new partition at the end.	 Find the hole closest
-		 * to the end of the rule list.	 Close gap from the last rule
-		 * only until this hole.  The new partition then gets the last
-		 * partition's parruleord.
+		 * Adding the new partition at the end.	 Find the hole closest to the
+		 * end of the rule list.	 Close gap from the last rule only until
+		 * this hole.  The new partition then gets the last partition's
+		 * parruleord.
 		 */
-		ListCell *lc;
-		PartitionRule *rule = NULL;
-		int hole = 1, stopkey = -1;
-		foreach(lc, pNode->rules)
+		int			hole = 1,
+					stopkey = -1;
+
+		for (int i = 0; i < pNode->num_rules; i++)
 		{
-			rule = lfirst(lc);
+			PartitionRule *rule = pNode->rules[i];
+
 			if (rule->parruleord > hole)
 			{
 				hole = stopkey = rule->parruleord;
@@ -6706,11 +6809,12 @@ atpxPartAddList(Relation rel,
 		}
 		if (stopkey != -1)
 		{
-			PartitionRule *last_rule = (PartitionRule *) llast(pNode->rules);
+			PartitionRule *last_rule = pNode->rules[pNode->num_rules - 1];
+
 			parruleord_open_gap(
-					pNode->part->partid, pNode->part->parlevel,
-					last_rule->parparentoid, last_rule->parruleord, stopkey,
-					true /* closegap */);
+								pNode->part->partid, pNode->part->parlevel,
+								last_rule->parparentoid, last_rule->parruleord, stopkey,
+								true /* closegap */ );
 			/* Let the new rule reuse last rule's parruleord. */
 			--maxpartno;
 		}
@@ -6718,17 +6822,16 @@ atpxPartAddList(Relation rel,
 	else if (bOpenGap)
 	{
 		/*
-		 * Adding new partition in between first and the last one.
-		 * Check if a hole exists by scanning rule list.  If one
-		 * exists, either open or close gap based on location of the
-		 * hole relative to maxpartno.
+		 * Adding new partition in between first and the last one. Check if a
+		 * hole exists by scanning rule list.  If one exists, either open or
+		 * close gap based on location of the hole relative to maxpartno.
 		 */
-		ListCell *lc;
 		PartitionRule *rule = NULL;
-		int hole = 1;
-		foreach(lc, pNode->rules)
+		int			hole = 1;
+
+		for (int i = 0; i < pNode->num_rules; i++)
 		{
-			rule = lfirst(lc);
+			rule = pNode->rules[i];
 			if (rule->parruleord > hole)
 				break;
 			++hole;
@@ -6736,161 +6839,89 @@ atpxPartAddList(Relation rel,
 		if (maxpartno > hole)
 		{
 			/*
-			 * Found a hole before maxpartno.  Make room for new
-			 * partition in the slot previous to maxpartno.  Decrement
-			 * parruleord values from this slot until the hole.
+			 * Found a hole before maxpartno.  Make room for new partition in
+			 * the slot previous to maxpartno.  Decrement parruleord values
+			 * from this slot until the hole.
 			 */
 			parruleord_open_gap(
-					pNode->part->partid,
-					pNode->part->parlevel,
-					rule->parparentoid,
-					--maxpartno,
-					++hole,
-					true /* closegap */);
+								pNode->part->partid,
+								pNode->part->parlevel,
+								rule->parparentoid,
+								--maxpartno,
+								++hole,
+								true /* closegap */ );
 		}
 		else if (maxpartno < hole)
 		{
 			/*
-			 * Found a hole after maxpartno.  Open gap for maxpartno
-			 * by incrementing parruleord values from the hole until
-			 * maxpartno.
+			 * Found a hole after maxpartno.  Open gap for maxpartno by
+			 * incrementing parruleord values from the hole until maxpartno.
 			 */
 			parruleord_open_gap(
-					pNode->part->partid,
-					pNode->part->parlevel,
-					rule->parparentoid,
-					hole,
-					maxpartno,
-					false /* closegap */);
+								pNode->part->partid,
+								pNode->part->parlevel,
+								rule->parparentoid,
+								hole,
+								maxpartno,
+								false /* closegap */ );
 		}
 		/* if (hole == maxpartno) we don't need to open a gap. */
 	}
 
 	{
-		List			*l1;
-		ListCell		*lc;
-		int				 ii					 = 0;
-		bool			 bFixFirstATS		 = true;
-		bool			 bFirst_TemplateOnly = true;   /* ignore dummy entry */
-		int				 pby_templ_depth	 = 0;	   /* template partdepth */
-		Oid				 skipTableRelid		 = InvalidOid;
+		List	   *l1;
+		ListCell   *lc;
+		int			ii = 0;
+		bool		bFixFirstATS = true;
+		bool		bFirst_TemplateOnly = true; /* ignore dummy entry */
+		int			pby_templ_depth = 0;	/* template partdepth */
+		Oid			skipTableRelid = InvalidOid;
 
 		/*
-		 * This transformCreateStmt() expands the phony create of a partitioned
-		 * table that we just build into the constituent commands we need to create
-		 * the new part.  (This will include some commands for the parent that we
-		 * don't need, since the parent already exists.)
+		 * This transformCreateStmt() expands the phony create of a
+		 * partitioned table that we just build into the constituent commands
+		 * we need to create the new part.  (This will include some commands
+		 * for the parent that we don't need, since the parent already
+		 * exists.)
 		 */
 		l1 = transformCreateStmt(ct, "ADD PARTITION", true);
 
 		/*
-		 * Look for the first CreateStmt and generate a GrantStmt
-		 * based on the RangeVar in it.
-		 */
-		foreach(lc, l1)
-		{
-			Node *s = lfirst(lc);
-
-			/* skip the first one, it's the fake create table for the parent */
-			if (lc == list_head(l1))
-				continue;
-
-			if (IsA(s, CreateStmt))
-			{
-				HeapTuple tuple;
-				Datum aclDatum;
-				bool isNull;
-				CreateStmt *t = (CreateStmt *) s;
-
-				tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(RelationGetRelid(rel)));
-				if (!HeapTupleIsValid(tuple))
-					elog(ERROR, "cache lookup failed for relation %u",
-						 RelationGetRelid(rel));
-
-				aclDatum = SysCacheGetAttr(RELOID, tuple,
-										   Anum_pg_class_relacl,
-										   &isNull);
-				if (!isNull)
-				{
-					List *cp = NIL;
-					int i, num;
-					Acl *acl;
-					AclItem *aidat;
-
-					acl = DatumGetAclP(aclDatum);
-
-					num = ACL_NUM(acl);
-					aidat = ACL_DAT(acl);
-
-					for (i = 0; i < num; i++)
-					{
-						AclItem	*aidata = &aidat[i];
-						Datum d;
-						char *str;
-
-						d = DirectFunctionCall1(aclitemout,
-												PointerGetDatum(aidata));
-						str = DatumGetCString(d);
-
-						cp = lappend(cp, makeString(str));
-
-					}
-
-					if (list_length(cp))
-					{
-						GrantStmt *gs = makeNode(GrantStmt);
-
-						gs->is_grant = true;
-						gs->objtype = ACL_OBJECT_RELATION;
-						gs->cooked_privs = cp;
-
-						gs->objects = list_make1(copyObject(t->relation));
-
-						l1 = lappend(l1, gs);
-					}
-				}
-
-				ReleaseSysCache(tuple);
-				break;
-			}
-		}
-
-		/* skip the first cell because the table already exists --
-		 * don't recreate it
+		 * skip the first cell because the table already exists -- don't
+		 * recreate it
 		 */
 		lc = list_head(l1);
 
 		if (lc)
 		{
-			Node *s = lfirst(lc);
+			Node	   *s = lfirst(lc);
 
-			/* MPP-10421: but save the relid of the skipped table,
-			 * because we skip indexes associated with it...
+			/*
+			 * MPP-10421: but save the relid of the skipped table, because we
+			 * skip indexes associated with it...
 			 */
 			if (IsA(s, CreateStmt))
 			{
 				CreateStmt *t = (CreateStmt *) s;
 
-				skipTableRelid = RangeVarGetRelid(t->relation, true);
+				skipTableRelid = RangeVarGetRelid(t->relation, NoLock, true);
 			}
 		}
 
-
 		for_each_cell(lc, lnext(lc))
 		{
-			Node *q = lfirst(lc);
+			Node	   *q = lfirst(lc);
 
 			/*
-			 * MPP-6379, MPP-10421: If the statement is an expanded
-			 * index creation statement on the parent (or the "skipped
-			 * table"), ignore it. We get into this situation when the
-			 * parent has one or more indexes on it that our new
-			 * partition is inheriting.
+			 * MPP-6379, MPP-10421: If the statement is an expanded index
+			 * creation statement on the parent (or the "skipped table"),
+			 * ignore it. We get into this situation when the parent has one
+			 * or more indexes on it that our new partition is inheriting.
 			 */
 			if (IsA(q, IndexStmt))
 			{
-				IndexStmt *istmt	 = (IndexStmt *)q;
-				Oid		   idxRelid	 = RangeVarGetRelid(istmt->relation, true);
+				IndexStmt  *istmt = (IndexStmt *) q;
+				Oid			idxRelid = RangeVarGetRelid(istmt->relation, NoLock, true);
 
 				if (idxRelid == RelationGetRelid(rel))
 					continue;
@@ -6900,15 +6931,16 @@ atpxPartAddList(Relation rel,
 					continue;
 			}
 
-			/* XXX XXX: fix the first Alter Table Statement to have
-			 * the correct maxpartno.  Whoohoo!!
+			/*
+			 * XXX XXX: fix the first Alter Table Statement to have the
+			 * correct maxpartno.  Whoohoo!!
 			 */
 			if (bFixFirstATS && q && IsA(q, AlterTableStmt))
 			{
-				PartitionSpec	*spec = NULL;
-				AlterTableStmt	*ats;
-				AlterTableCmd	*atc;
-				List			*cmds;
+				PartitionSpec *spec = NULL;
+				AlterTableStmt *ats;
+				AlterTableCmd *atc;
+				List	   *cmds;
 
 				bFixFirstATS = false;
 
@@ -6919,60 +6951,62 @@ atpxPartAddList(Relation rel,
 
 				Assert(cmds && (list_length(cmds) > 1));
 
-				atc = (AlterTableCmd *)lsecond(cmds);
+				atc = (AlterTableCmd *) lsecond(cmds);
 
 				Assert(atc->def);
 
-				pBy = (PartitionBy *)atc->def;
+				pBy = (PartitionBy *) atc->def;
 
 				Assert(IsA(pBy, PartitionBy));
 
-				spec = (PartitionSpec *)pBy->partSpec;
+				spec = (PartitionSpec *) pBy->partSpec;
 
 				if (spec)
 				{
-					List				*l2 = spec->partElem;
-					PartitionElem		*pel;
+					List	   *l2 = spec->partElem;
+					PartitionElem *pel;
 
 					if (l2 && list_length(l2))
 					{
-						pel = (PartitionElem *)linitial(l2);
+						pel = (PartitionElem *) linitial(l2);
 
 						pel->partno = maxpartno;
 					}
 
 				}
 
-			} /* end first alter table fixup */
+			}					/* end first alter table fixup */
 			else if (IsA(q, CreateStmt))
 			{
 				/* propagate owner */
 				((CreateStmt *) q)->ownerid = ownerid;
 			}
 
-			/* normal case - add partitions using CREATE statements
-			 * that get dispatched to the segments
+			/*
+			 * normal case - add partitions using CREATE statements that get
+			 * dispatched to the segments
 			 */
 			if (!bSetTemplate)
 				ProcessUtility(q,
 							   synthetic_sql,
+							   PROCESS_UTILITY_SUBCOMMAND,
 							   NULL,
-							   false, /* not top level */
 							   dest,
 							   NULL);
 			else
-			{ /* setting subpartition template only */
+			{					/* setting subpartition template only */
 
-				/* find all the alter table statements that contain
-				 * partaddinternal, and extract the definitions.  Only
-				 * build the catalog entries for subpartition
-				 * templates, not "real" table entries.
+				/*
+				 * find all the alter table statements that contain
+				 * partaddinternal, and extract the definitions.  Only build
+				 * the catalog entries for subpartition templates, not "real"
+				 * table entries.
 				 */
 				if (IsA(q, AlterTableStmt))
 				{
 					AlterTableStmt *at2 = (AlterTableStmt *) q;
-					List *l2 = at2->cmds;
-					ListCell *lc2;
+					List	   *l2 = at2->cmds;
+					ListCell   *lc2;
 
 					foreach(lc2, l2)
 					{
@@ -6981,27 +7015,27 @@ atpxPartAddList(Relation rel,
 						if (ac2->subtype == AT_PartAddInternal)
 						{
 							PartitionBy *templ_pby =
-							(PartitionBy *)ac2->def;
+							(PartitionBy *) ac2->def;
 
 							Assert(IsA(templ_pby, PartitionBy));
 
-							/* skip the first one because it's the
-							 * fake parent partition definition for
-							 * the subpartition template entries
+							/*
+							 * skip the first one because it's the fake parent
+							 * partition definition for the subpartition
+							 * template entries
 							 */
 
 							if (bFirst_TemplateOnly)
 							{
 								bFirst_TemplateOnly = false;
 
-								/* MPP-5992: only set one level of
-								 * templates -- we might have
-								 * templates for subpartitions of the
-								 * subpartitions, which would add
-								 * duplicate templates into the table.
-								 * Only add templates of the specified
-								 * depth and skip deeper template
-								 * definitions.
+								/*
+								 * MPP-5992: only set one level of templates
+								 * -- we might have templates for
+								 * subpartitions of the subpartitions, which
+								 * would add duplicate templates into the
+								 * table. Only add templates of the specified
+								 * depth and skip deeper template definitions.
 								 */
 								pby_templ_depth = templ_pby->partDepth + 1;
 
@@ -7011,17 +7045,18 @@ atpxPartAddList(Relation rel,
 								if (templ_pby->partDepth == pby_templ_depth)
 									add_part_to_catalog(
 														RelationGetRelid(rel),
-														(PartitionBy *)ac2->def,
+														(PartitionBy *) ac2->def,
 														true);
 							}
 
 						}
-					} /* end foreach lc2 l2 */
+					}			/* end foreach lc2 l2 */
 				}
-			} /* end else setting subpartition templates only */
+			}					/* end else setting subpartition templates
+								 * only */
 
 			ii++;
-		} /* end for each cell */
+		}						/* end for each cell */
 
 	}
 
@@ -7029,23 +7064,22 @@ atpxPartAddList(Relation rel,
 		heap_close(par_rel, NoLock);
 
 	return pSubSpec;
-} /* end atpxPartAddList */
+}								/* end atpxPartAddList */
 
 
 List *
 atpxDropList(Relation rel, PartitionNode *pNode)
 {
-	List *l1 = NIL;
-	ListCell *lc;
+	List	   *l1 = NIL;
 
 	if (!pNode)
 		return l1;
 
 	/* add the child lists first */
-	foreach(lc, pNode->rules)
+	for (int i = 0; i < pNode->num_rules; i++)
 	{
-		PartitionRule *rule = lfirst(lc);
-		List *l2 = NIL;
+		PartitionRule *rule = pNode->rules[i];
+		List	   *l2 = NIL;
 
 		if (rule->children)
 			l2 = atpxDropList(rel, rule->children);
@@ -7065,7 +7099,7 @@ atpxDropList(Relation rel, PartitionNode *pNode)
 	if (pNode->default_part)
 	{
 		PartitionRule *rule = pNode->default_part;
-		List *l2 = NIL;
+		List	   *l2 = NIL;
 
 		if (rule->children)
 			l2 = atpxDropList(rel, rule->children);
@@ -7082,11 +7116,11 @@ atpxDropList(Relation rel, PartitionNode *pNode)
 	}
 
 	/* add entries for rules at current level */
-	foreach(lc, pNode->rules)
+	for (int i = 0; i < pNode->num_rules; i++)
 	{
-		PartitionRule *rule = lfirst(lc);
-		char	*prelname;
-		char	*nspname;
+		PartitionRule *rule = pNode->rules[i];
+		char	   *prelname;
+		char	   *nspname;
 		Relation	rel;
 
 		rel = heap_open(rule->parchildrelid, AccessShareLock);
@@ -7106,8 +7140,8 @@ atpxDropList(Relation rel, PartitionNode *pNode)
 	if (pNode->default_part)
 	{
 		PartitionRule *rule = pNode->default_part;
-		char *prelname;
-		char *nspname;
+		char	   *prelname;
+		char	   *nspname;
 		Relation	rel;
 
 		rel = heap_open(rule->parchildrelid, AccessShareLock);
@@ -7124,21 +7158,22 @@ atpxDropList(Relation rel, PartitionNode *pNode)
 	}
 
 	return l1;
-} /* end atpxDropList */
+}								/* end atpxDropList */
 
 
 void
 exchange_part_rule(Oid oldrelid, Oid newrelid)
 {
-	HeapTuple	 tuple;
-	Relation	 catalogRelation;
-	ScanKeyData	scankey;
+	HeapTuple	tuple;
+	Relation	catalogRelation;
+	ScanKeyData scankey;
 	SysScanDesc sscan;
 
-	/* pg_partition and  pg_partition_rule are populated only on the
-	 * entry database, so a call to this function is only meaningful
-	 * there. */
-	Insist(Gp_segment == -1);
+	/*
+	 * pg_partition and  pg_partition_rule are populated only on the entry
+	 * database, so a call to this function is only meaningful there.
+	 */
+	Insist(IS_QUERY_DISPATCHER());
 
 	catalogRelation = heap_open(PartitionRuleRelationId, RowExclusiveLock);
 
@@ -7147,7 +7182,7 @@ exchange_part_rule(Oid oldrelid, Oid newrelid)
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(oldrelid));
 	sscan = systable_beginscan(catalogRelation, PartitionRuleParchildrelidIndexId, true,
-							   SnapshotNow, 1, &scankey);
+							   NULL, 1, &scankey);
 	tuple = systable_getnext(sscan);
 	if (HeapTupleIsValid(tuple))
 	{
@@ -7169,16 +7204,16 @@ exchange_part_rule(Oid oldrelid, Oid newrelid)
 void
 exchange_permissions(Oid oldrelid, Oid newrelid)
 {
-	HeapTuple oldtuple;
-	HeapTuple newtuple;
-	Datum save;
-	bool saveisnull;
-	Datum values[Natts_pg_class];
-	bool nulls[Natts_pg_class];
-	bool replaces[Natts_pg_class];
-	HeapTuple replace_tuple;
-	bool isnull;
-	Relation rel = heap_open(RelationRelationId, RowExclusiveLock);
+	HeapTuple	oldtuple;
+	HeapTuple	newtuple;
+	Datum		save;
+	bool		saveisnull;
+	Datum		values[Natts_pg_class];
+	bool		nulls[Natts_pg_class];
+	bool		replaces[Natts_pg_class];
+	HeapTuple	replace_tuple;
+	bool		isnull;
+	Relation	rel = heap_open(RelationRelationId, RowExclusiveLock);
 
 	oldtuple = SearchSysCache1(RELOID, ObjectIdGetDatum(oldrelid));
 	if (!HeapTupleIsValid(oldtuple))
@@ -7236,588 +7271,36 @@ exchange_permissions(Oid oldrelid, Oid newrelid)
 	heap_close(rel, NoLock);
 }
 
-
-bool
-atpxModifyListOverlap (Relation rel,
-					   AlterPartitionId *pid,
-					   PgPartRule		*prule,
-					   PartitionElem	*pelem,
-					   bool bAdd)
+static void
+atpxSkipper(PartitionNode *pNode, int *skipped)
 {
-	if (prule->pNode->default_part && bAdd)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
-				 errmsg("cannot MODIFY %s partition%s for "
-						"relation \"%s\" to ADD values -- would "
-						"overlap DEFAULT partition \"%s\"",
-						"LIST",
-						prule->partIdStr,
-						RelationGetRelationName(rel),
-						prule->pNode->default_part->parname),
-				 errhint("need to SPLIT partition \"%s\"",
-						 prule->pNode->default_part->parname)));
-
-	{
-		ListCell				*lc;
-		PartitionValuesSpec		*pVSpec;
-		AlterPartitionId		 pid2;
-		PartitionNode			*pNode	= prule->pNode;
-		CreateStmtContext		 cxt;
-
-		MemSet(&cxt, 0, sizeof(cxt));
-
-		Assert (IsA(pelem->boundSpec, PartitionValuesSpec));
-
-		MemSet(&pid2, 0, sizeof(AlterPartitionId));
-
-		/* this function does transformExpr on the boundary specs */
-		(void) atpxPart_validate_spec(makeNode(PartitionBy),
-									  &cxt,
-									  rel,
-									  NULL,		 /* CreateStmt */
-									  pelem,
-									  pNode,
-									  (pid->idtype == AT_AP_IDName) ?
-									  strVal(pid->partiddef) : NULL,
-									  false,		 /* isDefault */
-									  PARTTYP_LIST, /* part_type */
-									  prule->partIdStr);
-
-		pVSpec = (PartitionValuesSpec *)pelem->boundSpec;
-
-		foreach(lc, pVSpec->partValues)
-		{
-			List			*vals  = lfirst(lc);
-			PgPartRule		*prule2 = NULL;
-
-			pid2.idtype = AT_AP_IDValue;
-			pid2.partiddef = (Node *)vals;
-			pid2.location  = -1;
-
-			prule2 = get_part_rule(rel, &pid2, false, false,
-								   NULL, false);
-
-			if (bAdd)
-			{
-				/* if ADDing a value, should not match */
-
-				if (prule2)
-				{
-					if (prule2->topRuleRank != prule->topRuleRank)
-						ereport(ERROR,
-								(errcode(ERRCODE_UNDEFINED_OBJECT),
-								 errmsg("cannot MODIFY LIST partition%s for "
-										"relation \"%s\" -- "
-										"would overlap "
-										"existing partition%s",
-										prule->partIdStr,
-										RelationGetRelationName(rel),
-										prule2->isName ?
-										prule2->partIdStr : "")));
-					else
-						ereport(ERROR,
-								(errcode(ERRCODE_UNDEFINED_OBJECT),
-								 errmsg("cannot MODIFY LIST partition%s for "
-										"relation \"%s\" -- "
-										"ADD value has duplicate in "
-										"existing partition",
-										prule->partIdStr,
-										RelationGetRelationName(rel))));
-				}
-			}
-			else /* DROP values */
-			{
-				/* if DROPping a value, it should only be in the
-				 * specified partition
-				 */
-
-				if (!prule2)
-				{
-					ereport(ERROR,
-							(errcode(ERRCODE_UNDEFINED_OBJECT),
-							 errmsg("cannot MODIFY LIST partition%s for "
-									"relation \"%s\" -- DROP value not found",
-									prule->partIdStr,
-									RelationGetRelationName(rel))));
-				}
-
-				if (prule2 && (prule2->topRuleRank != prule->topRuleRank))
-				{
-					ereport(ERROR,
-							(errcode(ERRCODE_UNDEFINED_OBJECT),
-							 errmsg("cannot MODIFY LIST partition%s for "
-									"relation \"%s\" -- "
-									"found DROP value in%s partition%s",
-									prule->partIdStr,
-									RelationGetRelationName(rel),
-									prule2->isName ? "" : "other",
-									prule2->isName ? prule2->partIdStr : "")));
-				}
-			}
-
-		} /* end foreach */
-	}
-
-	return false;
-} /* end atpxModifyListOverlap */
-
-bool
-atpxModifyRangeOverlap (Relation				 rel,
-						AlterPartitionId		*pid,
-						PgPartRule				*prule,
-						PartitionElem			*pelem)
-{
-	PgPartRule			*prule2		 = NULL;
-	AlterPartitionId	 pid2;
-	PartitionNode		*pNode		 = prule->pNode;
-	bool				 bCheckStart = true;
-	PartitionBoundSpec	*pbs		 = NULL;
-	ParseState			*pstate;
-	bool				 bOverlap	 = false;
-	bool				*isnull;
-	TupleDesc			 tupledesc	 = RelationGetDescr(rel);
-	Datum				*d_start	 = NULL;
-	Datum				*d_end		 = NULL;
-	Node *pRangeValList = NULL;
-	int ii;
-
-	Assert (IsA(pelem->boundSpec, PartitionBoundSpec));
-
-	pbs = (PartitionBoundSpec *)pelem->boundSpec;
-
-	for (ii = 0; ii < 2 ; ii++)
-	{
-		PartitionRangeItem		*ri;
-
-		if (bCheckStart) /* check START first, then END */
-		{
-			if (!(pbs->partStart))
-			{
-				bCheckStart = false;
-
-				if (prule->topRule->parrangestart)
-				{
-					PartitionRangeItem *ri = makeNode(PartitionRangeItem);
-
-					ri->location = -1;
-
-					ri->partRangeVal =
-					copyObject(prule->topRule->parrangestart);
-
-					ri->partedge = prule->topRule->parrangestartincl ?
-					PART_EDGE_INCLUSIVE :
-					PART_EDGE_EXCLUSIVE;
-
-					/* no start, so use current start */
-					pbs->partStart = (Node *)ri;
-				}
-
-				continue;
-			}
-			ri = (PartitionRangeItem *)pbs->partStart;
-		}
-		else
-		{
-			/* no END, so we are done */
-			if (!(pbs->partEnd))
-			{
-
-				if (prule->topRule->parrangeend)
-				{
-					PartitionRangeItem *ri = makeNode(PartitionRangeItem);
-
-					ri->location = -1;
-
-					ri->partRangeVal = copyObject(prule->topRule->parrangeend);
-
-					ri->partedge = prule->topRule->parrangeendincl ?
-					PART_EDGE_INCLUSIVE :
-					PART_EDGE_EXCLUSIVE;
-
-					/* no end, so use current end */
-					pbs->partEnd = (Node *)ri;
-				}
-
-				break;
-			}
-			ri = (PartitionRangeItem *)pbs->partEnd;
-		}
-
-		MemSet(&pid2, 0, sizeof(AlterPartitionId));
-
-		pid2.idtype = AT_AP_IDValue;
-		pstate = make_parsestate(NULL);
-		pRangeValList = (Node *) copyObject(ri->partRangeVal);
-		pRangeValList = (Node *)
-		transformExpressionList(pstate, (List *)pRangeValList);
-		free_parsestate(pstate);
-		pid2.partiddef = pRangeValList;
-		pid2.location  = -1;
-
-		prule2 = get_part_rule(rel, &pid2, false, false,
-							   NULL, false);
-
-		if (!prule2)
-		{
-			/* no rules matched -- this is ok as long as no
-			 * default partition
-			 */
-			if (prule->pNode->default_part)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
-						 errmsg("cannot MODIFY %s partition%s for "
-								"relation \"%s\" to extend range -- would "
-								"overlap DEFAULT partition \"%s\"",
-								"RANGE",
-								prule->partIdStr,
-								RelationGetRelationName(rel),
-								prule->pNode->default_part->parname),
-						 errhint("need to SPLIT partition \"%s\"",
-								 prule->pNode->default_part->parname)));
-
-			/* if only 1 partition no further check needed */
-			if (1 == list_length(pNode->rules))
-				continue;
-
-			if (bCheckStart)
-			{
-				bool bstat;
-				PartitionRule *a_rule;
-
-				/* check for adjacent partition */
-				if (1 == prule->topRuleRank)
-					continue; /* no previous, so changing start is ok */
-
-				MemSet(&pid2, 0, sizeof(AlterPartitionId));
-
-				pid2.idtype = AT_AP_IDRank;
-				pid2.partiddef = (Node *)makeInteger(prule->topRuleRank - 1);
-				pid2.location  = -1;
-
-				prule2 = get_part_rule(rel, &pid2, false, false,
-									   NULL, false);
-
-				Assert(prule2);
-
-				a_rule = prule2->topRule;
-
-				/* just check against end of adjacent partition */
-				d_start =
-				magic_expr_to_datum(rel, pNode,
-									pRangeValList, &isnull);
-
-				bstat =
-				compare_partn_opfuncid(pNode,
-									   "pg_catalog",
-									   ">",
-									   (List *)a_rule->parrangeend,
-									   d_start, isnull, tupledesc);
-				if (bstat)
-				{
-					/* end > new start - overlap */
-					bOverlap = true;
-					break;
-				}
-
-				/* could be the case that new start == end of
-				 * previous.  This is ok if they have opposite
-				 * INCLUSIVE/EXCLUSIVE.
-				 */
-
-				bstat =
-				compare_partn_opfuncid(pNode,
-									   "pg_catalog",
-									   "=",
-									   (List *)a_rule->parrangeend,
-									   d_start, isnull, tupledesc);
-
-				if (bstat)
-				{
-					if (a_rule->parrangeendincl ==
-						(ri->partedge == PART_EDGE_INCLUSIVE))
-					{
-						/* start and end must be of opposite
-						 * types, else they overlap */
-						bOverlap = true;
-						break;
-					}
-				}
-			}
-			else /* check the end */
-			{
-				bool bstat;
-				PartitionRule *a_rule;
-
-				/* check for adjacent partition */
-				if (list_length(pNode->rules) == prule->topRuleRank)
-					continue; /* no next, so changing end is ok */
-
-				MemSet(&pid2, 0, sizeof(AlterPartitionId));
-
-				pid2.idtype = AT_AP_IDRank;
-				pid2.partiddef = (Node *)makeInteger(prule->topRuleRank + 1);
-				pid2.location  = -1;
-
-				prule2 = get_part_rule(rel, &pid2, false, false,
-									   NULL, false);
-
-				Assert(prule2);
-
-				a_rule = prule2->topRule;
-
-				/* just check against start of adjacent partition */
-				d_end =
-				magic_expr_to_datum(rel, pNode,
-									pRangeValList, &isnull);
-
-				bstat =
-				compare_partn_opfuncid(pNode,
-									   "pg_catalog",
-									   "<",
-									   (List *)a_rule->parrangestart,
-									   d_end, isnull, tupledesc);
-				if (bstat)
-				{
-					/* start < new end - overlap */
-					bOverlap = true;
-					break;
-				}
-
-				/* could be the case that new end == start of
-				 * next.  This is ok if they have opposite
-				 * INCLUSIVE/EXCLUSIVE.
-				 */
-
-				bstat =
-				compare_partn_opfuncid(pNode,
-									   "pg_catalog",
-									   "=",
-									   (List *)a_rule->parrangestart,
-									   d_end, isnull, tupledesc);
-
-				if (bstat)
-				{
-					if (a_rule->parrangeendincl ==
-						(ri->partedge == PART_EDGE_INCLUSIVE))
-					{
-						/* start and end must be of opposite
-						 * types, else they overlap */
-						bOverlap = true;
-						break;
-					}
-				}
-			} /* end else check the end */
-
-		}
-		else
-		{
-			/* matched a rule - definitely a problem if the range was
-			 * inclusive
-			 */
-			if (prule2->topRuleRank != prule->topRuleRank)
-			{
-				if (0 == prule2->topRuleRank)
-					ereport(ERROR,
-							(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
-							 errmsg("cannot MODIFY %s partition%s for "
-									"relation \"%s\" to extend range -- would "
-									"overlap DEFAULT partition \"%s\"",
-									"RANGE",
-									prule->partIdStr,
-									RelationGetRelationName(rel),
-									prule->pNode->default_part->parname),
-							 errhint("need to SPLIT partition \"%s\"",
-									 prule->pNode->default_part->parname)));
-
-
-				if (ri->partedge == PART_EDGE_INCLUSIVE)
-				{
-					bOverlap = true;
-					break;
-				}
-
-				/* range was exclusive -- need to do some checking */
-				if (bCheckStart)
-				{
-					bool bstat;
-					PartitionRule *a_rule = prule2->topRule;
-
-					/* check for adjacent partition */
-					if ((prule->topRuleRank - 1) != prule2->topRuleRank)
-					{
-						bOverlap = true;
-						break;
-					}
-
-					/* just check against end of adjacent partition */
-					d_start =
-					magic_expr_to_datum(rel, pNode,
-										pid2.partiddef, &isnull);
-
-					bstat =
-					compare_partn_opfuncid(pNode,
-										   "pg_catalog",
-										   ">",
-										   (List *)a_rule->parrangeend,
-										   d_start, isnull, tupledesc);
-					if (bstat)
-					{
-						/* end > new start - overlap */
-						bOverlap = true;
-						break;
-					}
-
-					/* Must be the case that new start == end of
-					 * a_rule (because if the end < new start then how
-					 * could we find it in the interval for prule ?)
-					 * This is ok if they have opposite
-					 * INCLUSIVE/EXCLUSIVE ->  New partition does not
-					 * overlap.
-					 */
-
-					Assert (compare_partn_opfuncid(pNode,
-												   "pg_catalog",
-												   "=",
-												   (List *)a_rule->parrangeend,
-												   d_start, isnull, tupledesc));
-
-					if (a_rule->parrangeendincl ==
-						(ri->partedge == PART_EDGE_INCLUSIVE))
-					{
-						/* start and end must be of opposite
-						 * types, else they overlap
-						 */
-						bOverlap = true;
-						break;
-					}
-				}
-				else /* check the end */
-				{
-					bool bstat;
-					PartitionRule *a_rule = prule2->topRule;
-
-					/* check for adjacent partition */
-					if ((prule->topRuleRank + 1) != prule2->topRuleRank)
-					{
-						bOverlap = true;
-						break;
-					}
-
-					/* just check against start of adjacent partition */
-					d_end =
-					magic_expr_to_datum(rel, pNode,
-										pid2.partiddef, &isnull);
-
-					bstat =
-					compare_partn_opfuncid(pNode,
-										   "pg_catalog",
-										   "<",
-										   (List *)a_rule->parrangestart,
-										   d_end, isnull, tupledesc);
-					if (bstat)
-					{
-						/* start < new end - overlap */
-						bOverlap = true;
-						break;
-					}
-
-					/* Must be the case that new end = start of
-					 * a_rule (because if the start > new end then how
-					 * could we find it in the interval for prule ?)
-					 * This is ok if they have opposite
-					 * INCLUSIVE/EXCLUSIVE ->  New partition does not
-					 * overlap.
-					 */
-
-					Assert (compare_partn_opfuncid(pNode,
-												   "pg_catalog",
-												   "=",
-												   (List *)a_rule->parrangestart,
-												   d_end, isnull, tupledesc));
-
-					if (a_rule->parrangestartincl ==
-						(ri->partedge == PART_EDGE_INCLUSIVE))
-					{
-						/* start and end must be of opposite
-						 * types, else they overlap
-						 */
-						bOverlap = true;
-						break;
-					}
-				} /* end else check the end */
-			} /* end if (prule2->topRuleRank != prule->topRuleRank) */
-		}
-
-		/* if checked START, then check END.  If checked END, then done */
-		if (!bCheckStart)
-			break;
-		if (bCheckStart)
-			bCheckStart = false;
-	} /* end for */
-
-	if (bOverlap)
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("cannot MODIFY RANGE partition%s for "
-						"relation \"%s\" -- "
-						"would overlap "
-						"existing partition%s",
-						prule->partIdStr,
-						RelationGetRelationName(rel),
-						(prule2 && prule2->isName) ?
-						prule2->partIdStr : "")));
-
-	{
-		CreateStmtContext		 cxt;
-
-		MemSet(&cxt, 0, sizeof(cxt));
-
-		/* this function does transformExpr on the boundary specs */
-		(void) atpxPart_validate_spec(makeNode(PartitionBy),
-									  &cxt,
-									  rel,
-									  NULL,		 /* CreateStmt */
-									  pelem,
-									  pNode,
-									  (pid->idtype == AT_AP_IDName) ?
-									  strVal(pid->partiddef) : NULL,
-									  false,		 /* isDefault */
-									  PARTTYP_RANGE, /* part_type */
-									  prule->partIdStr);
-	}
-
-
-	return false;
-} /* end atpxModifyRangeOverlap */
-
-static void atpxSkipper(PartitionNode *pNode, int *skipped)
-{
-	ListCell *lc;
-
-	if (!pNode) return;
+	if (!pNode)
+		return;
 
 	/* add entries for rules at current level */
-	foreach(lc, pNode->rules)
+	for (int i = 0; i < pNode->num_rules; i++)
 	{
-		PartitionRule	*rule = lfirst(lc);
+		PartitionRule *rule = pNode->rules[i];
 
-		if (skipped) *skipped += 1;
+		if (skipped)
+			*skipped += 1;
 
 		if (rule->children)
 			atpxSkipper(rule->children, skipped);
-	} /* end foreach */
+	}							/* end foreach */
 
 	/* and the default partition */
 	if (pNode->default_part)
 	{
-		PartitionRule	*rule = pNode->default_part;
+		PartitionRule *rule = pNode->default_part;
 
-		if (skipped) *skipped += 1;
+		if (skipped)
+			*skipped += 1;
 
 		if (rule->children)
 			atpxSkipper(rule->children, skipped);
 	}
-} /* end atpxSkipper */
+}								/* end atpxSkipper */
 
 static List *
 build_rename_part_recurse(PartitionRule *rule, const char *old_parentname,
@@ -7825,11 +7308,11 @@ build_rename_part_recurse(PartitionRule *rule, const char *old_parentname,
 						  int *skipped)
 {
 
-	RangeVar		*rv;
-	Relation		 rel;
-	char *relname = NULL;
-	char newRelNameBuf[(NAMEDATALEN*2)];
-	List *l1 = NIL;
+	RangeVar   *rv;
+	Relation	rel;
+	char	   *relname = NULL;
+	char		newRelNameBuf[(NAMEDATALEN * 2)];
+	List	   *l1 = NIL;
 
 	rel = heap_open(rule->parchildrelid, AccessShareLock);
 
@@ -7842,12 +7325,12 @@ build_rename_part_recurse(PartitionRule *rule, const char *old_parentname,
 	heap_close(rel, AccessShareLock);
 
 	/*
-	 * The child name should contain the old parent name as a
-	 * prefix - check the length and compare to make sure.
+	 * The child name should contain the old parent name as a prefix - check
+	 * the length and compare to make sure.
 	 *
-	 * To build the new child name, just use the new name as a
-	 * prefix, and use the remainder of the child name (the part
-	 * after the old parent name prefix) as the suffix.
+	 * To build the new child name, just use the new name as a prefix, and use
+	 * the remainder of the child name (the part after the old parent name
+	 * prefix) as the suffix.
 	 */
 	if (strlen(old_parentname) > strlen(relname))
 	{
@@ -7872,15 +7355,14 @@ build_rename_part_recurse(PartitionRule *rule, const char *old_parentname,
 			if (strlen(newRelNameBuf) > NAMEDATALEN)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
-						 errmsg("relation name \"%s\" for child partition "
-								"is too long",
+						 errmsg("relation name \"%s\" for child partition is too long",
 								newRelNameBuf)));
 
 			l1 = lappend(l1, list_make2(rv, pstrdup(newRelNameBuf)));
 
 			/* add the child lists next (not first) */
 			{
-				List *l2 = NIL;
+				List	   *l2 = NIL;
 
 				if (rule->children)
 					l2 = atpxRenameList(rule->children,
@@ -7898,28 +7380,27 @@ List *
 atpxRenameList(PartitionNode *pNode,
 			   char *old_parentname, const char *new_parentname, int *skipped)
 {
-	List *l1 = NIL;
-	ListCell *lc;
+	List	   *l1 = NIL;
 
 	if (!pNode)
 		return l1;
 
 	/* add entries for rules at current level */
-	foreach(lc, pNode->rules)
+	for (int i = 0; i < pNode->num_rules; i++)
 	{
-		PartitionRule	*rule = lfirst(lc);
+		PartitionRule *rule = pNode->rules[i];
 
 		l1 = list_concat(l1,
 						 build_rename_part_recurse(rule,
 												   old_parentname,
 												   new_parentname,
 												   skipped));
-	} /* end foreach */
+	}							/* end foreach */
 
 	/* and the default partition */
 	if (pNode->default_part)
 	{
-		PartitionRule	*rule = pNode->default_part;
+		PartitionRule *rule = pNode->default_part;
 
 		l1 = list_concat(l1,
 						 build_rename_part_recurse(rule,
@@ -7929,21 +7410,21 @@ atpxRenameList(PartitionNode *pNode,
 	}
 
 	return l1;
-} /* end atpxRenameList */
+}								/* end atpxRenameList */
 
 
 static Oid
 get_opfuncid_by_opname(List *opname, Oid lhsid, Oid rhsid)
 {
-	Oid opfuncid;
-	Operator op;
+	Oid			opfuncid;
+	Operator	op;
 
 	op = oper(NULL, opname, lhsid, rhsid, false, -1);
 
-	if (op == NULL)	  /* should not fail */
+	if (op == NULL)				/* should not fail */
 		elog(ERROR, "could not find operator");
 
-	opfuncid = ((Form_pg_operator)GETSTRUCT(op))->oprcode;
+	opfuncid = ((Form_pg_operator) GETSTRUCT(op))->oprcode;
 
 	ReleaseSysCache(op);
 	return opfuncid;
@@ -7959,7 +7440,7 @@ get_opfuncid_by_opname(List *opname, Oid lhsid, Oid rhsid)
 static PgPartRule *
 get_pprule_from_ATC(Relation rel, AlterTableCmd *cmd)
 {
-	List *pids = NIL; /* of AlterPartitionId */
+	List	   *pids = NIL;		/* of AlterPartitionId */
 	AlterPartitionId *pid = NULL;
 	PgPartRule *pprule = NULL;
 	AlterPartitionId *work_partid = NULL;
@@ -7968,42 +7449,42 @@ get_pprule_from_ATC(Relation rel, AlterTableCmd *cmd)
 
 
 	/* Get list of enclosing ALTER PARTITION ids. */
-	while ( atc->subtype == AT_PartAlter )
+	while (atc->subtype == AT_PartAlter)
 	{
-		AlterPartitionCmd *apc = (AlterPartitionCmd*)atc->def;
+		AlterPartitionCmd *apc = (AlterPartitionCmd *) atc->def;
 
-		pid = (AlterPartitionId*)apc->partid;
+		pid = (AlterPartitionId *) apc->partid;
 		Insist(IsA(pid, AlterPartitionId));
 
-		atc = (AlterTableCmd*)apc->arg1;
+		atc = (AlterTableCmd *) apc->arg1;
 		Insist(IsA(atc, AlterTableCmd));
 
 		pids = lappend(pids, pid);
 	}
 
-	/* The effective ALTER TABLE command is in atc.
-	 * The pids list (of AlterPartitionId nodes) represents the path to
-	 * top partitioning branch of rel.  Since we are only called for
-	 * branches and leaves (never the root) of the partition, the pid
-	 * list should not empty.
+	/*
+	 * The effective ALTER TABLE command is in atc. The pids list (of
+	 * AlterPartitionId nodes) represents the path to top partitioning branch
+	 * of rel.  Since we are only called for branches and leaves (never the
+	 * root) of the partition, the pid list should not empty.
 	 *
-	 * Use the AlterPartitionId interpretter, get_part_rule, to do
-	 * the interpretation.
+	 * Use the AlterPartitionId interpretter, get_part_rule, to do the
+	 * interpretation.
 	 */
-	Insist( list_length(pids) > 0 );
+	Insist(list_length(pids) > 0);
 
 	work_partid = makeNode(AlterPartitionId);
 
 	work_partid->idtype = AT_AP_IDList;
-	work_partid->partiddef = (Node*)pids;
+	work_partid->partiddef = (Node *) pids;
 	work_partid->location = -1;
 
 	pprule = get_part_rule(rel,
 						   work_partid,
-						   true, true, /* parts must exist */
-						   NULL, /* no implicit results */
-						   false /* no template rules */
-						   );
+						   true, true,	/* parts must exist */
+						   NULL,	/* no implicit results */
+						   false	/* no template rules */
+		);
 
 	return pprule;
 }
@@ -8020,7 +7501,7 @@ basic_AT_oids(Relation rel, AlterTableCmd *cmd)
 {
 	PgPartRule *pprule = get_pprule_from_ATC(rel, cmd);
 
-	if ( ! pprule )
+	if (!pprule)
 		return NIL;
 
 	return all_prule_relids(pprule->topRule);
@@ -8030,13 +7511,15 @@ basic_AT_oids(Relation rel, AlterTableCmd *cmd)
  * Return the basic AlterTableCmd found by peeling off intervening layers of
  * ALTER PARTITION from the given AlterTableCmd.
  */
-AlterTableCmd *basic_AT_cmd(AlterTableCmd *cmd)
+AlterTableCmd *
+basic_AT_cmd(AlterTableCmd *cmd)
 {
-	while ( cmd->subtype == AT_PartAlter )
+	while (cmd->subtype == AT_PartAlter)
 	{
-		AlterPartitionCmd *apc = (AlterPartitionCmd*)cmd->def;
+		AlterPartitionCmd *apc = (AlterPartitionCmd *) cmd->def;
+
 		Insist(IsA(apc, AlterPartitionCmd));
-		cmd = (AlterTableCmd*)apc->arg1;
+		cmd = (AlterTableCmd *) apc->arg1;
 		Insist(IsA(cmd, AlterTableCmd));
 	}
 	return cmd;
@@ -8053,10 +7536,11 @@ AlterTableCmd *basic_AT_cmd(AlterTableCmd *cmd)
  * rel              Pointer to cache entry for the whole partitioned table
  * dist_cnames      List of column names proposed for distribution some part
  */
-bool can_implement_dist_on_part(Relation rel, List *dist_cnames)
+bool
+can_implement_dist_on_part(Relation rel, DistributedBy *dist)
 {
-	ListCell *lc;
-	int i;
+	ListCell	*lc;
+	int		i;
 
 	if (Gp_role != GP_ROLE_DISPATCH)
 	{
@@ -8066,40 +7550,42 @@ bool can_implement_dist_on_part(Relation rel, List *dist_cnames)
 	}
 
 	/* Random is okay.  It is represented by a list of one empty list. */
-	if ( list_length(dist_cnames) == 1 && linitial(dist_cnames) == NIL )
+	if (dist->ptype == POLICYTYPE_PARTITIONED && dist->keyCols == NIL)
 		return true;
 
+	if (dist->ptype == POLICYTYPE_REPLICATED)
+		return false;
+
 	/* Require an exact match to the policy of the parent. */
-	if ( list_length(dist_cnames) != rel->rd_cdbpolicy->nattrs )
+	if (list_length(dist->keyCols) != rel->rd_cdbpolicy->nattrs)
 		return false;
 
 	i = 0;
-	foreach(lc, dist_cnames)
+	foreach(lc, dist->keyCols)
 	{
-		AttrNumber     attnum;
-		char *cname;
-		HeapTuple tuple;
-		Node *item = lfirst(lc);
-		bool ok = false;
+		DistributionKeyElem *dkelem = (DistributionKeyElem *) lfirst(lc);
+		AttrNumber	attnum;
+		HeapTuple	tuple;
+		bool		ok = false;
 
-		if ( !(item && IsA(item, String)) )
-			return false;
+		Assert(IsA(dkelem, DistributionKeyElem));
 
-		cname = strVal((Value *)item);
-		tuple = SearchSysCacheAttName(RelationGetRelid(rel), cname);
+		tuple = SearchSysCacheAttName(RelationGetRelid(rel), dkelem->name);
 		if (!HeapTupleIsValid(tuple))
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_COLUMN),
 					 errmsg("column \"%s\" of relation \"%s\" does not exist",
-							cname,
+							dkelem->name,
 							RelationGetRelationName(rel))));
 
 		attnum = ((Form_pg_attribute) GETSTRUCT(tuple))->attnum;
-		ok = attnum == rel->rd_cdbpolicy->attrs[i++];
+
+		if (attnum == rel->rd_cdbpolicy->attrs[i++])
+			ok = true;
 
 		ReleaseSysCache(tuple);
 
-		if ( ! ok )
+		if (!ok)
 			return false;
 	}
 	return true;
@@ -8118,55 +7604,73 @@ bool can_implement_dist_on_part(Relation rel, List *dist_cnames)
 bool
 is_exchangeable(Relation rel, Relation oldrel, Relation newrel, bool throw)
 {
-	AttrMap *map_new = NULL;
-	AttrMap *map_old = NULL;
-	bool congruent = TRUE;
+	TupleConversionMap *map_new = NULL;
+	TupleConversionMap *map_old = NULL;
+	bool		old_is_external;
+	bool		new_is_external;
+	bool		old_is_exchangeable;
+	bool		new_is_exchangeable;
+	bool		congruent = TRUE;
 
 	/* Both parts must be relations. */
-	if (!(oldrel->rd_rel->relkind == RELKIND_RELATION ||
-		  newrel->rd_rel->relkind == RELKIND_RELATION))
+	old_is_external = (oldrel->rd_rel->relkind == RELKIND_FOREIGN_TABLE &&
+					   rel_is_external_table(RelationGetRelid(oldrel)));
+	new_is_external = (newrel->rd_rel->relkind == RELKIND_FOREIGN_TABLE &&
+					   rel_is_external_table(RelationGetRelid(newrel)));
+	old_is_exchangeable = (oldrel->rd_rel->relkind == RELKIND_RELATION || old_is_external);
+	new_is_exchangeable = (newrel->rd_rel->relkind == RELKIND_RELATION || new_is_external);
+	if (!(old_is_exchangeable || new_is_exchangeable))
 	{
 		congruent = FALSE;
-		if ( throw )
+		if (throw)
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
 					 errmsg("cannot exchange relation "
 							"which is not a table")));
 	}
 
-	if (RelationIsExternal(newrel))
+	if(oldrel->rd_rel->relpersistence != newrel->rd_rel->relpersistence)
+	{
+		congruent = FALSE;
+		if (throw)
+			ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					errmsg("cannot exchange relations with differing persistence types")));
+	}
+
+	if (new_is_external)
 	{
 		if (rel_is_default_partition(oldrel->rd_id))
 		{
 			congruent = FALSE;
-			if ( throw )
+			if (throw)
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("cannot exchange DEFAULT partition "
-								"with external table")));
+						 errmsg("cannot exchange DEFAULT partition with external table")));
 		}
 
 		ExtTableEntry *extEntry = GetExtTableEntry(newrel->rd_id);
+
 		if (extEntry && extEntry->iswritable)
 		{
 			congruent = FALSE;
-			if ( throw )
+			if (throw)
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("cannot exchange relation "
-								"which is a WRITABLE external table")));
+						 errmsg("cannot exchange relation which is a WRITABLE external table")));
 		}
 	}
- 
-	/* Attributes of the existing part (oldrel) must be compatible with the
+
+	/*
+	 * Attributes of the existing part (oldrel) must be compatible with the
 	 * partitioned table as a whole.  This might be an assertion, but we don't
 	 * want this case to pass in a production build, so we use an internal
 	 * error.
 	 */
-	if (congruent && ! map_part_attrs(rel, oldrel, &map_old, FALSE) )
+	if (congruent && !map_part_attrs(rel, oldrel, &map_old, FALSE))
 	{
 		congruent = FALSE;
-		if ( throw )
+		if (throw)
 			elog(ERROR, "existing part \"%s\" not congruent with"
 				 "partitioned table \"%s\"",
 				 RelationGetRelationName(oldrel),
@@ -8175,21 +7679,21 @@ is_exchangeable(Relation rel, Relation oldrel, Relation newrel, bool throw)
 
 	/* From here on we need to be careful to free the maps. */
 
-	/* Attributes of new part must be compatible with the partitioned table.
+	/*
+	 * Attributes of new part must be compatible with the partitioned table.
 	 * (We assume that the attributes of the old part are compatible.)
 	 */
-	if ( congruent && ! map_part_attrs(rel, newrel, &map_new, throw) )
+	if (congruent && !map_part_attrs(rel, newrel, &map_new, throw))
 		congruent = FALSE;
 
 	/* Both parts must have the same owner. */
-	if ( congruent && oldrel->rd_rel->relowner != newrel->rd_rel->relowner)
+	if (congruent && oldrel->rd_rel->relowner != newrel->rd_rel->relowner)
 	{
 		congruent = FALSE;
-		if ( throw )
+		if (throw)
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("owner of \"%s\" must be the same as that "
-							"of \"%s\"",
+					 errmsg("owner of \"%s\" must be the same as that of \"%s\"",
 							RelationGetRelationName(newrel),
 							RelationGetRelationName(rel))));
 	}
@@ -8198,7 +7702,7 @@ is_exchangeable(Relation rel, Relation oldrel, Relation newrel, bool throw)
 	if (congruent && oldrel->rd_rel->relhasoids != newrel->rd_rel->relhasoids)
 	{
 		congruent = FALSE;
-		if ( throw )
+		if (throw)
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
 					 errmsg("\"%s\" and \"%s\" must have same OIDs setting",
@@ -8207,67 +7711,65 @@ is_exchangeable(Relation rel, Relation oldrel, Relation newrel, bool throw)
 	}
 
 	/* The new part table must not be involved in inheritance. */
-	if ( congruent && has_subclass_fast(RelationGetRelid(newrel)))
+	if (congruent && has_subclass(RelationGetRelid(newrel)))
 	{
 		congruent = FALSE;
-		if ( throw )
+		if (throw)
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("cannot EXCHANGE table \"%s\" as it has "
-							"child table(s)",
+					 errmsg("cannot EXCHANGE table \"%s\" as it has child table(s)",
 							RelationGetRelationName(newrel))));
 	}
 
 	if (congruent && relation_has_supers(RelationGetRelid(newrel)))
 	{
 		congruent = FALSE;
-		if ( throw )
+		if (throw)
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("cannot exchange table \"%s\" as it "
-							"inherits other table(s)",
+					 errmsg("cannot exchange table \"%s\" as it inherits other table(s)",
 							RelationGetRelationName(newrel))));
 	}
 
 	/* The new part table must not have rules on it. */
-	if ( congruent && ( newrel->rd_rules || oldrel->rd_rules ) )
+	if (congruent && (newrel->rd_rules || oldrel->rd_rules))
 	{
 		congruent = FALSE;
-		if ( throw )
+		if (throw)
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("cannot exchange table which has rules "
-							"defined on it")));
+					 errmsg("cannot exchange table which has rules defined on it")));
 	}
 
-	/* The distribution policies of the existing part (oldpart) and the
+	/*
+	 * The distribution policies of the existing part (oldpart) and the
 	 * candidate part (newpart) must match that of the whole partitioned
 	 * table.  However, we can only check this where the policy table is
-	 * populated, i.e., on the entry database.  Note checking the policy
-	 * of the existing part is defensive.  It SHOULD match.
-	 * Skip the check when either the oldpart or the newpart is external. 
+	 * populated, i.e., on the entry database.  Note checking the policy of
+	 * the existing part is defensive.  It SHOULD match. Skip the check when
+	 * either the oldpart or the newpart is external.
 	 */
 	if (congruent && Gp_role == GP_ROLE_DISPATCH &&
-	    !RelationIsExternal(newrel) && !RelationIsExternal(oldrel))
+		!new_is_external && !old_is_external)
 	{
-		GpPolicy *parpol = rel->rd_cdbpolicy;
-		GpPolicy *oldpol = oldrel->rd_cdbpolicy;
-		GpPolicy *newpol = newrel->rd_cdbpolicy;
-		GpPolicy *adjpol = NULL;
+		GpPolicy   *parpol = rel->rd_cdbpolicy;
+		GpPolicy   *oldpol = oldrel->rd_cdbpolicy;
+		GpPolicy   *newpol = newrel->rd_cdbpolicy;
+		GpPolicy   *adjpol = NULL;
 
-		if ( map_old != NULL )
+		if (map_old != NULL)
 		{
-			int i;
-			AttrNumber remapped_parent_attr = 0;
+			int			i;
+			AttrNumber	remapped_parent_attr = 0;
 
-			for ( i = 0; i < parpol->nattrs; i++ )
+			for (i = 0; i < parpol->nattrs; i++)
 			{
 				remapped_parent_attr = attrMap(map_old, parpol->attrs[i]);
 
-				if ( ! (parpol->attrs[i] > 0  /* assert parent live */
-						&& oldpol->attrs[i] > 0   /* assert old part live */
-						&& remapped_parent_attr == oldpol->attrs[i] /* assert match */
-						))
+				if (!(parpol->attrs[i] > 0	/* assert parent live */
+					  && oldpol->attrs[i] > 0	/* assert old part live */
+					  && remapped_parent_attr == oldpol->attrs[i]	/* assert match */
+					  ))
 					elog(ERROR,
 						 "discrepancy in partitioning policy of \"%s\"",
 						 RelationGetRelationName(rel));
@@ -8275,21 +7777,22 @@ is_exchangeable(Relation rel, Relation oldrel, Relation newrel, bool throw)
 		}
 		else
 		{
-			if (! GpPolicyEqual(parpol, oldpol) )
+			if (!GpPolicyEqual(parpol, oldpol))
 				elog(ERROR,
 					 "discrepancy in partitioning policy of \"%s\"",
 					 RelationGetRelationName(rel));
 		}
 
-		if ( map_new != NULL )
+		if (map_new != NULL)
 		{
-			int i;
-			adjpol = GpPolicyCopy(CurrentMemoryContext, parpol);
+			int			i;
 
-			for ( i = 0; i < adjpol->nattrs; i++ )
+			adjpol = GpPolicyCopy(parpol);
+
+			for (i = 0; i < adjpol->nattrs; i++)
 			{
 				adjpol->attrs[i] = attrMap(map_new, parpol->attrs[i]);
-				Assert(newpol->attrs[i] > 0); /* check new part */
+				Assert(newpol->attrs[i] > 0);	/* check new part */
 			}
 		}
 		else
@@ -8297,14 +7800,13 @@ is_exchangeable(Relation rel, Relation oldrel, Relation newrel, bool throw)
 			adjpol = parpol;
 		}
 
-		if (! GpPolicyEqual(adjpol, newpol) )
+		if (!GpPolicyEqual(adjpol, newpol))
 		{
 			congruent = FALSE;
-			if ( throw )
+			if (throw)
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("distribution policy for \"%s\" "
-								"must be the same as that for \"%s\"",
+						 errmsg("distribution policy for \"%s\" must be the same as that for \"%s\"",
 								RelationGetRelationName(newrel),
 								RelationGetRelationName(rel))));
 		}
@@ -8312,15 +7814,17 @@ is_exchangeable(Relation rel, Relation oldrel, Relation newrel, bool throw)
 								 sizeof(AttrNumber) * adjpol->nattrs))
 		{
 			congruent = FALSE;
-			if ( throw )
+			if (throw)
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
 						 errmsg("distribution policy matches but implementation lags")));
 		}
 	}
 
-	if ( map_old != NULL ) pfree(map_old);
-	if ( map_new != NULL ) pfree(map_new);
+	if (map_old != NULL)
+		pfree(map_old);
+	if (map_new != NULL)
+		pfree(map_new);
 
 	return congruent;
 }
@@ -8340,19 +7844,19 @@ is_exchangeable(Relation rel, Relation oldrel, Relation newrel, bool throw)
  * be supplied via this argument.
  */
 static NewConstraint *
-constraint_apply_mapped(HeapTuple tuple, AttrMap *map, Relation cand,
-						bool validate, bool is_split, Relation pgcon)
+constraint_apply_mapped(HeapTuple tuple, TupleConversionMap *map, Relation cand,
+						bool validate, Relation pgcon)
 {
-	Datum val;
-	bool isnull;
-	Datum *dats;
-	int16 *keys;
-	int nkeys;
-	int i;
-	Node *conexpr;
-	char *consrc;
-	char *conbin;
-	Form_pg_constraint con = (Form_pg_constraint)GETSTRUCT(tuple);
+	Datum		val;
+	bool		isnull;
+	Datum	   *dats;
+	int16	   *keys;
+	int			nkeys;
+	int			i;
+	Node	   *conexpr;
+	char	   *consrc;
+	char	   *conbin;
+	Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tuple);
 	NewConstraint *newcon = NULL;
 
 	/* Translate pg_constraint.conkey */
@@ -8367,16 +7871,17 @@ constraint_apply_mapped(HeapTuple tuple, AttrMap *map, Relation cand,
 	keys = palloc(sizeof(int16) * nkeys);
 	for (i = 0; i < nkeys; i++)
 	{
-		int16 key =  DatumGetInt16(dats[i]);
-		keys[i] = (int16)attrMap(map, key);
+		int16		key = DatumGetInt16(dats[i]);
+
+		keys[i] = (int16) attrMap(map, key);
 	}
 
 	/* Translate pg_constraint.conbin */
 	val = heap_getattr(tuple, Anum_pg_constraint_conbin,
 					   RelationGetDescr(pgcon), &isnull);
-	if ( !isnull )
+	if (!isnull)
 	{
-		conbin = DatumGetCString(DirectFunctionCall1(textout, val));
+		conbin = TextDatumGetCString(val);
 		conexpr = stringToNode(conbin);
 		conexpr = attrMapExpr(map, conexpr);
 		conbin = nodeToString(conexpr);
@@ -8393,7 +7898,7 @@ constraint_apply_mapped(HeapTuple tuple, AttrMap *map, Relation cand,
 					   RelationGetDescr(pgcon), &isnull);
 	if (!isnull)
 	{
-		consrc = DatumGetCString(DirectFunctionCall1(textout, val));
+		consrc = TextDatumGetCString(val);
 	}
 	else
 	{
@@ -8401,161 +7906,170 @@ constraint_apply_mapped(HeapTuple tuple, AttrMap *map, Relation cand,
 	}
 
 	/* Apply translated constraint to candidate. */
-	switch ( con->contype )
+	switch (con->contype)
 	{
 		case CONSTRAINT_CHECK:
-		{
-			Assert( conexpr && conbin && consrc );
+			{
+				Assert(conexpr && conbin && consrc);
 
-			CreateConstraintEntry(NameStr(con->conname),
-								  con->connamespace, // XXX should this be RelationGetNamespace(cand)?
-								  con->contype,
-								  con->condeferrable,
-								  con->condeferred,
-								  RelationGetRelid(cand),
-								  keys,
-								  nkeys,
-								  InvalidOid,
-								  InvalidOid,
-								  NULL,
-								  NULL,
-								  NULL,
-								  NULL,
-								  0,
-								  ' ',
-								  ' ',
-								  ' ',
-								  InvalidOid,
-								  conexpr,
-								  conbin,
-								  consrc);
-			break;
-		}
+				CreateConstraintEntry(NameStr(con->conname),
+									  con->connamespace, // XXX should this be RelationGetNamespace(cand)?
+									  con->contype,
+									  con->condeferrable,
+									  con->condeferred,
+									  con->convalidated,
+									  RelationGetRelid(cand),
+									  keys,
+									  nkeys,
+									  InvalidOid,
+									  InvalidOid,
+									  InvalidOid,
+									  NULL,
+									  NULL,
+									  NULL,
+									  NULL,
+									  0,
+									  ' ',
+									  ' ',
+									  ' ',
+									  NULL,		/* exclOp */
+									  conexpr,
+									  conbin,
+									  consrc,
+									  con->conislocal,
+									  con->coninhcount,
+									  false, /* conNoInherit */
+									  true /* is_internal */);
+				break;
+			}
 
 		case CONSTRAINT_FOREIGN:
-		{
-			int16 *fkeys;
-			int nfkeys;
-			Oid indexoid = InvalidOid;
-			Oid *opclasses = NULL;
-			Relation frel;
-
-			val = heap_getattr(tuple, Anum_pg_constraint_confkey,
-							   RelationGetDescr(pgcon), &isnull);
-			Assert(!isnull);
-
-			deconstruct_array(DatumGetArrayTypeP(val),
-							  INT2OID, 2, true, 's',
-							  &dats, NULL, &nfkeys);
-			fkeys = palloc(sizeof(int16) * nfkeys);
-			for (i = 0; i < nfkeys; i++)
 			{
-				fkeys[i] =  DatumGetInt16(dats[i]);
+				int16	   *fkeys;
+				int			nfkeys;
+				Oid			indexoid = InvalidOid;
+				Oid		   *opclasses = NULL;
+				Relation	frel;
+
+				val = heap_getattr(tuple, Anum_pg_constraint_confkey,
+								   RelationGetDescr(pgcon), &isnull);
+				Assert(!isnull);
+
+				deconstruct_array(DatumGetArrayTypeP(val),
+								  INT2OID, 2, true, 's',
+								  &dats, NULL, &nfkeys);
+				fkeys = palloc(sizeof(int16) * nfkeys);
+				for (i = 0; i < nfkeys; i++)
+				{
+					fkeys[i] = DatumGetInt16(dats[i]);
+				}
+
+				frel = heap_open(con->confrelid, AccessExclusiveLock);
+				indexoid = transformFkeyCheckAttrs(frel, nfkeys, fkeys, opclasses);
+
+				CreateConstraintEntry(NameStr(con->conname),
+									  RelationGetNamespace(cand),
+									  con->contype,
+									  con->condeferrable,
+									  con->condeferred,
+									  con->convalidated,
+									  RelationGetRelid(cand),
+									  keys,
+									  nkeys,
+									  InvalidOid,
+									  indexoid,
+									  con->confrelid,
+									  fkeys,
+									  NULL,
+									  NULL,
+									  NULL,
+									  nfkeys,
+									  con->confupdtype,
+									  con->confdeltype,
+									  con->confmatchtype,
+									  NULL,		/* exclOp */
+									  NULL,		/* no check constraint */
+									  NULL,
+									  NULL,
+									  con->conislocal,
+									  con->coninhcount,
+									  true, /* conNoInherit */
+									  true /* is_internal */);
+
+				heap_close(frel, AccessExclusiveLock);
+				break;
 			}
-
-			frel = heap_open(con->confrelid, AccessExclusiveLock);
-			indexoid = transformFkeyCheckAttrs(frel, nfkeys, fkeys, opclasses);
-
-			CreateConstraintEntry(NameStr(con->conname),
-								  RelationGetNamespace(cand),
-								  con->contype,
-								  con->condeferrable,
-								  con->condeferred,
-								  RelationGetRelid(cand),
-								  keys,
-								  nkeys,
-								  InvalidOid,
-								  con->confrelid,
-								  fkeys,
-								  NULL,
-								  NULL,
-								  NULL,
-								  nfkeys,
-								  con->confupdtype,
-								  con->confdeltype,
-								  con->confmatchtype,
-								  indexoid,
-								  NULL,		/* no check constraint */
-								  NULL,
-								  NULL);
-
-			heap_close(frel, AccessExclusiveLock);
-			break;
-		}
 		case CONSTRAINT_PRIMARY:
 		case CONSTRAINT_UNIQUE:
-		{
-			/* Index-backed constraints are handled as indexes.  No action here. */
-			char *what = (con->contype == CONSTRAINT_PRIMARY)? "PRIMARY KEY" :"UNIQUE";
-			char *who = NameStr(con->conname);
+			{
+				/*
+				 * Index-backed constraints are handled as indexes.  No action
+				 * here.
+				 */
+				char	   *what = (con->contype == CONSTRAINT_PRIMARY) ? "PRIMARY KEY" : "UNIQUE";
+				char	   *who = NameStr(con->conname);
 
-			if (is_split)
-			{
-				; /* nothing */
-			}
-			else if (validate)
-			{
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("%s constraint \"%s\" missing", what, who),
-						 errhint("Add %s constraint \"%s\" to the candidate table"
-								 " or drop it from the partitioned table."
-								 , what, who)));
-			}
-			else
-			{
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("WITHOUT VALIDATION incompatible with missing %s constraint \"%s\"",
-								what, who),
-						 errhint("Add %s constraint %s to the candidate table"
-								 " or drop it from the partitioned table."
-								 , what, who)));
+				if (validate)
+				{
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("%s constraint \"%s\" missing", what, who),
+							 errhint("Add %s constraint \"%s\" to the candidate table or drop it from the partitioned table.",
+									 what, who)));
+				}
+				else
+				{
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("WITHOUT VALIDATION incompatible with missing %s constraint \"%s\"",
+									what, who),
+							 errhint("Add %s constraint %s to the candidate table or drop it from the partitioned table.",
+									 what, who)));
 
+				}
+				break;
 			}
-			break;
-		}
 		default:
 			/* Defensive, can't occur. */
-			elog(ERROR,"invalid constraint type: %c", con->contype);
+			elog(ERROR, "invalid constraint type: %c", con->contype);
 			break;
 	}
 
 	newcon = NULL;
 
-	if ( validate )
+	if (validate)
 	{
-		switch ( con->contype )
+		switch (con->contype)
 		{
 			case CONSTRAINT_CHECK:
-			{
-				newcon = (NewConstraint*) palloc0(sizeof(NewConstraint));
-				newcon->name = pstrdup(NameStr(con->conname));
-				/* ExecQual wants implicit-AND format */
-				newcon->qual = (Node *)make_ands_implicit((Expr *)conexpr);
-				newcon->contype = CONSTR_CHECK;
-				break;
-			}
+				{
+					newcon = (NewConstraint *) palloc0(sizeof(NewConstraint));
+					newcon->name = pstrdup(NameStr(con->conname));
+					/* ExecQual wants implicit-AND format */
+					newcon->qual = (Node *) make_ands_implicit((Expr *) conexpr);
+					newcon->contype = CONSTR_CHECK;
+					break;
+				}
 			case CONSTRAINT_FOREIGN:
-			{
-				elog(WARNING, "Won't enforce FK constraint.");
-				break;
-			}
+				{
+					elog(WARNING, "Won't enforce FK constraint.");
+					break;
+				}
 			case CONSTRAINT_PRIMARY:
-			{
-				elog(WARNING, "Won't enforce PK constraint.");
-				break;
-			}
+				{
+					elog(WARNING, "Won't enforce PK constraint.");
+					break;
+				}
 			case CONSTRAINT_UNIQUE:
-			{
-				elog(WARNING, "Won't enforce ND constraint.");
-				break;
-			}
+				{
+					elog(WARNING, "Won't enforce ND constraint.");
+					break;
+				}
 			default:
-			{
-				elog(WARNING, "!! NOT READY FOR TYPE %c CONSTRAINT !!", con->contype);
-				break;
-			}
+				{
+					elog(WARNING, "!! NOT READY FOR TYPE %c CONSTRAINT !!", con->contype);
+					break;
+				}
 		}
 	}
 	return newcon;
@@ -8565,7 +8079,7 @@ constraint_apply_mapped(HeapTuple tuple, AttrMap *map, Relation cand,
 static bool
 relation_has_supers(Oid relid)
 {
-	ScanKeyData	scankey;
+	ScanKeyData scankey;
 	Relation	rel;
 	SysScanDesc sscan;
 	bool		result;
@@ -8577,7 +8091,7 @@ relation_has_supers(Oid relid)
 				ObjectIdGetDatum(relid));
 
 	sscan = systable_beginscan(rel, InheritsRelidSeqnoIndexId, true,
-							   SnapshotNow, 1, &scankey);
+							   NULL, 1, &scankey);
 
 	result = (systable_getnext(sscan) != NULL);
 
@@ -8600,41 +8114,40 @@ relation_has_supers(Oid relid)
 void
 fixCreateStmtForPartitionedTable(CreateStmt *stmt)
 {
-	ListCell *lc_elt;
+	ListCell   *lc_elt;
 	Constraint *con;
-	List *unnamed_cons = NIL;
-	List *unnamed_cons_col = NIL;
-	List *unnamed_cons_lbl = NIL;
-	List *used_names = NIL;
-	char *no_name = "";
-	int i;
+	List	   *unnamed_cons = NIL;
+	List	   *unnamed_cons_col = NIL;
+	List	   *unnamed_cons_lbl = NIL;
+	List	   *used_names = NIL;
+	char	   *no_name = "";
+	int			i;
 
 	/* Caller should check this! */
 	Assert(stmt->partitionBy && !stmt->is_part_child);
 
-	foreach( lc_elt, stmt->tableElts )
+	foreach(lc_elt, stmt->tableElts)
 	{
-		Node * elt = lfirst(lc_elt);
+		Node	   *elt = lfirst(lc_elt);
 
 		switch (nodeTag(elt))
 		{
 			case T_ColumnDef:
-			{
-				ListCell *lc_con;
-
-				ColumnDef *cdef = (ColumnDef*)elt;
-
-				foreach( lc_con, cdef->constraints )
 				{
-					Node *conelt = lfirst(lc_con);
+					ListCell   *lc_con;
 
-					if ( IsA(conelt, Constraint) )
+					ColumnDef  *cdef = (ColumnDef *) elt;
+
+					foreach(lc_con, cdef->constraints)
 					{
-						con = (Constraint*)conelt;
+						Node	   *conelt = lfirst(lc_con);
+						con = (Constraint *) conelt;
 
-						if ( con->name )
+						Assert(IsA(conelt, Constraint));
+
+						if (con->conname)
 						{
-							used_names = lappend(used_names, con->name);
+							used_names = lappend(used_names, con->conname);
 							continue;
 						}
 						switch (con->contype)
@@ -8654,127 +8167,82 @@ fixCreateStmtForPartitionedTable(CreateStmt *stmt)
 								unnamed_cons_col = lappend(unnamed_cons_col, cdef->colname);
 								unnamed_cons_lbl = lappend(unnamed_cons_lbl, "key");
 								break;
+							case CONSTR_FOREIGN:
+								unnamed_cons = lappend(unnamed_cons, con);
+								unnamed_cons_col = lappend(unnamed_cons_col, cdef->colname);
+								unnamed_cons_lbl = lappend(unnamed_cons_lbl, "fkey");
+								break;
 							default:
 								break;
 						}
 					}
+					break;
+				}
+			case T_Constraint:
+				{
+					con = (Constraint *) elt;
+
+					if (con->conname)
+					{
+						used_names = lappend(used_names, con->conname);
+					}
 					else
 					{
-						FkConstraint *fkcon = (FkConstraint*)conelt;
-
-						Insist( IsA(fkcon, FkConstraint) );
-
-						if ( fkcon->constr_name )
+						switch (con->contype)
 						{
-							used_names = lappend(used_names, fkcon->constr_name);
-							continue;
+							case CONSTR_CHECK:
+								unnamed_cons = lappend(unnamed_cons, con);
+								unnamed_cons_col = lappend(unnamed_cons_col, no_name);
+								unnamed_cons_lbl = lappend(unnamed_cons_lbl, "check");
+								break;
+							case CONSTR_PRIMARY:
+								unnamed_cons = lappend(unnamed_cons, con);
+								unnamed_cons_col = lappend(unnamed_cons_col, no_name);
+								unnamed_cons_lbl = lappend(unnamed_cons_lbl, "pkey");
+								break;
+							case CONSTR_UNIQUE:
+								unnamed_cons = lappend(unnamed_cons, con);
+								unnamed_cons_col = lappend(unnamed_cons_col, no_name);
+								unnamed_cons_lbl = lappend(unnamed_cons_lbl, "key");
+								break;
+							case CONSTR_FOREIGN:
+								unnamed_cons = lappend(unnamed_cons, con);
+								unnamed_cons_col = lappend(unnamed_cons_col, no_name);
+								unnamed_cons_lbl = lappend(unnamed_cons_lbl, "fkey");
+							default:
+								break;
 						}
-
-						unnamed_cons = lappend(unnamed_cons, fkcon);
-						unnamed_cons_col = lappend(unnamed_cons_col, cdef->colname);
-						unnamed_cons_lbl = lappend(unnamed_cons_lbl, "fkey");
 					}
+					break;
 				}
-				break;
-			}
-			case T_Constraint:
-			{
-				con = (Constraint*)elt;
-
-				if ( con->name )
+			case T_TableLikeClause:
 				{
-					used_names = lappend(used_names, con->name);
+					break;
 				}
-				else
-				{
-					switch (con->contype)
-					{
-						case CONSTR_CHECK:
-							unnamed_cons = lappend(unnamed_cons, con);
-							unnamed_cons_col = lappend(unnamed_cons_col, no_name);
-							unnamed_cons_lbl = lappend(unnamed_cons_lbl, "check");
-							break;
-						case CONSTR_PRIMARY:
-							unnamed_cons = lappend(unnamed_cons, con);
-							unnamed_cons_col = lappend(unnamed_cons_col, no_name);
-							unnamed_cons_lbl = lappend(unnamed_cons_lbl, "pkey");
-							break;
-						case CONSTR_UNIQUE:
-							unnamed_cons = lappend(unnamed_cons, con);
-							unnamed_cons_col = lappend(unnamed_cons_col, no_name);
-							unnamed_cons_lbl = lappend(unnamed_cons_lbl, "key");
-							break;
-						default:
-							break;
-					}
-				}
-				break;
-			}
-			case T_FkConstraint:
-			{
-				FkConstraint *fkcon = (FkConstraint*)elt;
-
-				unnamed_cons = lappend(unnamed_cons, fkcon);
-				unnamed_cons_col = lappend(unnamed_cons_col, no_name);
-				unnamed_cons_lbl = lappend(unnamed_cons_lbl, "fkey");
-
-				if ( fkcon->constr_name )
-				{
-					used_names = lappend(used_names, fkcon->constr_name);
-				}
-				break;
-			}
-			case T_InhRelation:
-			{
-				break;
-			}
 			default:
 				break;
 		}
 	}
 
-	used_names = list_union(used_names, NIL); /* eliminate dups */
+	used_names = list_union(used_names, NIL);	/* eliminate dups */
 
-	for ( i = 0; i < list_length(unnamed_cons); i++ )
+	for (i = 0; i < list_length(unnamed_cons); i++)
 	{
-		char *label = list_nth(unnamed_cons_lbl, i);
-		char *colname = NULL;
-		Node *elt = list_nth(unnamed_cons, i);
+		char	   *label = list_nth(unnamed_cons_lbl, i);
+		char	   *colname = NULL;
+		Constraint *con = list_nth(unnamed_cons, i);
 
-		switch ( nodeTag(elt) )
-		{
-			case T_FkConstraint:
-			{
-				FkConstraint *fcon = list_nth(unnamed_cons, i);
+		Assert(IsA(con, Constraint));
 
-				fcon->constr_name =
-					ChooseConstraintNameForPartitionCreate(stmt->relation->relname,
-														   colname,
-														   label,
-														   used_names);
-				used_names = lappend(used_names, fcon->constr_name);
-				break;
-			}
+		/* Conventionally, no column name for PK. */
+		if (0 != strcmp(label, "pkey"))
+			colname = list_nth(unnamed_cons_col, i);
 
-			case T_Constraint:
-			{
-				Constraint *con = list_nth(unnamed_cons, i);
-
-				/* Conventionally, no column name for PK. */
-				if ( 0 != strcmp(label, "pkey") )
-					colname = list_nth(unnamed_cons_col, i);
-
-				con->name = ChooseConstraintNameForPartitionCreate(stmt->relation->relname,
-																   colname,
-																   label,
-																   used_names);
-				used_names = lappend(used_names,con->name);
-
-				break;
-			}
-			default:
-				break;
-		}
+		con->conname = ChooseConstraintNameForPartitionCreate(stmt->relation->relname,
+															  colname,
+															  label,
+															  used_names);
+		used_names = lappend(used_names, con->conname);
 	}
 }
 
@@ -8801,16 +8269,16 @@ ChooseConstraintNameForPartitionCreate(const char *rname,
 									   const char *label,
 									   List *used_names)
 {
-	int pass = 0;
-	char *conname = NULL;
-	char modlabel[NAMEDATALEN];
-	bool found = false;
-	ListCell *lc;
+	int			pass = 0;
+	char	   *conname = NULL;
+	char		modlabel[NAMEDATALEN];
+	bool		found = false;
+	ListCell   *lc;
 
 	Assert(rname && *rname);
 
 	/* Allow caller to pass "" instead of NULL for non-singular cname */
-	if ( cname && *cname == '\0' )
+	if (cname && *cname == '\0')
 		cname = NULL;
 
 	/* try the unmodified label first */
@@ -8823,14 +8291,14 @@ ChooseConstraintNameForPartitionCreate(const char *rname,
 
 		foreach(lc, used_names)
 		{
-			if (strcmp((char*)lfirst(lc), conname) == 0)
+			if (strcmp((char *) lfirst(lc), conname) == 0)
 			{
 				found = true;
 				break;
 			}
 		}
-		if ( ! found )
-			break;  /* we have a winner */
+		if (!found)
+			break;				/* we have a winner */
 
 		pfree(conname);
 		snprintf(modlabel, sizeof(modlabel), "%s%d", label, ++pass);
@@ -8844,53 +8312,71 @@ ChooseConstraintNameForPartitionCreate(const char *rname,
  * an error.  The argument primary just conditions the message text.
  */
 void
-checkUniqueConstraintVsPartitioning(Relation rel, AttrNumber *indattr, int nidxatts, bool primary)
+index_check_partitioning_compatible(Relation rel,
+									AttrNumber *indattr, Oid *exclops, int nidxatts,
+									bool primary)
 {
-	int i;
-	bool contains;
-	Bitmapset *ikey = NULL;
-	Bitmapset *pkey = get_partition_key_bitmapset(RelationGetRelid(rel));
+	int			i;
+	Bitmapset  *ikey;
+	Bitmapset  *pkey;
 
+	if (exclops)
+	{
+		/*
+		 * For now, don't allow exclusion constraints on partitioned tables at
+		 * all.
+		 *
+		 * XXX: There's no fundamental reason they couldn't be made to work.
+		 * As long as the index contains all the partitioning key columns,
+		 * with the equality operators as the exclusion operators, they would
+		 * work. These are the same conditions as with compatibility with
+		 * distribution keys. But the code to check that hasn't been written
+		 * yet.
+		 */
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("exclusion constraints are not supported on partitioned tables")));
+	}
+
+	ikey = NULL;
 	for (i = 0; i < nidxatts; i++)
 		ikey = bms_add_member(ikey, indattr[i]);
 
-	contains = bms_is_subset(pkey, ikey);
+	pkey = get_partition_key_bitmapset(RelationGetRelid(rel));
 
-	if (pkey)
-		bms_free(pkey);
-	if (ikey)
-		bms_free(ikey);
-
-	if (! contains )
+	if (!bms_is_subset(pkey, ikey))
 	{
-		char *what = "UNIQUE";
+		char	   *what = "UNIQUE";
 
-		if ( primary )
+		if (primary)
 			what = "PRIMARY KEY";
 
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("%s constraint must contain all columns in the "
-						"partition key of relation \"%s\".",
+				 errmsg("%s constraint must contain all columns in the partition key of relation \"%s\"",
 						what, RelationGetRelationName(rel)),
 				 errhint("Include the partition key or create a part-wise UNIQUE index instead.")));
 	}
+
+	bms_free(pkey);
+	bms_free(ikey);
 }
 
 /**
  * Does a partition node correspond to a leaf partition?
  */
-static bool IsLeafPartitionNode(PartitionNode *p)
+static bool
+IsLeafPartitionNode(PartitionNode *p)
 {
 	Assert(p);
 
 	/**
 	 * If all of the rules have no children, this is a leaf partition.
 	 */
-	ListCell *lc = NULL;
-	foreach (lc, p->rules)
+	for (int i = 0; i < p->num_rules; i++)
 	{
-		PartitionRule *rule = (PartitionRule *) lfirst(lc);
+		PartitionRule *rule = p->rules[i];
+
 		if (rule->children)
 		{
 			return false;
@@ -8901,7 +8387,7 @@ static bool IsLeafPartitionNode(PartitionNode *p)
 	 * If default partition has children then, this is not a leaf
 	 */
 	if (p->default_part
-				&& p->default_part->children)
+		&& p->default_part->children)
 	{
 		return false;
 	}
@@ -8912,18 +8398,20 @@ static bool IsLeafPartitionNode(PartitionNode *p)
 /*
  * Given a partition node, return all the associated rules, including the default partition rule if present
  */
-static List*
+static List *
 get_partition_rules(PartitionNode *pn)
 {
 	Assert(pn);
 
-	List *result = NIL;
+	List	   *result = NIL;
+
 	if (pn->default_part)
 	{
 		result = lappend(result, pn->default_part);
 	}
 
-	result = list_concat(result, pn->rules);
+	for (int i = 0; i < pn->num_rules; i++)
+		result = lappend(result, pn->rules[i]);
 
 	return result;
 }
@@ -8936,17 +8424,17 @@ get_partition_rules(PartitionNode *pn)
  * Output:
  *	List of partition nodes corresponding to its children across all rules.
  */
-static List *PartitionChildren(PartitionNode *p)
+static List *
+PartitionChildren(PartitionNode *p)
 {
 	Assert(p);
 	Assert(!IsLeafPartitionNode(p));
 
-	List *result = NIL;
+	List	   *result = NIL;
 
-	ListCell *lc = NULL;
-	foreach (lc, p->rules)
+	for (int i = 0; i < p->num_rules; i++)
 	{
-		PartitionRule *rule = (PartitionRule *) lfirst(lc);
+		PartitionRule *rule = p->rules[i];
 
 		if (rule->children)
 		{
@@ -8958,7 +8446,7 @@ static List *PartitionChildren(PartitionNode *p)
 	 * Also add default child
 	 */
 	if (p->default_part
-			&& p->default_part->children)
+		&& p->default_part->children)
 	{
 		result = lappend(result, p->default_part->children);
 	}
@@ -8982,27 +8470,28 @@ static List *PartitionChildren(PartitionNode *p)
  */
 List *
 selectPartitionMulti(PartitionNode *partnode, Datum *values, bool *isnull,
-				 TupleDesc tupdesc, PartitionAccessMethods *accessMethods)
+					 TupleDesc tupdesc, PartitionAccessMethods *accessMethods)
 {
 	Assert(partnode);
 
-	List *leafPartitionOids = NIL;
+	List	   *leafPartitionOids = NIL;
 
-	List *inputList = list_make1(partnode);
+	List	   *inputList = list_make1(partnode);
 
 	while (list_length(inputList) > 0)
 	{
-		List *levelOutput = NIL;
+		List	   *levelOutput = NIL;
 
-		ListCell *lc = NULL;
-		foreach (lc, inputList)
+		ListCell   *lc = NULL;
+
+		foreach(lc, inputList)
 		{
 			PartitionNode *candidatePartNode = (PartitionNode *) lfirst(lc);
-			bool foundNull = false;
+			bool		foundNull = false;
 
 			for (int i = 0; i < candidatePartNode->part->parnatts; i++)
 			{
-				AttrNumber attno = candidatePartNode->part->paratts[i];
+				AttrNumber	attno = candidatePartNode->part->paratts[i];
 
 				/**
 				 * If corresponding value is null, then we should pick all of its
@@ -9034,7 +8523,8 @@ selectPartitionMulti(PartitionNode *partnode, Datum *values, bool *isnull,
 			{
 				if (IsLeafPartitionNode(candidatePartNode))
 				{
-					Oid matchOid = selectPartition1(candidatePartNode, values, isnull, tupdesc, accessMethods, NULL, NULL);
+					Oid			matchOid = selectPartition1(candidatePartNode, values, isnull, tupdesc, accessMethods, NULL, NULL);
+
 					if (matchOid != InvalidOid)
 					{
 						leafPartitionOids = lappend_oid(leafPartitionOids, matchOid);
@@ -9043,6 +8533,7 @@ selectPartitionMulti(PartitionNode *partnode, Datum *values, bool *isnull,
 				else
 				{
 					PartitionNode *childPartitionNode = NULL;
+
 					selectPartition1(candidatePartNode, values, isnull, tupdesc, accessMethods, NULL, &childPartitionNode);
 					if (childPartitionNode)
 					{
@@ -9072,10 +8563,10 @@ static void
 add_partition_encoding(Oid relid, Oid paroid, AttrNumber attnum, List *encoding)
 {
 	Relation	rel;
-	Datum		 partoptions;
-	Datum		 values[Natts_pg_partition_encoding];
-	bool		 nulls[Natts_pg_partition_encoding];
-	HeapTuple	 tuple;
+	Datum		partoptions;
+	Datum		values[Natts_pg_partition_encoding];
+	bool		nulls[Natts_pg_partition_encoding];
+	HeapTuple	tuple;
 
 	rel = heap_open(PartitionEncodingRelationId, RowExclusiveLock);
 
@@ -9083,6 +8574,7 @@ add_partition_encoding(Oid relid, Oid paroid, AttrNumber attnum, List *encoding)
 
 	partoptions = transformRelOptions(PointerGetDatum(NULL),
 									  encoding,
+									  NULL, NULL,
 									  true,
 									  false);
 
@@ -9106,9 +8598,9 @@ add_partition_encoding(Oid relid, Oid paroid, AttrNumber attnum, List *encoding)
 static void
 remove_partition_encoding_entry(Oid paroid, AttrNumber attnum)
 {
-	Relation rel;
+	Relation	rel;
 	HeapTuple	tup;
-	ScanKeyData	scankey;
+	ScanKeyData scankey;
 	SysScanDesc sscan;
 
 	rel = heap_open(PartitionEncodingRelationId, RowExclusiveLock);
@@ -9119,13 +8611,13 @@ remove_partition_encoding_entry(Oid paroid, AttrNumber attnum)
 				ObjectIdGetDatum(paroid));
 
 	sscan = systable_beginscan(rel, PartitionEncodingParencoidAttnumIndexId,
-							   true, SnapshotNow, 1, &scankey);
+							   true, NULL, 1, &scankey);
 	while (HeapTupleIsValid(tup = systable_getnext(sscan)))
 	{
 		if (attnum != InvalidAttrNumber)
 		{
 			Form_pg_partition_encoding ppe =
-				(Form_pg_partition_encoding)GETSTRUCT(tup);
+			(Form_pg_partition_encoding) GETSTRUCT(tup);
 
 			if (ppe->parencattnum != attnum)
 				continue;
@@ -9158,10 +8650,10 @@ remove_partition_encoding_by_key(Oid relid, AttrNumber attnum)
 				ObjectIdGetDatum(relid));
 
 	sscan = systable_beginscan(partrel, PartitionParrelidIndexId, true,
-							   SnapshotNow, 1, &scankey);
+							   NULL, 1, &scankey);
 	while (HeapTupleIsValid(tup = systable_getnext(sscan)))
 	{
-		Form_pg_partition part = (Form_pg_partition)GETSTRUCT(tup);
+		Form_pg_partition part = (Form_pg_partition) GETSTRUCT(tup);
 
 		if (part->paristemplate)
 			remove_partition_encoding_entry(HeapTupleGetOid(tup), attnum);
@@ -9193,16 +8685,16 @@ RemovePartitionEncodingByRelidAttribute(Oid relid, AttrNumber attnum)
 static void
 add_template_encoding_clauses(Oid relid, Oid paroid, List *stenc)
 {
-	ListCell *lc;
+	ListCell   *lc;
 
 	foreach(lc, stenc)
 	{
 		ColumnReferenceStorageDirective *c = lfirst(lc);
-		AttrNumber attnum;
+		AttrNumber	attnum;
 
 		/*
-		 * Don't store default clauses since we have no need of them
-		 * when we add partitions later.
+		 * Don't store default clauses since we have no need of them when we
+		 * add partitions later.
 		 */
 		if (c->deflt)
 			continue;
@@ -9211,7 +8703,7 @@ add_template_encoding_clauses(Oid relid, Oid paroid, List *stenc)
 
 		Insist(attnum > 0);
 
-		add_partition_encoding(relid, paroid, attnum,  c->encoding);
+		add_partition_encoding(relid, paroid, attnum, c->encoding);
 	}
 }
 
@@ -9225,10 +8717,9 @@ get_partition_encoding_attoptions(Relation rel, Oid paroid)
 	Datum	   *opts;
 
 	/*
-	 * XXX XXX: should be FOR UPDATE ? why ? probably should be an
-	 * AccessShare
+	 * XXX XXX: should be FOR UPDATE ? why ? probably should be an AccessShare
 	 */
-	pgpeenc  = heap_open(PartitionEncodingRelationId, RowExclusiveLock);
+	pgpeenc = heap_open(PartitionEncodingRelationId, RowExclusiveLock);
 
 	opts = palloc0(sizeof(Datum) * RelationGetNumberOfAttributes(rel));
 
@@ -9237,14 +8728,14 @@ get_partition_encoding_attoptions(Relation rel, Oid paroid)
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(paroid));
 	sscan = systable_beginscan(pgpeenc, PartitionEncodingParencoidIndexId, true,
-							   SnapshotNow, 1, &scankey);
+							   NULL, 1, &scankey);
 	while (HeapTupleIsValid(tup = systable_getnext(sscan)))
 	{
-		Datum paroptions;
-		AttrNumber attnum;
-		bool isnull;
+		Datum		paroptions;
+		AttrNumber	attnum;
+		bool		isnull;
 
-		attnum = ((Form_pg_partition_encoding)GETSTRUCT(tup))->parencattnum;
+		attnum = ((Form_pg_partition_encoding) GETSTRUCT(tup))->parencattnum;
 		paroptions = heap_getattr(tup,
 								  Anum_pg_partition_encoding_parencattoptions,
 								  RelationGetDescr(pgpeenc),
@@ -9265,17 +8756,17 @@ get_partition_encoding_attoptions(Relation rel, Oid paroid)
 static List *
 get_deparsed_partition_encodings(Oid relid, Oid paroid)
 {
-	int i;
-	List *out = NIL;
-	Relation rel = heap_open(relid, AccessShareLock);
-	Datum *opts = get_partition_encoding_attoptions(rel, paroid);
+	int			i;
+	List	   *out = NIL;
+	Relation	rel = heap_open(relid, AccessShareLock);
+	Datum	   *opts = get_partition_encoding_attoptions(rel, paroid);
 
 	for (i = 0; i < RelationGetNumberOfAttributes(rel); i++)
 	{
 		if (opts[i] && !rel->rd_att->attrs[i]->attisdropped)
 		{
 			ColumnReferenceStorageDirective *c =
-				makeNode(ColumnReferenceStorageDirective);
+			makeNode(ColumnReferenceStorageDirective);
 
 			c->encoding = untransformRelOptions(opts[i]);
 			c->column = get_attname(relid, i + 1);
@@ -9296,16 +8787,18 @@ get_deparsed_partition_encodings(Oid relid, Oid paroid)
  *
  * Result is allocated in the current memory context.
  */
-char*
+char *
 DebugPartitionOid(Datum *elements, int n)
 {
 
 	StringInfoData str;
+
 	initStringInfo(&str);
 	appendStringInfo(&str, "{");
-	for (int i=0; i<n; i++)
+	for (int i = 0; i < n; i++)
 	{
-		Oid o = DatumGetObjectId(elements[i]);
+		Oid			o = DatumGetObjectId(elements[i]);
+
 		appendStringInfo(&str, "%s, ", get_rel_name(o));
 	}
 	appendStringInfo(&str, "}");
@@ -9326,15 +8819,20 @@ DebugPartitionOid(Datum *elements, int n)
 void
 findPartitionMetadataEntry(List *partsMetadata, Oid partOid, PartitionNode **partsAndRules, PartitionAccessMethods **accessMethods)
 {
-	ListCell *lc = NULL;
-	foreach (lc, partsMetadata)
+	ListCell   *lc = NULL;
+
+	foreach(lc, partsMetadata)
 	{
-		PartitionMetadata *metadata = (PartitionMetadata *)lfirst(lc);
+		PartitionMetadata *metadata = (PartitionMetadata *) lfirst(lc);
+
 		*partsAndRules = findPartitionNodeEntry(metadata->partsAndRules, partOid);
 
 		if (NULL != *partsAndRules)
 		{
-			// accessMethods define the lookup access methods for partitions, one for each level
+			/*
+			 * accessMethods define the lookup access methods for partitions,
+			 * one for each level
+			 */
 			*accessMethods = metadata->accessMethods;
 			return;
 		}
@@ -9369,10 +8867,11 @@ findPartitionNodeEntry(PartitionNode *partitionNode, Oid partOid)
 	 * intermediate node
 	 */
 	PartitionNode *childNode = NULL;
-	ListCell *lcChild = NULL;
-	foreach (lcChild, partitionNode->rules)
+
+	for (int i = 0; i < partitionNode->num_rules; i++)
 	{
-		PartitionRule *childRule = (PartitionRule *) lfirst(lcChild);
+		PartitionRule *childRule = partitionNode->rules[i];
+
 		childNode = findPartitionNodeEntry(childRule->children, partOid);
 		if (NULL != childNode)
 		{
@@ -9389,4 +8888,29 @@ findPartitionNodeEntry(PartitionNode *partitionNode, Oid partOid)
 	}
 
 	return childNode;
+}
+
+/*
+ * check parition rule if contains
+ * external partition table
+ */
+static bool
+has_external_partition(PartitionNode *n)
+{
+	for (int i = 0; i < n->num_rules; i++)
+	{
+		PartitionRule *rule = n->rules[i];
+
+		if (rel_is_external_table(rule->parchildrelid))
+		{
+			return true;
+		}
+		else
+		{
+			if (rule->children && has_external_partition(rule->children))
+				return true;
+		}
+	}
+
+	return false;
 }

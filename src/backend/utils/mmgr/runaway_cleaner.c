@@ -19,10 +19,13 @@
 
 #include "postgres.h"
 
+#include "access/xact.h"
 #include "cdb/cdbvars.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "utils/faultinjector.h"
+#include "utils/resgroup.h"
+#include "utils/resource_manager.h"
 #include "utils/session_state.h"
 #include "utils/vmem_tracker.h"
 
@@ -97,6 +100,63 @@ RunawayCleaner_ShouldStartRunawayCleanup()
 
 	return false;
 }
+
+/*
+ * Determine if the runaway cleanup should be handled by aborting the current
+ * query or must be ignored. Since the cleanup can be attempted from multiple
+ * places, it is important to first validate if calling elog(ERROR) is safe and
+ * of value.
+ */
+static bool
+RunawayCleaner_ShouldCancelQuery()
+{
+	/* VMEM tracker not being used */
+	if (!vmemTrackerInited)
+		return false;
+
+	/* In critical section or when holding off on handling interrupts */
+	if (CritSectionCount != 0 || InterruptHoldoffCount != 0)
+		return false;
+
+	/*
+	 * Cleaning up QEs that are not executing a valid command may cause the QD to
+	 * get stuck [MPP-24950]
+	 */
+	if (gp_command_count <= 0)
+		return false;
+
+	/*
+	 * If not currently executing a transaction, aborting it won't release any
+	 * more resources.
+	 */
+	if (!IsTransactionState())
+		return false;
+
+	/* Ok, we are actively executing a query */
+
+	if (MySessionState->runawayStatus == RunawayStatus_PrimaryRunawaySession)
+	{
+		/*
+		 * Abort the query if it is actively executing and has been flagged as
+		 * consuming the most memory
+		 */
+		return true;
+	}
+	else
+	{
+		Assert(MySessionState->runawayStatus == RunawayStatus_SecondaryRunawaySession);
+
+		/*
+		 * If this process was flagged as a runaway session inspite another session
+		 * using more memory, only abort this query if the current user is not a
+		 * superuser. This is to ensure that critical administrative commands (such
+		 * as database restarts), which are done as superuser, are not interrupted
+		 * by the runaway cleaner.
+		 */
+		return !superuser();
+	}
+}
+
 /*
  * Starts a runaway cleanup by triggering an ERROR if the VMEM tracker is active
  * and a commit is not already in progress. Otherwise, it marks the process as clean
@@ -118,18 +178,26 @@ RunawayCleaner_StartCleanup()
 	{
 		Assert(beginCleanupRunawayVersion < *latestRunawayVersion);
 		Assert(endCleanupRunawayVersion < *latestRunawayVersion);
+
 		/* We don't want to cleanup multiple times for same runaway event */
 		beginCleanupRunawayVersion = *latestRunawayVersion;
 
-		if (CritSectionCount == 0 && InterruptHoldoffCount == 0 && vmemTrackerInited &&
-			gp_command_count > 0 /* Cleaning up QEs that are not executing a valid command
-			may cause the QD to get stuck [MPP-24950] */ &&
-			/* Super user is terminated only when it's the primary runaway consumer (i.e., the top consumer) */
-			(!superuser() || MySessionState->runawayStatus == RunawayStatus_PrimaryRunawaySession))
+		if (RunawayCleaner_ShouldCancelQuery())
 		{
-			SIMPLE_FAULT_INJECTOR(RunawayCleanup);
+			SIMPLE_FAULT_INJECTOR("runaway_cleanup");
 
-			ereport(ERROR, (errmsg("Canceling query because of high VMEM usage. Used: %dMB, available %dMB, red zone: %dMB",
+			if (IsResGroupEnabled())
+			{
+				StringInfoData    str;
+				initStringInfo(&str);
+			
+				LWLockAcquire(ResGroupLock, LW_SHARED);
+				ResGroupGetMemoryRunawayInfo(&str);
+				LWLockRelease(ResGroupLock);
+				ereport(ERROR, (errmsg("Canceling query because of high VMEM usage. %s", str.data)));
+			}
+			else
+				ereport(ERROR, (errmsg("Canceling query because of high VMEM usage. Used: %dMB, available %dMB, red zone: %dMB",
 					VmemTracker_ConvertVmemChunksToMB(MySessionState->sessionVmem), VmemTracker_GetAvailableVmemMB(),
 					RedZoneHandler_GetRedZoneLimitMB()), errprintstack(true)));
 		}
@@ -264,7 +332,6 @@ RunawayCleaner_RunawayCleanupDoneForProcess(bool ignoredCleanup)
 	 * Now, we have some head room to actually record our usage.
 	 */
 	write_stderr("Logging memory usage because of runaway cleanup. Note, this is a post-cleanup logging and may be incomplete.");
-	MemoryAccounting_SaveToLog();
 	MemoryContextStats(TopMemoryContext);
 }
 

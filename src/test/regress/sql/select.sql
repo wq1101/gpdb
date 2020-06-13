@@ -13,24 +13,24 @@ SELECT * FROM onek
 -- awk '{if($1<20){print $1,$14;}else{next;}}' onek.data | sort +0nr -1
 --
 SELECT onek.unique1, onek.stringu1 FROM onek
-   WHERE onek.unique1 < 20 
+   WHERE onek.unique1 < 20
    ORDER BY unique1 using >;
 
 --
 -- awk '{if($1>980){print $1,$14;}else{next;}}' onek.data | sort +1d -2
 --
 SELECT onek.unique1, onek.stringu1 FROM onek
-   WHERE onek.unique1 > 980 
+   WHERE onek.unique1 > 980
    ORDER BY stringu1 using <;
-	
+
 --
 -- awk '{if($1>980){print $1,$16;}else{next;}}' onek.data |
 -- sort +1d -2 +0nr -1
 --
 SELECT onek.unique1, onek.string4 FROM onek
-   WHERE onek.unique1 > 980 
+   WHERE onek.unique1 > 980
    ORDER BY string4 using <, unique1 using >;
-	
+
 --
 -- awk '{if($1>980){print $1,$16;}else{next;}}' onek.data |
 -- sort +1dr -2 +0n -1
@@ -38,7 +38,7 @@ SELECT onek.unique1, onek.string4 FROM onek
 SELECT onek.unique1, onek.string4 FROM onek
    WHERE onek.unique1 > 980
    ORDER BY string4 using >, unique1 using <;
-	
+
 --
 -- awk '{if($1<20){print $1,$16;}else{next;}}' onek.data |
 -- sort +0nr -1 +1d -2
@@ -52,7 +52,7 @@ SELECT onek.unique1, onek.string4 FROM onek
 -- sort +0n -1 +1dr -2
 --
 SELECT onek.unique1, onek.string4 FROM onek
-   WHERE onek.unique1 < 20 
+   WHERE onek.unique1 < 20
    ORDER BY unique1 using <, string4 using >;
 
 --
@@ -71,20 +71,20 @@ SET enable_sort TO off;
 --
 -- awk '{if($1<10){print $0;}else{next;}}' onek.data | sort +0n -1
 --
-SELECT onek2.* FROM onek2 WHERE onek2.unique1 < 10 ORDER BY 1;
+SELECT onek2.* FROM onek2 WHERE onek2.unique1 < 10;
 
 --
 -- awk '{if($1<20){print $1,$14;}else{next;}}' onek.data | sort +0nr -1
 --
 SELECT onek2.unique1, onek2.stringu1 FROM onek2
-    WHERE onek2.unique1 < 20 
+    WHERE onek2.unique1 < 20
     ORDER BY unique1 using >;
 
 --
 -- awk '{if($1>980){print $1,$14;}else{next;}}' onek.data | sort +1d -2
 --
 SELECT onek2.unique1, onek2.stringu1 FROM onek2
-   WHERE onek2.unique1 > 980 ORDER BY 1;
+   WHERE onek2.unique1 > 980;
 
 RESET enable_seqscan;
 RESET enable_bitmapscan;
@@ -102,7 +102,7 @@ SELECT two, stringu1, ten, string4
 -- awk 'BEGIN{FS="      ";}{if(NF!=2){print $4,$5;}else{print;}}' - stud_emp.data
 --
 -- SELECT name, age FROM person*; ??? check if different
-SELECT p.name, p.age FROM person* p  ORDER BY 1,2;
+SELECT p.name, p.age FROM person* p;
 
 --
 -- awk '{print $1,$2;}' person.data |
@@ -146,8 +146,7 @@ VALUES (1,2), (3,4+4), (7,77.7)
 UNION ALL
 SELECT 2+2, 57
 UNION ALL
-SELECT * FROM int8_tbl;
-
+TABLE int8_tbl;
 
 --
 -- Test ORDER BY options
@@ -187,6 +186,49 @@ SELECT * FROM foo ORDER BY f1;
 SELECT * FROM foo ORDER BY f1 NULLS FIRST;
 SELECT * FROM foo ORDER BY f1 DESC;
 SELECT * FROM foo ORDER BY f1 DESC NULLS LAST;
+
+--
+-- Test planning of some cases with partial indexes
+--
+-- partial index is usable
+explain (costs off)
+select * from onek2 where unique2 = 11 and stringu1 = 'ATAAAA';
+select * from onek2 where unique2 = 11 and stringu1 = 'ATAAAA';
+explain (costs off)
+select unique2 from onek2 where unique2 = 11 and stringu1 = 'ATAAAA';
+select unique2 from onek2 where unique2 = 11 and stringu1 = 'ATAAAA';
+-- partial index predicate implies clause, so no need for retest
+explain (costs off)
+select * from onek2 where unique2 = 11 and stringu1 < 'B';
+select * from onek2 where unique2 = 11 and stringu1 < 'B';
+explain (costs off)
+select unique2 from onek2 where unique2 = 11 and stringu1 < 'B';
+select unique2 from onek2 where unique2 = 11 and stringu1 < 'B';
+-- but if it's an update target, must retest anyway
+explain (costs off)
+select unique2 from onek2 where unique2 = 11 and stringu1 < 'B' for update;
+select unique2 from onek2 where unique2 = 11 and stringu1 < 'B' for update;
+-- partial index is not applicable
+explain (costs off)
+select unique2 from onek2 where unique2 = 11 and stringu1 < 'C';
+select unique2 from onek2 where unique2 = 11 and stringu1 < 'C';
+-- partial index implies clause, but bitmap scan must recheck predicate anyway
+SET enable_indexscan TO off;
+explain (costs off)
+select unique2 from onek2 where unique2 = 11 and stringu1 < 'B';
+select unique2 from onek2 where unique2 = 11 and stringu1 < 'B';
+RESET enable_indexscan;
+-- check multi-index cases too
+explain (costs off)
+select unique1, unique2 from onek2
+  where (unique2 = 11 or unique1 = 0) and stringu1 < 'B';
+select unique1, unique2 from onek2
+  where (unique2 = 11 or unique1 = 0) and stringu1 < 'B';
+explain (costs off)
+select unique1, unique2 from onek2
+  where (unique2 = 11 and stringu1 < 'B') or unique1 = 0;
+select unique1, unique2 from onek2
+  where (unique2 = 11 and stringu1 < 'B') or unique1 = 0;
 
 --
 -- Test some corner cases that have been known to confuse the planner

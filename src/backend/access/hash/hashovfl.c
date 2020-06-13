@@ -3,12 +3,12 @@
  * hashovfl.c
  *	  Overflow page management code for the Postgres hash access method
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/access/hash/hashovfl.c,v 1.62 2008/01/01 19:45:46 momjian Exp $
+ *	  src/backend/access/hash/hashovfl.c
  *
  * NOTES
  *	  Overflow pages look like ordinary relation pages.
@@ -18,6 +18,7 @@
 #include "postgres.h"
 
 #include "access/hash.h"
+#include "utils/rel.h"
 
 
 static Buffer _hash_getovflpage(Relation rel, Buffer metabuf);
@@ -79,7 +80,7 @@ blkno_to_bitno(HashMetaPage metap, BlockNumber ovflblkno)
  *
  *	Add an overflow page to the bucket whose last page is pointed to by 'buf'.
  *
- *	On entry, the caller must hold a pin but no lock on 'buf'.	The pin is
+ *	On entry, the caller must hold a pin but no lock on 'buf'.  The pin is
  *	dropped before exiting (we assume the caller is not interested in 'buf'
  *	anymore).  The returned overflow page will be pinned and write-locked;
  *	it is guaranteed to be empty.
@@ -88,12 +89,12 @@ blkno_to_bitno(HashMetaPage metap, BlockNumber ovflblkno)
  *	That buffer is returned in the same state.
  *
  *	The caller must hold at least share lock on the bucket, to ensure that
- *	no one else tries to compact the bucket meanwhile.	This guarantees that
+ *	no one else tries to compact the bucket meanwhile.  This guarantees that
  *	'buf' won't stop being part of the bucket while it's unlocked.
  *
  * NB: since this could be executed concurrently by multiple processes,
  * one should not assume that the returned overflow page will be the
- * immediate successor of the originally passed 'buf'.	Additional overflow
+ * immediate successor of the originally passed 'buf'.  Additional overflow
  * pages might have been added to the bucket chain in between.
  */
 Buffer
@@ -104,8 +105,6 @@ _hash_addovflpage(Relation rel, Buffer metabuf, Buffer buf)
 	Page		ovflpage;
 	HashPageOpaque pageopaque;
 	HashPageOpaque ovflopaque;
-
-	MIRROREDLOCK_BUFMGR_MUST_ALREADY_BE_HELD;
 
 	/* allocate and lock an empty overflow page */
 	ovflbuf = _hash_getovflpage(rel, metabuf);
@@ -158,7 +157,7 @@ _hash_addovflpage(Relation rel, Buffer metabuf, Buffer buf)
 /*
  *	_hash_getovflpage()
  *
- *	Find an available overflow page and return it.	The returned buffer
+ *	Find an available overflow page and return it.  The returned buffer
  *	is pinned and write-locked, and has had _hash_pageinit() applied,
  *	but it is caller's responsibility to fill the special space.
  *
@@ -183,13 +182,11 @@ _hash_getovflpage(Relation rel, Buffer metabuf)
 	uint32		i,
 				j;
 
-	MIRROREDLOCK_BUFMGR_MUST_ALREADY_BE_HELD;
-
 	/* Get exclusive lock on the meta page */
 	_hash_chgbufaccess(rel, metabuf, HASH_NOLOCK, HASH_WRITE);
 
 	_hash_checkpage(rel, metabuf, LH_META_PAGE);
-	metap = (HashMetaPage) BufferGetPage(metabuf);
+	metap = HashPageGetMeta(BufferGetPage(metabuf));
 
 	/* start search at hashm_firstfree */
 	orig_firstfree = metap->hashm_firstfree;
@@ -256,12 +253,12 @@ _hash_getovflpage(Relation rel, Buffer metabuf)
 		 * We create the new bitmap page with all pages marked "in use".
 		 * Actually two pages in the new bitmap's range will exist
 		 * immediately: the bitmap page itself, and the following page which
-		 * is the one we return to the caller.	Both of these are correctly
+		 * is the one we return to the caller.  Both of these are correctly
 		 * marked "in use".  Subsequent pages do not exist yet, but it is
 		 * convenient to pre-mark them as "in use" too.
 		 */
 		bit = metap->hashm_spares[splitnum];
-		_hash_initbitmap(rel, metap, bitno_to_blkno(metap, bit));
+		_hash_initbitmap(rel, metap, bitno_to_blkno(metap, bit), MAIN_FORKNUM);
 		metap->hashm_spares[splitnum]++;
 	}
 	else
@@ -282,12 +279,12 @@ _hash_getovflpage(Relation rel, Buffer metabuf)
 	 * with metapage write lock held; would be better to use a lock that
 	 * doesn't block incoming searches.
 	 */
-	newbuf = _hash_getnewbuf(rel, blkno);
+	newbuf = _hash_getnewbuf(rel, blkno, MAIN_FORKNUM);
 
 	metap->hashm_spares[splitnum]++;
 
 	/*
-	 * Adjust hashm_firstfree to avoid redundant searches.	But don't risk
+	 * Adjust hashm_firstfree to avoid redundant searches.  But don't risk
 	 * changing it if someone moved it while we were searching bitmap pages.
 	 */
 	if (metap->hashm_firstfree == orig_firstfree)
@@ -316,7 +313,7 @@ found:
 	blkno = bitno_to_blkno(metap, bit);
 
 	/*
-	 * Adjust hashm_firstfree to avoid redundant searches.	But don't risk
+	 * Adjust hashm_firstfree to avoid redundant searches.  But don't risk
 	 * changing it if someone moved it while we were searching bitmap pages.
 	 */
 	if (metap->hashm_firstfree == orig_firstfree)
@@ -394,9 +391,7 @@ _hash_freeovflpage(Relation rel, Buffer ovflbuf,
 	uint32		ovflbitno;
 	int32		bitmappage,
 				bitmapbit;
-	Bucket		bucket;
-
-	MIRROREDLOCK_BUFMGR_MUST_ALREADY_BE_HELD;
+	Bucket bucket PG_USED_FOR_ASSERTS_ONLY;
 
 	/* Get information from the doomed page */
 	_hash_checkpage(rel, ovflbuf, LH_OVERFLOW_PAGE);
@@ -454,7 +449,7 @@ _hash_freeovflpage(Relation rel, Buffer ovflbuf,
 
 	/* Read the metapage so we can determine which bitmap page to use */
 	metabuf = _hash_getbuf(rel, HASH_METAPAGE, HASH_READ, LH_META_PAGE);
-	metap = (HashMetaPage) BufferGetPage(metabuf);
+	metap = HashPageGetMeta(BufferGetPage(metabuf));
 
 	/* Identify which bit to set */
 	ovflbitno = blkno_to_bitno(metap, ovflblkno);
@@ -499,7 +494,7 @@ _hash_freeovflpage(Relation rel, Buffer ovflbuf,
 /*
  *	_hash_initbitmap()
  *
- *	 Initialize a new bitmap page.	The metapage has a write-lock upon
+ *	 Initialize a new bitmap page.  The metapage has a write-lock upon
  *	 entering the function, and must be written by caller after return.
  *
  * 'blkno' is the block number of the new bitmap page.
@@ -507,14 +502,13 @@ _hash_freeovflpage(Relation rel, Buffer ovflbuf,
  * All bits in the new bitmap page are set to "1", indicating "in use".
  */
 void
-_hash_initbitmap(Relation rel, HashMetaPage metap, BlockNumber blkno)
+_hash_initbitmap(Relation rel, HashMetaPage metap, BlockNumber blkno,
+				 ForkNumber forkNum)
 {
 	Buffer		buf;
 	Page		pg;
 	HashPageOpaque op;
 	uint32	   *freep;
-
-	MIRROREDLOCK_BUFMGR_MUST_ALREADY_BE_HELD;
 
 	/*
 	 * It is okay to write-lock the new bitmap page while holding metapage
@@ -526,7 +520,7 @@ _hash_initbitmap(Relation rel, HashMetaPage metap, BlockNumber blkno)
 	 * page while holding the metapage lock, but this path is taken so seldom
 	 * that it's not worth worrying about.
 	 */
-	buf = _hash_getnewbuf(rel, blkno);
+	buf = _hash_getnewbuf(rel, blkno, forkNum);
 	pg = BufferGetPage(buf);
 
 	/* initialize the page's special space */
@@ -584,24 +578,19 @@ _hash_initbitmap(Relation rel, HashMetaPage metap, BlockNumber blkno)
  */
 void
 _hash_squeezebucket(Relation rel,
-					Bucket bucket __attribute__((unused)),
+					Bucket bucket pg_attribute_unused(),
 					BlockNumber bucket_blkno,
 					BufferAccessStrategy bstrategy)
 {
-	Buffer		wbuf;
-	Buffer		rbuf = 0;
 	BlockNumber wblkno;
 	BlockNumber rblkno;
+	Buffer		wbuf;
+	Buffer		rbuf;
 	Page		wpage;
 	Page		rpage;
 	HashPageOpaque wopaque;
 	HashPageOpaque ropaque;
-	OffsetNumber woffnum;
-	OffsetNumber roffnum;
-	IndexTuple	itup;
-	Size		itemsz;
-
-	MIRROREDLOCK_BUFMGR_MUST_ALREADY_BE_HELD;
+	bool		wbuf_dirty;
 
 	/*
 	 * start squeezing into the base bucket page.
@@ -630,11 +619,12 @@ _hash_squeezebucket(Relation rel,
 	 * usually smaller than the buffer ring being used by VACUUM, else using
 	 * the access strategy here would be counterproductive.
 	 */
+	rbuf = InvalidBuffer;
 	ropaque = wopaque;
 	do
 	{
 		rblkno = ropaque->hasho_nextblkno;
-		if (ropaque != wopaque)
+		if (rbuf != InvalidBuffer)
 			_hash_relbuf(rel, rbuf);
 		rbuf = _hash_getbuf_with_strategy(rel,
 										  rblkno,
@@ -649,12 +639,23 @@ _hash_squeezebucket(Relation rel,
 	/*
 	 * squeeze the tuples.
 	 */
-	roffnum = FirstOffsetNumber;
+	wbuf_dirty = false;
 	for (;;)
 	{
-		/* this test is needed in case page is empty on entry */
-		if (roffnum <= PageGetMaxOffsetNumber(rpage))
+		OffsetNumber roffnum;
+		OffsetNumber maxroffnum;
+		OffsetNumber deletable[MaxOffsetNumber];
+		int			ndeletable = 0;
+
+		/* Scan each tuple in "read" page */
+		maxroffnum = PageGetMaxOffsetNumber(rpage);
+		for (roffnum = FirstOffsetNumber;
+			 roffnum <= maxroffnum;
+			 roffnum = OffsetNumberNext(roffnum))
 		{
+			IndexTuple	itup;
+			Size		itemsz;
+
 			itup = (IndexTuple) PageGetItem(rpage,
 											PageGetItemId(rpage, roffnum));
 			itemsz = IndexTupleDSize(*itup);
@@ -671,12 +672,22 @@ _hash_squeezebucket(Relation rel,
 				wblkno = wopaque->hasho_nextblkno;
 				Assert(BlockNumberIsValid(wblkno));
 
-				_hash_wrtbuf(rel, wbuf);
+				if (wbuf_dirty)
+					_hash_wrtbuf(rel, wbuf);
+				else
+					_hash_relbuf(rel, wbuf);
 
+				/* nothing more to do if we reached the read page */
 				if (rblkno == wblkno)
 				{
-					/* wbuf is already released */
-					_hash_wrtbuf(rel, rbuf);
+					if (ndeletable > 0)
+					{
+						/* Delete tuples we already moved off read page */
+						PageIndexMultiDelete(rpage, deletable, ndeletable);
+						_hash_wrtbuf(rel, rbuf);
+					}
+					else
+						_hash_relbuf(rel, rbuf);
 					return;
 				}
 
@@ -688,28 +699,27 @@ _hash_squeezebucket(Relation rel,
 				wpage = BufferGetPage(wbuf);
 				wopaque = (HashPageOpaque) PageGetSpecialPointer(wpage);
 				Assert(wopaque->hasho_bucket == bucket);
+				wbuf_dirty = false;
 			}
 
 			/*
-			 * we have found room so insert on the "write" page.
+			 * we have found room so insert on the "write" page, being careful
+			 * to preserve hashkey ordering.  (If we insert many tuples into
+			 * the same "write" page it would be worth qsort'ing instead of
+			 * doing repeated _hash_pgaddtup.)
 			 */
-			woffnum = OffsetNumberNext(PageGetMaxOffsetNumber(wpage));
-			if (PageAddItem(wpage, (Item) itup, itemsz, woffnum, false, false)
-				== InvalidOffsetNumber)
-				elog(ERROR, "failed to add index item to \"%s\"",
-					 RelationGetRelationName(rel));
+			(void) _hash_pgaddtup(rel, wbuf, itemsz, itup);
+			wbuf_dirty = true;
 
-			/*
-			 * delete the tuple from the "read" page. PageIndexTupleDelete
-			 * repacks the ItemId array, so 'roffnum' will be "advanced" to
-			 * the "next" ItemId.
-			 */
-			PageIndexTupleDelete(rpage, roffnum);
+			/* remember tuple for deletion from "read" page */
+			deletable[ndeletable++] = roffnum;
 		}
 
 		/*
-		 * if the "read" page is now empty because of the deletion (or because
-		 * it was empty when we got to it), free it.
+		 * If we reach here, there are no live tuples on the "read" page ---
+		 * it was empty when we got to it, or we moved them all.  So we can
+		 * just free the page without bothering with deleting tuples
+		 * individually.  Then advance to the previous "read" page.
 		 *
 		 * Tricky point here: if our read and write pages are adjacent in the
 		 * bucket chain, our write lock on wbuf will conflict with
@@ -717,36 +727,34 @@ _hash_squeezebucket(Relation rel,
 		 * removed page.  However, in that case we are done anyway, so we can
 		 * simply drop the write lock before calling _hash_freeovflpage.
 		 */
-		if (PageIsEmpty(rpage))
+		rblkno = ropaque->hasho_prevblkno;
+		Assert(BlockNumberIsValid(rblkno));
+
+		/* are we freeing the page adjacent to wbuf? */
+		if (rblkno == wblkno)
 		{
-			rblkno = ropaque->hasho_prevblkno;
-			Assert(BlockNumberIsValid(rblkno));
-
-			/* are we freeing the page adjacent to wbuf? */
-			if (rblkno == wblkno)
-			{
-				/* yes, so release wbuf lock first */
+			/* yes, so release wbuf lock first */
+			if (wbuf_dirty)
 				_hash_wrtbuf(rel, wbuf);
-				/* free this overflow page (releases rbuf) */
-				_hash_freeovflpage(rel, rbuf, bstrategy);
-				/* done */
-				return;
-			}
-
-			/* free this overflow page, then get the previous one */
+			else
+				_hash_relbuf(rel, wbuf);
+			/* free this overflow page (releases rbuf) */
 			_hash_freeovflpage(rel, rbuf, bstrategy);
-
-			rbuf = _hash_getbuf_with_strategy(rel,
-											  rblkno,
-											  HASH_WRITE,
-											  LH_OVERFLOW_PAGE,
-											  bstrategy);
-			rpage = BufferGetPage(rbuf);
-			ropaque = (HashPageOpaque) PageGetSpecialPointer(rpage);
-			Assert(ropaque->hasho_bucket == bucket);
-
-			roffnum = FirstOffsetNumber;
+			/* done */
+			return;
 		}
+
+		/* free this overflow page, then get the previous one */
+		_hash_freeovflpage(rel, rbuf, bstrategy);
+
+		rbuf = _hash_getbuf_with_strategy(rel,
+										  rblkno,
+										  HASH_WRITE,
+										  LH_OVERFLOW_PAGE,
+										  bstrategy);
+		rpage = BufferGetPage(rbuf);
+		ropaque = (HashPageOpaque) PageGetSpecialPointer(rpage);
+		Assert(ropaque->hasho_bucket == bucket);
 	}
 
 	/* NOTREACHED */

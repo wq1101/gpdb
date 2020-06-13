@@ -13,18 +13,30 @@
       expressions. These are described as if they were actual data columns; in particular,
         <codeph>starelid</codeph> references the index. No entry is made for an ordinary
       non-expression index column, however, since it would be redundant with the entry for the
-      underlying table column.</p>
+      underlying table column. Currently, entries for index expressions always have
+      <codeph>stainherit = false</codeph>.</p>
+    <p>When <codeph>stainherit = false</codeph>, there is normally one entry for each table column
+      that has been analyzed. If the table has inheritance children, Greenplum Database creates
+      a second entry with <codeph>stainherit = true</codeph>. This row represents the column's
+       statistics over the inheritance tree, for example, statistics for the data you would see
+        with <codeph>SELECT <varname>column</varname> FROM <varname>table</varname>*</codeph>,
+        whereas the <codeph>stainherit = false</codeph> row represents the results of
+        <codeph>SELECT <varname>column</varname> FROM ONLY <varname>table</varname></codeph>.</p>
     <p>Since different kinds of statistics may be appropriate for different kinds of data,
         <codeph>pg_statistic</codeph> is designed not to assume very much about what sort of
       statistics it stores. Only extremely general statistics (such as nullness) are given dedicated
       columns in <codeph>pg_statistic</codeph>. Everything else is stored in slots, which are groups
       of associated columns whose content is identified by a code number in one of the slot's
       columns.</p>
-    <p><codeph>pg_statistic</codeph> should not be readable by the public, since even statistical
-      information about a table's contents may be considered sensitive (for example: minimum and
-      maximum values of a salary column). <codeph>pg_stats</codeph> is a publicly readable view on
-        <codeph>pg_statistic</codeph> that only exposes information about those tables that are
-      readable by the current user.</p>
+    <p>Statistical information about a table's contents should be considered sensitive (for example:
+      minimum and maximum values of a salary column). <codeph>pg_stats</codeph> is a publicly
+      readable view on <codeph>pg_statistic</codeph> that only exposes information about those
+      tables that are readable by the current user.</p>
+    <note type="warning">Diagnostic tools such as <codeph>gpsd</codeph> and
+        <codeph>minirepro</codeph> collect sensitive information from <codeph>pg_statistic</codeph>,
+      such as histogram boundaries, in a clear, readable form. Always review the output files of
+      these utilities to ensure that the contents are acceptable for transport outside of the
+      database in your organization.</note>
     <table id="hv156260">
       <title>pg_catalog.pg_statistic</title>
       <tgroup cols="4">
@@ -56,6 +68,15 @@
             <entry colname="col2">int2</entry>
             <entry colname="col3">pg_attribute.attnum</entry>
             <entry colname="col4">The number of the described column.</entry>
+          </row>
+          <row>
+            <entry colname="col1">
+              <codeph>stainherit</codeph>
+            </entry>
+            <entry colname="col2">bool</entry>
+            <entry colname="col3"/>
+            <entry colname="col4">If true, the statistics include inheritance child columns,
+              not just the values in the specified relations.</entry>
           </row>
           <row>
             <entry colname="col1">

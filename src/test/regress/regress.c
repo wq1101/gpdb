@@ -1,22 +1,41 @@
-/*
- * $PostgreSQL: pgsql/src/test/regress/regress.c,v 1.72 2009/01/07 13:44:37 tgl Exp $
+/*------------------------------------------------------------------------
+ *
+ * regress.c
+ *	 Code for various C-language functions defined as part of the
+ *	 regression tests.
+ *
+ * This code is released under the terms of the PostgreSQL License.
+ *
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ * src/test/regress/regress.c
+ *
+ *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
 
 #include <float.h>
 #include <math.h>
+#include <signal.h>
 
+#include "access/htup_details.h"
 #include "access/transam.h"
+#include "access/tuptoaster.h"
 #include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "commands/sequence.h"
 #include "commands/trigger.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
+#include "miscadmin.h"
 #include "port/atomics.h"
 #include "utils/builtins.h"
 #include "utils/geo_decls.h"
+#include "utils/rel.h"
+#include "utils/typcache.h"
+#include "utils/memutils.h"
 
 
 #define P_MAXDIG 12
@@ -24,24 +43,10 @@
 #define RDELIM			')'
 #define DELIM			','
 
-extern Datum regress_dist_ptpath(PG_FUNCTION_ARGS);
-extern Datum regress_path_dist(PG_FUNCTION_ARGS);
 extern PATH *poly2path(POLYGON *poly);
-extern Datum interpt_pp(PG_FUNCTION_ARGS);
 extern void regress_lseg_construct(LSEG *lseg, Point *pt1, Point *pt2);
-extern Datum overpaid(PG_FUNCTION_ARGS);
-extern Datum boxarea(PG_FUNCTION_ARGS);
 extern char *reverse_name(char *string);
 extern int	oldstyle_length(int n, text *t);
-extern Datum int44in(PG_FUNCTION_ARGS);
-extern Datum int44out(PG_FUNCTION_ARGS);
-
-/*
- * GPDB_94_MERGE_FIXME: test_atomic_ops was backported from 9.5. This prototype
- * doesn't appear in the upstream version, because the PG_FUNCTION_INFO_V1()
- * macro includes it since 9.4.
- */
-extern Datum test_atomic_ops(PG_FUNCTION_ARGS);
 
 #ifdef PG_MODULE_MAGIC
 PG_MODULE_MAGIC;
@@ -207,7 +212,6 @@ regress_lseg_construct(LSEG *lseg, Point *pt1, Point *pt2)
 	lseg->p[0].y = pt1->y;
 	lseg->p[1].x = pt2->x;
 	lseg->p[1].y = pt2->y;
-	lseg->m = point_sl(pt1, pt2);
 }
 
 PG_FUNCTION_INFO_V1(overpaid);
@@ -234,11 +238,10 @@ typedef struct
 {
 	Point		center;
 	double		radius;
-}	WIDGET;
+} WIDGET;
 
 WIDGET	   *widget_in(char *str);
-char	   *widget_out(WIDGET * widget);
-extern Datum pt_in_widget(PG_FUNCTION_ARGS);
+char	   *widget_out(WIDGET *widget);
 
 #define NARGS	3
 
@@ -246,40 +249,35 @@ WIDGET *
 widget_in(char *str)
 {
 	char	   *p,
-			   *coord[NARGS],
-				buf2[1000];
+			   *coord[NARGS];
 	int			i;
 	WIDGET	   *result;
 
-	if (str == NULL)
-		return NULL;
 	for (i = 0, p = str; *p && i < NARGS && *p != RDELIM; p++)
-		if (*p == ',' || (*p == LDELIM && !i))
+	{
+		if (*p == DELIM || (*p == LDELIM && i == 0))
 			coord[i++] = p + 1;
-	if (i < NARGS - 1)
-		return NULL;
+	}
+
+	if (i < NARGS)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("invalid input syntax for type widget: \"%s\"",
+						str)));
+
 	result = (WIDGET *) palloc(sizeof(WIDGET));
 	result->center.x = atof(coord[0]);
 	result->center.y = atof(coord[1]);
 	result->radius = atof(coord[2]);
 
-	snprintf(buf2, sizeof(buf2), "widget_in: read (%f, %f, %f)\n",
-			 result->center.x, result->center.y, result->radius);
 	return result;
 }
 
 char *
-widget_out(WIDGET * widget)
+widget_out(WIDGET *widget)
 {
-	char	   *result;
-
-	if (widget == NULL)
-		return NULL;
-
-	result = (char *) palloc(60);
-	sprintf(result, "(%g,%g,%g)",
-			widget->center.x, widget->center.y, widget->radius);
-	return result;
+	return psprintf("(%g,%g,%g)",
+					widget->center.x, widget->center.y, widget->radius);
 }
 
 PG_FUNCTION_INFO_V1(pt_in_widget);
@@ -347,7 +345,6 @@ static int	fd17b_level = 0;
 static int	fd17a_level = 0;
 static bool fd17b_recursion = true;
 static bool fd17a_recursion = true;
-extern Datum funny_dup17(PG_FUNCTION_ARGS);
 
 PG_FUNCTION_INFO_V1(funny_dup17);
 
@@ -365,7 +362,7 @@ funny_dup17(PG_FUNCTION_ARGS)
 			   *fieldval,
 			   *fieldtype;
 	char	   *when;
-	int			inserted;
+	uint64		inserted;
 	int			selected = 0;
 	int			ret;
 
@@ -446,7 +443,7 @@ funny_dup17(PG_FUNCTION_ARGS)
 																		))));
 	}
 
-	elog(DEBUG4, "funny_dup17 (fired %s) on level %3d: %d/%d tuples inserted/selected",
+	elog(DEBUG4, "funny_dup17 (fired %s) on level %3d: " UINT64_FORMAT "/%d tuples inserted/selected",
 		 when, *level, inserted, selected);
 
 	SPI_finish();
@@ -459,8 +456,21 @@ funny_dup17(PG_FUNCTION_ARGS)
 	return PointerGetDatum(tuple);
 }
 
-extern Datum ttdummy(PG_FUNCTION_ARGS);
-extern Datum set_ttdummy(PG_FUNCTION_ARGS);
+PG_FUNCTION_INFO_V1(trigger_return_old);
+
+Datum
+trigger_return_old(PG_FUNCTION_ARGS)
+{
+	TriggerData *trigdata = (TriggerData *) fcinfo->context;
+	HeapTuple	tuple;
+
+	if (!CALLED_AS_TRIGGER(fcinfo))
+		elog(ERROR, "trigger_return_old: not fired by trigger manager");
+
+	tuple = trigdata->tg_trigtuple;
+
+	return PointerGetDatum(tuple);
+}
 
 #define TTDUMMY_INFINITY	999999
 
@@ -495,9 +505,9 @@ ttdummy(PG_FUNCTION_ARGS)
 
 	if (!CALLED_AS_TRIGGER(fcinfo))
 		elog(ERROR, "ttdummy: not fired by trigger manager");
-	if (TRIGGER_FIRED_FOR_STATEMENT(trigdata->tg_event))
-		elog(ERROR, "ttdummy: cannot process STATEMENT events");
-	if (TRIGGER_FIRED_AFTER(trigdata->tg_event))
+	if (!TRIGGER_FIRED_FOR_ROW(trigdata->tg_event))
+		elog(ERROR, "ttdummy: must be fired for row");
+	if (!TRIGGER_FIRED_BEFORE(trigdata->tg_event))
 		elog(ERROR, "ttdummy: must be fired before event");
 	if (TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))
 		elog(ERROR, "ttdummy: cannot process INSERT event");
@@ -554,8 +564,10 @@ ttdummy(PG_FUNCTION_ARGS)
 			elog(ERROR, "ttdummy (%s): %s must be NOT NULL", relname, args[1]);
 
 		if (oldon != newon || oldoff != newoff)
-			elog(ERROR, "ttdummy (%s): you cannot change %s and/or %s columns (use set_ttdummy)",
-				 relname, args[0], args[1]);
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("ttdummy (%s): you cannot change %s and/or %s columns (use set_ttdummy)",
+							relname, args[0], args[1])));
 
 		if (newoff != TTDUMMY_INFINITY)
 		{
@@ -629,9 +641,8 @@ ttdummy(PG_FUNCTION_ARGS)
 		if (pplan == NULL)
 			elog(ERROR, "ttdummy (%s): SPI_prepare returned %d", relname, SPI_result);
 
-		pplan = SPI_saveplan(pplan);
-		if (pplan == NULL)
-			elog(ERROR, "ttdummy (%s): SPI_saveplan returned %d", relname, SPI_result);
+		if (SPI_keepplan(pplan))
+			elog(ERROR, "ttdummy (%s): SPI_keepplan failed", relname);
 
 		splan = pplan;
 	}
@@ -744,6 +755,149 @@ int44out(PG_FUNCTION_ARGS)
 	}
 	*--walk = '\0';
 	PG_RETURN_CSTRING(result);
+}
+
+PG_FUNCTION_INFO_V1(make_tuple_indirect);
+Datum
+make_tuple_indirect(PG_FUNCTION_ARGS)
+{
+	HeapTupleHeader rec = PG_GETARG_HEAPTUPLEHEADER(0);
+	HeapTupleData tuple;
+	int			ncolumns;
+	Datum	   *values;
+	bool	   *nulls;
+
+	Oid			tupType;
+	int32		tupTypmod;
+	TupleDesc	tupdesc;
+
+	HeapTuple	newtup;
+
+	int			i;
+
+	MemoryContext old_context;
+
+	/* Extract type info from the tuple itself */
+	tupType = HeapTupleHeaderGetTypeId(rec);
+	tupTypmod = HeapTupleHeaderGetTypMod(rec);
+	tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod);
+	ncolumns = tupdesc->natts;
+
+	/* Build a temporary HeapTuple control structure */
+	tuple.t_len = HeapTupleHeaderGetDatumLength(rec);
+	ItemPointerSetInvalid(&(tuple.t_self));
+#if 0
+	tuple.t_tableOid = InvalidOid;
+#endif
+	tuple.t_data = rec;
+
+	values = (Datum *) palloc(ncolumns * sizeof(Datum));
+	nulls = (bool *) palloc(ncolumns * sizeof(bool));
+
+	heap_deform_tuple(&tuple, tupdesc, values, nulls);
+
+	old_context = MemoryContextSwitchTo(TopTransactionContext);
+
+	for (i = 0; i < ncolumns; i++)
+	{
+		struct varlena *attr;
+		struct varlena *new_attr;
+		struct varatt_indirect redirect_pointer;
+
+		/* only work on existing, not-null varlenas */
+		if (tupdesc->attrs[i]->attisdropped ||
+			nulls[i] ||
+			tupdesc->attrs[i]->attlen != -1)
+			continue;
+
+		attr = (struct varlena *) DatumGetPointer(values[i]);
+
+		/* don't recursively indirect */
+		if (VARATT_IS_EXTERNAL_INDIRECT(attr))
+			continue;
+
+		/* copy datum, so it still lives later */
+		if (VARATT_IS_EXTERNAL_ONDISK(attr))
+			attr = heap_tuple_fetch_attr(attr);
+		else
+		{
+			struct varlena *oldattr = attr;
+
+			attr = palloc0(VARSIZE_ANY(oldattr));
+			memcpy(attr, oldattr, VARSIZE_ANY(oldattr));
+		}
+
+		/* build indirection Datum */
+		new_attr = (struct varlena *) palloc0(INDIRECT_POINTER_SIZE);
+		redirect_pointer.pointer = attr;
+		SET_VARTAG_EXTERNAL(new_attr, VARTAG_INDIRECT);
+		memcpy(VARDATA_EXTERNAL(new_attr), &redirect_pointer,
+			   sizeof(redirect_pointer));
+
+		values[i] = PointerGetDatum(new_attr);
+	}
+
+	newtup = heap_form_tuple(tupdesc, values, nulls);
+	pfree(values);
+	pfree(nulls);
+	ReleaseTupleDesc(tupdesc);
+
+	MemoryContextSwitchTo(old_context);
+
+	/*
+	 * We intentionally don't use PG_RETURN_HEAPTUPLEHEADER here, because that
+	 * would cause the indirect toast pointers to be flattened out of the
+	 * tuple immediately, rendering subsequent testing irrelevant.  So just
+	 * return the HeapTupleHeader pointer as-is.  This violates the general
+	 * rule that composite Datums shouldn't contain toast pointers, but so
+	 * long as the regression test scripts don't insert the result of this
+	 * function into a container type (record, array, etc) it should be OK.
+	 */
+	PG_RETURN_POINTER(newtup->t_data);
+}
+
+PG_FUNCTION_INFO_V1(regress_putenv);
+
+Datum
+regress_putenv(PG_FUNCTION_ARGS)
+{
+	MemoryContext oldcontext;
+	char	   *envbuf;
+
+	if (!superuser())
+		elog(ERROR, "must be superuser to change environment variables");
+
+	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+	envbuf = text_to_cstring((text *) PG_GETARG_POINTER(0));
+	MemoryContextSwitchTo(oldcontext);
+
+	if (putenv(envbuf) != 0)
+		elog(ERROR, "could not set environment variable: %m");
+
+	PG_RETURN_VOID();
+}
+
+/* Sleep until no process has a given PID. */
+PG_FUNCTION_INFO_V1(wait_pid);
+
+Datum
+wait_pid(PG_FUNCTION_ARGS)
+{
+	int			pid = PG_GETARG_INT32(0);
+
+	if (!superuser())
+		elog(ERROR, "must be superuser to check PID liveness");
+
+	while (kill(pid, 0) == 0)
+	{
+		CHECK_FOR_INTERRUPTS();
+		pg_usleep(50000);
+	}
+
+	if (errno != ESRCH)
+		elog(ERROR, "could not check PID %d liveness: %m", pid);
+
+	PG_RETURN_VOID();
 }
 
 #ifndef PG_HAVE_ATOMIC_FLAG_SIMULATION
@@ -983,4 +1137,3 @@ test_atomic_ops(PG_FUNCTION_ARGS)
 
 	PG_RETURN_BOOL(true);
 }
-

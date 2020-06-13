@@ -5,10 +5,10 @@
  *	  However, we define it here so that the format is documented.
  *
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/catalog/pg_control.h,v 1.40 2008/02/17 02:09:30 tgl Exp $
+ * src/include/catalog/pg_control.h
  *
  *-------------------------------------------------------------------------
  */
@@ -26,27 +26,46 @@
  * The first three digits is the PostgreSQL version number. The last
  * four digits indicates the GPDB version.
  */
-#define PG_CONTROL_VERSION	8410600
+#define PG_CONTROL_VERSION	9600700
 
 /*
  * Body of CheckPoint XLOG records.  This is declared here because we keep
  * a copy of the latest one in pg_control for possible disaster recovery.
+ * Changing this struct requires a PG_CONTROL_VERSION bump.
  */
 typedef struct CheckPoint
 {
 	XLogRecPtr	redo;			/* next RecPtr available when we began to
 								 * create CheckPoint (i.e. REDO start point) */
 	TimeLineID	ThisTimeLineID; /* current TLI */
+	TimeLineID	PrevTimeLineID; /* previous TLI, if this record begins a new
+								 * timeline (equals ThisTimeLineID otherwise) */
+	bool		fullPageWrites; /* current full_page_writes */
 	uint32		nextXidEpoch;	/* higher-order bits of nextXid */
 	TransactionId nextXid;		/* next free XID */
 	Oid			nextOid;		/* next free OID */
 	Oid			nextRelfilenode;	/* next free Relfilenode */
 	MultiXactId nextMulti;		/* next free MultiXactId */
 	MultiXactOffset nextMultiOffset;	/* next free MultiXact offset */
+	TransactionId oldestXid;	/* cluster-wide minimum datfrozenxid */
+	Oid			oldestXidDB;	/* database with minimum datfrozenxid */
+	MultiXactId oldestMulti;	/* cluster-wide minimum datminmxid */
+	Oid			oldestMultiDB;	/* database with minimum datminmxid */
 	pg_time_t	time;			/* time stamp of checkpoint */
+	TransactionId oldestCommitTsXid;	/* oldest Xid with valid commit
+										 * timestamp */
+	TransactionId newestCommitTsXid;	/* newest Xid with valid commit
+										 * timestamp */
+
+	/*
+	 * Oldest XID still running. This is only needed to initialize hot standby
+	 * mode from an online checkpoint, so we only bother calculating this for
+	 * online checkpoints and only when wal_level is replica. Otherwise it's
+	 * set to InvalidTransactionId.
+	 */
+	TransactionId oldestActiveXid;
 
 	/* IN XLOG RECORD, MORE DATA FOLLOWS AT END OF STRUCT FOR DTM CHECKPOINT */
-
 } CheckPoint;
 
 /* XLOG info values for XLOG rmgr */
@@ -56,32 +75,36 @@ typedef struct CheckPoint
 #define XLOG_NEXTOID					0x30
 #define XLOG_SWITCH						0x40
 #define XLOG_BACKUP_END					0x50
-#define XLOG_NEXTRELFILENODE			0x60
-#define XLOG_HINT						0x70
+#define XLOG_PARAMETER_CHANGE			0x60
+#define XLOG_RESTORE_POINT				0x70
+#define XLOG_FPW_CHANGE					0x80
+#define XLOG_END_OF_RECOVERY			0x90
+#define XLOG_FPI_FOR_HINT				0xA0
+#define XLOG_FPI						0xB0
+#define XLOG_NEXTRELFILENODE			0xC0
 
 
-/* System status indicator */
+/*
+ * System status indicator.  Note this is stored in pg_control; if you change
+ * it, you must bump PG_CONTROL_VERSION
+ */
 typedef enum DBState
 {
 	DB_STARTUP = 0,
 	DB_SHUTDOWNED,
+	DB_SHUTDOWNED_IN_RECOVERY,
 	DB_SHUTDOWNING,
 	DB_IN_CRASH_RECOVERY,
-	DB_IN_STANDBY_MODE,
-	DB_IN_STANDBY_PROMOTED,
-	DB_IN_STANDBY_NEW_TLI_SET,
+	DB_IN_ARCHIVE_RECOVERY,
 	DB_IN_PRODUCTION
 } DBState;
-
-#define LOCALE_NAME_BUFLEN	128
 
 /*
  * Contents of pg_control.
  *
  * NOTE: try to keep this under 512 bytes so that it will fit on one physical
  * sector of typical disk drives.  This reduces the odds of corruption due to
- * power failure midway through a write.  Currently it fits comfortably,
- * but we could probably reduce LOCALE_NAME_BUFLEN if things get tight.
+ * power failure midway through a write.
  */
 
 typedef struct ControlFileData
@@ -93,9 +116,9 @@ typedef struct ControlFileData
 	uint64		system_identifier;
 
 	/*
-	 * Version identifier information.	Keep these fields at the same offset,
+	 * Version identifier information.  Keep these fields at the same offset,
 	 * especially pg_control_version; they won't be real useful if they move
-	 * around.	(For historical reasons they must be 8 bytes into the file
+	 * around.  (For historical reasons they must be 8 bytes into the file
 	 * rather than immediately at the front.)
 	 *
 	 * pg_control_version identifies the format of pg_control itself.
@@ -118,6 +141,8 @@ typedef struct ControlFileData
 
 	CheckPoint	checkPointCopy; /* copy of last check point record */
 
+	XLogRecPtr	unloggedLSN;	/* current fake LSN value, for unlogged rels */
+
 	/*
 	 * These values determine the minimum point we must recover up to
 	 * before starting up:
@@ -136,15 +161,35 @@ typedef struct ControlFileData
 	 * record, to make sure the end-of-backup record corresponds the base
 	 * backup we're recovering from.
 	 *
+	 * backupEndPoint is the backup end location, if we are recovering from an
+	 * online backup which was taken from the standby and haven't reached the
+	 * end of backup yet. It is initialized to the minimum recovery point in
+	 * pg_control which was backed up last. It is reset to zero when the end
+	 * of backup is reached, and we mustn't start up before that.
+	 *
 	 * If backupEndRequired is true, we know for sure that we're restoring
 	 * from a backup, and must see a backup-end record before we can safely
 	 * start up. If it's false, but backupStartPoint is set, a backup_label
 	 * file was found at startup but it may have been a leftover from a stray
 	 * pg_start_backup() call, not accompanied by pg_stop_backup().
 	 */
-	XLogRecPtr	minRecoveryPoint;		/* must replay xlog to here */
-	XLogRecPtr		backupStartPoint;
+	XLogRecPtr	minRecoveryPoint;
+	TimeLineID	minRecoveryPointTLI;
+	XLogRecPtr	backupStartPoint;
+	XLogRecPtr	backupEndPoint;
 	bool		backupEndRequired;
+
+	/*
+	 * Parameter settings that determine if the WAL can be used for archival
+	 * or hot standby.
+	 */
+	int			wal_level;
+	bool		wal_log_hints;
+	int			MaxConnections;
+	int			max_worker_processes;
+	int			max_prepared_xacts;
+	int			max_locks_per_xact;
+	bool		track_commit_timestamp;
 
 	/*
 	 * This data is used to check for hardware-architecture compatibility of
@@ -176,14 +221,14 @@ typedef struct ControlFileData
 	uint32		indexMaxKeys;	/* max number of columns in an index */
 
 	uint32		toast_max_chunk_size;	/* chunk size in TOAST tables */
+	uint32		loblksize;		/* chunk size in pg_largeobject */
 
 	/* flag indicating internal format of timestamp, interval, time */
-	uint32		enableIntTimes; /* int64 storage enabled? */
+	bool		enableIntTimes; /* int64 storage enabled? */
 
-	/* active locales */
-	uint32		localeBuflen;
-	char		lc_collate[LOCALE_NAME_BUFLEN];
-	char		lc_ctype[LOCALE_NAME_BUFLEN];
+	/* flags indicating pass-by-value status of various types */
+	bool		float4ByVal;	/* float4 pass-by-value? */
+	bool		float8ByVal;	/* float8, int8, etc pass-by-value? */
 
 	/* Are data pages protected by checksums? Zero if no checksum version */
 	uint32		data_checksum_version;

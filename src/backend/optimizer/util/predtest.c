@@ -4,48 +4,33 @@
  *	  Routines to attempt to prove logical implications between predicate
  *	  expressions.
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/optimizer/util/predtest.c,v 1.19.2.3 2010/02/25 21:00:10 tgl Exp $
+ *	  src/backend/optimizer/util/predtest.c
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
-#include "catalog/pg_amop.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
+#include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
 #include "optimizer/predtest.h"
-#include "parser/parse_expr.h"
 #include "utils/array.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
-#include "cdb/cdbhash.h"
-#include "access/hash.h"
 #include "nodes/makefuncs.h"
 
 #include "catalog/pg_operator.h"
 #include "optimizer/paths.h"
-/*
- * Proof attempts involving many AND or OR branches are likely to require
- * O(N^2) time, and more often than not fail anyway.  So we set an arbitrary
- * limit on the number of branches that we will allow at any one level of
- * clause.  (Note that this is only effective because the trees have been
- * AND/OR flattened!)  XXX is it worth exposing this as a GUC knob?
- */
-#define MAX_BRANCHES_TO_TEST    100
-
-#define INT16MAX (32767)
-#define INT16MIN (-32768)
-#define INT32MAX (2147483647)
-#define INT32MIN (-2147483648)
 
 static const bool kUseFnEvaluationForPredicates = true;
 
@@ -116,18 +101,15 @@ static bool predicate_refuted_by_simple_clause(Expr *predicate, Node *clause);
 static Node *extract_not_arg(Node *clause);
 static Node *extract_strong_not_arg(Node *clause);
 static bool list_member_strip(List *list, Expr *datum);
-static bool btree_predicate_proof(Expr *predicate, Node *clause,
-					  bool refute_it);
+static bool operator_predicate_proof(Expr *predicate, Node *clause,
+						 bool refute_it);
+static bool operator_same_subexprs_proof(Oid pred_op, Oid clause_op,
+							 bool refute_it);
+static bool operator_same_subexprs_lookup(Oid pred_op, Oid clause_op,
+							  bool refute_it);
+static Oid	get_btree_test_op(Oid pred_op, Oid clause_op, bool refute_it);
+static void InvalidateOprProofCacheCallBack(Datum arg, int cacheid, uint32 hashvalue);
 
-static HTAB* CreateNodeSetHashTable();
-static void AddValue(PossibleValueSet *pvs, Const *valueToCopy);
-static void RemoveValue(PossibleValueSet *pvs, Const *value);
-static bool ContainsValue(PossibleValueSet *pvs, Const *value);
-static void AddUnmatchingValues( PossibleValueSet *pvs, PossibleValueSet *toCheck );
-static void RemoveUnmatchingValues(PossibleValueSet *pvs, PossibleValueSet *toCheck);
-static PossibleValueSet ProcessAndClauseForPossibleValues( PredIterInfoData *clauseInfo, Node *clause, Node *variable);
-static PossibleValueSet ProcessOrClauseForPossibleValues( PredIterInfoData *clauseInfo, Node *clause, Node *variable);
-static bool TryProcessEqualityNodeForPossibleValues(OpExpr *expr, Node *variable, PossibleValueSet *resultOut );
 
 static bool simple_equality_predicate_refuted(Node *clause, Node *predicate);
 
@@ -153,14 +135,31 @@ static bool simple_equality_predicate_refuted(Node *clause, Node *predicate);
 bool
 predicate_implied_by(List *predicate_list, List *restrictinfo_list)
 {
+	Node	   *p,
+			   *r;
+
 	if (predicate_list == NIL)
 		return true;			/* no predicate: implication is vacuous */
 	if (restrictinfo_list == NIL)
 		return false;			/* no restriction: implication must fail */
 
-	/* Otherwise, away we go ... */
-	return predicate_implied_by_recurse((Node *) restrictinfo_list,
-										(Node *) predicate_list);
+	/*
+	 * If either input is a single-element list, replace it with its lone
+	 * member; this avoids one useless level of AND-recursion.  We only need
+	 * to worry about this at top level, since eval_const_expressions should
+	 * have gotten rid of any trivial ANDs or ORs below that.
+	 */
+	if (list_length(predicate_list) == 1)
+		p = (Node *) linitial(predicate_list);
+	else
+		p = (Node *) predicate_list;
+	if (list_length(restrictinfo_list) == 1)
+		r = (Node *) linitial(restrictinfo_list);
+	else
+		r = (Node *) restrictinfo_list;
+
+	/* And away we go ... */
+	return predicate_implied_by_recurse(r, p);
 }
 
 /*
@@ -194,22 +193,36 @@ predicate_implied_by(List *predicate_list, List *restrictinfo_list)
 bool
 predicate_refuted_by(List *predicate_list, List *restrictinfo_list)
 {
+	Node	   *p,
+			   *r;
+
 	if (predicate_list == NIL)
 		return false;			/* no predicate: no refutation is possible */
 	if (restrictinfo_list == NIL)
 		return false;			/* no restriction: refutation must fail */
 
-	/* Otherwise, away we go ... */
-	if ( predicate_refuted_by_recurse((Node *) restrictinfo_list,
-										(Node *) predicate_list))
-    {
+	/*
+	 * If either input is a single-element list, replace it with its lone
+	 * member; this avoids one useless level of AND-recursion.  We only need
+	 * to worry about this at top level, since eval_const_expressions should
+	 * have gotten rid of any trivial ANDs or ORs below that.
+	 */
+	if (list_length(predicate_list) == 1)
+		p = (Node *) linitial(predicate_list);
+	else
+		p = (Node *) predicate_list;
+	if (list_length(restrictinfo_list) == 1)
+		r = (Node *) linitial(restrictinfo_list);
+	else
+		r = (Node *) restrictinfo_list;
+
+	/* And away we go ... */
+	if ( predicate_refuted_by_recurse(r, p))
         return true;
-    }
 
     if ( ! kUseFnEvaluationForPredicates )
         return false;
-    return simple_equality_predicate_refuted((Node *) restrictinfo_list,
-										(Node *) predicate_list);
+    return simple_equality_predicate_refuted((Node*)restrictinfo_list, (Node*)predicate_list);
 }
 
 /*----------
@@ -229,7 +242,7 @@ predicate_refuted_by(List *predicate_list, List *restrictinfo_list)
  *	OR-expr A => AND-expr B iff:	A => each of B's components
  *	OR-expr A => OR-expr B iff:		each of A's components => any of B's
  *
- * An "atom" is anything other than an AND or OR node.	Notice that we don't
+ * An "atom" is anything other than an AND or OR node.  Notice that we don't
  * have any special logic to handle NOT nodes; these should have been pushed
  * down or eliminated where feasible by prepqual.c.
  *
@@ -661,9 +674,9 @@ predicate_refuted_by_recurse(Node *clause, Node *predicate)
 			/*
 			 * If A is a strong NOT-clause, A R=> B if B equals A's arg
 			 *
-			 * We cannot make the stronger conclusion that B is refuted if
-			 * B implies A's arg; that would only prove that B is not-TRUE,
-			 * not that it's not NULL either.  Hence use equal() rather than
+			 * We cannot make the stronger conclusion that B is refuted if B
+			 * implies A's arg; that would only prove that B is not-TRUE, not
+			 * that it's not NULL either.  Hence use equal() rather than
 			 * predicate_implied_by_recurse().  We could do the latter if we
 			 * ever had a need for the weak form of refutation.
 			 */
@@ -743,7 +756,7 @@ predicate_refuted_by_recurse(Node *clause, Node *predicate)
  * This function also implements enforcement of MAX_SAOP_ARRAY_SIZE: if a
  * ScalarArrayOpExpr's array has too many elements, we just classify it as an
  * atom.  (This will result in its being passed as-is to the simple_clause
- * functions, which will fail to prove anything about it.)  Note that we
+ * functions, which will fail to prove anything about it.)	Note that we
  * cannot just stop after considering MAX_SAOP_ARRAY_SIZE elements; in general
  * that would result in wrong proofs, rather than failing to prove anything.
  */
@@ -826,7 +839,7 @@ predicate_classify(Node *clause, PredIterInfo info)
 }
 
 /*
- * PredIterInfo routines for iterating over regular Lists.	The iteration
+ * PredIterInfo routines for iterating over regular Lists.  The iteration
  * state variable is the next ListCell to visit.
  */
 static void
@@ -910,12 +923,15 @@ arrayconst_startup_fn(Node *clause, PredIterInfo info)
 	state->opexpr.opfuncid = saop->opfuncid;
 	state->opexpr.opresulttype = BOOLOID;
 	state->opexpr.opretset = false;
+	state->opexpr.opcollid = InvalidOid;
+	state->opexpr.inputcollid = saop->inputcollid;
 	state->opexpr.args = list_copy(saop->args);
 
 	/* Set up a dummy Const node to hold the per-element values */
 	state->constexpr.xpr.type = T_Const;
 	state->constexpr.consttype = ARR_ELEMTYPE(arrayval);
 	state->constexpr.consttypmod = -1;
+	state->constexpr.constcollid = arrayconst->constcollid;
 	state->constexpr.constlen = elmlen;
 	state->constexpr.constbyval = elmbyval;
 	lsecond(state->opexpr.args) = &state->constexpr;
@@ -975,6 +991,8 @@ arrayexpr_startup_fn(Node *clause, PredIterInfo info)
 	state->opexpr.opfuncid = saop->opfuncid;
 	state->opexpr.opresulttype = BOOLOID;
 	state->opexpr.opretset = false;
+	state->opexpr.opcollid = InvalidOid;
+	state->opexpr.inputcollid = saop->inputcollid;
 	state->opexpr.args = list_copy(saop->args);
 
 	/* Initialize iteration variable to first member of ArrayExpr */
@@ -1015,19 +1033,22 @@ arrayexpr_cleanup_fn(PredIterInfo info)
  * implies another:
  *
  * A simple and general way is to see if they are equal(); this works for any
- * kind of expression.	(Actually, there is an implied assumption that the
+ * kind of expression.  (Actually, there is an implied assumption that the
  * functions in the expression are immutable, ie dependent only on their input
  * arguments --- but this was checked for the predicate by the caller.)
  *
  * When the predicate is of the form "foo IS NOT NULL", we can conclude that
  * the predicate is implied if the clause is a strict operator or function
- * that has "foo" as an input.	In this case the clause must yield NULL when
+ * that has "foo" as an input.  In this case the clause must yield NULL when
  * "foo" is NULL, which we can take as equivalent to FALSE because we know
  * we are within an AND/OR subtree of a WHERE clause.  (Again, "foo" is
  * already known immutable, so the clause will certainly always fail.)
+ * Also, if the clause is just "foo" (meaning it's a boolean variable),
+ * the predicate is implied since the clause can't be true if "foo" is NULL.
  *
- * Finally, we may be able to deduce something using knowledge about btree
- * operator families; this is encapsulated in btree_predicate_proof().
+ * Finally, if both clauses are binary operator expressions, we may be able
+ * to prove something using the system's knowledge about operators; those
+ * proof rules are encapsulated in operator_predicate_proof().
  *----------
  */
 static bool
@@ -1047,7 +1068,7 @@ predicate_implied_by_simple_clause(Expr *predicate, Node *clause)
 		Expr	   *nonnullarg = ((NullTest *) predicate)->arg;
 
 		/* row IS NOT NULL does not act in the simple way we have in mind */
-		if (!type_is_rowtype(exprType((Node *) nonnullarg)))
+		if (!((NullTest *) predicate)->argisrow)
 		{
 			if (is_opclause(clause) &&
 				list_member_strip(((OpExpr *) clause)->args, nonnullarg) &&
@@ -1057,12 +1078,14 @@ predicate_implied_by_simple_clause(Expr *predicate, Node *clause)
 				list_member_strip(((FuncExpr *) clause)->args, nonnullarg) &&
 				func_strict(((FuncExpr *) clause)->funcid))
 				return true;
+			if (equal(clause, nonnullarg))
+				return true;
 		}
 		return false;			/* we can't succeed below... */
 	}
 
-	/* Else try btree operator knowledge */
-	return btree_predicate_proof(predicate, clause, false);
+	/* Else try operator-related knowledge */
+	return operator_predicate_proof(predicate, clause, false);
 }
 
 /*----------
@@ -1084,8 +1107,9 @@ predicate_implied_by_simple_clause(Expr *predicate, Node *clause)
  * these cases is to support using IS NULL/IS NOT NULL as partition-defining
  * constraints.)
  *
- * Finally, we may be able to deduce something using knowledge about btree
- * operator families; this is encapsulated in btree_predicate_proof().
+ * Finally, if both clauses are binary operator expressions, we may be able
+ * to prove something using the system's knowledge about operators; those
+ * proof rules are encapsulated in operator_predicate_proof().
  *----------
  */
 static bool
@@ -1106,7 +1130,7 @@ predicate_refuted_by_simple_clause(Expr *predicate, Node *clause)
 		Expr	   *isnullarg = ((NullTest *) predicate)->arg;
 
 		/* row IS NULL does not act in the simple way we have in mind */
-		if (type_is_rowtype(exprType((Node *) isnullarg)))
+		if (((NullTest *) predicate)->argisrow)
 			return false;
 
 		/* Any strict op/func on foo refutes foo IS NULL */
@@ -1122,6 +1146,7 @@ predicate_refuted_by_simple_clause(Expr *predicate, Node *clause)
 		/* foo IS NOT NULL refutes foo IS NULL */
 		if (clause && IsA(clause, NullTest) &&
 			((NullTest *) clause)->nulltesttype == IS_NOT_NULL &&
+			!((NullTest *) clause)->argisrow &&
 			equal(((NullTest *) clause)->arg, isnullarg))
 			return true;
 
@@ -1135,20 +1160,21 @@ predicate_refuted_by_simple_clause(Expr *predicate, Node *clause)
 		Expr	   *isnullarg = ((NullTest *) clause)->arg;
 
 		/* row IS NULL does not act in the simple way we have in mind */
-		if (type_is_rowtype(exprType((Node *) isnullarg)))
+		if (((NullTest *) clause)->argisrow)
 			return false;
 
 		/* foo IS NULL refutes foo IS NOT NULL */
 		if (predicate && IsA(predicate, NullTest) &&
 			((NullTest *) predicate)->nulltesttype == IS_NOT_NULL &&
+			!((NullTest *) predicate)->argisrow &&
 			equal(((NullTest *) predicate)->arg, isnullarg))
 			return true;
 
 		return false;			/* we can't succeed below... */
 	}
 
-	/* Else try btree operator knowledge */
-	return btree_predicate_proof(predicate, clause, true);
+	/* Else try operator-related knowledge */
+	return operator_predicate_proof(predicate, clause, true);
 }
 
 /**
@@ -1259,7 +1285,7 @@ simple_equality_predicate_refuted(Node *clause, Node *predicate)
          *   simply be removed and some test cases built. */
         return false;
     }
-    
+
     /* DONE inspecting the predicate */
 
 	/* clause may have non-immutable functions...don't eval if that's the case:
@@ -1276,14 +1302,21 @@ simple_equality_predicate_refuted(Node *clause, Node *predicate)
 	{
 		Node *newClause, *reducedExpression;
 		ReplaceExpressionMutatorReplacement replacement;
-		bool result = false;
-		SwitchedMemoryContext memContext;
+		bool				result = false;
+		MemoryContext 		old_context;
+		MemoryContext		tmp_context;
 
 		replacement.replaceThis = varExprInPredicate;
 		replacement.withThis = constExprInPredicate;
         replacement.numReplacementsDone = 0;
 
-        memContext = AllocSetCreateDefaultContextInCurrentAndSwitchTo( "Predtest");
+		tmp_context = AllocSetContextCreate(CurrentMemoryContext,
+											"Predtest",
+											ALLOCSET_DEFAULT_MINSIZE,
+											ALLOCSET_DEFAULT_INITSIZE,
+											ALLOCSET_DEFAULT_MAXSIZE);
+
+		old_context = MemoryContextSwitchTo(tmp_context);
 
 		newClause = replace_expression_mutator(clause, &replacement);
 
@@ -1303,7 +1336,8 @@ simple_equality_predicate_refuted(Node *clause, Node *predicate)
             }
         }
 
-        DeleteAndRestoreSwitchedMemoryContext(memContext);
+		MemoryContextSwitchTo(old_context);
+		MemoryContextDelete(tmp_context);
         return result;
 	}
 }
@@ -1394,38 +1428,53 @@ list_member_strip(List *list, Expr *datum)
 
 
 /*
- * Define an "operator implication table" for btree operators ("strategies"),
- * and a similar table for refutation.
+ * Define "operator implication tables" for btree operators ("strategies"),
+ * and similar tables for refutation.
  *
- * The strategy numbers defined by btree indexes (see access/skey.h) are:
- *		(1) <	(2) <=	 (3) =	 (4) >=   (5) >
- * and in addition we use (6) to represent <>.	<> is not a btree-indexable
+ * The strategy numbers defined by btree indexes (see access/stratnum.h) are:
+ *		1 <		2 <=	3 =		4 >=	5 >
+ * and in addition we use 6 to represent <>.  <> is not a btree-indexable
  * operator, but we assume here that if an equality operator of a btree
  * opfamily has a negator operator, the negator behaves as <> for the opfamily.
+ * (This convention is also known to get_op_btree_interpretation().)
  *
- * The interpretation of:
+ * BT_implies_table[] and BT_refutes_table[] are used for cases where we have
+ * two identical subexpressions and we want to know whether one operator
+ * expression implies or refutes the other.  That is, if the "clause" is
+ * EXPR1 clause_op EXPR2 and the "predicate" is EXPR1 pred_op EXPR2 for the
+ * same two (immutable) subexpressions:
+ *		BT_implies_table[clause_op-1][pred_op-1]
+ *			is true if the clause implies the predicate
+ *		BT_refutes_table[clause_op-1][pred_op-1]
+ *			is true if the clause refutes the predicate
+ * where clause_op and pred_op are strategy numbers (from 1 to 6) in the
+ * same btree opfamily.  For example, "x < y" implies "x <= y" and refutes
+ * "x > y".
  *
- *		test_op = BT_implic_table[given_op-1][target_op-1]
+ * BT_implic_table[] and BT_refute_table[] are used where we have two
+ * constants that we need to compare.  The interpretation of:
  *
- * where test_op, given_op and target_op are strategy numbers (from 1 to 6)
+ *		test_op = BT_implic_table[clause_op-1][pred_op-1]
+ *
+ * where test_op, clause_op and pred_op are strategy numbers (from 1 to 6)
  * of btree operators, is as follows:
  *
- *	 If you know, for some ATTR, that "ATTR given_op CONST1" is true, and you
- *	 want to determine whether "ATTR target_op CONST2" must also be true, then
+ *	 If you know, for some EXPR, that "EXPR clause_op CONST1" is true, and you
+ *	 want to determine whether "EXPR pred_op CONST2" must also be true, then
  *	 you can use "CONST2 test_op CONST1" as a test.  If this test returns true,
- *	 then the target expression must be true; if the test returns false, then
- *	 the target expression may be false.
+ *	 then the predicate expression must be true; if the test returns false,
+ *	 then the predicate expression may be false.
  *
  * For example, if clause is "Quantity > 10" and pred is "Quantity > 5"
  * then we test "5 <= 10" which evals to true, so clause implies pred.
  *
  * Similarly, the interpretation of a BT_refute_table entry is:
  *
- *	 If you know, for some ATTR, that "ATTR given_op CONST1" is true, and you
- *	 want to determine whether "ATTR target_op CONST2" must be false, then
+ *	 If you know, for some EXPR, that "EXPR clause_op CONST1" is true, and you
+ *	 want to determine whether "EXPR pred_op CONST2" must be false, then
  *	 you can use "CONST2 test_op CONST1" as a test.  If this test returns true,
- *	 then the target expression must be false; if the test returns false, then
- *	 the target expression may be true.
+ *	 then the predicate expression must be false; if the test returns false,
+ *	 then the predicate expression may be true.
  *
  * For example, if clause is "Quantity > 10" and pred is "Quantity < 5"
  * then we test "5 <= 10" which evals to true, so clause refutes pred.
@@ -1438,42 +1487,69 @@ list_member_strip(List *list, Expr *datum)
 #define BTEQ BTEqualStrategyNumber
 #define BTGE BTGreaterEqualStrategyNumber
 #define BTGT BTGreaterStrategyNumber
-#define BTNE 6
+#define BTNE ROWCOMPARE_NE
+
+/* We use "none" for 0/false to make the tables align nicely */
+#define none 0
+
+static const bool BT_implies_table[6][6] = {
+/*
+ *			The predicate operator:
+ *	 LT    LE	 EQ    GE	 GT    NE
+ */
+	{TRUE, TRUE, none, none, none, TRUE},		/* LT */
+	{none, TRUE, none, none, none, none},		/* LE */
+	{none, TRUE, TRUE, TRUE, none, none},		/* EQ */
+	{none, none, none, TRUE, none, none},		/* GE */
+	{none, none, none, TRUE, TRUE, TRUE},		/* GT */
+	{none, none, none, none, none, TRUE}		/* NE */
+};
+
+static const bool BT_refutes_table[6][6] = {
+/*
+ *			The predicate operator:
+ *	 LT    LE	 EQ    GE	 GT    NE
+ */
+	{none, none, TRUE, TRUE, TRUE, none},		/* LT */
+	{none, none, none, none, TRUE, none},		/* LE */
+	{TRUE, none, none, none, TRUE, TRUE},		/* EQ */
+	{TRUE, none, none, none, none, none},		/* GE */
+	{TRUE, TRUE, TRUE, none, none, none},		/* GT */
+	{none, none, TRUE, none, none, none}		/* NE */
+};
 
 static const StrategyNumber BT_implic_table[6][6] = {
 /*
- *			The target operator:
- *
+ *			The predicate operator:
  *	 LT    LE	 EQ    GE	 GT    NE
  */
-	{BTGE, BTGE, 0, 0, 0, BTGE},	/* LT */
-	{BTGT, BTGE, 0, 0, 0, BTGT},	/* LE */
+	{BTGE, BTGE, none, none, none, BTGE},		/* LT */
+	{BTGT, BTGE, none, none, none, BTGT},		/* LE */
 	{BTGT, BTGE, BTEQ, BTLE, BTLT, BTNE},		/* EQ */
-	{0, 0, 0, BTLE, BTLT, BTLT},	/* GE */
-	{0, 0, 0, BTLE, BTLE, BTLE},	/* GT */
-	{0, 0, 0, 0, 0, BTEQ}		/* NE */
+	{none, none, none, BTLE, BTLT, BTLT},		/* GE */
+	{none, none, none, BTLE, BTLE, BTLE},		/* GT */
+	{none, none, none, none, none, BTEQ}		/* NE */
 };
 
 static const StrategyNumber BT_refute_table[6][6] = {
 /*
- *			The target operator:
- *
+ *			The predicate operator:
  *	 LT    LE	 EQ    GE	 GT    NE
  */
-	{0, 0, BTGE, BTGE, BTGE, 0},	/* LT */
-	{0, 0, BTGT, BTGT, BTGE, 0},	/* LE */
+	{none, none, BTGE, BTGE, BTGE, none},		/* LT */
+	{none, none, BTGT, BTGT, BTGE, none},		/* LE */
 	{BTLE, BTLT, BTNE, BTGT, BTGE, BTEQ},		/* EQ */
-	{BTLE, BTLT, BTLT, 0, 0, 0},	/* GE */
-	{BTLE, BTLE, BTLE, 0, 0, 0},	/* GT */
-	{0, 0, BTEQ, 0, 0, 0}		/* NE */
+	{BTLE, BTLT, BTLT, none, none, none},		/* GE */
+	{BTLE, BTLE, BTLE, none, none, none},		/* GT */
+	{none, none, BTEQ, none, none, none}		/* NE */
 };
 
 
 /*
- * btree_predicate_proof
+ * operator_predicate_proof
  *	  Does the predicate implication or refutation test for a "simple clause"
- *	  predicate and a "simple clause" restriction, when both are simple
- *	  operator clauses using related btree operators.
+ *	  predicate and a "simple clause" restriction, when both are operator
+ *	  clauses using related operators and identical input expressions.
  *
  * When refute_it == false, we want to prove the predicate true;
  * when refute_it == true, we want to prove the predicate false.
@@ -1481,300 +1557,195 @@ static const StrategyNumber BT_refute_table[6][6] = {
  * in one routine.)  We return TRUE if able to make the proof, FALSE
  * if not able to prove it.
  *
- * What we look for here is binary boolean opclauses of the form
- * "foo op constant", where "foo" is the same in both clauses.	The operators
- * and constants can be different but the operators must be in the same btree
- * operator family.  We use the above operator implication tables to
- * derive implications between nonidentical clauses.  (Note: "foo" is known
- * immutable, and constants are surely immutable, but we have to check that
- * the operators are too.  As of 8.0 it's possible for opfamilies to contain
- * operators that are merely stable, and we dare not make deductions with
- * these.)
+ * We can make proofs involving several expression forms (here "foo" and "bar"
+ * represent subexpressions that are identical according to equal()):
+ *	"foo op1 bar" refutes "foo op2 bar" if op1 is op2's negator
+ *	"foo op1 bar" implies "bar op2 foo" if op1 is op2's commutator
+ *	"foo op1 bar" refutes "bar op2 foo" if op1 is negator of op2's commutator
+ *	"foo op1 bar" can imply/refute "foo op2 bar" based on btree semantics
+ *	"foo op1 bar" can imply/refute "bar op2 foo" based on btree semantics
+ *	"foo op1 const1" can imply/refute "foo op2 const2" based on btree semantics
+ *
+ * For the last three cases, op1 and op2 have to be members of the same btree
+ * operator family.  When both subexpressions are identical, the idea is that,
+ * for instance, x < y implies x <= y, independently of exactly what x and y
+ * are.  If we have two different constants compared to the same expression
+ * foo, we have to execute a comparison between the two constant values
+ * in order to determine the result; for instance, foo < c1 implies foo < c2
+ * if c1 <= c2.  We assume it's safe to compare the constants at plan time
+ * if the comparison operator is immutable.
+ *
+ * Note: all the operators and subexpressions have to be immutable for the
+ * proof to be safe.  We assume the predicate expression is entirely immutable,
+ * so no explicit check on the subexpressions is needed here, but in some
+ * cases we need an extra check of operator immutability.  In particular,
+ * btree opfamilies can contain cross-type operators that are merely stable,
+ * and we dare not make deductions with those.
  */
 static bool
-btree_predicate_proof(Expr *predicate, Node *clause, bool refute_it)
+operator_predicate_proof(Expr *predicate, Node *clause, bool refute_it)
 {
-	Node	   *leftop,
-			   *rightop;
-	Node	   *pred_var,
-			   *clause_var;
-	Const	   *pred_const,
-			   *clause_const;
-	bool		pred_var_on_left,
-				clause_var_on_left,
-				pred_op_negated;
+	OpExpr	   *pred_opexpr,
+			   *clause_opexpr;
+	Oid			pred_collation,
+				clause_collation;
 	Oid			pred_op,
 				clause_op,
-				pred_op_negator,
-				clause_op_negator,
-				test_op = InvalidOid;
-	Oid			opfamily_id;
-	bool		found = false;
-	StrategyNumber pred_strategy,
-				clause_strategy,
-				test_strategy;
-	Oid			clause_righttype;
+				test_op;
+	Node	   *pred_leftop,
+			   *pred_rightop,
+			   *clause_leftop,
+			   *clause_rightop;
+	Const	   *pred_const,
+			   *clause_const;
 	Expr	   *test_expr;
 	ExprState  *test_exprstate;
 	Datum		test_result;
 	bool		isNull;
-	CatCList   *catlist;
-	int			i;
 	EState	   *estate;
 	MemoryContext oldcontext;
 
 	/*
-	 * Both expressions must be binary opclauses with a Const on one side, and
-	 * identical subexpressions on the other sides. Note we don't have to
-	 * think about binary relabeling of the Const node, since that would have
-	 * been folded right into the Const.
+	 * Both expressions must be binary opclauses, else we can't do anything.
 	 *
-	 * If either Const is null, we also fail right away; this assumes that the
-	 * test operator will always be strict.
+	 * Note: in future we might extend this logic to other operator-based
+	 * constructs such as DistinctExpr.  But the planner isn't very smart
+	 * about DistinctExpr in general, and this probably isn't the first place
+	 * to fix if you want to improve that.
 	 */
 	if (!is_opclause(predicate))
 		return false;
-	leftop = get_leftop(predicate);
-	rightop = get_rightop(predicate);
-	if (rightop == NULL)
-		return false;			/* not a binary opclause */
-	if (IsA(rightop, Const))
-	{
-		pred_var = leftop;
-		pred_const = (Const *) rightop;
-		pred_var_on_left = true;
-	}
-	else if (IsA(leftop, Const))
-	{
-		pred_var = rightop;
-		pred_const = (Const *) leftop;
-		pred_var_on_left = false;
-	}
-	else
-		return false;			/* no Const to be found */
-	if (pred_const->constisnull)
+	pred_opexpr = (OpExpr *) predicate;
+	if (list_length(pred_opexpr->args) != 2)
 		return false;
-
 	if (!is_opclause(clause))
 		return false;
-	leftop = get_leftop((Expr *) clause);
-	rightop = get_rightop((Expr *) clause);
-	if (rightop == NULL)
-		return false;			/* not a binary opclause */
-	if (IsA(rightop, Const))
-	{
-		clause_var = leftop;
-		clause_const = (Const *) rightop;
-		clause_var_on_left = true;
-	}
-	else if (IsA(leftop, Const))
-	{
-		clause_var = rightop;
-		clause_const = (Const *) leftop;
-		clause_var_on_left = false;
-	}
-	else
-		return false;			/* no Const to be found */
-	if (clause_const->constisnull)
+	clause_opexpr = (OpExpr *) clause;
+	if (list_length(clause_opexpr->args) != 2)
 		return false;
 
 	/*
-	 * Check for matching subexpressions on the non-Const sides.  We used to
-	 * only allow a simple Var, but it's about as easy to allow any
-	 * expression.	Remember we already know that the pred expression does not
-	 * contain any non-immutable functions, so identical expressions should
-	 * yield identical results.
+	 * If they're marked with different collations then we can't do anything.
+	 * This is a cheap test so let's get it out of the way early.
 	 */
-	if (!equal(pred_var, clause_var))
+	pred_collation = pred_opexpr->inputcollid;
+	clause_collation = clause_opexpr->inputcollid;
+	if (pred_collation != clause_collation)
 		return false;
 
+	/* Grab the operator OIDs now too.  We may commute these below. */
+	pred_op = pred_opexpr->opno;
+	clause_op = clause_opexpr->opno;
+
 	/*
-	 * Okay, get the operators in the two clauses we're comparing. Commute
-	 * them if needed so that we can assume the variables are on the left.
+	 * We have to match up at least one pair of input expressions.
 	 */
-	pred_op = ((OpExpr *) predicate)->opno;
-	if (!pred_var_on_left)
+	pred_leftop = (Node *) linitial(pred_opexpr->args);
+	pred_rightop = (Node *) lsecond(pred_opexpr->args);
+	clause_leftop = (Node *) linitial(clause_opexpr->args);
+	clause_rightop = (Node *) lsecond(clause_opexpr->args);
+
+	if (equal(pred_leftop, clause_leftop))
 	{
+		if (equal(pred_rightop, clause_rightop))
+		{
+			/* We have x op1 y and x op2 y */
+			return operator_same_subexprs_proof(pred_op, clause_op, refute_it);
+		}
+		else
+		{
+			/* Fail unless rightops are both Consts */
+			if (pred_rightop == NULL || !IsA(pred_rightop, Const))
+				return false;
+			pred_const = (Const *) pred_rightop;
+			if (clause_rightop == NULL || !IsA(clause_rightop, Const))
+				return false;
+			clause_const = (Const *) clause_rightop;
+		}
+	}
+	else if (equal(pred_rightop, clause_rightop))
+	{
+		/* Fail unless leftops are both Consts */
+		if (pred_leftop == NULL || !IsA(pred_leftop, Const))
+			return false;
+		pred_const = (Const *) pred_leftop;
+		if (clause_leftop == NULL || !IsA(clause_leftop, Const))
+			return false;
+		clause_const = (Const *) clause_leftop;
+		/* Commute both operators so we can assume Consts are on the right */
 		pred_op = get_commutator(pred_op);
 		if (!OidIsValid(pred_op))
 			return false;
-	}
-
-	clause_op = ((OpExpr *) clause)->opno;
-	if (!clause_var_on_left)
-	{
 		clause_op = get_commutator(clause_op);
 		if (!OidIsValid(clause_op))
 			return false;
 	}
-
-	/*
-	 * Try to find a btree opfamily containing the needed operators.
-	 *
-	 * We must find a btree opfamily that contains both operators, else the
-	 * implication can't be determined.  Also, the opfamily must contain a
-	 * suitable test operator taking the pred_const and clause_const
-	 * datatypes.
-	 *
-	 * If there are multiple matching opfamilies, assume we can use any one to
-	 * determine the logical relationship of the two operators and the correct
-	 * corresponding test operator.  This should work for any logically
-	 * consistent opfamilies.
-	 */
-	catlist = SearchSysCacheList(AMOPOPID, 1,
-								 ObjectIdGetDatum(pred_op),
-								 0, 0, 0);
-
-	/*
-	 * If we couldn't find any opfamily containing the pred_op, perhaps it is
-	 * a <> operator.  See if it has a negator that is in an opfamily.
-	 */
-	pred_op_negated = false;
-	if (catlist->n_members == 0)
+	else if (equal(pred_leftop, clause_rightop))
 	{
-		pred_op_negator = get_negator(pred_op);
-		if (OidIsValid(pred_op_negator))
+		if (equal(pred_rightop, clause_leftop))
 		{
-			pred_op_negated = true;
-			ReleaseSysCacheList(catlist);
-			catlist = SearchSysCacheList(AMOPOPID, 1,
-										 ObjectIdGetDatum(pred_op_negator),
-										 0, 0, 0);
+			/* We have x op1 y and y op2 x */
+			/* Commute pred_op that we can treat this like a straight match */
+			pred_op = get_commutator(pred_op);
+			if (!OidIsValid(pred_op))
+				return false;
+			return operator_same_subexprs_proof(pred_op, clause_op, refute_it);
+		}
+		else
+		{
+			/* Fail unless pred_rightop/clause_leftop are both Consts */
+			if (pred_rightop == NULL || !IsA(pred_rightop, Const))
+				return false;
+			pred_const = (Const *) pred_rightop;
+			if (clause_leftop == NULL || !IsA(clause_leftop, Const))
+				return false;
+			clause_const = (Const *) clause_leftop;
+			/* Commute clause_op so we can assume Consts are on the right */
+			clause_op = get_commutator(clause_op);
+			if (!OidIsValid(clause_op))
+				return false;
 		}
 	}
-
-	/* Also may need the clause_op's negator */
-	clause_op_negator = get_negator(clause_op);
-
-	/* Now search the opfamilies */
-	for (i = 0; i < catlist->n_members; i++)
+	else if (equal(pred_rightop, clause_leftop))
 	{
-		HeapTuple	pred_tuple = &catlist->members[i]->tuple;
-		Form_pg_amop pred_form = (Form_pg_amop) GETSTRUCT(pred_tuple);
-		HeapTuple	clause_tuple;
-
-		/* Must be btree */
-		if (pred_form->amopmethod != BTREE_AM_OID)
-			continue;
-
-		/* Get the predicate operator's btree strategy number */
-		opfamily_id = pred_form->amopfamily;
-		pred_strategy = (StrategyNumber) pred_form->amopstrategy;
-		Assert(pred_strategy >= 1 && pred_strategy <= 5);
-
-		if (pred_op_negated)
-		{
-			/* Only consider negators that are = */
-			if (pred_strategy != BTEqualStrategyNumber)
-				continue;
-			pred_strategy = BTNE;
-		}
-
-		/*
-		 * From the same opfamily, find a strategy number for the clause_op,
-		 * if possible
-		 */
-		clause_tuple = SearchSysCache(AMOPOPID,
-									  ObjectIdGetDatum(clause_op),
-									  ObjectIdGetDatum(opfamily_id),
-									  0, 0);
-		if (HeapTupleIsValid(clause_tuple))
-		{
-			Form_pg_amop clause_form = (Form_pg_amop) GETSTRUCT(clause_tuple);
-
-			/* Get the restriction clause operator's strategy/datatype */
-			clause_strategy = (StrategyNumber) clause_form->amopstrategy;
-			Assert(clause_strategy >= 1 && clause_strategy <= 5);
-			Assert(clause_form->amoplefttype == pred_form->amoplefttype);
-			clause_righttype = clause_form->amoprighttype;
-			ReleaseSysCache(clause_tuple);
-		}
-		else if (OidIsValid(clause_op_negator))
-		{
-			clause_tuple = SearchSysCache(AMOPOPID,
-										  ObjectIdGetDatum(clause_op_negator),
-										  ObjectIdGetDatum(opfamily_id),
-										  0, 0);
-			if (HeapTupleIsValid(clause_tuple))
-			{
-				Form_pg_amop clause_form = (Form_pg_amop) GETSTRUCT(clause_tuple);
-
-				/* Get the restriction clause operator's strategy/datatype */
-				clause_strategy = (StrategyNumber) clause_form->amopstrategy;
-				Assert(clause_strategy >= 1 && clause_strategy <= 5);
-				Assert(clause_form->amoplefttype == pred_form->amoplefttype);
-				clause_righttype = clause_form->amoprighttype;
-				ReleaseSysCache(clause_tuple);
-
-				/* Only consider negators that are = */
-				if (clause_strategy != BTEqualStrategyNumber)
-					continue;
-				clause_strategy = BTNE;
-			}
-			else
-				continue;
-		}
-		else
-			continue;
-
-		/*
-		 * Look up the "test" strategy number in the implication table
-		 */
-		if (refute_it)
-			test_strategy = BT_refute_table[clause_strategy - 1][pred_strategy - 1];
-		else
-			test_strategy = BT_implic_table[clause_strategy - 1][pred_strategy - 1];
-
-		if (test_strategy == 0)
-		{
-			/* Can't determine implication using this interpretation */
-			continue;
-		}
-
-		/*
-		 * See if opfamily has an operator for the test strategy and the
-		 * datatypes.
-		 */
-		if (test_strategy == BTNE)
-		{
-			test_op = get_opfamily_member(opfamily_id,
-										  pred_form->amoprighttype,
-										  clause_righttype,
-										  BTEqualStrategyNumber);
-			if (OidIsValid(test_op))
-				test_op = get_negator(test_op);
-		}
-		else
-		{
-			test_op = get_opfamily_member(opfamily_id,
-										  pred_form->amoprighttype,
-										  clause_righttype,
-										  test_strategy);
-		}
-		if (OidIsValid(test_op))
-		{
-			/*
-			 * Last check: test_op must be immutable.
-			 *
-			 * Note that we require only the test_op to be immutable, not the
-			 * original clause_op.	(pred_op is assumed to have been checked
-			 * immutable by the caller.)  Essentially we are assuming that the
-			 * opfamily is consistent even if it contains operators that are
-			 * merely stable.
-			 */
-			if (op_volatile(test_op) == PROVOLATILE_IMMUTABLE)
-			{
-				found = true;
-				break;
-			}
-		}
+		/* Fail unless pred_leftop/clause_rightop are both Consts */
+		if (pred_leftop == NULL || !IsA(pred_leftop, Const))
+			return false;
+		pred_const = (Const *) pred_leftop;
+		if (clause_rightop == NULL || !IsA(clause_rightop, Const))
+			return false;
+		clause_const = (Const *) clause_rightop;
+		/* Commute pred_op so we can assume Consts are on the right */
+		pred_op = get_commutator(pred_op);
+		if (!OidIsValid(pred_op))
+			return false;
+	}
+	else
+	{
+		/* Failed to match up any of the subexpressions, so we lose */
+		return false;
 	}
 
-	ReleaseSysCacheList(catlist);
+	/*
+	 * We have two identical subexpressions, and two other subexpressions that
+	 * are not identical but are both Consts; and we have commuted the
+	 * operators if necessary so that the Consts are on the right.  We'll need
+	 * to compare the Consts' values.  If either is NULL, fail.
+	 */
+	if (pred_const->constisnull)
+		return false;
+	if (clause_const->constisnull)
+		return false;
 
-	if (!found)
+	/*
+	 * Lookup the constant-comparison operator using the system catalogs and
+	 * the operator implication tables.
+	 */
+	test_op = get_btree_test_op(pred_op, clause_op, refute_it);
+
+	if (!OidIsValid(test_op))
 	{
-		/* couldn't find a btree opfamily to interpret the operators */
+		/* couldn't find a suitable comparison operator */
 		return false;
 	}
 
@@ -1791,10 +1762,15 @@ btree_predicate_proof(Expr *predicate, Node *clause, bool refute_it)
 							  BOOLOID,
 							  false,
 							  (Expr *) pred_const,
-							  (Expr *) clause_const);
+							  (Expr *) clause_const,
+							  InvalidOid,
+							  pred_collation);
+
+	/* Fill in opfuncids */
+	fix_opfuncids((Node *) test_expr);
 
 	/* Prepare it for execution */
-	test_exprstate = ExecPrepareExpr(test_expr, estate);
+	test_exprstate = ExecInitExpr(test_expr, NULL);
 
 	/* And execute it. */
 	test_result = ExecEvalExprSwitchContext(test_exprstate,
@@ -1816,259 +1792,345 @@ btree_predicate_proof(Expr *predicate, Node *clause, bool refute_it)
 	return DatumGetBool(test_result);
 }
 
-typedef struct ConstHashValue
-{
-	Const * c;
-} ConstHashValue;
 
-static void
-CalculateHashWithHashAny(void *clientData, void *buf, size_t len)
+/*
+ * operator_same_subexprs_proof
+ *	  Assuming that EXPR1 clause_op EXPR2 is true, try to prove or refute
+ *	  EXPR1 pred_op EXPR2.
+ *
+ * Return TRUE if able to make the proof, false if not able to prove it.
+ */
+static bool
+operator_same_subexprs_proof(Oid pred_op, Oid clause_op, bool refute_it)
 {
-	uint32 *result = (uint32*) clientData;
-	*result = hash_any((unsigned char *)buf, len );
-}
-
-static uint32
-ConstHashTableHash(const void *keyPtr, Size keysize)
-{
-	uint32 result;
-	Const *c = *((Const **)keyPtr);
-
-	if ( c->constisnull)
+	/*
+	 * A simple and general rule is that the predicate is proven if clause_op
+	 * and pred_op are the same, or refuted if they are each other's negators.
+	 * We need not check immutability since the pred_op is already known
+	 * immutable.  (Actually, by this point we may have the commutator of a
+	 * known-immutable pred_op, but that should certainly be immutable too.
+	 * Likewise we don't worry whether the pred_op's negator is immutable.)
+	 *
+	 * Note: the "same" case won't get here if we actually had EXPR1 clause_op
+	 * EXPR2 and EXPR1 pred_op EXPR2, because the overall-expression-equality
+	 * test in predicate_implied_by_simple_clause would have caught it.  But
+	 * we can see the same operator after having commuted the pred_op.
+	 */
+	if (refute_it)
 	{
-		hashNullDatum(CalculateHashWithHashAny, &result);
+		if (get_negator(pred_op) == clause_op)
+			return true;
 	}
 	else
 	{
-		hashDatum(c->constvalue, c->consttype, CalculateHashWithHashAny, &result);
+		if (pred_op == clause_op)
+			return true;
 	}
-	return result;
+
+	/*
+	 * Otherwise, see if we can determine the implication by finding the
+	 * operators' relationship via some btree opfamily.
+	 */
+	return operator_same_subexprs_lookup(pred_op, clause_op, refute_it);
 }
 
-static int
-ConstHashTableMatch(const void*keyPtr1, const void *keyPtr2, Size keysize)
-{
-	Node *left = *((Node **)keyPtr1);
-	Node *right = *((Node **)keyPtr2);
-	return equal(left, right) ? 0 : 1;
-}
 
-/**
- * returns a hashtable that can be used to map from a node to itself
+/*
+ * We use a lookaside table to cache the result of btree proof operator
+ * lookups, since the actual lookup is pretty expensive and doesn't change
+ * for any given pair of operators (at least as long as pg_amop doesn't
+ * change).  A single hash entry stores both implication and refutation
+ * results for a given pair of operators; but note we may have determined
+ * only one of those sets of results as yet.
  */
-static HTAB*
-CreateNodeSetHashTable(MemoryContext memoryContext)
+typedef struct OprProofCacheKey
 {
-	HASHCTL	hash_ctl;
+	Oid			pred_op;		/* predicate operator */
+	Oid			clause_op;		/* clause operator */
+} OprProofCacheKey;
 
-	MemSet(&hash_ctl, 0, sizeof(hash_ctl));
+typedef struct OprProofCacheEntry
+{
+	/* the hash lookup key MUST BE FIRST */
+	OprProofCacheKey key;
 
-	hash_ctl.keysize = sizeof(Const**);
-	hash_ctl.entrysize = sizeof(ConstHashValue);
-	hash_ctl.hash = ConstHashTableHash;
-	hash_ctl.match = ConstHashTableMatch;
-	hash_ctl.hcxt = memoryContext;
+	bool		have_implic;	/* do we know the implication result? */
+	bool		have_refute;	/* do we know the refutation result? */
+	bool		same_subexprs_implies;	/* X clause_op Y implies X pred_op Y? */
+	bool		same_subexprs_refutes;	/* X clause_op Y refutes X pred_op Y? */
+	Oid			implic_test_op; /* OID of the test operator, or 0 if none */
+	Oid			refute_test_op; /* OID of the test operator, or 0 if none */
+} OprProofCacheEntry;
 
-	return hash_create("ConstantSet", 16, &hash_ctl, HASH_ELEM | HASH_FUNCTION | HASH_COMPARE | HASH_CONTEXT);
-}
+static HTAB *OprProofCacheHash = NULL;
 
-/**
- * basic operation on PossibleValueSet:  initialize to "any value possible"
+
+/*
+ * lookup_proof_cache
+ *	  Get, and fill in if necessary, the appropriate cache entry.
  */
-void
-InitPossibleValueSetData(PossibleValueSet *pvs)
+static OprProofCacheEntry *
+lookup_proof_cache(Oid pred_op, Oid clause_op, bool refute_it)
 {
-	pvs->memoryContext = NULL;
-	pvs->set = NULL;
-	pvs->isAnyValuePossible = true;
-}
+	OprProofCacheKey key;
+	OprProofCacheEntry *cache_entry;
+	bool		cfound;
+	bool		same_subexprs = false;
+	Oid			test_op = InvalidOid;
+	bool		found = false;
+	List	   *pred_op_infos,
+			   *clause_op_infos;
+	ListCell   *lcp,
+			   *lcc;
 
-/**
- * Take the values from the given PossibleValueSet and return them as an allocated array.
- *
- * @param pvs the set to turn into an array
- * @param numValuesOut receives the length of the returned array
- * @return the array of Node objects
- */
-Node **
-GetPossibleValuesAsArray( PossibleValueSet *pvs, int *numValuesOut )
-{
-	HASH_SEQ_STATUS status;
-	ConstHashValue *value;
-	List *list = NULL;
-	Node ** result;
-	int numValues, i;
-	ListCell *lc;
-
-	if ( pvs->set == NULL)
+	/*
+	 * Find or make a cache entry for this pair of operators.
+	 */
+	if (OprProofCacheHash == NULL)
 	{
-		*numValuesOut = 0;
-		return NULL;
+		/* First time through: initialize the hash table */
+		HASHCTL		ctl;
+
+		MemSet(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(OprProofCacheKey);
+		ctl.entrysize = sizeof(OprProofCacheEntry);
+		OprProofCacheHash = hash_create("Btree proof lookup cache", 256,
+										&ctl, HASH_ELEM | HASH_BLOBS);
+
+		/* Arrange to flush cache on pg_amop changes */
+		CacheRegisterSyscacheCallback(AMOPOPID,
+									  InvalidateOprProofCacheCallBack,
+									  (Datum) 0);
 	}
 
-	hash_seq_init(&status, pvs->set);
-	while ((value = (ConstHashValue*) hash_seq_search(&status)) != NULL)
+	key.pred_op = pred_op;
+	key.clause_op = clause_op;
+	cache_entry = (OprProofCacheEntry *) hash_search(OprProofCacheHash,
+													 (void *) &key,
+													 HASH_ENTER, &cfound);
+	if (!cfound)
 	{
-		list = lappend(list, copyObject(value->c));
+		/* new cache entry, set it invalid */
+		cache_entry->have_implic = false;
+		cache_entry->have_refute = false;
+	}
+	else
+	{
+		/* pre-existing cache entry, see if we know the answer yet */
+		if (refute_it ? cache_entry->have_refute : cache_entry->have_implic)
+			return cache_entry;
 	}
 
-	numValues = list_length(list);
-	result = palloc(sizeof(Node*) * numValues);
-	foreach_with_count( lc, list, i)
+	/*
+	 * Try to find a btree opfamily containing the given operators.
+	 *
+	 * We must find a btree opfamily that contains both operators, else the
+	 * implication can't be determined.  Also, the opfamily must contain a
+	 * suitable test operator taking the operators' righthand datatypes.
+	 *
+	 * If there are multiple matching opfamilies, assume we can use any one to
+	 * determine the logical relationship of the two operators and the correct
+	 * corresponding test operator.  This should work for any logically
+	 * consistent opfamilies.
+	 *
+	 * Note that we can determine the operators' relationship for
+	 * same-subexprs cases even from an opfamily that lacks a usable test
+	 * operator.  This can happen in cases with incomplete sets of cross-type
+	 * comparison operators.
+	 */
+	clause_op_infos = get_op_btree_interpretation(clause_op);
+	if (clause_op_infos)
+		pred_op_infos = get_op_btree_interpretation(pred_op);
+	else	/* no point in looking */
+		pred_op_infos = NIL;
+
+	foreach(lcp, pred_op_infos)
 	{
-		result[i] = (Node*) lfirst(lc);
-	}
+		OpBtreeInterpretation *pred_op_info = lfirst(lcp);
+		Oid			opfamily_id = pred_op_info->opfamily_id;
 
-	*numValuesOut = numValues;
-	return result;
-}
-
-/**
- * basic operation on PossibleValueSet:  cleanup
- */
-void
-DeletePossibleValueSetData(PossibleValueSet *pvs)
-{
-	if ( pvs->set != NULL)
-	{
-		Assert(pvs->memoryContext != NULL);
-
-		MemoryContextDelete(pvs->memoryContext);
-		pvs->memoryContext = NULL;
-		pvs->set = NULL;
-	}
-	pvs->isAnyValuePossible = true;
-}
-
-/**
- * basic operation on PossibleValueSet:  add a value to the set field of PossibleValueSet
- *
- * The caller must verify that the valueToCopy is greenplum hashable
- */
-static void
-AddValue(PossibleValueSet *pvs, Const *valueToCopy)
-{
-	Assert( isGreenplumDbHashable(valueToCopy->consttype));
-	
-	if ( pvs->set == NULL)
-	{
-		Assert(pvs->memoryContext == NULL);
-
-		pvs->memoryContext = AllocSetContextCreate(CurrentMemoryContext,
-													   "PossibleValueSet",
-													   ALLOCSET_DEFAULT_MINSIZE,
-													   ALLOCSET_DEFAULT_INITSIZE,
-													   ALLOCSET_DEFAULT_MAXSIZE);
-		pvs->set = CreateNodeSetHashTable(pvs->memoryContext);
-	}
-
-	if ( ! ContainsValue(pvs, valueToCopy))
-	{
-		bool found; /* unused but needed in call */
-		MemoryContext oldContext = MemoryContextSwitchTo(pvs->memoryContext);
-
-		Const *key = copyObject(valueToCopy);
-		void *entry = hash_search(pvs->set, &key, HASH_ENTER, &found);
-
-		if ( entry == NULL)
+		foreach(lcc, clause_op_infos)
 		{
-			ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY), errmsg("out of memory")));
+			OpBtreeInterpretation *clause_op_info = lfirst(lcc);
+			StrategyNumber pred_strategy,
+						clause_strategy,
+						test_strategy;
+
+			/* Must find them in same opfamily */
+			if (opfamily_id != clause_op_info->opfamily_id)
+				continue;
+			/* Lefttypes should match */
+			Assert(clause_op_info->oplefttype == pred_op_info->oplefttype);
+
+			pred_strategy = pred_op_info->strategy;
+			clause_strategy = clause_op_info->strategy;
+
+			/*
+			 * Check to see if we can make a proof for same-subexpressions
+			 * cases based on the operators' relationship in this opfamily.
+			 */
+			if (refute_it)
+				same_subexprs |= BT_refutes_table[clause_strategy - 1][pred_strategy - 1];
+			else
+				same_subexprs |= BT_implies_table[clause_strategy - 1][pred_strategy - 1];
+
+			/*
+			 * Look up the "test" strategy number in the implication table
+			 */
+			if (refute_it)
+				test_strategy = BT_refute_table[clause_strategy - 1][pred_strategy - 1];
+			else
+				test_strategy = BT_implic_table[clause_strategy - 1][pred_strategy - 1];
+
+			if (test_strategy == 0)
+			{
+				/* Can't determine implication using this interpretation */
+				continue;
+			}
+
+			/*
+			 * See if opfamily has an operator for the test strategy and the
+			 * datatypes.
+			 */
+			if (test_strategy == BTNE)
+			{
+				test_op = get_opfamily_member(opfamily_id,
+											  pred_op_info->oprighttype,
+											  clause_op_info->oprighttype,
+											  BTEqualStrategyNumber);
+				if (OidIsValid(test_op))
+					test_op = get_negator(test_op);
+			}
+			else
+			{
+				test_op = get_opfamily_member(opfamily_id,
+											  pred_op_info->oprighttype,
+											  clause_op_info->oprighttype,
+											  test_strategy);
+			}
+
+			if (!OidIsValid(test_op))
+				continue;
+
+			/*
+			 * Last check: test_op must be immutable.
+			 *
+			 * Note that we require only the test_op to be immutable, not the
+			 * original clause_op.  (pred_op is assumed to have been checked
+			 * immutable by the caller.)  Essentially we are assuming that the
+			 * opfamily is consistent even if it contains operators that are
+			 * merely stable.
+			 */
+			if (op_volatile(test_op) == PROVOLATILE_IMMUTABLE)
+			{
+				found = true;
+				break;
+			}
 		}
-		((ConstHashValue*)entry)->c = key;
 
-		MemoryContextSwitchTo(oldContext);
+		if (found)
+			break;
 	}
-}
 
-static void
-SetToNoValuesPossible(PossibleValueSet *pvs)
-{
-	if ( pvs->memoryContext )
+	list_free_deep(pred_op_infos);
+	list_free_deep(clause_op_infos);
+
+	if (!found)
 	{
-		MemoryContextDelete(pvs->memoryContext);
+		/* couldn't find a suitable comparison operator */
+		test_op = InvalidOid;
 	}
-	pvs->memoryContext = AllocSetContextCreate(CurrentMemoryContext,
-												   "PossibleValueSet",
-												   ALLOCSET_DEFAULT_MINSIZE,
-												   ALLOCSET_DEFAULT_INITSIZE,
-												   ALLOCSET_DEFAULT_MAXSIZE);
-	pvs->set = CreateNodeSetHashTable(pvs->memoryContext);
-	pvs->isAnyValuePossible = false;
+
+	/*
+	 * If we think we were able to prove something about same-subexpressions
+	 * cases, check to make sure the clause_op is immutable before believing
+	 * it completely.  (Usually, the clause_op would be immutable if the
+	 * pred_op is, but it's not entirely clear that this must be true in all
+	 * cases, so let's check.)
+	 */
+	if (same_subexprs &&
+		op_volatile(clause_op) != PROVOLATILE_IMMUTABLE)
+		same_subexprs = false;
+
+	/* Cache the results, whether positive or negative */
+	if (refute_it)
+	{
+		cache_entry->refute_test_op = test_op;
+		cache_entry->same_subexprs_refutes = same_subexprs;
+		cache_entry->have_refute = true;
+	}
+	else
+	{
+		cache_entry->implic_test_op = test_op;
+		cache_entry->same_subexprs_implies = same_subexprs;
+		cache_entry->have_implic = true;
+	}
+
+	return cache_entry;
 }
 
-/**
- * basic operation on PossibleValueSet:  remove a value from the set field of PossibleValueSet
- */
-static void
-RemoveValue(PossibleValueSet *pvs, Const *value)
-{
-	bool found; /* unused, needed in call */
-	Assert( pvs->set != NULL);
-	hash_search(pvs->set, &value, HASH_REMOVE, &found);
-}
-
-/**
- * basic operation on PossibleValueSet:  determine if a value is contained in the set field of PossibleValueSet
+/*
+ * operator_same_subexprs_lookup
+ *	  Convenience subroutine to look up the cached answer for
+ *	  same-subexpressions cases.
  */
 static bool
-ContainsValue(PossibleValueSet *pvs, Const *value)
+operator_same_subexprs_lookup(Oid pred_op, Oid clause_op, bool refute_it)
 {
-	bool found = false;
-	Assert(!pvs->isAnyValuePossible);
-	if ( pvs->set != NULL)
-		hash_search(pvs->set, &value, HASH_FIND, &found);
-	return found;
+	OprProofCacheEntry *cache_entry;
+
+	cache_entry = lookup_proof_cache(pred_op, clause_op, refute_it);
+	if (refute_it)
+		return cache_entry->same_subexprs_refutes;
+	else
+		return cache_entry->same_subexprs_implies;
 }
 
-/**
- * in-place union operation
+/*
+ * get_btree_test_op
+ *	  Identify the comparison operator needed for a btree-operator
+ *	  proof or refutation involving comparison of constants.
+ *
+ * Given the truth of a clause "var clause_op const1", we are attempting to
+ * prove or refute a predicate "var pred_op const2".  The identities of the
+ * two operators are sufficient to determine the operator (if any) to compare
+ * const2 to const1 with.
+ *
+ * Returns the OID of the operator to use, or InvalidOid if no proof is
+ * possible.
  */
-static void
-AddUnmatchingValues( PossibleValueSet *pvs, PossibleValueSet *toCheck )
+static Oid
+get_btree_test_op(Oid pred_op, Oid clause_op, bool refute_it)
 {
-	HASH_SEQ_STATUS status;
-	ConstHashValue *value;
+	OprProofCacheEntry *cache_entry;
 
-	Assert(!pvs->isAnyValuePossible);
-	Assert(!toCheck->isAnyValuePossible);
-
-	hash_seq_init(&status, toCheck->set);
-	while ((value = (ConstHashValue*) hash_seq_search(&status)) != NULL)
-	{
-		AddValue(pvs, value->c);
-	}
+	cache_entry = lookup_proof_cache(pred_op, clause_op, refute_it);
+	if (refute_it)
+		return cache_entry->refute_test_op;
+	else
+		return cache_entry->implic_test_op;
 }
 
-/**
- * in-place intersection operation
+
+/*
+ * Callback for pg_amop inval events
  */
 static void
-RemoveUnmatchingValues(PossibleValueSet *pvs, PossibleValueSet *toCheck)
+InvalidateOprProofCacheCallBack(Datum arg, int cacheid, uint32 hashvalue)
 {
-	List *toRemove = NULL;
-	ListCell *lc;
 	HASH_SEQ_STATUS status;
-	ConstHashValue *value;
+	OprProofCacheEntry *hentry;
 
-	Assert(!pvs->isAnyValuePossible);
-	Assert(!toCheck->isAnyValuePossible);
+	Assert(OprProofCacheHash != NULL);
 
-	hash_seq_init(&status, pvs->set);
-	while ((value = (ConstHashValue*) hash_seq_search(&status)) != NULL)
+	/* Currently we just reset all entries; hard to be smarter ... */
+	hash_seq_init(&status, OprProofCacheHash);
+
+	while ((hentry = (OprProofCacheEntry *) hash_seq_search(&status)) != NULL)
 	{
-		if ( ! ContainsValue(toCheck, value->c ))
-		{
-			toRemove = lappend(toRemove, value->c);
-		}
+		hentry->have_implic = false;
+		hentry->have_refute = false;
 	}
-
-	/* remove after so we don't mod hashtable underneath iteration */
-	foreach(lc, toRemove)
-	{
-		Const *value = (Const*) lfirst(lc);
-		RemoveValue(pvs, value);
-	}
-	list_free(toRemove);
 }
 
 /**
@@ -2078,6 +2140,7 @@ static PossibleValueSet
 ProcessAndClauseForPossibleValues( PredIterInfoData *clauseInfo, Node *clause, Node *variable)
 {
 	PossibleValueSet result;
+
 	InitPossibleValueSetData(&result);
 
 	iterate_begin(child, clause, *clauseInfo)
@@ -2149,226 +2212,6 @@ ProcessOrClauseForPossibleValues( PredIterInfoData *clauseInfo, Node *clause, No
 	return result;
 }
 
-/**
- * Check to see if the given OpExpr is a valid equality between the listed variable and a constant.
- *
- * @param expr the expression to check for being a valid quality
- * @param variable the varaible to look for
- * @param resultOut will be updated with the modified values
- */
-static bool
-TryProcessEqualityNodeForPossibleValues(OpExpr *expr, Node *variable, PossibleValueSet *resultOut )
-{
-	Node *leftop, *rightop, *varExpr;
-    Const *constExpr;
-    bool constOnRight;
-
-	InitPossibleValueSetData(resultOut);
-
-	leftop = get_leftop((Expr*)expr);
-	rightop = get_rightop((Expr*)expr);
-	if (!leftop || !rightop)
-		return false;
-
-	/* check if one operand is a constant */
-	if ( IsA(rightop, Const))
-	{
-		varExpr = leftop;
-		constExpr = (Const *) rightop;
-		constOnRight = true;
-	}
-	else if ( IsA(leftop, Const))
-	{
-		constExpr = (Const *) leftop;
-		varExpr = rightop;
-		constOnRight = false;
-	}
-	else
-	{
-		/** not a constant?  Learned nothing */
-		return false;
-	}
-
-	if ( constExpr->constisnull)
-	{
-		/* null doesn't help us */
-		return false;
-	}
-
-	if ( IsA(varExpr, RelabelType))
-	{
-		RelabelType *rt = (RelabelType*) varExpr;
-		varExpr = (Node*) rt->arg;
-	}
-
-	if ( ! equal(varExpr, variable))
-	{
-		/**
-		 * Not talking about our variable?  Learned nothing
-		 */
-		return false;
-	}
-
-	/* check if it's equality operation */
-	if ( is_builtin_greenplum_hashable_equality_between_same_type(expr->opno))
-	{
-		if ( isGreenplumDbHashable(constExpr->consttype))
-		{
-			/**
-			 * Found a constant match!
-			 */
-			resultOut->isAnyValuePossible = false;
-			AddValue(resultOut, constExpr);
-		}
-		else
-		{
-			/**
-			 * Not cdb hashable, can't determine the value
-			 */
-			resultOut->isAnyValuePossible = true;
-		}
-		return true;
-	}
-	else
-	{
-		Oid consttype;
-		Datum constvalue;
-
-		/* try to handle equality between differently-sized integer types */
-		bool isOverflow = false;
-		switch ( expr->opno )
-		{
-			case Int84EqualOperator:
-			case Int48EqualOperator:
-			{
-				bool bigOnRight = expr->opno == Int48EqualOperator;
-				if ( constOnRight == bigOnRight )
-				{
-					// convert large constant to small
-					int64 val =  DatumGetInt64(constExpr->constvalue);
-
-					if ( val > INT32MAX || val < INT32MIN )
-					{
-						isOverflow = true;
-					}
-					else
-					{
-						consttype = INT4OID;
-						constvalue = Int32GetDatum((int32)val);
-					}
-				}
-				else
-				{
-					// convert small constant to small
-					int32 val =  DatumGetInt32(constExpr->constvalue);
-
-					consttype = INT8OID;
-					constvalue = Int64GetDatum(val);
-				}
-				break;
-			}
-			case Int24EqualOperator:
-			case Int42EqualOperator:
-			{
-				bool bigOnRight = expr->opno == Int24EqualOperator;
-				if ( constOnRight == bigOnRight )
-				{
-					// convert large constant to small
-					int32 val =  DatumGetInt32(constExpr->constvalue);
-
-					if ( val > INT16MAX || val < INT16MIN )
-					{
-						isOverflow = true;
-					}
-					else
-					{
-						consttype = INT2OID;
-						constvalue = Int16GetDatum((int16)val);
-					}
-				}
-				else
-				{
-					// convert small constant to small
-					int16 val =  DatumGetInt16(constExpr->constvalue);
-
-					consttype = INT4OID;
-					constvalue = Int32GetDatum(val);
-				}
-				break;
-			}
-			case Int28EqualOperator:
-			case Int82EqualOperator:
-			{
-				bool bigOnRight = expr->opno == Int28EqualOperator;
-				if ( constOnRight == bigOnRight )
-				{
-					// convert large constant to small
-					int64 val =  DatumGetInt64(constExpr->constvalue);
-
-					if ( val > INT16MAX || val < INT16MIN )
-					{
-						isOverflow = true;
-					}
-					else
-					{
-						consttype = INT2OID;
-						constvalue = Int16GetDatum((int16)val);
-					}
-				}
-				else
-				{
-					// convert small constant to small
-					int16 val =  DatumGetInt16(constExpr->constvalue);
-
-					consttype = INT8OID;
-					constvalue = Int64GetDatum(val);
-				}
-				break;
-			}
-			default:
-				/* not a useful operator ... */
-				return false;
-		}
-
-		if ( isOverflow )
-		{
-			SetToNoValuesPossible(resultOut);
-		}
-		else
-		{
-			/* okay, got a new constant value .. set it and done!*/
-			Const *newConst;
-			int constlen = 0;
-
-			Assert(isGreenplumDbHashable(consttype));
-
-			switch ( consttype)
-			{
-				case INT8OID:
-					constlen = sizeof(int64);
-					break;
-				case INT4OID:
-					constlen = sizeof(int32);
-					break;
-				case INT2OID:
-					constlen = sizeof(int16);
-					break;
-				default:
-					Assert(!"unreachable");
-			}
-
-			newConst = makeConst(consttype, /* consttypmod */ 0, constlen, constvalue,
-				/* constisnull */ false, /* constbyval */ true);
-
-
-			resultOut->isAnyValuePossible = false;
-			AddValue(resultOut, newConst);
-
-			pfree(newConst);
-		}
-		return true;
-	}
-}
 
 /**
  *
@@ -2382,7 +2225,7 @@ TryProcessEqualityNodeForPossibleValues(OpExpr *expr, Node *variable, PossibleVa
  *    possible values is within the cross-product of the two variables' sets
  */
 PossibleValueSet
-DeterminePossibleValueSet( Node *clause, Node *variable)
+DeterminePossibleValueSet(Node *clause, Node *variable)
 {
 	PredIterInfoData clauseInfo;
 	PossibleValueSet result;
@@ -2400,8 +2243,7 @@ DeterminePossibleValueSet( Node *clause, Node *variable)
 		case CLASS_OR:
 			return ProcessOrClauseForPossibleValues(&clauseInfo, clause, variable);
 		case CLASS_ATOM:
-			if (IsA(clause, OpExpr) &&
-				TryProcessEqualityNodeForPossibleValues((OpExpr*)clause, variable, &result))
+			if (TryProcessExprForPossibleValues(clause, variable, &result))
 			{
 				return result;
 			}
@@ -2409,7 +2251,7 @@ DeterminePossibleValueSet( Node *clause, Node *variable)
 			InitPossibleValueSetData(&result);
 			return result;
 	}
-	
+
 
 	/* can't get here */
 	elog(ERROR, "predicate_classify returned a bad value");

@@ -1,8 +1,11 @@
-# $PostgreSQL: pgsql/src/bin/scripts/nls.mk,v 1.23.2.1 2009/09/03 21:01:11 petere Exp $
-CATALOG_NAME    := pgscripts
-AVAIL_LANGUAGES := cs de es fr it ko pt_BR ro ru sk sl sv ta tr zh_CN zh_TW
-GETTEXT_FILES   := createdb.c createlang.c createuser.c \
+# src/bin/scripts/nls.mk
+CATALOG_NAME     = pgscripts
+AVAIL_LANGUAGES  = cs de es fr it ja ko pl pt_BR ru sv zh_CN
+GETTEXT_FILES    = createdb.c createlang.c createuser.c \
                    dropdb.c droplang.c dropuser.c \
                    clusterdb.c vacuumdb.c reindexdb.c \
-                   common.c
-GETTEXT_TRIGGERS:= _ simple_prompt yesno_prompt
+                   pg_isready.c \
+                   common.c \
+                   ../../fe_utils/print.c \
+                   ../../common/fe_memutils.c ../../common/username.c
+GETTEXT_TRIGGERS = simple_prompt yesno_prompt

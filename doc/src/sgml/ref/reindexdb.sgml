@@ -1,11 +1,15 @@
 <!--
-$PostgreSQL $
+doc/src/sgml/ref/reindexdb.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="APP-REINDEXDB">
+ <indexterm zone="app-reindexdb">
+  <primary>reindexdb</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="APP-REINDEXDB-TITLE"><application>reindexdb</application></refentrytitle>
+  <refentrytitle><application>reindexdb</application></refentrytitle>
   <manvolnum>1</manvolnum>
   <refmiscinfo>Application</refmiscinfo>
  </refmeta>
@@ -15,29 +19,69 @@ PostgreSQL documentation
   <refpurpose>reindex a <productname>PostgreSQL</productname> database</refpurpose>
  </refnamediv>
 
- <indexterm zone="app-reindexdb">
-  <primary>reindexdb</primary>
- </indexterm>
-
  <refsynopsisdiv>
   <cmdsynopsis>
    <command>reindexdb</command>
    <arg rep="repeat"><replaceable>connection-option</replaceable></arg>
-   <arg>--table | -t <replaceable>table</replaceable> </arg>
-   <arg>--index | -i <replaceable>index</replaceable> </arg>
-   <arg><replaceable>dbname</replaceable></arg>
-   <sbr>
+   <arg rep="repeat"><replaceable>option</replaceable></arg>
+   
+   <arg choice="plain" rep="repeat">
+    <arg choice="opt">
+     <group choice="plain">
+      <arg choice="plain"><option>--schema</option></arg>
+      <arg choice="plain"><option>-S</option></arg>
+     </group>
+     <replaceable>schema</replaceable>
+    </arg>
+   </arg>
+
+   <arg choice="plain" rep="repeat">
+    <arg choice="opt">
+     <group choice="plain">
+      <arg choice="plain"><option>--table</option></arg>
+      <arg choice="plain"><option>-t</option></arg>
+     </group>
+     <replaceable>table</replaceable>
+    </arg>
+   </arg>
+
+   <arg choice="plain" rep="repeat">
+    <arg choice="opt">
+     <group choice="plain">
+      <arg choice="plain"><option>--index</option></arg>
+      <arg choice="plain"><option>-i</option></arg>
+     </group>
+     <replaceable>index</replaceable>
+    </arg>
+   </arg>
+
+   <arg choice="opt"><replaceable>dbname</replaceable></arg>
+  </cmdsynopsis>
+
+  <cmdsynopsis>
    <command>reindexdb</command>
    <arg rep="repeat"><replaceable>connection-option</replaceable></arg>
-   <arg>--all | -a</arg>
-   <sbr>
+   <arg rep="repeat"><replaceable>option</replaceable></arg>
+
+   <group choice="plain">
+    <arg choice="plain"><option>--all</option></arg>
+    <arg choice="plain"><option>-a</option></arg>
+   </group>
+  </cmdsynopsis>
+
+  <cmdsynopsis>
    <command>reindexdb</command>
    <arg rep="repeat"><replaceable>connection-option</replaceable></arg>
-   <arg>--system | -s</arg>
-   <arg><replaceable>dbname</replaceable></arg>
+   <arg rep="repeat"><replaceable>option</replaceable></arg>
+
+   <group choice="plain">
+    <arg choice="plain"><option>--system</option></arg>
+    <arg choice="plain"><option>-s</option></arg>
+   </group>
+   <arg choice="opt"><replaceable>dbname</replaceable></arg>
   </cmdsynopsis>
  </refsynopsisdiv>
- 
+
 
  <refsect1>
   <title>Description</title>
@@ -49,7 +93,7 @@ PostgreSQL documentation
 
   <para>
    <application>reindexdb</application> is a wrapper around the SQL
-   command <xref linkend="SQL-REINDEX" endterm="sql-reindex-title">.
+   command <xref linkend="SQL-REINDEX">.
    There is no effective difference between reindexing databases via
    this utility and via other methods for accessing the server.
   </para>
@@ -62,7 +106,7 @@ PostgreSQL documentation
 
    <para>
     <application>reindexdb</application> accepts the following command-line arguments:
-    
+
     <variablelist>
      <varlistentry>
       <term><option>-a</></term>
@@ -76,7 +120,7 @@ PostgreSQL documentation
 
      <varlistentry>
       <term><option><optional>-d</> <replaceable class="parameter">dbname</replaceable></></term>
-      <term><option><optional>--dbname</> <replaceable class="parameter">dbname</replaceable></></term>
+      <term><option><optional>--dbname=</><replaceable class="parameter">dbname</replaceable></></term>
       <listitem>
        <para>
         Specifies the name of the database to be reindexed.
@@ -102,10 +146,12 @@ PostgreSQL documentation
 
      <varlistentry>
       <term><option>-i <replaceable class="parameter">index</replaceable></></term>
-      <term><option>--index <replaceable class="parameter">index</replaceable></></term>
+      <term><option>--index=<replaceable class="parameter">index</replaceable></></term>
       <listitem>
        <para>
         Recreate <replaceable class="parameter">index</replaceable> only.
+        Multiple indexes can be recreated by writing multiple
+        <option>-i</> switches.
        </para>
       </listitem>
      </varlistentry>
@@ -131,25 +177,72 @@ PostgreSQL documentation
      </varlistentry>
 
      <varlistentry>
-      <term><option>-t <replaceable class="parameter">table</replaceable></></term>
-      <term><option>--table <replaceable class="parameter">table</replaceable></></term>
+      <term><option>-S <replaceable class="parameter">schema</replaceable></></term>
+      <term><option>--schema=<replaceable class="parameter">schema</replaceable></></term>
       <listitem>
        <para>
-        Reindex <replaceable class="parameter">table</replaceable> only.
+        Reindex <replaceable class="parameter">schema</replaceable> only.
+        Multiple schemas can be reindexed by writing multiple
+        <option>-S</> switches.
        </para>
       </listitem>
      </varlistentry>
-    </variablelist>
+
+     <varlistentry>
+      <term><option>-t <replaceable class="parameter">table</replaceable></></term>
+      <term><option>--table=<replaceable class="parameter">table</replaceable></></term>
+      <listitem>
+       <para>
+        Reindex <replaceable class="parameter">table</replaceable> only.
+        Multiple tables can be reindexed by writing multiple
+        <option>-t</> switches.
+       </para>
+      </listitem>
+     </varlistentry>
+
+    <varlistentry>
+     <term><option>-v</></term>
+     <term><option>--verbose</></term>
+     <listitem>
+      <para>
+       Print detailed information during processing.
+      </para>
+     </listitem>
+    </varlistentry>
+
+    <varlistentry>
+      <term><option>-V</></term>
+      <term><option>--version</></term>
+      <listitem>
+       <para>
+       Print the <application>reindexdb</application> version and exit.
+       </para>
+      </listitem>
+    </varlistentry>
+
+    <varlistentry>
+      <term><option>-?</></term>
+      <term><option>--help</></term>
+      <listitem>
+      <para>
+      Show help about <application>reindexdb</application> command line
+      arguments, and exit.
+      </para>
+      </listitem>
+    </varlistentry>
+
+   </variablelist>
+
    </para>
 
    <para>
-    <application>reindexdb</application> also accepts 
+    <application>reindexdb</application> also accepts
     the following command-line arguments for connection parameters:
 
     <variablelist>
      <varlistentry>
       <term><option>-h <replaceable class="parameter">host</replaceable></></term>
-      <term><option>--host <replaceable class="parameter">host</replaceable></></term>
+      <term><option>--host=<replaceable class="parameter">host</replaceable></></term>
       <listitem>
        <para>
         Specifies the host name of the machine on which the server is
@@ -161,10 +254,10 @@ PostgreSQL documentation
 
      <varlistentry>
       <term><option>-p <replaceable class="parameter">port</replaceable></></term>
-      <term><option>--port <replaceable class="parameter">port</replaceable></></term>
+      <term><option>--port=<replaceable class="parameter">port</replaceable></></term>
       <listitem>
        <para>
-        Specifies the TCP port or local Unix domain socket file 
+        Specifies the TCP port or local Unix domain socket file
         extension on which the server
         is listening for connections.
        </para>
@@ -173,10 +266,25 @@ PostgreSQL documentation
 
      <varlistentry>
       <term><option>-U <replaceable class="parameter">username</replaceable></></term>
-      <term><option>--username <replaceable class="parameter">username</replaceable></></term>
+      <term><option>--username=<replaceable class="parameter">username</replaceable></></term>
       <listitem>
        <para>
         User name to connect as.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><option>-w</></term>
+      <term><option>--no-password</></term>
+      <listitem>
+       <para>
+        Never issue a password prompt.  If the server requires
+        password authentication and a password is not available by
+        other means such as a <filename>.pgpass</filename> file, the
+        connection attempt will fail.  This option can be useful in
+        batch jobs and scripts where no user is present to enter a
+        password.
        </para>
       </listitem>
      </varlistentry>
@@ -187,7 +295,7 @@ PostgreSQL documentation
       <listitem>
        <para>
         Force <application>reindexdb</application> to prompt for a
-        password before connecting to a database.  
+        password before connecting to a database.
        </para>
 
        <para>
@@ -198,6 +306,18 @@ PostgreSQL documentation
         connection attempt finding out that the server wants a password.
         In some cases it is worth typing <option>-W</> to avoid the extra
         connection attempt.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><option>--maintenance-db=<replaceable class="parameter">dbname</replaceable></></term>
+      <listitem>
+       <para>
+         Specifies the name of the database to connect to discover what other
+         databases should be reindexed. If not specified, the
+         <literal>postgres</literal> database will be used,
+         and if that does not exist, <literal>template1</literal> will be used.
        </para>
       </listitem>
      </varlistentry>
@@ -237,8 +357,8 @@ PostgreSQL documentation
   <title>Diagnostics</title>
 
   <para>
-   In case of difficulty, see <xref linkend="SQL-REINDEX"
-   endterm="sql-reindex-title"> and <xref linkend="APP-PSQL"> for
+   In case of difficulty, see <xref linkend="SQL-REINDEX">
+   and <xref linkend="APP-PSQL"> for
    discussions of potential problems and error messages.
    The database server must be running at the
    targeted host.  Also, any default connection settings and environment
@@ -277,8 +397,7 @@ PostgreSQL documentation
     <literal>bar</literal> in a database named <literal>abcd</literal>:
 <screen>
 <prompt>$ </prompt><userinput>reindexdb --table foo --index bar abcd</userinput>
-</screen>
-   </para>
+</screen></para>
 
  </refsect1>
 
@@ -286,7 +405,7 @@ PostgreSQL documentation
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-reindex" endterm="sql-reindex-title"></member>
+   <member><xref linkend="sql-reindex"></member>
   </simplelist>
  </refsect1>
 

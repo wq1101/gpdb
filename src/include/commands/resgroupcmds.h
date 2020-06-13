@@ -15,19 +15,29 @@
 #define RESGROUPCMDS_H
 
 #include "nodes/parsenodes.h"
+#include "storage/lock.h"
 #include "utils/resgroup.h"
+#include "utils/relcache.h"
 
-#define RESGROUP_MAX_MEMORY_LIMIT	(100)
+typedef enum ResGroupMemAuditorType
+{
+	RESGROUP_MEMORY_AUDITOR_VMTRACKER = 0,
+	RESGROUP_MEMORY_AUDITOR_CGROUP,
+
+	RESGROUP_MEMORY_AUDITOR_COUNT,
+} ResGroupMemAuditorType;
 
 extern void CreateResourceGroup(CreateResourceGroupStmt *stmt);
 extern void DropResourceGroup(DropResourceGroupStmt *stmt);
 extern void AlterResourceGroup(AlterResourceGroupStmt *stmt);
 
 /* catalog access function */
-extern Oid GetResGroupIdForName(char *name, LOCKMODE lockmode);
-extern char *GetResGroupNameForId(Oid oid, LOCKMODE lockmode);
+extern Oid GetResGroupIdForName(const char *name);
+extern char *GetResGroupNameForId(Oid oid);
 extern Oid GetResGroupIdForRole(Oid roleid);
-extern void GetResGroupCapabilities(Oid groupId, ResGroupCaps *resgroupCaps);
-extern void AtEOXact_ResGroup(bool isCommit);
+extern void GetResGroupCapabilities(Relation rel,
+									Oid groupId,
+									ResGroupCaps *resgroupCaps);
+extern void ResGroupCheckForRole(Oid groupId);
 
 #endif   /* RESGROUPCMDS_H */

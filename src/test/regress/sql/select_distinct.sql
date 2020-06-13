@@ -5,7 +5,7 @@
 --
 -- awk '{print $3;}' onek.data | sort -n | uniq
 --
-SELECT DISTINCT two FROM tmp  ORDER BY 1;
+SELECT DISTINCT two FROM tmp ORDER BY 1;
 
 --
 -- awk '{print $5;}' onek.data | sort -n | uniq
@@ -35,6 +35,17 @@ SELECT DISTINCT two, string4, ten
 SELECT DISTINCT p.age FROM person* p ORDER BY age using >;
 
 --
+-- Check mentioning same column more than once
+--
+
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT count(*) FROM
+  (SELECT DISTINCT two, four, two FROM tenk1) ss;
+
+SELECT count(*) FROM
+  (SELECT DISTINCT two, four, two FROM tenk1) ss;
+
+--
 -- Also, some tests of IS DISTINCT FROM, which doesn't quite deserve its
 -- very own regression file.
 --
@@ -46,10 +57,10 @@ INSERT INTO DISTTABLE VALUES(3);
 INSERT INTO DISTTABLE VALUES(NULL);
 
 -- basic cases
-SELECT f1, f1 IS DISTINCT FROM 2 as "not 2" FROM disttable ORDER BY 1;
-SELECT f1, f1 IS DISTINCT FROM NULL as "not null" FROM disttable ORDER BY 1;
-SELECT f1, f1 IS DISTINCT FROM f1 as "false" FROM disttable ORDER BY 1;
-SELECT f1, f1 IS DISTINCT FROM f1+1 as "not null" FROM disttable ORDER BY 1;
+SELECT f1, f1 IS DISTINCT FROM 2 as "not 2" FROM disttable;
+SELECT f1, f1 IS DISTINCT FROM NULL as "not null" FROM disttable;
+SELECT f1, f1 IS DISTINCT FROM f1 as "false" FROM disttable;
+SELECT f1, f1 IS DISTINCT FROM f1+1 as "not null" FROM disttable;
 
 -- check that optimizer constant-folds it properly
 SELECT 1 IS DISTINCT FROM 2 as "yes";
@@ -57,7 +68,7 @@ SELECT 2 IS DISTINCT FROM 2 as "no";
 SELECT 2 IS DISTINCT FROM null as "yes";
 SELECT null IS DISTINCT FROM null as "no";
 
--- ANSI SQL 2003 form
+-- negated form
 SELECT 1 IS NOT DISTINCT FROM 2 as "no";
 SELECT 2 IS NOT DISTINCT FROM 2 as "yes";
 SELECT 2 IS NOT DISTINCT FROM null as "no";

@@ -20,13 +20,8 @@
 
 extern SequenceState *ExecInitSequence(Sequence *node, EState *estate, int eflags);
 extern TupleTableSlot *ExecSequence(SequenceState *node);
-extern void ExecReScanSequence(SequenceState *node, ExprContext *exprCtxt);
+extern void ExecReScanSequence(SequenceState *node);
 extern void ExecEndSequence(SequenceState *node);
-extern int ExecCountSlotsSequence(Sequence *node);
-
-static inline gpmon_packet_t * GpmonPktFromSequenceState(SequenceState *node)
-{
-	return &node->ps.gpmon_pkt;
-}
+extern void ExecSquelchSequence(SequenceState *node);
 
 #endif

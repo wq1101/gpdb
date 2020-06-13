@@ -3,12 +3,12 @@
  * dfmgr.c
  *	  Dynamic function manager code.
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/fmgr/dfmgr.c,v 1.99.2.1 2009/09/03 22:11:13 tgl Exp $
+ *	  src/backend/utils/fmgr/dfmgr.c
  *
  *-------------------------------------------------------------------------
  */
@@ -16,13 +16,10 @@
 
 #include <sys/stat.h>
 
-#ifndef WIN32_ONLY_COMPILER
 #include "dynloader.h"
-#else
-#include "port/dynloader/win32.h"
-#endif
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
+#include "storage/shmem.h"
 #include "utils/dynamic_loader.h"
 #include "utils/hsearch.h"
 
@@ -51,12 +48,7 @@ typedef struct df_files
 	ino_t		inode;			/* Inode number of file */
 #endif
 	void	   *handle;			/* a handle for pg_dl* functions */
-	char		filename[1];	/* Full pathname of file */
-
-	/*
-	 * we allocate the block big enough for actual length of pathname.
-	 * filename[] must be last item in struct!
-	 */
+	char		filename[FLEXIBLE_ARRAY_MEMBER];		/* Full pathname of file */
 } DynamicFileList;
 
 static DynamicFileList *file_list = NULL;
@@ -132,7 +124,7 @@ load_external_function(char *filename, char *funcname,
 
 /*
  * This function loads a shlib file without looking up any particular
- * function in it.	If the same shlib has previously been loaded,
+ * function in it.  If the same shlib has previously been loaded,
  * unload and reload it.
  *
  * When 'restricted' is true, only libraries in the presumed-secure
@@ -172,7 +164,7 @@ lookup_external_function(void *filehandle, char *funcname)
 
 /*
  * Load the specified dynamic-link library file, unless it already is
- * loaded.	Return the pg_dl* handle for the file.
+ * loaded.  Return the pg_dl* handle for the file.
  *
  * Note: libname is expected to be an exact name for the library file.
  */
@@ -218,13 +210,13 @@ internal_load_library(const char *libname)
 		 * File not loaded yet.
 		 */
 		file_scanner = (DynamicFileList *)
-			malloc(sizeof(DynamicFileList) + strlen(libname));
+			malloc(offsetof(DynamicFileList, filename) +strlen(libname) + 1);
 		if (file_scanner == NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_OUT_OF_MEMORY),
 					 errmsg("out of memory")));
 
-		MemSet(file_scanner, 0, sizeof(DynamicFileList));
+		MemSet(file_scanner, 0, offsetof(DynamicFileList, filename));
 		strcpy(file_scanner->filename, libname);
 		file_scanner->device = stat_buf.st_dev;
 #ifndef WIN32
@@ -382,9 +374,7 @@ incompatible_module_error(const char *libname,
 	if (module_magic_data->funcmaxargs != magic_data.funcmaxargs)
 	{
 		if (details.len)
-		{
 			appendStringInfoChar(&details, '\n');
-		}
 		appendStringInfo(&details,
 						 _("Server has FUNC_MAX_ARGS = %d, library has %d."),
 						 magic_data.funcmaxargs,
@@ -393,9 +383,7 @@ incompatible_module_error(const char *libname,
 	if (module_magic_data->indexmaxkeys != magic_data.indexmaxkeys)
 	{
 		if (details.len)
-		{
 			appendStringInfoChar(&details, '\n');
-		}
 		appendStringInfo(&details,
 						 _("Server has INDEX_MAX_KEYS = %d, library has %d."),
 						 magic_data.indexmaxkeys,
@@ -404,9 +392,7 @@ incompatible_module_error(const char *libname,
 	if (module_magic_data->namedatalen != magic_data.namedatalen)
 	{
 		if (details.len)
-		{
 			appendStringInfoChar(&details, '\n');
-		}
 		appendStringInfo(&details,
 						 _("Server has NAMEDATALEN = %d, library has %d."),
 						 magic_data.namedatalen,
@@ -415,9 +401,7 @@ incompatible_module_error(const char *libname,
 	if (module_magic_data->float4byval != magic_data.float4byval)
 	{
 		if (details.len)
-		{
 			appendStringInfoChar(&details, '\n');
-		}
 		appendStringInfo(&details,
 					   _("Server has FLOAT4PASSBYVAL = %s, library has %s."),
 						 magic_data.float4byval ? "true" : "false",
@@ -426,9 +410,7 @@ incompatible_module_error(const char *libname,
 	if (module_magic_data->float8byval != magic_data.float8byval)
 	{
 		if (details.len)
-		{
 			appendStringInfoChar(&details, '\n');
-		}
 		appendStringInfo(&details,
 					   _("Server has FLOAT8PASSBYVAL = %s, library has %s."),
 						 magic_data.float8byval ? "true" : "false",
@@ -436,15 +418,13 @@ incompatible_module_error(const char *libname,
 	}
 
 	if (details.len == 0)
-	{
-		appendStringInfo(&details,
+		appendStringInfoString(&details,
 			  _("Magic block has unexpected length or padding difference."));
-	}
 
 	ereport(ERROR,
 			(errmsg("incompatible library \"%s\": magic block mismatch",
 					libname),
-			 errdetail("%s", details.data)));
+			 errdetail_internal("%s", details.data)));
 }
 
 /*
@@ -509,7 +489,7 @@ internal_unload_library(const char *libname)
 		else
 			prv = file_scanner;
 	}
-#endif /* NOT_USED */
+#endif   /* NOT_USED */
 }
 
 static bool
@@ -539,7 +519,7 @@ file_exists(const char *name)
  * If name contains a slash, check if the file exists, if so return
  * the name.  Else (no slash) try to expand using search path (see
  * find_in_dynamic_libpath below); if that works, return the fully
- * expanded file name.	If the previous failed, append DLSUFFIX and
+ * expanded file name.  If the previous failed, append DLSUFFIX and
  * try again.  If all fails, just return the original name.
  *
  * The result will always be freshly palloc'd.
@@ -569,9 +549,7 @@ expand_dynamic_library_name(const char *name)
 		pfree(full);
 	}
 
-	new = palloc(strlen(name) + strlen(DLSUFFIX) + 1);
-	strcpy(new, name);
-	strcat(new, DLSUFFIX);
+	new = psprintf("%s%s", name, DLSUFFIX);
 
 	if (!have_slash)
 	{
@@ -620,7 +598,6 @@ static char *
 substitute_libpath_macro(const char *name)
 {
 	const char *sep_ptr;
-	char	   *ret;
 
 	AssertArg(name != NULL);
 
@@ -638,12 +615,7 @@ substitute_libpath_macro(const char *name)
 				 errmsg("invalid macro name in dynamic library path: %s",
 						name)));
 
-	ret = palloc(strlen(pkglib_path) + strlen(sep_ptr) + 1);
-
-	strcpy(ret, pkglib_path);
-	strcat(ret, sep_ptr);
-
-	return ret;
+	return psprintf("%s%s", pkglib_path, sep_ptr);
 }
 
 
@@ -676,13 +648,13 @@ find_in_dynamic_libpath(const char *basename)
 		char	   *mangled;
 		char	   *full;
 
-		piece = first_path_separator(p);
+		piece = first_path_var_separator(p);
 		if (piece == p)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_NAME),
 					 errmsg("zero-length component in parameter \"dynamic_library_path\"")));
 
-		if (piece == 0)
+		if (piece == NULL)
 			len = strlen(p);
 		else
 			len = piece - p;
@@ -770,4 +742,57 @@ find_rendezvous_variable(const char *varName)
 		hentry->varValue = NULL;
 
 	return &hentry->varValue;
+}
+
+/*
+ * Estimate the amount of space needed to serialize the list of libraries
+ * we have loaded.
+ */
+Size
+EstimateLibraryStateSpace(void)
+{
+	DynamicFileList *file_scanner;
+	Size		size = 1;
+
+	for (file_scanner = file_list;
+		 file_scanner != NULL;
+		 file_scanner = file_scanner->next)
+		size = add_size(size, strlen(file_scanner->filename) + 1);
+
+	return size;
+}
+
+/*
+ * Serialize the list of libraries we have loaded to a chunk of memory.
+ */
+void
+SerializeLibraryState(Size maxsize, char *start_address)
+{
+	DynamicFileList *file_scanner;
+
+	for (file_scanner = file_list;
+		 file_scanner != NULL;
+		 file_scanner = file_scanner->next)
+	{
+		Size		len;
+
+		len = strlcpy(start_address, file_scanner->filename, maxsize) + 1;
+		Assert(len < maxsize);
+		maxsize -= len;
+		start_address += len;
+	}
+	start_address[0] = '\0';
+}
+
+/*
+ * Load every library the serializing backend had loaded.
+ */
+void
+RestoreLibraryState(char *start_address)
+{
+	while (*start_address != '\0')
+	{
+		internal_load_library(start_address);
+		start_address += strlen(start_address) + 1;
+	}
 }

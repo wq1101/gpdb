@@ -10,14 +10,14 @@
  * Particularly, the case when the current visimap entry has already
  * been stashed at least once.
  */
-void
+static void
 test__AppendOnlyVisimapDelete_Finish_outoforder(void **state)
 {
 	AppendOnlyVisiMapDeleteKey key;
 	AppendOnlyVisiMapDeleteData val;
 	AppendOnlyVisimapDelete visiMapDelete;
 	AppendOnlyVisimap visiMap;
-	bool found;
+
 	visiMapDelete.visiMap = &visiMap;
 	visiMap.visimapEntry.segmentFileNum = 2;
 	visiMap.visimapEntry.firstRowNum = 32768;
@@ -32,9 +32,9 @@ test__AppendOnlyVisimapDelete_Finish_outoforder(void **state)
 	will_return(AppendOnlyVisimapEntry_HasChanged, true);
 
 #ifdef USE_ASSERT_CHECKING
+
 	/*
-	 * AppendOnlyVisimap_Store calls
-	 * Assert(AppendOnlyVisimapEntry_IsValid)
+	 * AppendOnlyVisimap_Store calls Assert(AppendOnlyVisimapEntry_IsValid)
 	 */
 	expect_any(AppendOnlyVisimapEntry_IsValid, visiMapEntry);
 	will_return(AppendOnlyVisimapEntry_IsValid, true);
@@ -54,8 +54,8 @@ test__AppendOnlyVisimapDelete_Finish_outoforder(void **state)
 	expect_any(hash_destroy, hashp);
 	will_be_called(hash_destroy);
 
-	expect_any(ExecWorkFile_Close, workfile);
-	will_return(ExecWorkFile_Close, 0);
+	expect_any(BufFileClose, file);
+	will_return(BufFileClose, 0);
 
 	expect_any(hash_get_num_entries, hashp);
 	will_return(hash_get_num_entries, 0);
@@ -65,13 +65,13 @@ test__AppendOnlyVisimapDelete_Finish_outoforder(void **state)
 }
 
 
-int 
-main(int argc, char* argv[]) 
+int
+main(int argc, char *argv[])
 {
 	cmockery_parse_arguments(argc, argv);
 
-	const UnitTest tests[] = {
-			unit_test(test__AppendOnlyVisimapDelete_Finish_outoforder)
+	const		UnitTest tests[] = {
+		unit_test(test__AppendOnlyVisimapDelete_Finish_outoforder)
 	};
 
 	MemoryContextInit();

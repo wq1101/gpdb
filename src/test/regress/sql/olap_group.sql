@@ -1,6 +1,12 @@
 --
 -- OLAP_GROUP - Test OLAP GROUP BY extensions
 --
+-- Many of the tests here test different queries that are expected to
+-- produce the same result. Such queries are kept in "start_equiv" /
+-- "end_equiv" comments. We used to have special support in gpdiff.pl to
+-- check that they really produce the same result, but they no longer
+-- bear any special meaning, the markers are for human consumption only.
+--
 
 -- Syntactic equivalents --
 
@@ -59,7 +65,7 @@ select cn, vn, pn, sum(qty*prc) from sale group by cube (cn, vn, pn);
 select cn, vn, pn, sum(qty*prc) from sale group by grouping sets ((), (cn), (vn), (pn), (cn,vn), (cn,pn), (vn,pn), (cn,vn,pn));
 --end_equiv
 
--- start_equiv
+--start_equiv
 select cn, vn, pn, count(distinct dt) from sale group by cn, vn, pn
 union all
 select cn, vn, null, count(distinct dt) from sale group by cn, vn
@@ -69,7 +75,7 @@ union all
 select null, null, null, count(distinct dt) from sale;    --mvd 1,2,3->4
 select cn, vn, pn, count(distinct dt) from sale group by rollup(cn,vn,pn);--mvd 1,2,3->4
 select cn, vn, pn, count(distinct dt) from sale group by grouping sets((), (cn), (cn,vn), (cn,vn,pn));--mvd 1,2,3->4
--- end_equiv
+--end_equiv
 
 --start_equiv order 1,2,3
 select cn, vn, pn, count(distinct dt) from sale group by cn, vn, pn
@@ -91,7 +97,6 @@ order by 1,2,3; -- order 1,2,3
 select cn, vn, pn, count(distinct dt) from sale group by cube (cn, vn, pn) order by 1,2,3; -- order 1,2,3
 select cn, vn, pn, count(distinct dt) from sale group by grouping sets ((), (cn), (vn), (pn), (cn,vn), (cn,pn), (vn,pn), (cn,vn,pn)) order by 1,2,3; -- order 1,2,3
 --end_equiv
-
 --start_equiv order 1,2,3
 select cn, vn, pn, sum(qty*prc) from sale group by cn, vn, pn
 union all
@@ -173,7 +178,6 @@ order by 1,2,3; -- order 1,2,3
 select cn, vn, pn, count(distinct dt) from sale group by cube (cn, vn, pn) order by 1,2,3; -- order 1,2,3
 select cn, vn, pn, count(distinct dt) from sale group by grouping sets ((), (cn), (vn), (pn), (cn,vn), (cn,pn), (vn,pn), (cn,vn,pn)) order by 1,2,3; -- order 1,2,3
 --end_equiv
-
 
 -- Ordinary Grouping Set Specifications --
 
@@ -332,11 +336,11 @@ select grouping(cn,vn,pn) from sale group by rollup(cn); --error
 -- Using in View --
 
 create view cube_view as select cn,vn,grouping(vn,cn) from sale group by cube(cn,vn);
-\d cube_view;
+\d+ cube_view;
 create view rollup_view as select cn,vn,pn,grouping(cn,vn,pn) from sale group by rollup(cn),vn,pn;
-\d rollup_view;
+\d+ rollup_view;
 create view gs_view as select cn,vn,grouping(vn,cn) from sale group by grouping sets ((vn), (cn), (), (cn,vn));
-\d gs_view;
+\d+ gs_view;
 
 -- GROUP_ID function --
 
@@ -433,7 +437,7 @@ select a,b from (select 1 as a , 2 as b) r(a,b) group by rollup(a,b);
 select dt,pn,cn,GROUP_ID(), count(prc) FROM sale GROUP BY ROLLUP((dt)),ROLLUP((cn)),ROLLUP((vn)),ROLLUP((pn),(cn));
 
 --start_equiv
-select vn,cn,dt,0,REGR_COUNT(prc*qty,prc*qty) FROM sale GROUP BY pn,qty,vn,cn,dt
+select vn,cn,dt,0 as group_id,REGR_COUNT(prc*qty,prc*qty) FROM sale GROUP BY pn,qty,vn,cn,dt
 union all select vn,cn,dt,1,REGR_COUNT(prc*qty,prc*qty) FROM sale GROUP BY pn,qty,vn,cn,dt;
 select vn,cn,dt,GROUP_ID(), REGR_COUNT(prc*qty,prc*qty) FROM sale GROUP BY (pn,qty),(vn),ROLLUP((qty)),cn,dt;
 --end_equiv
@@ -494,9 +498,9 @@ select count(*) from sale group by grouping sets((), ());
 create view grp_v1 as select count(*) from sale group by ();
 create view grp_v2 as select count(*) from sale group by grouping sets(());
 create view grp_v3 as select count(*) from sale group by grouping sets((), ());
-\d grp_v1;
-\d grp_v2;
-\d grp_v3;
+\d+ grp_v1;
+\d+ grp_v2;
+\d+ grp_v3;
 drop view grp_v1;
 drop view grp_v2;
 drop view grp_v3;
@@ -597,11 +601,6 @@ drop table s6756 cascade; --ignore
 select sum((select prc from sale where cn = s.cn and vn = s.vn and pn = s.pn)) from sale s;
 -- end MPP-14021
 
--- begin MPP-14125: if prelim function is missing, do not choose hash agg.
-create temp table mpp14125 as select repeat('a', a) a, a % 10 b from generate_series(1, 100)a;
-explain select string_agg(a) from mpp14125 group by b;
--- end MPP-14125
-
 -- Test COUNT in a subquery
 create table prod_agg (sale integer, prod varchar);
 insert into prod_agg values
@@ -637,3 +636,16 @@ insert into test_gsets values (0, 0), (0, 1), (0,2);
 select i,n,count(*), grouping(i), grouping(n), grouping(i,n) from test_gsets group by grouping sets((), (i,n)) having n is null;
 
 select x, y, count(*), grouping(x,y) from generate_series(1,1) x, generate_series(1,1) y group by grouping sets(x,y) having x is not null;
+
+
+-- GROUPING SETS meets subplan [issue 8342]
+create table foo_gset(a int);
+create table bar_gset(b int);
+
+insert into foo_gset select i from generate_series(1,10)i;
+insert into bar_gset select i from generate_series(1,10)i;
+
+select a, (select b from bar_gset where foo_gset.a = bar_gset.b) from foo_gset group by rollup(a) order by 1,2;
+
+drop table foo_gset;
+drop table bar_gset;

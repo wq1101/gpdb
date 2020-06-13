@@ -164,6 +164,7 @@ select relid::regclass,compresslevel,compresstype,blocksize,checksum,columnstore
 	from pg_appendonly order by 1;
 select attrelid::regclass,attnum,attoptions
 	from pg_attribute_encoding order by 1,2;
+drop database if exists dsp3;
 create database dsp3;
 \c dsp3
 set gp_default_storage_options=
@@ -325,14 +326,11 @@ show gp_default_storage_options;
 create table ao8 with (compresstype=none) as select * from ao7
     distributed by (a);
 \d ao8
--- compresslevel only
+-- compresslevel only (should fail)
 create table ao9 with (compresslevel=0) as select * from ao8
     distributed by (a);
-\d ao9
-select * from ao9 limit 4 order by 1;
 create table ao10 with (compresslevel=0, compresstype=none)
-    as select * from ao9 distributed by (a);
-\d ao10
+    as select * from ao8 distributed by (a);
 
 -- MPP-14504: we need to allow compresstype=none with compresslevel>0
 create table ao11 (a int, b int) with (compresstype=none, compresslevel=2)
@@ -354,13 +352,19 @@ set gp_default_storage_options='appendonly=true';
 create external table ext_t1 (a int, b int)
     location ('file:///tmp/test.txt') format 'text';
 \d+ ext_t1
+create external table ext_error_logging_off (a int, b int)
+    location ('file:///tmp/test.txt') format 'text'
+    segment reject limit 100;
+\d+ ext_error_logging_off
 create external table ext_t2 (a int, b int)
     location ('file:///tmp/test.txt') format 'text'
     log errors segment reject limit 100;
 \d+ ext_t2
-drop external table ext_t1;
-drop external table ext_t2;
 
+create external table ext_t3 (a int, b int)
+    location ('file:///tmp/test.txt') format 'text'
+    log errors persistently segment reject limit 100;
+\d+ ext_t3
 -- Make sure gp_default_storage_options GUC value is set in newly created cdbgangs
 -- after previous idle cdbgang is stopped
 SET gp_vmem_idle_resource_timeout=30;
@@ -373,8 +377,59 @@ SELECT DISTINCT relname, reloptions FROM pg_class WHERE relname='check_guc_value
 SELECT DISTINCT relname, reloptions FROM gp_dist_random('pg_class') WHERE relname='check_guc_value_after_new_cdbgang';
 RESET gp_vmem_idle_resource_timeout;
 
+-- Make sure ALTER TABLE REORGANIZE does not change the table type due
+-- to gp_default_storage_options GUC
+set gp_default_storage_options='appendonly=false,blocksize=32768';
+create table alter_table_reorg_heap (a int, b text);
+select relname, relstorage, reloptions from pg_class where relname='alter_table_reorg_heap';
+set gp_default_storage_options='appendonly=true,blocksize=32768,orientation=column';
+alter table alter_table_reorg_heap set with (reorganize=true);
+select relname, relstorage, reloptions from pg_class where relname='alter_table_reorg_heap';
+
+set gp_default_storage_options='appendonly=true,blocksize=32768,orientation=column';
+create table alter_table_reorg_aoco (a int, b text);
+select relname, relstorage, reloptions from pg_class where relname='alter_table_reorg_aoco';
+set gp_default_storage_options='appendonly=false,blocksize=32768';
+alter table alter_table_reorg_aoco set with (reorganize=true);
+select relname, relstorage, reloptions from pg_class where relname='alter_table_reorg_aoco';
+
+-- Make sure SELECT INTO uses gp_default_storage_options GUC
+create table select_into_heap_from (a int, b text);
+insert into select_into_heap_from select i, 'aaa' from generate_series(1,50)i;
+set gp_default_storage_options='appendonly=true,blocksize=32768,orientation=column';
+select * into select_into_heap_to from select_into_heap_from;
+select relname, relstorage, reloptions from pg_class where relname='select_into_heap_to';
+select count(*) from select_into_heap_to;
+-- Also check CTAS works fine
+create table ctas_ao_from_heap as select * from select_into_heap_from;
+select relname, relstorage, reloptions from pg_class where relname='ctas_ao_from_heap';
+select count(*) from ctas_ao_from_heap;
+
+RESET gp_default_storage_options;
+create table dsp_partition1(i int, j int, k int) with(appendonly=true) partition by range(i) (start(1) end(10) every(5));
+Insert into dsp_partition1 select i, i+1, i+2 from generate_series(1,9) i;
+select count(*) from dsp_partition1;
+select relname, relkind, relstorage, reloptions from pg_class where relname like 'dsp_partition1%' order by relname;
+select compresslevel, compresstype, blocksize, checksum, columnstore from pg_appendonly
+       where relid in (select oid from pg_class where relname  like 'dsp_partition1%') order by columnstore;
+set gp_default_storage_options="appendonly=true, orientation=column";
+-- Add partition
+alter table dsp_partition1 add partition p3 start(11) end(15);
+alter table dsp_partition1 add partition p4 start(16) end(18) with(appendonly=false);
+select relname, relkind, relstorage, reloptions from pg_class where relname like 'dsp_partition1%' order by relname;
+-- Split partition
+alter table dsp_partition1 split partition for (rank(2)) at (7) into (partition split_p1, partition split_p2);
+select relname, relkind, relstorage, reloptions from pg_class where relname like 'dsp_partition1%' order by relname;
+RESET gp_default_storage_options;
+
 -- cleanup
 \c postgres
-drop database dsp1;
-drop database dsp2;
-drop database dsp3;
+
+-- start_matchsubs
+-- m/.*\[ERROR\]*/
+-- s/.*\[ERROR\]/[ERROR]/gm
+-- end_matchsubs
+\!gpconfig -c gp_default_storage_options -v 'appendonly=true' --masteronly
+\!gpconfig -c gp_default_storage_options -v 'appendonly=true' -m 'appendonly=false'
+
+\!gpconfig -s gp_default_storage_options

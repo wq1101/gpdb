@@ -4,11 +4,11 @@
  *	  support for communication destinations
  *
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/tcop/dest.c,v 1.72.2.1 2010/01/30 20:10:05 tgl Exp $
+ *	  src/backend/tcop/dest.c
  *
  *-------------------------------------------------------------------------
  */
@@ -31,7 +31,10 @@
 #include "access/printtup.h"
 #include "access/xact.h"
 #include "commands/copy.h"
-#include "executor/executor.h"
+#include "commands/createas.h"
+#include "commands/matview.h"
+#include "executor/functions.h"
+#include "executor/tqueue.h"
 #include "executor/tstoreReceiver.h"
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
@@ -44,9 +47,10 @@
  *		dummy DestReceiver functions
  * ----------------
  */
-static void
+static bool
 donothingReceive(TupleTableSlot *slot, DestReceiver *self)
 {
+	return true;
 }
 
 static void
@@ -95,21 +99,16 @@ BeginCommand(const char *commandTag, CommandDest dest)
 
 /* ----------------
  *		CreateDestReceiver - return appropriate receiver function set for dest
- *
- * Note: a Portal must be specified for destinations DestRemote,
- * DestRemoteExecute, and DestTuplestore.  It can be NULL for the others.
  * ----------------
  */
 DestReceiver *
-CreateDestReceiver(CommandDest dest, Portal portal)
+CreateDestReceiver(CommandDest dest)
 {
 	switch (dest)
 	{
 		case DestRemote:
 		case DestRemoteExecute:
-			if (portal == NULL)
-				elog(ERROR, "no portal specified for DestRemote receiver");
-			return printtup_create_DR(dest, portal);
+			return printtup_create_DR(dest);
 
 		case DestNone:
 			return &donothingDR;
@@ -121,19 +120,22 @@ CreateDestReceiver(CommandDest dest, Portal portal)
 			return &spi_printtupDR;
 
 		case DestTuplestore:
-			if (portal == NULL)
-				elog(ERROR, "no portal specified for DestTuplestore receiver");
-			if (portal->holdStore == NULL ||
-				portal->holdContext == NULL)
-				elog(ERROR, "portal has no holdStore");
-			return CreateTuplestoreDestReceiver(portal->holdStore,
-												portal->holdContext);
+			return CreateTuplestoreDestReceiver();
 
 		case DestIntoRel:
-			return CreateIntoRelDestReceiver();
+			return CreateIntoRelDestReceiver(NULL);
 
 		case DestCopyOut:
 			return CreateCopyDestReceiver();
+
+		case DestSQLFunction:
+			return CreateSQLFunctionDestReceiver();
+
+		case DestTransientRel:
+			return CreateTransientRelDestReceiver(InvalidOid, InvalidOid, false, 't', false);
+
+		case DestTupleQueue:
+			return CreateTupleQueueDestReceiver(NULL);
 	}
 
 	/* should never get here */
@@ -151,9 +153,10 @@ EndCommand(const char *commandTag, CommandDest dest)
 	{
 		case DestRemote:
 		case DestRemoteExecute:
+
 			/*
-			 * We assume the commandTag is plain ASCII and therefore
-			 * requires no encoding conversion.
+			 * We assume the commandTag is plain ASCII and therefore requires
+			 * no encoding conversion.
 			 */
 			pq_putmessage('C', commandTag, strlen(commandTag) + 1);
 			break;
@@ -164,6 +167,9 @@ EndCommand(const char *commandTag, CommandDest dest)
 		case DestTuplestore:
 		case DestIntoRel:
 		case DestCopyOut:
+		case DestSQLFunction:
+		case DestTransientRel:
+		case DestTupleQueue:
 			break;
 	}
 }
@@ -204,6 +210,9 @@ NullCommand(CommandDest dest)
 		case DestTuplestore:
 		case DestIntoRel:
 		case DestCopyOut:
+		case DestSQLFunction:
+		case DestTransientRel:
+		case DestTupleQueue:
 			break;
 	}
 }
@@ -235,6 +244,10 @@ ReadyForQuery(CommandDest dest)
 					pq_beginmessage(&buf, 'k');
 					pq_sendint64(&buf, VmemTracker_GetMaxReservedVmemBytes());
 					pq_endmessage(&buf);
+
+					pq_beginmessage(&buf, 'x');
+					pq_sendbyte(&buf, TransactionDidWriteXLog());
+					pq_endmessage(&buf);
 				}
 
 				pq_beginmessage(&buf, 'Z');
@@ -253,6 +266,9 @@ ReadyForQuery(CommandDest dest)
 		case DestTuplestore:
 		case DestIntoRel:
 		case DestCopyOut:
+		case DestSQLFunction:
+		case DestTransientRel:
+		case DestTupleQueue:
 			break;
 	}
 }

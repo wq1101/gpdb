@@ -1,10 +1,12 @@
-# $PostgreSQL: pgsql/contrib/pg_freespacemap/Makefile,v 1.4 2007/11/10 23:59:51 momjian Exp $
+# contrib/pg_freespacemap/Makefile
 
 MODULE_big = pg_freespacemap
-OBJS	= pg_freespacemap.o
+OBJS = pg_freespacemap.o $(WIN32RES)
 
-DATA_built = pg_freespacemap.sql 
-DATA = uninstall_pg_freespacemap.sql 
+EXTENSION = pg_freespacemap
+DATA = pg_freespacemap--1.1.sql pg_freespacemap--1.0--1.1.sql \
+	pg_freespacemap--unpackaged--1.0.sql
+PGFILEDESC = "pg_freespacemap - monitoring of free space map"
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config

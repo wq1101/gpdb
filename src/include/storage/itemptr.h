@@ -4,10 +4,10 @@
  *	  POSTGRES disk item pointer definitions.
  *
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/storage/itemptr.h,v 1.32 2009/01/01 17:24:01 momjian Exp $
+ * src/include/storage/itemptr.h
  *
  *-------------------------------------------------------------------------
  */
@@ -29,7 +29,7 @@
  * tuple header on disk, it's very important not to waste space with
  * structure padding bytes.  The struct is designed to be six bytes long
  * (it contains three int16 fields) but a few compilers will pad it to
- * eight bytes unless coerced.	We apply appropriate persuasion where
+ * eight bytes unless coerced.  We apply appropriate persuasion where
  * possible, and to cope with unpersuadable compilers, we try to use
  * "SizeOfIptrData" rather than "sizeof(ItemPointerData)" when computing
  * on-disk sizes.
@@ -39,9 +39,10 @@ typedef struct ItemPointerData
 	BlockIdData ip_blkid;
 	OffsetNumber ip_posid;
 }
-
-#ifdef __arm__
-__attribute__((packed))			/* Appropriate whack upside the head for ARM */
+/* If compiler understands packed and aligned pragmas, use those */
+#if defined(pg_attribute_packed) && defined(pg_attribute_aligned)
+pg_attribute_packed()
+pg_attribute_aligned(2)
 #endif
 ItemPointerData;
 
@@ -116,6 +117,9 @@ typedef ItemPointerData *ItemPointer;
 /*
  * ItemPointerCopy
  *		Copies the contents of one disk item pointer to another.
+ *
+ * Should there ever be padding in an ItemPointer this would need to be handled
+ * differently as it's used as hash key.
  */
 #define ItemPointerCopy(fromPointer, toPointer) \
 ( \

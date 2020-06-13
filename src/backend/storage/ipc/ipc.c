@@ -4,16 +4,16 @@
  *	  POSTGRES inter-process communication definitions.
  *
  * This file is misnamed, as it no longer has much of anything directly
- * to do with IPC.	The functionality here is concerned with managing
+ * to do with IPC.  The functionality here is concerned with managing
  * exit-time cleanup for either a postmaster or a backend.
  *
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/storage/ipc/ipc.c,v 1.105 2009/06/11 14:49:01 momjian Exp $
+ *	  src/backend/storage/ipc/ipc.c
  *
  *-------------------------------------------------------------------------
  */
@@ -24,11 +24,13 @@
 #include <sys/stat.h>
 
 #include "cdb/cdbdisp.h"
+#include "cdb/ml_ipc.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #ifdef PROFILE_PID_DIR
 #include "postmaster/autovacuum.h"
 #endif
+#include "storage/dsm.h"
 #include "storage/ipc.h"
 #include "tcop/tcopprot.h"
 
@@ -41,16 +43,16 @@
 bool		proc_exit_inprogress = false;
 
 /*
- * This flag tracks whether we've called atexit(2) in the current process
+ * This flag tracks whether we've called atexit() in the current process
  * (or in the parent postmaster).
  */
 static bool atexit_callback_setup = false;
-extern void WaitInterconnectQuit(void);
+
 
 /* ----------------------------------------------------------------
  *						exit() handling stuff
  *
- * These functions are in generally the same spirit as atexit(2),
+ * These functions are in generally the same spirit as atexit(),
  * but provide some additional features we need --- in particular,
  * we want to register callbacks to invoke when we are disconnecting
  * from a broken shared-memory context but not exiting the postmaster.
@@ -63,14 +65,19 @@ extern void WaitInterconnectQuit(void);
 
 #define MAX_ON_EXITS 20
 
-static struct ONEXIT
+struct ONEXIT
 {
 	pg_on_exit_callback function;
 	Datum		arg;
-}	on_proc_exit_list[MAX_ON_EXITS], on_shmem_exit_list[MAX_ON_EXITS];
+};
+
+static struct ONEXIT on_proc_exit_list[MAX_ON_EXITS];
+static struct ONEXIT on_shmem_exit_list[MAX_ON_EXITS];
+static struct ONEXIT before_shmem_exit_list[MAX_ON_EXITS];
 
 static int	on_proc_exit_index,
-			on_shmem_exit_index;
+			on_shmem_exit_index,
+			before_shmem_exit_index;
 
 
 /* ----------------------------------------------------------------
@@ -104,7 +111,7 @@ proc_exit(int code)
 		 * fixed file name, each backend will overwrite earlier profiles. To
 		 * fix that, we create a separate subdirectory for each backend
 		 * (./gprof/pid) and 'cd' to that subdirectory before we exit() - that
-		 * forces mcleanup() to write each profile into its own directory.	We
+		 * forces mcleanup() to write each profile into its own directory.  We
 		 * end up with something like: $PGDATA/gprof/8829/gmon.out
 		 * $PGDATA/gprof/8845/gmon.out ...
 		 *
@@ -127,8 +134,8 @@ proc_exit(int code)
 		else
 			snprintf(gprofDirName, 32, "gprof/%d", (int) getpid());
 
-		mkdir("gprof", 0777);
-		mkdir(gprofDirName, 0777);
+		mkdir("gprof", S_IRWXU | S_IRWXG | S_IRWXO);
+		mkdir(gprofDirName, S_IRWXU | S_IRWXG | S_IRWXO);
 		chdir(gprofDirName);
 	}
 #endif
@@ -170,37 +177,21 @@ proc_exit_prepare(int code)
 	InterruptPending = false;
 	ProcDiePending = false;
 	QueryCancelPending = false;
-	/* And let's just make *sure* we're not interrupted ... */
-	ImmediateInterruptOK = false;
 	InterruptHoldoffCount = 1;
 	CritSectionCount = 0;
 
 	/*
-	 * Also clear the error context stack, to prevent error callbacks
-	 * from being invoked by any elog/ereport calls made during proc_exit.
-	 * Whatever context they might want to offer is probably not relevant,
-	 * and in any case they are likely to fail outright after we've done
-	 * things like aborting any open transaction.  (In normal exit scenarios
-	 * the context stack should be empty anyway, but it might not be in the
-	 * case of elog(FATAL) for example.)
+	 * Also clear the error context stack, to prevent error callbacks from
+	 * being invoked by any elog/ereport calls made during proc_exit. Whatever
+	 * context they might want to offer is probably not relevant, and in any
+	 * case they are likely to fail outright after we've done things like
+	 * aborting any open transaction.  (In normal exit scenarios the context
+	 * stack should be empty anyway, but it might not be in the case of
+	 * elog(FATAL) for example.)
 	 */
 	error_context_stack = NULL;
 	/* For the same reason, reset debug_query_string before it's clobbered */
 	debug_query_string = NULL;
-
-	/*
-	 * Make sure threads get cleaned up: there might be still ongoing
-	 * dispatch threads with something that will be cleaned up during
-	 * shmem_exit.  And this should be after proc_exit_inprogress = true above
-	 * so that threads will recognize we are dying and break-out from the loop
-	 * even if they're in the middle of work.  Note this call will block for
-	 * a certain time until threads get cleaned up.  While it is generally
-	 * expected for a process to die immediately in this code path, it should
-	 * be ok to block as we are most likely not in signal handler or
-	 * something.  Actually, I cannot find any better option to do the
-	 * correct work.
-	 */
-	cdbdisp_onProcExit();
 
 	/*
 	* Make sure interconnect thread quit before shmem_exit() in FATAL case.
@@ -242,25 +233,60 @@ proc_exit_prepare(int code)
 /* ------------------
  * Run all of the on_shmem_exit routines --- but don't actually exit.
  * This is used by the postmaster to re-initialize shared memory and
- * semaphores after a backend dies horribly.
+ * semaphores after a backend dies horribly.  As with proc_exit(), we
+ * remove each callback from the list before calling it, to avoid
+ * infinite loop in case of error.
  * ------------------
  */
 void
 shmem_exit(int code)
 {
-	elog(DEBUG3, "shmem_exit(%d): %d callbacks to make",
-		 code, on_shmem_exit_index);
+	/*
+	 * Call before_shmem_exit callbacks.
+	 *
+	 * These should be things that need most of the system to still be up and
+	 * working, such as cleanup of temp relations, which requires catalog
+	 * access; or things that need to be completed because later cleanup steps
+	 * depend on them, such as releasing lwlocks.
+	 */
+	elog(DEBUG3, "shmem_exit(%d): %d before_shmem_exit callbacks to make",
+		 code, before_shmem_exit_index);
+	while (--before_shmem_exit_index >= 0)
+		(*before_shmem_exit_list[before_shmem_exit_index].function) (code,
+						before_shmem_exit_list[before_shmem_exit_index].arg);
+	before_shmem_exit_index = 0;
 
 	/*
-	 * call all the registered callbacks.
+	 * Call dynamic shared memory callbacks.
 	 *
-	 * As with proc_exit(), we remove each callback from the list before
-	 * calling it, to avoid infinite loop in case of error.
+	 * These serve the same purpose as late callbacks, but for dynamic shared
+	 * memory segments rather than the main shared memory segment.
+	 * dsm_backend_shutdown() has the same kind of progressive logic we use
+	 * for the main shared memory segment; namely, it unregisters each
+	 * callback before invoking it, so that we don't get stuck in an infinite
+	 * loop if one of those callbacks itself throws an ERROR or FATAL.
+	 *
+	 * Note that explicitly calling this function here is quite different from
+	 * registering it as an on_shmem_exit callback for precisely this reason:
+	 * if one dynamic shared memory callback errors out, the remaining
+	 * callbacks will still be invoked.  Thus, hard-coding this call puts it
+	 * equal footing with callbacks for the main shared memory segment.
 	 */
+	dsm_backend_shutdown();
+
+	/*
+	 * Call on_shmem_exit callbacks.
+	 *
+	 * These are generally releasing low-level shared memory resources.  In
+	 * some cases, this is a backstop against the possibility that the early
+	 * callbacks might themselves fail, leading to re-entry to this routine;
+	 * in other cases, it's cleanup that only happens at process exit.
+	 */
+	elog(DEBUG3, "shmem_exit(%d): %d on_shmem_exit callbacks to make",
+		 code, on_shmem_exit_index);
 	while (--on_shmem_exit_index >= 0)
 		(*on_shmem_exit_list[on_shmem_exit_index].function) (code,
 								on_shmem_exit_list[on_shmem_exit_index].arg);
-
 	on_shmem_exit_index = 0;
 }
 
@@ -274,8 +300,6 @@ shmem_exit(int code)
  * postmaster treat it as a crash --- see pmsignal.c.
  * ----------------------------------------------------------------
  */
-#ifdef HAVE_ATEXIT
-
 static void
 atexit_callback(void)
 {
@@ -283,21 +307,12 @@ atexit_callback(void)
 	/* ... too bad we don't know the real exit code ... */
 	proc_exit_prepare(-1);
 }
-#else							/* assume we have on_exit instead */
-
-static void
-atexit_callback(int exitstatus, void *arg)
-{
-	/* Clean up everything that must be cleaned up */
-	proc_exit_prepare(exitstatus);
-}
-#endif   /* HAVE_ATEXIT */
 
 /* ----------------------------------------------------------------
  *		on_proc_exit
  *
  *		this function adds a callback function to the list of
- *		functions invoked by proc_exit().	-cim 2/6/90
+ *		functions invoked by proc_exit().   -cim 2/6/90
  * ----------------------------------------------------------------
  */
 void
@@ -315,11 +330,35 @@ on_proc_exit(pg_on_exit_callback function, Datum arg)
 
 	if (!atexit_callback_setup)
 	{
-#ifdef HAVE_ATEXIT
 		atexit(atexit_callback);
-#else
-		on_exit(atexit_callback, NULL);
-#endif
+		atexit_callback_setup = true;
+	}
+}
+
+/* ----------------------------------------------------------------
+ *		before_shmem_exit
+ *
+ *		Register early callback to perform user-level cleanup,
+ *		e.g. transaction abort, before we begin shutting down
+ *		low-level subsystems.
+ * ----------------------------------------------------------------
+ */
+void
+before_shmem_exit(pg_on_exit_callback function, Datum arg)
+{
+	if (before_shmem_exit_index >= MAX_ON_EXITS)
+		ereport(FATAL,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg_internal("out of before_shmem_exit slots")));
+
+	before_shmem_exit_list[before_shmem_exit_index].function = function;
+	before_shmem_exit_list[before_shmem_exit_index].arg = arg;
+
+	++before_shmem_exit_index;
+
+	if (!atexit_callback_setup)
+	{
+		atexit(atexit_callback);
 		atexit_callback_setup = true;
 	}
 }
@@ -327,8 +366,9 @@ on_proc_exit(pg_on_exit_callback function, Datum arg)
 /* ----------------------------------------------------------------
  *		on_shmem_exit
  *
- *		this function adds a callback function to the list of
- *		functions invoked by shmem_exit().	-cim 2/6/90
+ *		Register ordinary callback to perform low-level shutdown
+ *		(e.g. releasing our PGPROC); run after before_shmem_exit
+ *		callbacks and before on_proc_exit callbacks.
  * ----------------------------------------------------------------
  */
 void
@@ -346,31 +386,28 @@ on_shmem_exit(pg_on_exit_callback function, Datum arg)
 
 	if (!atexit_callback_setup)
 	{
-#ifdef HAVE_ATEXIT
 		atexit(atexit_callback);
-#else
-		on_exit(atexit_callback, NULL);
-#endif
 		atexit_callback_setup = true;
 	}
 }
 
 /* ----------------------------------------------------------------
- *		cancel_shmem_exit
+ *		cancel_before_shmem_exit
  *
- *		this function removes an entry, if present, from the list of
- *		functions to be invoked by shmem_exit().  For simplicity,
- *		only the latest entry can be removed.  (We could work harder
- *		but there is no need for current uses.)
+ *		this function removes a previously-registed before_shmem_exit
+ *		callback.  For simplicity, only the latest entry can be
+ *		removed.  (We could work harder but there is no need for
+ *		current uses.)
  * ----------------------------------------------------------------
  */
 void
-cancel_shmem_exit(pg_on_exit_callback function, Datum arg)
+cancel_before_shmem_exit(pg_on_exit_callback function, Datum arg)
 {
-	if (on_shmem_exit_index > 0 &&
-		on_shmem_exit_list[on_shmem_exit_index - 1].function == function &&
-		on_shmem_exit_list[on_shmem_exit_index - 1].arg == arg)
-		--on_shmem_exit_index;
+	if (before_shmem_exit_index > 0 &&
+		before_shmem_exit_list[before_shmem_exit_index - 1].function
+		== function &&
+		before_shmem_exit_list[before_shmem_exit_index - 1].arg == arg)
+		--before_shmem_exit_index;
 }
 
 /* ----------------------------------------------------------------
@@ -385,6 +422,8 @@ cancel_shmem_exit(pg_on_exit_callback function, Datum arg)
 void
 on_exit_reset(void)
 {
+	before_shmem_exit_index = 0;
 	on_shmem_exit_index = 0;
 	on_proc_exit_index = 0;
+	reset_on_dsm_detach();
 }

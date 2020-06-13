@@ -9,12 +9,12 @@
  * always use NAMEDATALEN as the symbolic constant!   - jolly 8/21/95
  *
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/adt/name.c,v 1.61 2008/01/01 19:45:52 momjian Exp $
+ *	  src/backend/utils/adt/name.c
  *
  *-------------------------------------------------------------------------
  */
@@ -185,65 +185,6 @@ namege(PG_FUNCTION_ARGS)
 }
 
 
-/*
- * comparison routines for LIKE indexing support
- */
-
-Datum
-name_pattern_eq(PG_FUNCTION_ARGS)
-{
-	Name		arg1 = PG_GETARG_NAME(0);
-	Name		arg2 = PG_GETARG_NAME(1);
-
-	PG_RETURN_BOOL(memcmp(NameStr(*arg1), NameStr(*arg2), NAMEDATALEN) == 0);
-}
-
-Datum
-name_pattern_ne(PG_FUNCTION_ARGS)
-{
-	Name		arg1 = PG_GETARG_NAME(0);
-	Name		arg2 = PG_GETARG_NAME(1);
-
-	PG_RETURN_BOOL(memcmp(NameStr(*arg1), NameStr(*arg2), NAMEDATALEN) != 0);
-}
-
-Datum
-name_pattern_lt(PG_FUNCTION_ARGS)
-{
-	Name		arg1 = PG_GETARG_NAME(0);
-	Name		arg2 = PG_GETARG_NAME(1);
-
-	PG_RETURN_BOOL(memcmp(NameStr(*arg1), NameStr(*arg2), NAMEDATALEN) < 0);
-}
-
-Datum
-name_pattern_le(PG_FUNCTION_ARGS)
-{
-	Name		arg1 = PG_GETARG_NAME(0);
-	Name		arg2 = PG_GETARG_NAME(1);
-
-	PG_RETURN_BOOL(memcmp(NameStr(*arg1), NameStr(*arg2), NAMEDATALEN) <= 0);
-}
-
-Datum
-name_pattern_gt(PG_FUNCTION_ARGS)
-{
-	Name		arg1 = PG_GETARG_NAME(0);
-	Name		arg2 = PG_GETARG_NAME(1);
-
-	PG_RETURN_BOOL(memcmp(NameStr(*arg1), NameStr(*arg2), NAMEDATALEN) > 0);
-}
-
-Datum
-name_pattern_ge(PG_FUNCTION_ARGS)
-{
-	Name		arg1 = PG_GETARG_NAME(0);
-	Name		arg2 = PG_GETARG_NAME(1);
-
-	PG_RETURN_BOOL(memcmp(NameStr(*arg1), NameStr(*arg2), NAMEDATALEN) >= 0);
-}
-
-
 /* (see char.c for comparison/operation routines) */
 
 int
@@ -251,7 +192,7 @@ namecpy(Name n1, Name n2)
 {
 	if (!n1 || !n2)
 		return -1;
-	strncpy(NameStr(*n1), NameStr(*n2), NAMEDATALEN);
+	StrNCpy(NameStr(*n1), NameStr(*n2), NAMEDATALEN);
 	return 0;
 }
 
@@ -322,13 +263,13 @@ namestrcmp(Name name, const char *str)
 Datum
 current_user(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_DATUM(DirectFunctionCall1(namein, CStringGetDatum(GetUserNameFromId(GetUserId()))));
+	PG_RETURN_DATUM(DirectFunctionCall1(namein, CStringGetDatum(GetUserNameFromId(GetUserId(), false))));
 }
 
 Datum
 session_user(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_DATUM(DirectFunctionCall1(namein, CStringGetDatum(GetUserNameFromId(GetSessionUserId()))));
+	PG_RETURN_DATUM(DirectFunctionCall1(namein, CStringGetDatum(GetUserNameFromId(GetSessionUserId(), false))));
 }
 
 

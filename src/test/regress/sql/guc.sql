@@ -3,14 +3,14 @@
 SHOW datestyle;
 
 -- SET to some nondefault value
-SET vacuum_cost_delay TO 400;
+SET vacuum_cost_delay TO 40;
 SET datestyle = 'ISO, YMD';
 SHOW vacuum_cost_delay;
 SHOW datestyle;
 SELECT '2006-08-13 12:34:56'::timestamptz;
 
 -- SET LOCAL has no effect outside of a transaction
-SET LOCAL vacuum_cost_delay TO 500;
+SET LOCAL vacuum_cost_delay TO 50;
 SHOW vacuum_cost_delay;
 SET LOCAL datestyle = 'SQL';
 SHOW datestyle;
@@ -18,7 +18,7 @@ SELECT '2006-08-13 12:34:56'::timestamptz;
 
 -- SET LOCAL within a transaction that commits
 BEGIN;
-SET LOCAL vacuum_cost_delay TO 500;
+SET LOCAL vacuum_cost_delay TO 50;
 SHOW vacuum_cost_delay;
 SET LOCAL datestyle = 'SQL';
 SHOW datestyle;
@@ -30,7 +30,7 @@ SELECT '2006-08-13 12:34:56'::timestamptz;
 
 -- SET should be reverted after ROLLBACK
 BEGIN;
-SET vacuum_cost_delay TO 600;
+SET vacuum_cost_delay TO 60;
 SHOW vacuum_cost_delay;
 SET datestyle = 'German';
 SHOW datestyle;
@@ -42,12 +42,12 @@ SELECT '2006-08-13 12:34:56'::timestamptz;
 
 -- Some tests with subtransactions
 BEGIN;
-SET vacuum_cost_delay TO 700;
+SET vacuum_cost_delay TO 70;
 SET datestyle = 'MDY';
 SHOW datestyle;
 SELECT '2006-08-13 12:34:56'::timestamptz;
 SAVEPOINT first_sp;
-SET vacuum_cost_delay TO 800;
+SET vacuum_cost_delay TO 80;
 SHOW vacuum_cost_delay;
 SET datestyle = 'German, DMY';
 SHOW datestyle;
@@ -56,12 +56,12 @@ ROLLBACK TO first_sp;
 SHOW datestyle;
 SELECT '2006-08-13 12:34:56'::timestamptz;
 SAVEPOINT second_sp;
-SET vacuum_cost_delay TO 900;
+SET vacuum_cost_delay TO 90;
 SET datestyle = 'SQL, YMD';
 SHOW datestyle;
 SELECT '2006-08-13 12:34:56'::timestamptz;
 SAVEPOINT third_sp;
-SET vacuum_cost_delay TO 1000;
+SET vacuum_cost_delay TO 100;
 SHOW vacuum_cost_delay;
 SET datestyle = 'Postgres, MDY';
 SHOW datestyle;
@@ -85,7 +85,7 @@ SHOW vacuum_cost_delay;
 SHOW datestyle;
 SELECT '2006-08-13 12:34:56'::timestamptz;
 SAVEPOINT sp;
-SET LOCAL vacuum_cost_delay TO 300;
+SET LOCAL vacuum_cost_delay TO 30;
 SHOW vacuum_cost_delay;
 SET LOCAL datestyle = 'Postgres, MDY';
 SHOW datestyle;
@@ -105,7 +105,7 @@ SHOW vacuum_cost_delay;
 SHOW datestyle;
 SELECT '2006-08-13 12:34:56'::timestamptz;
 SAVEPOINT sp;
-SET LOCAL vacuum_cost_delay TO 300;
+SET LOCAL vacuum_cost_delay TO 30;
 SHOW vacuum_cost_delay;
 SET LOCAL datestyle = 'Postgres, MDY';
 SHOW datestyle;
@@ -121,8 +121,8 @@ SELECT '2006-08-13 12:34:56'::timestamptz;
 
 -- SET followed by SET LOCAL
 BEGIN;
-SET vacuum_cost_delay TO 400;
-SET LOCAL vacuum_cost_delay TO 500;
+SET vacuum_cost_delay TO 40;
+SET LOCAL vacuum_cost_delay TO 50;
 SHOW vacuum_cost_delay;
 SET datestyle = 'ISO, DMY';
 SET LOCAL datestyle = 'Postgres, MDY';
@@ -162,99 +162,162 @@ PREPARE foo AS SELECT 1;
 LISTEN foo_event;
 SET vacuum_cost_delay = 13;
 CREATE TEMP TABLE tmp_foo (data text) ON COMMIT DELETE ROWS;
-CREATE ROLE temp_reset_user;
-SET SESSION AUTHORIZATION temp_reset_user;
+CREATE ROLE regress_guc_user;
+SET SESSION AUTHORIZATION regress_guc_user;
 -- look changes
-SELECT relname FROM pg_listener;
+SELECT pg_listening_channels();
 SELECT name FROM pg_prepared_statements;
 SELECT name FROM pg_cursors;
 SHOW vacuum_cost_delay;
 SELECT relname from pg_class where relname = 'tmp_foo';
-SELECT current_user = 'temp_reset_user';
+SELECT current_user = 'regress_guc_user';
 -- discard everything
 DISCARD ALL;
 -- look again
-SELECT relname FROM pg_listener;
+SELECT pg_listening_channels();
 SELECT name FROM pg_prepared_statements;
 SELECT name FROM pg_cursors;
 SHOW vacuum_cost_delay;
 SELECT relname from pg_class where relname = 'tmp_foo';
-SELECT current_user = 'temp_reset_user';
-DROP ROLE temp_reset_user;
+SELECT current_user = 'regress_guc_user';
+DROP ROLE regress_guc_user;
+
+--
+-- search_path should react to changes in pg_namespace
+--
+
+set search_path = foo, public, not_there_initially;
+select current_schemas(false);
+create schema not_there_initially;
+select current_schemas(false);
+drop schema not_there_initially;
+select current_schemas(false);
+reset search_path;
 
 --
 -- Tests for function-local GUC settings
 --
 
-set regex_flavor = advanced;
+set work_mem = '3MB';
 
 create function report_guc(text) returns text as
 $$ select current_setting($1) $$ language sql
-set regex_flavor = basic;
+set work_mem = '1MB';
 
-select report_guc('regex_flavor'), current_setting('regex_flavor');
+select report_guc('work_mem'), current_setting('work_mem');
 
--- this should draw only a warning
-alter function report_guc(text) set search_path = no_such_schema;
+alter function report_guc(text) set work_mem = '2MB';
 
--- with error occurring here
-select report_guc('regex_flavor'), current_setting('regex_flavor');
-
-alter function report_guc(text) reset search_path set regex_flavor = extended;
-
-select report_guc('regex_flavor'), current_setting('regex_flavor');
+select report_guc('work_mem'), current_setting('work_mem');
 
 alter function report_guc(text) reset all;
 
-select report_guc('regex_flavor'), current_setting('regex_flavor');
+select report_guc('work_mem'), current_setting('work_mem');
 
 -- SET LOCAL is restricted by a function SET option
 create or replace function myfunc(int) returns text as $$
 begin
-  set local regex_flavor = extended;
-  return current_setting('regex_flavor');
+  set local work_mem = '2MB';
+  return current_setting('work_mem');
 end $$
 language plpgsql
-set regex_flavor = basic;
+set work_mem = '1MB';
 
-select myfunc(0), current_setting('regex_flavor');
+select myfunc(0), current_setting('work_mem');
 
 alter function myfunc(int) reset all;
 
-select myfunc(0), current_setting('regex_flavor');
+select myfunc(0), current_setting('work_mem');
 
-set regex_flavor = advanced;
+set work_mem = '3MB';
 
 -- but SET isn't
 create or replace function myfunc(int) returns text as $$
 begin
-  set regex_flavor = extended;
-  return current_setting('regex_flavor');
+  set work_mem = '2MB';
+  return current_setting('work_mem');
 end $$
 language plpgsql
-set regex_flavor = basic;
+set work_mem = '1MB';
 
-select myfunc(0), current_setting('regex_flavor');
+select myfunc(0), current_setting('work_mem');
 
--- In GPDB, the plan looks somewhat different from what you get on
--- PostgreSQL, so that the current_setting() in previous query is
--- evaluated before myfunc(0), and therefore it shows 'advanced'.
--- Query again to show that the myfunc(0) call actually changed
--- the setting.
-select current_setting('regex_flavor');
-
-set regex_flavor = advanced;
+set work_mem = '3MB';
 
 -- it should roll back on error, though
 create or replace function myfunc(int) returns text as $$
 begin
-  set regex_flavor = extended;
+  set work_mem = '2MB';
   perform 1/$1;
-  return current_setting('regex_flavor');
+  return current_setting('work_mem');
 end $$
 language plpgsql
-set regex_flavor = basic;
+set work_mem = '1MB';
 
 select myfunc(0);
-select current_setting('regex_flavor');
-select myfunc(1), current_setting('regex_flavor');
+select current_setting('work_mem');
+select myfunc(1), current_setting('work_mem');
+
+-- check current_setting()'s behavior with invalid setting name
+
+select current_setting('nosuch.setting');  -- FAIL
+select current_setting('nosuch.setting', false);  -- FAIL
+select current_setting('nosuch.setting', true) is null;
+
+-- after this, all three cases should yield 'nada'
+set nosuch.setting = 'nada';
+
+select current_setting('nosuch.setting');
+select current_setting('nosuch.setting', false);
+select current_setting('nosuch.setting', true);
+
+-- Normally, CREATE FUNCTION should complain about invalid values in
+-- function SET options; but not if check_function_bodies is off,
+-- because that creates ordering hazards for pg_dump
+
+create function func_with_bad_set() returns int as $$ select 1 $$
+language sql
+set default_text_search_config = no_such_config;
+
+set check_function_bodies = off;
+
+create function func_with_bad_set() returns int as $$ select 1 $$
+language sql
+set default_text_search_config = no_such_config;
+
+select func_with_bad_set();
+
+reset check_function_bodies;
+
+SET "request.header.user-agent" = 'curl/7.29.0';
+SHOW "request.header.user-agent";
+
+-- Test function with SET search_path
+create schema n1;
+create type ty1 as (i int);
+
+CREATE OR REPLACE FUNCTION n1.drop_table(v_schema character varying, v_table character varying) RETURNS text
+AS $$
+BEGIN
+    EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(v_schema) || '.' || quote_ident(v_table) || ';';
+    RETURN '0';
+EXCEPTION
+    WHEN OTHERS THEN
+        RETURN SQLSTATE;
+END;
+$$ LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = n1, pg_temp;
+
+-- Destroy the QD-QE libpq connections.
+select cleanupAllGangs();
+
+select n1.drop_table('public','t1');
+
+-- After funtion drop table, public schema is still in search_path
+create table public.t1(i ty1);
+
+drop table public.t1;
+drop type public.ty1;
+drop function n1.drop_table(v_schema character varying, v_table character varying);
+drop schema n1;

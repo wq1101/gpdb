@@ -4,18 +4,19 @@
  *	  POSTGRES definitions for external and compressed storage
  *	  of variable size attributes.
  *
- * Copyright (c) 2000-2009, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2016, PostgreSQL Global Development Group
  *
- * $PostgreSQL: pgsql/src/include/access/tuptoaster.h,v 1.38 2008/01/01 19:45:56 momjian Exp $
+ * src/include/access/tuptoaster.h
  *
  *-------------------------------------------------------------------------
  */
 #ifndef TUPTOASTER_H
 #define TUPTOASTER_H
 
-#include "access/htup.h"
+#include "access/htup_details.h"
 #include "access/memtup.h"
-#include "storage/bufpage.h"
+#include "storage/lockdefs.h"
+#include "utils/relcache.h"
 
 #ifndef VARSIZE_TO_SHORT
 #define VARSIZE_TO_SHORT(PTR)   ((char)(VARSIZE(PTR)-VARHDRSZ+VARHDRSZ_SHORT) | 0x80)
@@ -30,19 +31,25 @@
 
 
 /*
+ * Find the maximum size of a tuple if there are to be N tuples per page.
+ */
+#define MaximumBytesPerTuple(tuplesPerPage) \
+	MAXALIGN_DOWN((BLCKSZ - \
+				   MAXALIGN(SizeOfPageHeaderData + (tuplesPerPage) * sizeof(ItemIdData))) \
+				  / (tuplesPerPage))
+
+/*
  * These symbols control toaster activation.  If a tuple is larger than
  * TOAST_TUPLE_THRESHOLD, we will try to toast it down to no more than
- * TOAST_TUPLE_TARGET bytes.  Both numbers include all tuple header overhead
- * and between-fields alignment padding, but we do *not* consider any
- * end-of-tuple alignment padding; hence the values can be compared directly
- * to a tuple's t_len field.
+ * TOAST_TUPLE_TARGET bytes through compressing compressible fields and
+ * moving EXTENDED and EXTERNAL data out-of-line.
  *
  * The numbers need not be the same, though they currently are.  It doesn't
  * make sense for TARGET to exceed THRESHOLD, but it could be useful to make
  * it be smaller.
  *
  * Currently we choose both values to match the largest tuple size for which
- * TOAST_TUPLES_PER_PAGE tuples can fit on a disk page.
+ * TOAST_TUPLES_PER_PAGE tuples can fit on a heap page.
  *
  * XXX while these can be modified without initdb, some thought needs to be
  * given to needs_toast_table() in toasting.c before unleashing random
@@ -51,13 +58,20 @@
  */
 #define TOAST_TUPLES_PER_PAGE	4
 
-/* Note: sizeof(PageHeaderData) includes the first ItemId on the page */
-#define TOAST_TUPLE_THRESHOLD	\
-	MAXALIGN_DOWN((BLCKSZ - \
-				   MAXALIGN(sizeof(PageHeaderData) + (TOAST_TUPLES_PER_PAGE-1) * sizeof(ItemIdData))) \
-				  / TOAST_TUPLES_PER_PAGE)
+#define TOAST_TUPLE_THRESHOLD	MaximumBytesPerTuple(TOAST_TUPLES_PER_PAGE)
 
 #define TOAST_TUPLE_TARGET		TOAST_TUPLE_THRESHOLD
+
+/*
+ * The code will also consider moving MAIN data out-of-line, but only as a
+ * last resort if the previous steps haven't reached the target tuple size.
+ * In this phase we use a different target size, currently equal to the
+ * largest tuple that will fit on a heap page.  This is reasonable since
+ * the user has told us to keep the data in-line if at all possible.
+ */
+#define TOAST_TUPLES_PER_PAGE_MAIN	1
+
+#define TOAST_TUPLE_TARGET_MAIN MaximumBytesPerTuple(TOAST_TUPLES_PER_PAGE_MAIN)
 
 /*
  * If an index value is larger than TOAST_INDEX_TARGET, we will try to
@@ -68,7 +82,7 @@
 
 /*
  * When we store an oversize datum externally, we divide it into chunks
- * containing at most TOAST_MAX_CHUNK_SIZE data bytes.	This number *must*
+ * containing at most TOAST_MAX_CHUNK_SIZE data bytes.  This number *must*
  * be small enough that the completed toast-table tuple (including the
  * ID and sequence fields and all overhead) will fit on a page.
  * The coding here sets the size on the theory that we want to fit
@@ -78,19 +92,47 @@
  */
 #define EXTERN_TUPLES_PER_PAGE	4		/* tweak only this */
 
-/* Note: sizeof(PageHeaderData) includes the first ItemId on the page */
-#define EXTERN_TUPLE_MAX_SIZE	\
-	MAXALIGN_DOWN((BLCKSZ - \
-				   MAXALIGN(sizeof(PageHeaderData) + (EXTERN_TUPLES_PER_PAGE-1) * sizeof(ItemIdData))) \
-				  / EXTERN_TUPLES_PER_PAGE)
+#define EXTERN_TUPLE_MAX_SIZE	MaximumBytesPerTuple(EXTERN_TUPLES_PER_PAGE)
 
 #define TOAST_MAX_CHUNK_SIZE	\
 	(EXTERN_TUPLE_MAX_SIZE -							\
-	 MAXALIGN(offsetof(HeapTupleHeaderData, t_bits)) -	\
+	 MAXALIGN(SizeofHeapTupleHeader) -					\
 	 sizeof(Oid) -										\
 	 sizeof(int32) -									\
 	 VARHDRSZ)
 
+/* Size of an EXTERNAL datum that contains a standard TOAST pointer */
+#define TOAST_POINTER_SIZE (VARHDRSZ_EXTERNAL + sizeof(varatt_external))
+
+/* Size of an EXTERNAL datum that contains an indirection pointer */
+#define INDIRECT_POINTER_SIZE (VARHDRSZ_EXTERNAL + sizeof(varatt_indirect))
+
+/*
+ * Testing whether an externally-stored value is compressed now requires
+ * comparing extsize (the actual length of the external data) to rawsize
+ * (the original uncompressed datum's size).  The latter includes VARHDRSZ
+ * overhead, the former doesn't.  We never use compression unless it actually
+ * saves space, so we expect either equality or less-than.
+ */
+#define VARATT_EXTERNAL_IS_COMPRESSED(toast_pointer) \
+	((toast_pointer).va_extsize < (toast_pointer).va_rawsize - VARHDRSZ)
+
+/*
+ * Macro to fetch the possibly-unaligned contents of an EXTERNAL datum
+ * into a local "struct varatt_external" toast pointer.  This should be
+ * just a memcpy, but some versions of gcc seem to produce broken code
+ * that assumes the datum contents are aligned.  Introducing an explicit
+ * intermediate "varattrib_1b_e *" variable seems to fix it.
+ */
+#define VARATT_EXTERNAL_GET_POINTER(toast_pointer, attr) \
+do { \
+	varattrib_1b_e *attre = (varattrib_1b_e *) (attr); \
+	Assert(VARATT_IS_EXTERNAL(attre)); \
+	Assert(VARSIZE_EXTERNAL(attre) == sizeof(toast_pointer) + VARHDRSZ_EXTERNAL); \
+	memcpy(&(toast_pointer), VARDATA_EXTERNAL(attre), sizeof(toast_pointer)); \
+} while (0)
+
+#define SET_VARSIZE_C(PTR)			(((varattrib_1b *) (PTR))->va_header |= 0x40)
 
 /* ----------
  * toast_insert_or_update -
@@ -106,8 +148,13 @@
  */
 extern HeapTuple toast_insert_or_update(Relation rel,
 					   HeapTuple newtup, HeapTuple oldtup, 
-					   MemTupleBinding *pbind, int toast_tuple_target,
-					   bool isFrozen, bool use_wal, bool use_fsm);
+					   int toast_tuple_target,
+					   bool isFrozen, int options);
+
+extern MemTuple toast_insert_or_update_memtup(Relation rel,
+							  MemTuple newtup, MemTuple oldtup, 
+							  MemTupleBinding *pbind, int toast_tuple_target,
+							  bool isFrozen, int options);
 
 /* ----------
  * toast_delete -
@@ -115,7 +162,8 @@ extern HeapTuple toast_insert_or_update(Relation rel,
  *	Called by heap_delete().
  * ----------
  */
-extern void toast_delete(Relation rel, HeapTuple oldtup, MemTupleBinding *pbind);
+extern void toast_delete(Relation rel, HeapTuple oldtup, bool is_speculative);
+extern void toast_delete_memtup(Relation rel, MemTuple oldtup, MemTupleBinding *pbind);
 
 /* ----------
  * heap_tuple_fetch_attr() -
@@ -173,16 +221,14 @@ extern struct varlena *heap_tuple_untoast_attr_slice(struct varlena * attr,
 extern HeapTuple toast_flatten_tuple(HeapTuple tup, TupleDesc tupleDesc);
 
 /* ----------
- * toast_flatten_tuple_attribute -
+ * toast_flatten_tuple_to_datum -
  *
- *	If a Datum is of composite type, "flatten" it to contain no toasted fields.
- *	This must be invoked on any potentially-composite field that is to be
- *	inserted into a tuple.	Doing this preserves the invariant that toasting
- *	goes only one level deep in a tuple.
+ *	"Flatten" a tuple containing out-of-line toasted fields into a Datum.
  * ----------
  */
-extern Datum toast_flatten_tuple_attribute(Datum value,
-							  Oid typeId, int32 typeMod);
+extern Datum toast_flatten_tuple_to_datum(HeapTupleHeader tup,
+							 uint32 tup_len,
+							 TupleDesc tupleDesc);
 
 /* ----------
  * toast_compress_datum -
@@ -207,5 +253,13 @@ extern Size toast_raw_datum_size(Datum value);
  * ----------
  */
 extern Size toast_datum_size(Datum value);
+
+/* ----------
+ * toast_get_valid_index -
+ *
+ *	Return OID of valid index associated to a toast relation
+ * ----------
+ */
+extern Oid	toast_get_valid_index(Oid toastoid, LOCKMODE lock);
 
 #endif   /* TUPTOASTER_H */

@@ -1,24 +1,25 @@
 SELECT name, setting FROM pg_settings WHERE name LIKE 'enable%';
-       name        | setting 
--------------------+---------
- enable_bitmapscan | on
- enable_groupagg   | on
- enable_hashagg    | on
- enable_hashjoin   | on
- enable_indexscan  | on
- enable_mergejoin  | off
- enable_nestloop   | off
- enable_seqscan    | on
- enable_sort       | on
- enable_tidscan    | on
-(10 rows)
+         name         | setting 
+----------------------+---------
+ enable_bitmapscan    | on
+ enable_groupagg      | on
+ enable_hashagg       | on
+ enable_hashjoin      | on
+ enable_indexonlyscan | on
+ enable_indexscan     | on
+ enable_material      | on
+ enable_mergejoin     | off
+ enable_nestloop      | off
+ enable_seqscan       | on
+ enable_sort          | on
+ enable_tidscan       | on
+(12 rows)
 
 DROP TABLE IF EXISTS foo;
 NOTICE:  table "foo" does not exist, skipping
 CREATE TABLE foo(
   fooid int, foosubid int, fooname text, primary key(fooid,foosubid)
   ) DISTRIBUTED BY (fooid, foosubid);
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "foo_pkey" for table "foo"
 INSERT INTO foo VALUES
   (1,1,'Joe'),
   (1,2,'Ed'),
@@ -100,11 +101,14 @@ select * from foo2, foost(3) z where foo2.f2 = z.f2;
      1 | 11 |     3 | 11
 (1 row)
 
--- supposed to fail with ERROR - requires LATERAL
+-- Lateral function. (If it was a subquery, this would require the LATERAL
+-- keyword, but for a function, we're more lenient.)
 select * from foo2, foost(foo2.fooid) z where foo2.f2 = z.f2;
-ERROR:  function expression in FROM cannot refer to other relations of same query level
-LINE 1: select * from foo2, foost(foo2.fooid) z where foo2.f2 = z.f2...
-                                  ^
+ fooid | f2 | fooid | f2 
+-------+----+-------+----
+     1 | 11 |     1 | 11
+(1 row)
+
 -- function in subselect, without correlation
 select * from foo2 
 where f2 in (select f2 from foost(1) z where z.fooid = foo2.fooid) 
@@ -170,7 +174,7 @@ $$  LANGUAGE plpgsql;
 --   Fails: plpgsql does not support SFRM_Materialize
 select foor(1);
 ERROR:  set-valued function called in context that cannot accept a set
-CONTEXT:  PL/pgSQL function "foor"
+CONTEXT:  PL/pgSQL function "foor" line 5 at RETURN NEXT
 -- expanding columns in the select list
 --    Fails: record type not registered
 select (foor(1)).*;
@@ -201,12 +205,15 @@ select * from foo2, foor(3) z(fooid int, f2 int) where foo2.f2 = z.f2;
      1 | 11 |     3 | 11
 (1 row)
 
--- supposed to fail with ERROR - requires LATERAL
+-- Lateral function. (If it was a subquery, this would require the LATERAL
+-- keyword, but for a function, we're more lenient.)
 select * from foo2, foor(foo2.fooid) z(fooid int, f2 int) 
 where foo2.f2 = z.f2;
-ERROR:  function expression in FROM cannot refer to other relations of same query level
-LINE 1: select * from foo2, foor(foo2.fooid) z(fooid int, f2 int) 
-                                 ^
+ fooid | f2 | fooid | f2 
+-------+----+-------+----
+     1 | 11 |     1 | 11
+(1 row)
+
 -- function in subselect, without correlation
 select * from foo2 
 where f2 in (select f2 from foor(1) z(fooid int, f2 int) 
@@ -313,11 +320,14 @@ select * from foo2, fooro(3) z where foo2.f2 = z.f2;
      1 | 11 |     3 | 11
 (1 row)
 
--- supposed to fail with ERROR - requires LATERAL
+-- Lateral function. (If it was a subquery, this would require the LATERAL
+-- keyword, but for a function, we're more lenient.)
 select * from foo2, fooro(foo2.fooid) z where foo2.f2 = z.f2;
-ERROR:  function expression in FROM cannot refer to other relations of same query level
-LINE 1: select * from foo2, fooro(foo2.fooid) z where foo2.f2 = z.f2...
-                                  ^
+ fooid | f2 | fooid | f2 
+-------+----+-------+----
+     1 | 11 |     1 | 11
+(1 row)
+
 -- function in subselect, without correlation
 select * from foo2 
 where f2 in (select f2 from fooro(1) z where z.fooid = foo2.fooid) 
@@ -363,10 +373,7 @@ select z.fooid, z.f2 from fooro(sin(pi()/2)::int) z ORDER BY 1,2;
      1 | 33
 (2 rows)
 
-DROP FUNCTION fooro;
-ERROR:  syntax error at or near ";"
-LINE 1: DROP FUNCTION fooro;
-                           ^
+DROP FUNCTION fooro(int);
 --
 -- RETURNS TABLE
 --
@@ -421,11 +428,14 @@ select * from foo2, foot(3) z where foo2.f2 = z.f2;
      1 | 11 |     3 | 11
 (1 row)
 
--- supposed to fail with ERROR - requires LATERAL
+-- Lateral function. (If it was a subquery, this would require the LATERAL
+-- keyword, but for a function, we're more lenient.)
 select * from foo2, foot(foo2.fooid) z where foo2.f2 = z.f2;
-ERROR:  function expression in FROM cannot refer to other relations of same query level
-LINE 1: select * from foo2, foot(foo2.fooid) z where foo2.f2 = z.f2;
-                                 ^
+ fooid | f2 | fooid | f2 
+-------+----+-------+----
+     1 | 11 |     1 | 11
+(1 row)
+
 -- function in subselect, without correlation
 select * from foo2 
 where f2 in (select f2 from foot(1) z where z.fooid = foo2.fooid) 
@@ -471,10 +481,7 @@ select z.fooid, z.f2 from foot(sin(pi()/2)::int) z ORDER BY 1,2;
      1 | 33
 (2 rows)
 
-DROP FUNCTION foot;
-ERROR:  syntax error at or near ";"
-LINE 1: DROP FUNCTION foot;
-                          ^
+DROP FUNCTION foot(int);
 -- sql, proretset = f, prorettype = b
 CREATE FUNCTION getfoo(int) RETURNS int AS 'SELECT $1;' LANGUAGE SQL CONTAINS SQL;
 SELECT * FROM getfoo(1) AS t1;
@@ -744,7 +751,7 @@ HINT:  Use DROP FUNCTION first.
 CREATE OR REPLACE FUNCTION foor(in f1 int, out f2 int, out text)
 AS $$select $1-1, $1::text || 'z'$$ LANGUAGE sql;
 SELECT f1, foor(f1) FROM int4_tbl;
-     f1      |            foor
+     f1      |            foor            
 -------------+----------------------------
            0 | (-1,0z)
       123456 | (123455,123456z)
@@ -768,7 +775,7 @@ SELECT * FROM foor(42) AS p(a,b);
 CREATE OR REPLACE FUNCTION foob(in f1 int, inout f2 int, out text)
 AS $$select $2-1, $1::text || 'z'$$ LANGUAGE sql;
 SELECT f1, foob(f1, f1/2) FROM int4_tbl;
-     f1      |            foob
+     f1      |            foob            
 -------------+----------------------------
            0 | (-1,0z)
       123456 | (61727,123456z)
@@ -821,6 +828,8 @@ SELECT * FROM dup('xyz'::text);
 -- equivalent specification
 CREATE OR REPLACE FUNCTION dup (inout f2 anyelement, out f3 anyarray)
 AS 'select $1, array[$1,$1]' LANGUAGE sql;
+ERROR:  cannot change name of input parameter "f1"
+HINT:  Use DROP FUNCTION first.
 SELECT dup(22);
       dup       
 ----------------
@@ -833,4 +842,34 @@ CREATE FUNCTION bad (f1 int, out f2 anyelement, out f3 anyarray)
 AS 'select $1, array[$1,$1]' LANGUAGE sql;
 ERROR:  cannot determine result data type
 DETAIL:  A function returning a polymorphic type must have at least one polymorphic argument.
+--
+-- Test that a set-returning function is not called unnecessarily.
+--
+-- The planner could legitimately call an immutable function as many times it
+-- wishes, but there's no need to call it more than once. (ORCA used to create
+-- plans where the FunctionScan was executed on every segment, but a Result
+-- on top of it filtered all the rows, except on one segment.
+--
+CREATE FUNCTION notice_srf() RETURNS SETOF text AS $$
+begin
+   RAISE NOTICE 'notice_srf called in segment %', gp_execution_segment();
+
+   RETURN NEXT 'foo';
+   RETURN NEXT 'bar';
+end;
+$$ LANGUAGE plpgsql IMMUTABLE;
+-- gpdiff suppresses identical NOTICEs coming from multiple segments. But we
+-- specifically want to check that we get the NOTICE only from one segment.
+-- To defeat gpdiff's duplicate-elimination, the NOTICE includes the segment
+-- number in the message, so that the message is different on every segment.
+-- But we don't actually don't care which segment it executes on, so filter
+-- out the segment number for comparison.
+--
+-- start_matchsubs
+-- m/NOTICE:  notice_srf called in segment (\d+)/
+-- s/in segment (\d+)/in segment ###/
+-- end_matchsubs
+CREATE TEMPORARY TABLE srfdest (t text) DISTRIBUTED RANDOMLY;
+INSERT INTO srfdest select * FROM notice_srf();
+NOTICE:  notice_srf called in segment 1  (seg1 slice1 127.0.0.1:40001 pid=21879)
 reset optimizer_segments;

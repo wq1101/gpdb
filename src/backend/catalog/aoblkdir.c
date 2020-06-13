@@ -21,15 +21,19 @@
 #include "catalog/aocatalog.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
+#include "utils/faultinjector.h"
 
 void
-AlterTableCreateAoBlkdirTable(Oid relOid, bool is_part_child)
+AlterTableCreateAoBlkdirTable(Oid relOid, bool is_part_child, bool is_part_parent)
 {
 	Relation	rel;
 	TupleDesc	tupdesc;
 	IndexInfo  *indexInfo;
 	Oid			classObjectId[3];
 	int16		coloptions[3];
+	List	   *indexColNames;
+
+	SIMPLE_FAULT_INJECTOR("before_acquire_lock_during_create_ao_blkdir_table");
 
 	/*
 	 * Grab an exclusive lock on the target table, which we will NOT release
@@ -41,7 +45,8 @@ AlterTableCreateAoBlkdirTable(Oid relOid, bool is_part_child)
 	else
 		rel = heap_open(relOid, AccessExclusiveLock);
 
-	if (!RelationIsAoRows(rel) && !RelationIsAoCols(rel)) {
+	if (!RelationIsAppendOptimized(rel))
+	{
 		heap_close(rel, NoLock);
 		return;
 	}
@@ -87,6 +92,7 @@ AlterTableCreateAoBlkdirTable(Oid relOid, bool is_part_child)
 	indexInfo->ii_PredicateState = NIL;
 	indexInfo->ii_Unique = true;
 	indexInfo->ii_Concurrent = false;
+	indexColNames = list_make3("segno", "columngroup_no", "first_row_no");
 	
 	classObjectId[0] = INT4_BTREE_OPS_OID;
 	classObjectId[1] = INT4_BTREE_OPS_OID;
@@ -97,9 +103,12 @@ AlterTableCreateAoBlkdirTable(Oid relOid, bool is_part_child)
 	coloptions[2] = 0;
 
 	(void) CreateAOAuxiliaryTable(rel,
-			"pg_aoblkdir",
-			RELKIND_AOBLOCKDIR,
-			tupdesc, indexInfo, classObjectId, coloptions);
+								  "pg_aoblkdir",
+								  RELKIND_AOBLOCKDIR,
+								  tupdesc,
+								  indexInfo, indexColNames,
+								  classObjectId,
+								  coloptions, is_part_parent);
 
 	heap_close(rel, NoLock);
 }

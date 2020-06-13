@@ -1,11 +1,15 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/set.sgml,v 1.94 2008/11/14 10:22:47 petere Exp $
+doc/src/sgml/ref/set.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-SET">
+ <indexterm zone="sql-set">
+  <primary>SET</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="SQL-SET-TITLE">SET</refentrytitle>
+  <refentrytitle>SET</refentrytitle>
   <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
@@ -15,17 +19,13 @@ PostgreSQL documentation
   <refpurpose>change a run-time parameter</refpurpose>
  </refnamediv>
 
- <indexterm zone="sql-set">
-  <primary>SET</primary>
- </indexterm>
-
  <refsynopsisdiv>
 <synopsis>
 SET [ SESSION | LOCAL ] <replaceable class="PARAMETER">configuration_parameter</replaceable> { TO | = } { <replaceable class="PARAMETER">value</replaceable> | '<replaceable class="PARAMETER">value</replaceable>' | DEFAULT }
 SET [ SESSION | LOCAL ] TIME ZONE { <replaceable class="PARAMETER">timezone</replaceable> | LOCAL | DEFAULT }
 </synopsis>
  </refsynopsisdiv>
- 
+
  <refsect1>
   <title>Description</title>
 
@@ -67,7 +67,7 @@ SET [ SESSION | LOCAL ] TIME ZONE { <replaceable class="PARAMETER">timezone</rep
   <para>
    If <command>SET LOCAL</command> is used within a function that has a
    <literal>SET</> option for the same variable (see
-   <xref linkend="sql-createfunction" endterm="sql-createfunction-title">),
+   <xref linkend="sql-createfunction">),
    the effects of the <command>SET LOCAL</command> command disappear at
    function exit; that is, the value in effect when the function was called is
    restored anyway.  This allows <command>SET LOCAL</command> to be used for
@@ -110,10 +110,9 @@ SET [ SESSION | LOCAL ] TIME ZONE { <replaceable class="PARAMETER">timezone</rep
      <para>
       Specifies that the command takes effect for only the current
       transaction.  After <command>COMMIT</> or <command>ROLLBACK</>,
-      the session-level setting takes effect again.  Note that
-      <command>SET LOCAL</> will appear to have no effect if it is
-      executed outside a <command>BEGIN</> block, since the
-      transaction will end immediately.
+      the session-level setting takes effect again.  Issuing this
+      outside of a transaction block emits a warning and otherwise has
+      no effect.
      </para>
     </listitem>
    </varlistentry>
@@ -154,8 +153,7 @@ SET [ SESSION | LOCAL ] TIME ZONE { <replaceable class="PARAMETER">timezone</rep
     <varlistentry>
      <term><literal>SCHEMA</literal></term>
      <listitem>
-      <para>
-       <literal>SET SCHEMA '<replaceable>value</>'</> is an alias for
+      <para><literal>SET SCHEMA '<replaceable>value</>'</> is an alias for
        <literal>SET search_path TO <replaceable>value</></>.  Only one
        schema can be specified using this syntax.
       </para>
@@ -165,8 +163,7 @@ SET [ SESSION | LOCAL ] TIME ZONE { <replaceable class="PARAMETER">timezone</rep
     <varlistentry>
      <term><literal>NAMES</literal></term>
      <listitem>
-      <para>
-       <literal>SET NAMES <replaceable>value</></> is an alias for
+      <para><literal>SET NAMES <replaceable>value</></> is an alias for
        <literal>SET client_encoding TO <replaceable>value</></>.
       </para>
      </listitem>
@@ -187,16 +184,14 @@ SET [ SESSION | LOCAL ] TIME ZONE { <replaceable class="PARAMETER">timezone</rep
        <function>setseed</function>:
 <programlisting>
 SELECT setseed(<replaceable>value</replaceable>);
-</programlisting>
-      </para>
+</programlisting></para>
      </listitem>
     </varlistentry>
 
     <varlistentry>
      <term><literal>TIME ZONE</literal></term>
      <listitem>
-      <para>
-       <literal>SET TIME ZONE <replaceable>value</></> is an alias
+      <para><literal>SET TIME ZONE <replaceable>value</></> is an alias
        for <literal>SET timezone TO <replaceable>value</></>.  The
        syntax <literal>SET TIME ZONE</literal> allows special syntax
        for the time zone specification.  Here are examples of valid
@@ -243,14 +238,21 @@ SELECT setseed(<replaceable>value</replaceable>);
          <listitem>
           <para>
            Set the time zone to your local time zone (that is, the
-           server's default value of <varname>timezone</>; if this
-           has not been explicitly set anywhere, it will be the zone that
-           the server's operating system defaults to).
+           server's default value of <varname>timezone</>).
           </para>
          </listitem>
         </varlistentry>
        </variablelist>
+      </para>
 
+      <para>
+       Timezone settings given as numbers or intervals are internally
+       translated to POSIX timezone syntax.  For example, after
+       <literal>SET TIME ZONE -7</>, <command>SHOW TIME ZONE</> would
+       report <literal>&lt;-07&gt;+07</>.
+      </para>
+
+      <para>
        See <xref linkend="datatype-timezones"> for more information
        about time zones.
       </para>
@@ -271,7 +273,7 @@ SELECT setseed(<replaceable>value</replaceable>);
    system view to perform the equivalent of <command>SET</>.
   </para>
  </refsect1>
- 
+
  <refsect1>
   <title>Examples</title>
 
@@ -302,8 +304,7 @@ SET TIME ZONE 'PST8PDT';
    Set the time zone for Italy:
 <screen>
 SET TIME ZONE 'Europe/Rome';
-</screen>
-  </para>
+</screen></para>
  </refsect1>
 
  <refsect1>
@@ -322,8 +323,8 @@ SET TIME ZONE 'Europe/Rome';
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="SQL-RESET" endterm="SQL-RESET-title"></member>
-   <member><xref linkend="SQL-SHOW" endterm="SQL-SHOW-title"></member>
+   <member><xref linkend="SQL-RESET"></member>
+   <member><xref linkend="SQL-SHOW"></member>
   </simplelist>
  </refsect1>
 </refentry>

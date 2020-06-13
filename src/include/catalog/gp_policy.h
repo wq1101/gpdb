@@ -20,25 +20,70 @@
 
 #include "access/attnum.h"
 #include "catalog/genbki.h"
+#include "nodes/pg_list.h"
+
 /*
  * Defines for gp_policy
  */
-#define GpPolicyRelationName		"gp_distribution_policy"
-
 #define GpPolicyRelationId  5002
 
 CATALOG(gp_distribution_policy,5002) BKI_WITHOUT_OIDS
 {
 	Oid			localoid;
-	int2		attrnums[1];
+	char		policytype; /* distribution policy type */
+	int32		numsegments;
+#ifdef CATALOG_VARLEN			/* variable-length fields start here */
+	int2vector	distkey;		/* column numbers of distribution key cols */
+	oidvector	distclass;		/* opclass identifiers */
+#endif
 } FormData_gp_policy;
 
 /* GPDB added foreign key definitions for gpcheckcat. */
 FOREIGN_KEY(localoid REFERENCES pg_class(oid));
 
-#define Natts_gp_policy			2
-#define Anum_gp_policy_localoid	1
-#define Anum_gp_policy_attrnums	2
+/* ----------------
+ *		Form_gp_policy corresponds to a pointer to a tuple with
+ *		the format of gp_distribution_policy relation.
+ * ----------------
+ */
+typedef FormData_gp_policy *Form_gp_policy;
+
+#define Natts_gp_policy		5
+#define Anum_gp_policy_localoid		1
+#define Anum_gp_policy_policytype	2
+#define Anum_gp_policy_numsegments	3
+#define Anum_gp_policy_distkey		4
+#define Anum_gp_policy_distclass	5
+
+/*
+ * Symbolic values for Anum_gp_policy_type column
+ */
+#define SYM_POLICYTYPE_PARTITIONED 'p'
+#define SYM_POLICYTYPE_REPLICATED 'r'
+
+/*
+ * Default set of segments, the value is controlled by the variable
+ * gp_create_table_default_numsegments.
+ */
+#define GP_POLICY_DEFAULT_NUMSEGMENTS()		\
+( gp_create_table_default_numsegments == GP_DEFAULT_NUMSEGMENTS_FULL    ? getgpsegmentCount() \
+: gp_create_table_default_numsegments == GP_DEFAULT_NUMSEGMENTS_RANDOM  ? (1 + random() % getgpsegmentCount()) \
+: gp_create_table_default_numsegments == GP_DEFAULT_NUMSEGMENTS_MINIMAL ? 1 \
+: gp_create_table_default_numsegments )
+
+/*
+ * The the default numsegments policies when creating a table.
+ *
+ * - FULL: all the segments;
+ * - RANDOM: pick a random set of segments each time;
+ * - MINIMAL: the minimal set of segments;
+ */
+enum
+{
+	GP_DEFAULT_NUMSEGMENTS_FULL    = -1,
+	GP_DEFAULT_NUMSEGMENTS_RANDOM  = -2,
+	GP_DEFAULT_NUMSEGMENTS_MINIMAL = -3,
+};
 
 /*
  * GpPolicyType represents a type of policy under which a relation's
@@ -47,7 +92,8 @@ FOREIGN_KEY(localoid REFERENCES pg_class(oid));
 typedef enum GpPolicyType
 {
 	POLICYTYPE_PARTITIONED,		/* Tuples partitioned onto segment database. */
-	POLICYTYPE_ENTRY			/* Tuples stored on entry database. */
+	POLICYTYPE_ENTRY,			/* Tuples stored on entry database. */
+	POLICYTYPE_REPLICATED		/* Tuples stored a copy on all segment database. */
 } GpPolicyType;
 
 /*
@@ -60,28 +106,34 @@ typedef enum GpPolicyType
  */
 typedef struct GpPolicy
 {
+	NodeTag		type;
 	GpPolicyType ptype;
+	int			numsegments;
 
 	/* These fields apply to POLICYTYPE_PARTITIONED. */
 	int			nattrs;
-	AttrNumber	attrs[1];		/* the first of nattrs attribute numbers.  */
+	AttrNumber *attrs;		/* array of attribute numbers  */
+	Oid		   *opclasses;	/* and their opclasses */
 } GpPolicy;
 
-#define SizeOfGpPolicy(nattrs)	(offsetof(GpPolicy, attrs) + sizeof(AttrNumber) * (nattrs))
+/*
+ * Global Variables
+ */
+extern int	gp_create_table_default_numsegments;
 
 /*
  * GpPolicyCopy -- Return a copy of a GpPolicy object.
  *
  * The copy is palloc'ed in the specified context.
  */
-GpPolicy *GpPolicyCopy(MemoryContext mcxt, const GpPolicy *src);
+extern GpPolicy *GpPolicyCopy(const GpPolicy *src);
 
 /* GpPolicyEqual
  *
  * A field-by-field comparison just to facilitate comparing IntoClause
  * (which embeds this) in equalFuncs.c
  */
-bool GpPolicyEqual(const GpPolicy *lft, const GpPolicy *rgt);
+extern bool GpPolicyEqual(const GpPolicy *lft, const GpPolicy *rgt);
 
 /*
  * GpPolicyFetch
@@ -95,19 +147,28 @@ bool GpPolicyEqual(const GpPolicy *lft, const GpPolicy *rgt);
  * function does not check and assigns a policy of type POLICYTYPE_ENTRY
  * for any oid not found in gp_distribution_policy.
  */
-GpPolicy *GpPolicyFetch(MemoryContext mcxt, Oid tbloid);
+extern GpPolicy *GpPolicyFetch(Oid tbloid);
 
 /*
  * GpPolicyStore: sets the GpPolicy for a table.
  */
-void GpPolicyStore(Oid tbloid, const GpPolicy *policy);
+extern void GpPolicyStore(Oid tbloid, const GpPolicy *policy);
 
-void GpPolicyReplace(Oid tbloid, const GpPolicy *policy);
+extern void GpPolicyReplace(Oid tbloid, const GpPolicy *policy);
 
-void GpPolicyRemove(Oid tbloid);
+extern void GpPolicyRemove(Oid tbloid);
 
-bool GpPolicyIsRandomly(GpPolicy *policy);
+extern bool GpPolicyIsRandomPartitioned(const GpPolicy *policy);
+extern bool GpPolicyIsHashPartitioned(const GpPolicy *policy);
+extern bool GpPolicyIsPartitioned(const GpPolicy *policy);
+extern bool GpPolicyIsReplicated(const GpPolicy *policy);
+extern bool GpPolicyIsEntry(const GpPolicy *policy);
 
-extern GpPolicy *createRandomDistribution(void);
+extern GpPolicy *makeGpPolicy(GpPolicyType ptype, int nattrs, int numsegments);
+extern GpPolicy *createReplicatedGpPolicy(int numsegments);
+extern GpPolicy *createRandomPartitionedPolicy(int numsegments);
+extern GpPolicy *createHashPartitionedPolicy(List *keys, List *opclasses, int numsegments);
+
+extern bool IsReplicatedTable(Oid relid);
 
 #endif /*_GP_POLICY_H_*/

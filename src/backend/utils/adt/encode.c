@@ -3,11 +3,11 @@
  * encode.c
  *	  Various data encoding/decoding things.
  *
- * Copyright (c) 2001-2009, PostgreSQL Global Development Group
+ * Copyright (c) 2001-2016, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/adt/encode.c,v 1.21 2008/02/26 02:54:08 tgl Exp $
+ *	  src/backend/utils/adt/encode.c
  *
  *-------------------------------------------------------------------------
  */
@@ -215,7 +215,7 @@ static const int8 b64lookup[128] = {
 };
 
 static unsigned
-b64_encode(const char *src, unsigned len, char *dst)
+pg_base64_encode(const char *src, unsigned len, char *dst)
 {
 	char	   *p,
 			   *lend = dst + 76;
@@ -262,7 +262,7 @@ b64_encode(const char *src, unsigned len, char *dst)
 }
 
 static unsigned
-b64_decode(const char *src, unsigned len, char *dst)
+pg_base64_decode(const char *src, unsigned len, char *dst)
 {
 	const char *srcend = src + len,
 			   *s = src;
@@ -292,7 +292,7 @@ b64_decode(const char *src, unsigned len, char *dst)
 				else
 					ereport(ERROR,
 							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							 errmsg("unexpected \"=\"")));
+							 errmsg("unexpected \"=\" while decoding base64 sequence")));
 			}
 			b = 0;
 		}
@@ -304,7 +304,7 @@ b64_decode(const char *src, unsigned len, char *dst)
 			if (b < 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("invalid symbol")));
+						 errmsg("invalid symbol \"%c\" while decoding base64 sequence", (int) c)));
 		}
 		/* add it to buffer */
 		buf = (buf << 6) + b;
@@ -324,21 +324,22 @@ b64_decode(const char *src, unsigned len, char *dst)
 	if (pos != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("invalid end sequence")));
+				 errmsg("invalid base64 end sequence"),
+				 errhint("Input data is missing padding, is truncated, or is otherwise corrupted.")));
 
 	return p - dst;
 }
 
 
 static unsigned
-b64_enc_len(const char *src, unsigned srclen)
+pg_base64_enc_len(const char *src, unsigned srclen)
 {
 	/* 3 bytes will be converted to 4, linefeed after 76 chars */
 	return (srclen + 2) * 4 / 3 + srclen / (76 * 3 / 4);
 }
 
 static unsigned
-b64_dec_len(const char *src, unsigned srclen)
+pg_base64_dec_len(const char *src, unsigned srclen)
 {
 	return (srclen * 3) >> 2;
 }
@@ -531,7 +532,7 @@ static const struct
 	{
 		"base64",
 		{
-			b64_enc_len, b64_dec_len, b64_encode, b64_decode
+			pg_base64_enc_len, pg_base64_dec_len, pg_base64_encode, pg_base64_decode
 		}
 	},
 	{

@@ -17,7 +17,7 @@
 
 #include "gpos/base.h"
 #include "gpos/common/CBitSet.h"
-#include "gpos/memory/IMemoryPool.h"
+#include "gpos/memory/CMemoryPool.h"
 
 #include "naucrates/traceflags/traceflags.h"
 
@@ -48,20 +48,20 @@ namespace gpdxl
 			struct SConfigMappingElem
 			{
 				// trace flag
-				EOptTraceFlag m_etf;
+				EOptTraceFlag m_trace_flag;
 
 				// config param address
-				BOOL *m_pfParam;
+				BOOL *m_is_param;
 
 				// if true, we negate the config param value before setting traceflag value
-				BOOL m_fNegate;
+				BOOL m_negate_param;
 
 				// description
-				const WCHAR *wszDescription;
+				const WCHAR *description_str;
 			};
 
 			// array of mapping elements
-			static SConfigMappingElem m_elem[];
+			static SConfigMappingElem m_elements[];
 
 			// private ctor
 			CConfigParamMapping(const CConfigParamMapping &);
@@ -69,7 +69,7 @@ namespace gpdxl
 		public:
 			// pack enabled optimizer config params in a traceflag bitset
 			static
-			CBitSet *PbsPack(IMemoryPool *pmp, ULONG ulXforms);
+			CBitSet *PackConfigParamInBitset(CMemoryPool *mp, ULONG xform_id);
 	};
 }
 

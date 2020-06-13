@@ -218,19 +218,6 @@ with my_sum(total) as (select sum(value) from with_test1 into total_value)
 select *
 from my_sum;
 
--- alias columns mismatch
-with my_sum(group_total) as (select i, sum(value) from with_test1 group by i)
-select *
-from my_sum;
-
-with my_sum as (select i, sum(value) as i from with_test1 group by i)
-select *
-from my_sum;
-
-with my_sum(i, total) as (select i, sum(value) as i from with_test1 group by i)
-select *
-from my_sum; -- this works
-
 -- name resolution
 select * from with_test1, my_max
 where value < (with my_max(maximum) as (select max(i) from with_test1)
@@ -309,10 +296,10 @@ order by 1,2,3
 limit 60; --order 1,2,3
 --end_equivalent
 
+drop table if exists d;
 drop table if exists b;
-create table with_b (i integer);
-insert into with_b values(1);
-insert into with_b values(2);
+create table with_b (i integer) distributed by (i);
+insert into with_b values (1), (2);
 
 --begin_equivalent
 with b1 as (select * from with_b) select * from (select * from b1 where b1.i =1) AS FOO, b1 FOO2;
@@ -320,15 +307,15 @@ with b1 as (select * from with_b) select * from (select * from b1 where b1.i =1)
 select * from (select * from (select * from with_b) as b1 where b1.i = 1) AS FOO, (select * from with_b) as foo2;
 --end_equivalent
 -- qual push down test
-with t as (select * from with_test1) select * from t where i = 10;
+explain (costs off) with t as (select * from with_test1) select * from t where i = 10;
 
--- MPP-17848
-drop table x;
-CREATE TABLE x(a int);
+-- Test to validate an old bug which caused incorrect results when a subquery
+-- in the WITH clause appears under a nested-loop join in the query plan when
+-- gp_cte_sharing was set to off. (MPP-17848)
+CREATE TABLE x (a integer) DISTRIBUTED BY (a);
 insert into x values(1), (2);
 
-drop TABLE y;
-CREATE TABLE y (m integer NOT NULL, n smallint);
+CREATE TABLE y (m integer NOT NULL, n smallint) DISTRIBUTED BY (m);
 insert into y values(10, 1);
 insert into y values(20, 1);
 
@@ -339,4 +326,97 @@ with yy as (
    where n = iv.p
 )
 select * from x, yy;
--- End of MPP-17848
+
+-- Check that WITH query is run to completion even if outer query isn't.
+-- This is a test which exists in the upstream 'with' test suite in a section
+-- which is currently under an ignore block. It has been copied here to avoid
+-- merge conflicts since enabling it in the upstream test suite would require
+-- altering the test output (as it depends on earlier tests which are failing
+-- in GPDB currently).
+DELETE FROM y;
+INSERT INTO y SELECT generate_series(1,15) m;
+WITH t AS (
+    UPDATE y SET m = m * 100 RETURNING *
+)
+SELECT m BETWEEN 100 AND 1500 FROM t LIMIT 1;
+
+SELECT * FROM y;
+
+-- Nested RECURSIVE queries with double self-referential joins are planned by
+-- joining two WorkTableScans, which GPDB cannot do yet. Ensure that we error
+-- out with a descriptive message.
+WITH RECURSIVE r1 AS (
+	SELECT 1 AS a
+	UNION ALL
+	(
+		WITH RECURSIVE r2 AS (
+			SELECT 2 AS b
+			UNION ALL
+			SELECT b FROM r1, r2
+		)
+		SELECT b FROM r2
+	)
+)
+SELECT * FROM r1 LIMIT 1;
+
+
+-- This used to deadlock, before the IPC between ShareInputScans across
+-- slices was rewritten.
+set gp_cte_sharing=on;
+
+CREATE TEMP TABLE foo (i int, j int);
+INSERT INTO foo SELECT g, g FROM generate_series(1, 2) g;
+
+WITH a1 as (select * from foo),
+     a2 as (select * from foo)
+SELECT a1.i
+  FROM a1
+  INNER JOIN a2 ON a2.i = a1.i
+UNION ALL
+SELECT count(a1.i)
+  FROM a1
+  INNER JOIN a2 ON a2.i = a1.i;
+
+explain (costs off)
+WITH a1 as (select * from foo),
+     a2 as (select * from foo)
+SELECT a1.i
+  FROM a1
+  INNER JOIN a2 ON a2.i = a1.i
+UNION ALL
+SELECT count(a1.i)
+  FROM a1
+  INNER JOIN a2 ON a2.i = a1.i;
+
+-- Another cross-slice ShareInputScan test. There is one producing slice,
+-- and two consumers in second slice. Make sure the Share Input Scan
+-- consumer slice doesn't prematurely notify the producer that it's done,
+-- when one of the Scans in the consumer slice finishes, but there are still
+-- Scans left in the same slice.
+explain (costs off)
+WITH cte AS (SELECT * FROM foo)
+  -- This branch runs on different slice. It is the producer slice.
+  (SELECT DISTINCT 'a' as branch, j FROM cte)
+UNION ALL
+  -- This branch runs in the consumer slice. It contains a join. A join
+  -- causes the input to be squelched when it reaches the end.
+  (SELECT 'b', x.i FROM cte x, cte y WHERE x.i = y.i)
+UNION ALL
+  -- Sleep a bit between executing the previous slice and the next slice,
+  -- so that if the squelch from the join incorrectly sent a "done" message
+  -- to the producer slice, the producer has a chance to finish and remove
+  -- the tuplestore, before the next branch tries to open the shared
+  -- tuplestore again.
+  SELECT 'sleep', 1 where pg_sleep(1) is not null
+UNION ALL
+  -- Consumer, runs in same slice as the join above.
+  SELECT 'c', j FROM cte;
+
+WITH cte AS (SELECT * FROM foo)
+  (SELECT DISTINCT 'a' as branch, j FROM cte)
+UNION ALL
+  (SELECT 'b', x.i FROM cte x, cte y WHERE x.i = y.i)
+UNION ALL
+  SELECT 'sleep', 1 where pg_sleep(1) is not null
+UNION ALL
+  SELECT 'c', j FROM cte;

@@ -1,11 +1,15 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/drop_rule.sgml,v 1.23 2008/11/14 10:22:46 petere Exp $
+doc/src/sgml/ref/drop_rule.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-DROPRULE">
+ <indexterm zone="sql-droprule">
+  <primary>DROP RULE</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="SQL-DROPRULE-TITLE">DROP RULE</refentrytitle>
+  <refentrytitle>DROP RULE</refentrytitle>
   <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
@@ -15,13 +19,9 @@ PostgreSQL documentation
   <refpurpose>remove a rewrite rule</refpurpose>
  </refnamediv>
 
- <indexterm zone="sql-droprule">
-  <primary>DROP RULE</primary>
- </indexterm>
-
  <refsynopsisdiv>
 <synopsis>
-DROP RULE [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> ON <replaceable class="PARAMETER">relation</replaceable> [ CASCADE | RESTRICT ]
+DROP RULE [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> ON <replaceable class="PARAMETER">table_name</replaceable> [ CASCADE | RESTRICT ]
 </synopsis>
  </refsynopsisdiv>
 
@@ -42,7 +42,7 @@ DROP RULE [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> ON <re
     <term><literal>IF EXISTS</literal></term>
     <listitem>
      <para>
-      Do not throw an error if the rule does not exist. A notice is issued 
+      Do not throw an error if the rule does not exist. A notice is issued
       in this case.
      </para>
     </listitem>
@@ -58,7 +58,7 @@ DROP RULE [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> ON <re
    </varlistentry>
 
    <varlistentry>
-    <term><replaceable class="parameter">relation</replaceable></term>
+    <term><replaceable class="parameter">table_name</replaceable></term>
     <listitem>
      <para>
       The name (optionally schema-qualified) of the table or view that
@@ -71,7 +71,9 @@ DROP RULE [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> ON <re
     <term><literal>CASCADE</literal></term>
     <listitem>
      <para>
-      Automatically drop objects that depend on the rule.
+      Automatically drop objects that depend on the rule,
+      and in turn all objects that depend on those objects
+      (see <xref linkend="ddl-depend">).
      </para>
     </listitem>
    </varlistentry>
@@ -96,15 +98,16 @@ DROP RULE [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> ON <re
 
 <programlisting>
 DROP RULE newrule ON mytable;
-</programlisting>
-  </para>
+</programlisting></para>
  </refsect1>
- 
+
  <refsect1>
   <title>Compatibility</title>
 
   <para>
-   There is no <command>DROP RULE</command> statement in the SQL standard.
+   <command>DROP RULE</command> is a
+   <productname>PostgreSQL</productname> language extension, as is the
+   entire query rewrite system.
   </para>
  </refsect1>
 
@@ -112,7 +115,8 @@ DROP RULE newrule ON mytable;
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-createrule" endterm="sql-createrule-title"></member>
+   <member><xref linkend="sql-createrule"></member>
+   <member><xref linkend="sql-alterrule"></member>
   </simplelist>
  </refsect1>
 

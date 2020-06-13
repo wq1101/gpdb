@@ -52,6 +52,7 @@ INSERT INTO TIMESTAMP_TBL VALUES ('infinity');
 INSERT INTO TIMESTAMP_TBL VALUES ('epoch');
 -- Obsolete special values
 INSERT INTO TIMESTAMP_TBL VALUES ('invalid');
+INSERT INTO TIMESTAMP_TBL VALUES ('undefined');
 INSERT INTO TIMESTAMP_TBL VALUES ('current');
 
 -- Postgres v6.0 standard output format
@@ -140,7 +141,12 @@ INSERT INTO TIMESTAMP_TBL VALUES ('Jan 01 17:32:01 2001');
 INSERT INTO TIMESTAMP_TBL VALUES ('Feb 16 17:32:01 -0097');
 INSERT INTO TIMESTAMP_TBL VALUES ('Feb 16 17:32:01 5097 BC');
 
-SELECT '' AS "64", d1 FROM TIMESTAMP_TBL; 
+SELECT '' AS "64", d1 FROM TIMESTAMP_TBL;
+
+-- Check behavior at the lower boundary of the timestamp range
+SELECT '4714-11-24 00:00:00 BC'::timestamp;
+SELECT '4714-11-23 23:59:59 BC'::timestamp;  -- out of range
+-- The upper boundary differs between integer and float timestamps, so no check
 
 -- Demonstrate functions and operators
 SELECT '' AS "48", d1 FROM TIMESTAMP_TBL
@@ -189,7 +195,7 @@ SELECT '' AS "54", d1 as "timestamp",
    FROM TIMESTAMP_TBL WHERE d1 BETWEEN '1902-01-01' AND '2038-01-01';
 
 -- TO_CHAR()
-SELECT '' AS to_char_1, to_char(d1, 'DAY Day day DY Dy dy MONTH Month month RM MON Mon mon') 
+SELECT '' AS to_char_1, to_char(d1, 'DAY Day day DY Dy dy MONTH Month month RM MON Mon mon')
    FROM TIMESTAMP_TBL;
 
 SELECT '' AS to_char_2, to_char(d1, 'FMDAY FMDay FMday FMMONTH FMMonth FMmonth FMRM')
@@ -198,23 +204,23 @@ SELECT '' AS to_char_2, to_char(d1, 'FMDAY FMDay FMday FMMONTH FMMonth FMmonth F
 SELECT '' AS to_char_3, to_char(d1, 'Y,YYY YYYY YYY YY Y CC Q MM WW DDD DD D J')
    FROM TIMESTAMP_TBL;
 
-SELECT '' AS to_char_4, to_char(d1, 'FMY,YYY FMYYYY FMYYY FMYY FMY FMCC FMQ FMMM FMWW FMDDD FMDD FMD FMJ') 
+SELECT '' AS to_char_4, to_char(d1, 'FMY,YYY FMYYYY FMYYY FMYY FMY FMCC FMQ FMMM FMWW FMDDD FMDD FMD FMJ')
    FROM TIMESTAMP_TBL;
 
-SELECT '' AS to_char_5, to_char(d1, 'HH HH12 HH24 MI SS SSSS') 
+SELECT '' AS to_char_5, to_char(d1, 'HH HH12 HH24 MI SS SSSS')
    FROM TIMESTAMP_TBL;
 
-SELECT '' AS to_char_6, to_char(d1, E'"HH:MI:SS is" HH:MI:SS "\\"text between quote marks\\""') 
+SELECT '' AS to_char_6, to_char(d1, E'"HH:MI:SS is" HH:MI:SS "\\"text between quote marks\\""')
    FROM TIMESTAMP_TBL;
 
 SELECT '' AS to_char_7, to_char(d1, 'HH24--text--MI--text--SS')
    FROM TIMESTAMP_TBL;
 
-SELECT '' AS to_char_8, to_char(d1, 'YYYYTH YYYYth Jth') 
+SELECT '' AS to_char_8, to_char(d1, 'YYYYTH YYYYth Jth')
    FROM TIMESTAMP_TBL;
-  
-SELECT '' AS to_char_9, to_char(d1, 'YYYY A.D. YYYY a.d. YYYY bc HH:MI:SS P.M. HH:MI:SS p.m. HH:MI:SS pm') 
-   FROM TIMESTAMP_TBL;   
+
+SELECT '' AS to_char_9, to_char(d1, 'YYYY A.D. YYYY a.d. YYYY bc HH:MI:SS P.M. HH:MI:SS p.m. HH:MI:SS pm')
+   FROM TIMESTAMP_TBL;
 
 SELECT '' AS to_char_10, to_char(d1, 'IYYY IYY IY I IW IDDD ID')
    FROM TIMESTAMP_TBL;
@@ -267,16 +273,10 @@ SELECT '' AS to_timestamp_20, to_timestamp('5527', 'IIWID');
 
 SELECT '' AS to_timestamp_21, to_timestamp('2005364', 'IYYYIDDD');
 
+-- timestamp numeric fields constructor
+SELECT make_timestamp(2014,12,28,6,30,45.887);
+
 SET DateStyle TO DEFAULT;
 
 -- Make sure timeofdate() and current_time() are doing roughly the same thing
 select timeofday()::date = current_timestamp::date;
-
---MPP-5665
-select '20081225130000.123456'::timestamp;
-select '20081225130000'::timestamp;
-select '20081225130000.000000000000000000000'::timestamp;
-select '20090625123002.111111111111'::timestamp;
--- should error out
-select '2009062512300.111111111111'::timestamp;
-select '200906251230021.111111111111'::timestamp;

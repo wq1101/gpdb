@@ -1,11 +1,16 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/drop_tsconfig.sgml,v 1.1 2007/08/21 21:08:47 tgl Exp $
+doc/src/sgml/ref/drop_tsconfig.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-DROPTSCONFIG">
+ <indexterm zone="sql-droptsconfig">
+  <primary>DROP TEXT SEARCH CONFIGURATION</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="SQL-DROPTSCONFIG-TITLE">DROP TEXT SEARCH CONFIGURATION</refentrytitle>
+  <refentrytitle>DROP TEXT SEARCH CONFIGURATION</refentrytitle>
+  <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
 
@@ -13,10 +18,6 @@ PostgreSQL documentation
   <refname>DROP TEXT SEARCH CONFIGURATION</refname>
   <refpurpose>remove a text search configuration</refpurpose>
  </refnamediv>
-  
- <indexterm zone="sql-droptsconfig">
-  <primary>DROP TEXT SEARCH CONFIGURATION</primary>
- </indexterm>
 
  <refsynopsisdiv>
 <synopsis>
@@ -33,7 +34,7 @@ DROP TEXT SEARCH CONFIGURATION [ IF EXISTS ] <replaceable class="PARAMETER">name
    configuration.
   </para>
  </refsect1>
-  
+
  <refsect1>
   <title>Parameters</title>
 
@@ -63,7 +64,9 @@ DROP TEXT SEARCH CONFIGURATION [ IF EXISTS ] <replaceable class="PARAMETER">name
     <term><literal>CASCADE</literal></term>
     <listitem>
      <para>
-      Automatically drop objects that depend on the text search configuration.
+      Automatically drop objects that depend on the text search configuration,
+      and in turn all objects that depend on those objects
+      (see <xref linkend="ddl-depend">).
      </para>
     </listitem>
    </varlistentry>
@@ -96,7 +99,7 @@ DROP TEXT SEARCH CONFIGURATION my_english;
    drop such indexes along with the text search configuration.
   </para>
  </refsect1>
- 
+
  <refsect1>
   <title>Compatibility</title>
 
@@ -110,8 +113,8 @@ DROP TEXT SEARCH CONFIGURATION my_english;
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-altertsconfig" endterm="sql-altertsconfig-title"></member>
-   <member><xref linkend="sql-createtsconfig" endterm="sql-createtsconfig-title"></member>
+   <member><xref linkend="sql-altertsconfig"></member>
+   <member><xref linkend="sql-createtsconfig"></member>
   </simplelist>
  </refsect1>
 

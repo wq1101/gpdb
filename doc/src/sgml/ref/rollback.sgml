@@ -1,11 +1,16 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/rollback.sgml,v 1.19 2006/09/16 00:30:19 momjian Exp $
+doc/src/sgml/ref/rollback.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-ROLLBACK">
+ <indexterm zone="sql-rollback">
+  <primary>ROLLBACK</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="SQL-ROLLBACK-TITLE">ROLLBACK</refentrytitle>
+  <refentrytitle>ROLLBACK</refentrytitle>
+  <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
 
@@ -13,10 +18,6 @@ PostgreSQL documentation
   <refname>ROLLBACK</refname>
   <refpurpose>abort the current transaction</refpurpose>
  </refnamediv>
-
- <indexterm zone="sql-rollback">
-  <primary>ROLLBACK</primary>
- </indexterm>
 
  <refsynopsisdiv>
 <synopsis>
@@ -53,13 +54,13 @@ ROLLBACK [ WORK | TRANSACTION ]
   <title>Notes</title>
 
   <para>
-   Use <xref linkend="SQL-COMMIT" endterm="SQL-COMMIT-TITLE"> to
+   Use <xref linkend="SQL-COMMIT"> to
    successfully terminate a transaction.
   </para>
 
   <para>
-   Issuing <command>ROLLBACK</> when not inside a transaction does
-   no harm, but it will provoke a warning message.
+   Issuing <command>ROLLBACK</> outside of a transaction
+   block emits a warning and otherwise has no effect.
   </para>
  </refsect1>
 
@@ -70,8 +71,7 @@ ROLLBACK [ WORK | TRANSACTION ]
    To abort all changes:
 <programlisting>
 ROLLBACK;
-</programlisting>
-  </para>
+</programlisting></para>
  </refsect1>
 
  <refsect1>
@@ -88,9 +88,9 @@ ROLLBACK;
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-begin" endterm="sql-begin-title"></member>
-   <member><xref linkend="sql-commit" endterm="sql-commit-title"></member>
-   <member><xref linkend="sql-rollback-to" endterm="sql-rollback-to-title"></member>
+   <member><xref linkend="sql-begin"></member>
+   <member><xref linkend="sql-commit"></member>
+   <member><xref linkend="sql-rollback-to"></member>
   </simplelist>
  </refsect1>
 </refentry>

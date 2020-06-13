@@ -1,11 +1,15 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/alter_conversion.sgml,v 1.9 2008/11/14 10:22:45 petere Exp $
+doc/src/sgml/ref/alter_conversion.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-ALTERCONVERSION">
+ <indexterm zone="sql-alterconversion">
+  <primary>ALTER CONVERSION</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="SQL-ALTERCONVERSION-TITLE">ALTER CONVERSION</refentrytitle>
+  <refentrytitle>ALTER CONVERSION</refentrytitle>
   <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
@@ -13,19 +17,16 @@ PostgreSQL documentation
  <refnamediv>
   <refname>ALTER CONVERSION</refname>
   <refpurpose>change the definition of a conversion</refpurpose>
- </refnamediv>  
-  
- <indexterm zone="sql-alterconversion">
-  <primary>ALTER CONVERSION</primary>
- </indexterm>
+ </refnamediv>
 
  <refsynopsisdiv>
 <synopsis>
-ALTER CONVERSION <replaceable>name</replaceable> RENAME TO <replaceable>newname</replaceable>
-ALTER CONVERSION <replaceable>name</replaceable> OWNER TO <replaceable>newowner</replaceable>
+ALTER CONVERSION <replaceable>name</replaceable> RENAME TO <replaceable>new_name</replaceable>
+ALTER CONVERSION <replaceable>name</replaceable> OWNER TO { <replaceable>new_owner</replaceable> | CURRENT_USER | SESSION_USER }
+ALTER CONVERSION <replaceable>name</replaceable> SET SCHEMA <replaceable>new_schema</replaceable>
 </synopsis>
  </refsynopsisdiv>
-  
+
  <refsect1>
   <title>Description</title>
 
@@ -44,7 +45,7 @@ ALTER CONVERSION <replaceable>name</replaceable> OWNER TO <replaceable>newowner<
    anyway.)
   </para>
  </refsect1>
-  
+
  <refsect1>
   <title>Parameters</title>
 
@@ -59,7 +60,7 @@ ALTER CONVERSION <replaceable>name</replaceable> OWNER TO <replaceable>newowner<
    </varlistentry>
 
    <varlistentry>
-    <term><replaceable class="parameter">newname</replaceable></term>
+    <term><replaceable class="parameter">new_name</replaceable></term>
     <listitem>
      <para>
       The new name of the conversion.
@@ -68,10 +69,19 @@ ALTER CONVERSION <replaceable>name</replaceable> OWNER TO <replaceable>newowner<
    </varlistentry>
 
    <varlistentry>
-    <term><replaceable class="parameter">newowner</replaceable></term>
+    <term><replaceable class="parameter">new_owner</replaceable></term>
     <listitem>
      <para>
       The new owner of the conversion.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><replaceable class="parameter">new_schema</replaceable></term>
+    <listitem>
+     <para>
+      The new schema for the conversion.
      </para>
     </listitem>
    </varlistentry>
@@ -94,8 +104,7 @@ ALTER CONVERSION iso_8859_1_to_utf8 RENAME TO latin1_to_unicode;
    <literal>joe</literal>:
 <programlisting>
 ALTER CONVERSION iso_8859_1_to_utf8 OWNER TO joe;
-</programlisting>
-  </para>
+</programlisting></para>
  </refsect1>
 
  <refsect1>
@@ -111,8 +120,8 @@ ALTER CONVERSION iso_8859_1_to_utf8 OWNER TO joe;
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-createconversion" endterm="sql-createconversion-title"></member>
-   <member><xref linkend="sql-dropconversion" endterm="sql-dropconversion-title"></member>
+   <member><xref linkend="sql-createconversion"></member>
+   <member><xref linkend="sql-dropconversion"></member>
   </simplelist>
  </refsect1>
 </refentry>

@@ -26,7 +26,7 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $PostgreSQL: pgsql/contrib/pgcrypto/pgcrypto.h,v 1.11 2006/09/05 21:26:48 tgl Exp $
+ * contrib/pgcrypto/pgcrypto.h
  */
 
 #ifndef _PG_CRYPTO_H
@@ -45,5 +45,6 @@ Datum		pg_decrypt(PG_FUNCTION_ARGS);
 Datum		pg_encrypt_iv(PG_FUNCTION_ARGS);
 Datum		pg_decrypt_iv(PG_FUNCTION_ARGS);
 Datum		pg_random_bytes(PG_FUNCTION_ARGS);
+Datum		pg_random_uuid(PG_FUNCTION_ARGS);
 
 #endif

@@ -24,6 +24,7 @@
 #include "access/twophase.h"
 #include "access/twophase_rmgr.h"
 #include "access/xact.h"
+#include "catalog/pg_resourcetype.h"
 #include "catalog/pg_resqueue.h"
 #include "catalog/pg_type.h"
 #include "cdb/cdbgang.h"
@@ -39,9 +40,11 @@
 #include "utils/portal.h"
 #include "utils/ps_status.h"
 #include "utils/resowner.h"
+#include "utils/resource_manager.h"
 #include "utils/resscheduler.h"
 #include "cdb/memquota.h"
 #include "commands/queue.h"
+#include "storage/proc.h"
 
 static void ResCleanUpLock(LOCK *lock, PROCLOCK *proclock, uint32 hashcode, bool wakeupNeeded);
 
@@ -162,9 +165,12 @@ ResLockAcquire(LOCKTAG *locktag, ResPortalIncrement *incrementSet)
 		locallock->lock = NULL;
 		locallock->proclock = NULL;
 		locallock->hashcode = LockTagHashCode(&(localtag.lock));
+		locallock->istemptable = false;
 		locallock->nLocks = 0;
 		locallock->numLockOwners = 0;
 		locallock->maxLockOwners = 8;
+		locallock->holdsStrongLockCount = FALSE;
+		locallock->lockCleared = false;
 		locallock->lockOwners = NULL;
 		locallock->lockOwners = (LOCALLOCKOWNER *)
 			MemoryContextAlloc(TopMemoryContext, locallock->maxLockOwners * sizeof(LOCALLOCKOWNER));
@@ -192,7 +198,7 @@ ResLockAcquire(LOCKTAG *locktag, ResPortalIncrement *incrementSet)
 		ereport(ERROR,
 				(errcode(ERRCODE_OUT_OF_MEMORY),
 				 errmsg("out of shared memory"),
-				 errhint("You may need to increase max_resource_qeueues.")));
+				 errhint("You may need to increase max_resource_queues.")));
 	}
 
 	/*
@@ -257,7 +263,7 @@ ResLockAcquire(LOCKTAG *locktag, ResPortalIncrement *incrementSet)
 		ereport(ERROR,
 				(errcode(ERRCODE_OUT_OF_MEMORY),
 				 errmsg("out of shared memory"),
-				 errhint("You may need to increase max_resource_qeueues.")));
+				 errhint("You may need to increase max_resource_queues.")));
 	}
 
 	/*
@@ -265,6 +271,15 @@ ResLockAcquire(LOCKTAG *locktag, ResPortalIncrement *incrementSet)
 	 */
 	if (!found)
 	{
+		/*
+		 * Resource queues don't participate in "group locking", used to share
+		 * locks between leader process and parallel worker processes in
+		 * PostgreSQL. But we better still set 'groupLeader', it is assumed
+		 * to be valid on all PROCLOCKs, and is accessed e.g. by
+		 * GetLockStatusData().
+		 */
+		proclock->groupLeader = MyProc->lockGroupLeader != NULL ?
+			MyProc->lockGroupLeader : MyProc;
 		proclock->holdMask = 0;
 		proclock->releaseMask = 0;
 		/* Add proclock to appropriate lists */
@@ -301,6 +316,8 @@ ResLockAcquire(LOCKTAG *locktag, ResPortalIncrement *incrementSet)
 		 * Something wrong happened - our RQ is gone. Release all locks and
 		 * clean out
 		 */
+		lock->nRequested--;
+		lock->requested[lockmode]--;
 		LWLockReleaseAll();
 		PG_RE_THROW();
 	}
@@ -340,6 +357,8 @@ ResLockAcquire(LOCKTAG *locktag, ResPortalIncrement *incrementSet)
 	incrementSet = ResIncrementAdd(incrementSet, proclock, owner);
 	if (!incrementSet)
 	{
+		lock->nRequested--;
+		lock->requested[lockmode]--;
 		LWLockRelease(ResQueueLock);
 		LWLockRelease(partitionLock);
 		ereport(ERROR,
@@ -432,7 +451,7 @@ ResLockAcquire(LOCKTAG *locktag, ResPortalIncrement *incrementSet)
 		 */
 		if (ResourceCleanupIdleGangs)
 		{
-			disconnectAndDestroyIdleReaderGangs();
+			cdbcomponent_cleanupIdleQEs(false);
 		}
 
 		/*
@@ -557,6 +576,7 @@ ResLockRelease(LOCKTAG *locktag, uint32 resPortalId)
 		LWLockRelease(partitionLock);
 		elog(DEBUG1, "Resource queue %d: proclock not held", locktag->locktag_field1);
 		RemoveLocalLock(locallock);
+		ResCleanUpLock(lock, proclock, hashcode, false);
 
 		return false;
 	}
@@ -619,6 +639,11 @@ ResLockRelease(LOCKTAG *locktag, uint32 resPortalId)
 	pgstat_record_end_queue_exec(resPortalId, locktag->locktag_field1);
 
 	return true;
+}
+
+bool
+IsResQueueLockedForPortal(Portal portal) {
+	return portal->hasResQueueLock;
 }
 
 
@@ -967,10 +992,10 @@ ResCleanUpLock(LOCK *lock, PROCLOCK *proclock, uint32 hashcode, bool wakeupNeede
 	{
 		uint32		proclock_hashcode;
 
-		if (proclock->lockLink.next != INVALID_OFFSET)
+		if (proclock->lockLink.next != NULL)
 			SHMQueueDelete(&proclock->lockLink);
 
-		if (proclock->procLink.next != INVALID_OFFSET)
+		if (proclock->procLink.next != NULL)
 			SHMQueueDelete(&proclock->procLink);
 
 		proclock_hashcode = ProcLockHashCode(&proclock->tag, hashcode);
@@ -1021,14 +1046,14 @@ ResWaitOnLock(LOCALLOCK *locallock, ResourceOwner owner, ResPortalIncrement *inc
 	/* Report change to waiting status */
 	if (update_process_title)
 	{
-		old_status = get_ps_display(&len);
+		old_status = get_real_act_ps_display(&len);
 		new_status = (char *) palloc(len + 8 + 1);
 		memcpy(new_status, old_status, len);
 		strcpy(new_status + len, " queuing");
 		set_ps_display(new_status, false);		/* truncate off " queuing" */
 		new_status[len] = '\0';
 	}
-	pgstat_report_waiting(PGBE_WAITING_LOCK);
+	pgstat_report_wait_start(WAIT_RESOURCE_QUEUE, 0);
 
 	awaitedLock = locallock;
 	awaitedOwner = owner;
@@ -1046,6 +1071,7 @@ ResWaitOnLock(LOCALLOCK *locallock, ResourceOwner owner, ResPortalIncrement *inc
 		LWLockRelease(partitionLock);
 		DeadLockReport();
 	}
+	pgstat_report_wait_end();
 
 	awaitedLock = NULL;
 
@@ -1055,7 +1081,6 @@ ResWaitOnLock(LOCALLOCK *locallock, ResourceOwner owner, ResPortalIncrement *inc
 		set_ps_display(new_status, false);
 		pfree(new_status);
 	}
-	pgstat_report_waiting(PGBE_WAITING_NONE);
 
 	return;
 }
@@ -1094,7 +1119,7 @@ ResProcLockRemoveSelfAndWakeup(LOCK *lock)
 		return;
 	}
 
-	proc = (PGPROC *) MAKE_PTR(waitQueue->links.next);
+	proc = (PGPROC *) waitQueue->links.next;
 
 	while (queue_size-- > 0)
 	{
@@ -1109,7 +1134,7 @@ ResProcLockRemoveSelfAndWakeup(LOCK *lock)
 		{
 			PGPROC	   *nextproc;
 
-			nextproc = (PGPROC *) MAKE_PTR(proc->links.next);
+			nextproc = (PGPROC *) proc->links.next;
 
 			SHMQueueDelete(&(proc->links));
 			(proc->waitLock->waitProcs.size)--;
@@ -1137,18 +1162,18 @@ ResProcLockRemoveSelfAndWakeup(LOCK *lock)
 		 * See if it is ok to wake this guy. (note that the wakeup writes to
 		 * the wait list, and gives back a *new* next proc).
 		 */
-		status = ResLockCheckLimit(lock, (PROCLOCK *) proc->waitProcLock, incrementSet, true);
+		status = ResLockCheckLimit(lock, proc->waitProcLock, incrementSet, true);
 		if (status == STATUS_OK)
 		{
-			ResGrantLock(lock, (PROCLOCK *) proc->waitProcLock);
-			ResLockUpdateLimit(lock, (PROCLOCK *) proc->waitProcLock, incrementSet, true, false);
+			ResGrantLock(lock, proc->waitProcLock);
+			ResLockUpdateLimit(lock, proc->waitProcLock, incrementSet, true, false);
 
 			proc = ResProcWakeup(proc, STATUS_OK);
 		}
 		else
 		{
 			/* Otherwise move on to the next guy. */
-			proc = (PGPROC *) MAKE_PTR(proc->links.next);
+			proc = (PGPROC *) proc->links.next;
 		}
 	}
 
@@ -1169,12 +1194,12 @@ ResProcWakeup(PGPROC *proc, int waitStatus)
 	PGPROC	   *retProc;
 
 	/* Proc should be sleeping ... */
-	if (proc->links.prev == INVALID_OFFSET ||
-		proc->links.next == INVALID_OFFSET)
+	if (proc->links.prev == NULL ||
+		proc->links.next == NULL)
 		return NULL;
 
 	/* Save next process before we zap the list link */
-	retProc = (PGPROC *) MAKE_PTR(proc->links.next);
+	retProc = (PGPROC *) proc->links.next;
 
 	/* Remove process from wait queue */
 	SHMQueueDelete(&(proc->links));
@@ -1211,7 +1236,7 @@ ResRemoveFromWaitQueue(PGPROC *proc, uint32 hashcode)
 	Assert(lockmethodid == RESOURCE_LOCKMETHOD);
 
 	/* Make sure proc is waiting */
-	Assert(proc->links.next != INVALID_OFFSET);
+	Assert(proc->links.next != NULL);
 	Assert(waitLock);
 	Assert(waitLock->waitProcs.size > 0);
 
@@ -1252,7 +1277,7 @@ ResRemoveFromWaitQueue(PGPROC *proc, uint32 hashcode)
 	 * LockRelease expects there to be no remaining proclocks.) Then see if
 	 * any other waiters for the lock can be woken up now.
 	 */
-	ResCleanUpLock(waitLock, (PROCLOCK *) proclock, hashcode, true);
+	ResCleanUpLock(waitLock, proclock, hashcode, true);
 	LWLockRelease(ResQueueLock);
 
 }
@@ -1319,6 +1344,7 @@ ResCheckSelfDeadLock(LOCK *lock, PROCLOCK *proclock, ResPortalIncrement *increme
 						costThesholdOvercommitted = true;
 					}
 				}
+				break;
 
 			case RES_MEMORY_LIMIT:
 				{
@@ -1359,7 +1385,7 @@ ResCheckSelfDeadLock(LOCK *lock, PROCLOCK *proclock, ResPortalIncrement *increme
 		if (lock->nRequested > lock->nGranted)
 		{
 			/* we're no longer waiting. */
-			pgstat_report_waiting(PGBE_WAITING_NONE);
+			pgstat_report_wait_end();
 			ResGrantLock(lock, proclock);
 			ResLockUpdateLimit(lock, proclock, incrementSet, true, true);
 		}
@@ -1461,7 +1487,7 @@ ResIncrementAdd(ResPortalIncrement *incSet, PROCLOCK *proclock, ResourceOwner ow
 	else
 	{
 		/* We have added this portId before - something has gone wrong! */
-
+		ResIncrementRemove(&portaltag);
 		elog(WARNING, "duplicate portal id %u for proc %d", incSet->portalId, incSet->pid);
 		incrementSet = NULL;
 	}
@@ -1754,9 +1780,9 @@ pg_resqueue_status(PG_FUNCTION_ARGS)
 static void
 BuildQueueStatusContext(QueueStatusContext *fctx)
 {
-	LWLockId	partitionLock;
 	int			num_calls = 0;
-	int			partition = 0;
+	int			numRecords;
+	int			i;
 	HASH_SEQ_STATUS status;
 	ResQueueData *queue = NULL;
 
@@ -1768,11 +1794,8 @@ BuildQueueStatusContext(QueueStatusContext *fctx)
 	 * the same lock order as the rest of the code - i.e. partition locks
 	 * *first* *then* the queue lock (otherwise we could deadlock ourselves).
 	 */
-	for (partition = 0; partition < NUM_LOCK_PARTITIONS; partition++)
-	{
-		partitionLock = FirstLockMgrLock + partition;
-		LWLockAcquire(partitionLock, LW_EXCLUSIVE);
-	}
+	for (i = 0; i < NUM_LOCK_PARTITIONS; i++)
+		LWLockAcquire(LockHashPartitionLockByIndex(i), LW_EXCLUSIVE);
 
 	/*
 	 * Lock resource queue structures.
@@ -1784,10 +1807,10 @@ BuildQueueStatusContext(QueueStatusContext *fctx)
 	num_calls = hash_get_num_entries(ResQueueHash);
 	Assert(num_calls == ResScheduler->num_queues);
 
-	int			i = 0;
-
+	numRecords = 0;
 	while ((queue = (ResQueueData *) hash_seq_search(&status)) != NULL)
 	{
+		QueueStatusRec *record = &fctx->record[numRecords];
 		int			j;
 		ResLimit	limits = NULL;
 		uint32		hashcode;
@@ -1797,44 +1820,29 @@ BuildQueueStatusContext(QueueStatusContext *fctx)
 		 */
 		limits = queue->limits;
 
-		fctx->record[i].queueid = queue->queueid;
+		record->queueid = queue->queueid;
 
 		for (j = 0; j < NUM_RES_LIMIT_TYPES; j++)
 		{
 			switch (limits[j].type)
 			{
 				case RES_COUNT_LIMIT:
-					{
-						fctx->record[i].queuecountthreshold =
-							limits[j].threshold_value;
-
-						fctx->record[i].queuecountvalue =
-							limits[j].current_value;
-					}
+					record->queuecountthreshold = limits[j].threshold_value;
+					record->queuecountvalue = limits[j].current_value;
 					break;
 
 				case RES_COST_LIMIT:
-					{
-						fctx->record[i].queuecostthreshold =
-							limits[j].threshold_value;
-
-						fctx->record[i].queuecostvalue =
-							limits[j].current_value;
-					}
+					record->queuecostthreshold = limits[j].threshold_value;
+					record->queuecostvalue = limits[j].current_value;
 					break;
 
 				case RES_MEMORY_LIMIT:
-					{
-						fctx->record[i].queuememthreshold =
-							limits[j].threshold_value;
-
-						fctx->record[i].queuememvalue =
-							limits[j].current_value;
-					}
+					record->queuememthreshold = limits[j].threshold_value;
+					record->queuememvalue =limits[j].current_value;
 					break;
 
 				default:
-					Assert(false && "Should never reach here!");
+					elog(ERROR, "unrecognized resource queue limit type: %d", limits[j].type);
 			}
 		}
 
@@ -1855,31 +1863,28 @@ BuildQueueStatusContext(QueueStatusContext *fctx)
 
 		if (!found || !lock)
 		{
-			fctx->record[i].queuewaiters = 0;
-			fctx->record[i].queueholders = 0;
+			record->queuewaiters = 0;
+			record->queueholders = 0;
 		}
 		else
 		{
-			fctx->record[i].queuewaiters = lock->nRequested - lock->nGranted;
-			fctx->record[i].queueholders = lock->nGranted;
+			record->queuewaiters = lock->nRequested - lock->nGranted;
+			record->queueholders = lock->nGranted;
 		}
 
-		i++;
-		Assert(i <= MaxResourceQueues);
+		numRecords++;
+		Assert(numRecords <= MaxResourceQueues);
 	}
 
 	/* Release the resource scheduler lock. */
 	LWLockRelease(ResQueueLock);
 
 	/* ...and the partition locks. */
-	for (partition = NUM_LOCK_PARTITIONS; --partition >= 0;)
-	{
-		partitionLock = FirstLockMgrLock + partition;
-		LWLockRelease(partitionLock);
-	}
+	for (i = NUM_LOCK_PARTITIONS; --i >= 0;)
+		LWLockRelease(LockHashPartitionLockByIndex(i));
 
 	/* Set the real no. of calls as we know it now! */
-	fctx->numRecords = i;
+	fctx->numRecords = numRecords;
 	return;
 }
 
@@ -2173,7 +2178,7 @@ uint64 ResourceQueueGetQueryMemoryLimit(PlannedStmt *stmt, Oid queueId)
 	/**
 	 * If user requests more using statement_mem, grant that.
 	 */
-	if (queryMem < statement_mem * 1024L)
+	if (queryMem < (uint64) statement_mem * 1024L)
 	{
 		queryMem = (uint64) statement_mem * 1024L;
 	}

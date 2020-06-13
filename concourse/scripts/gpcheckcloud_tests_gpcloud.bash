@@ -9,20 +9,12 @@ function gen_env(){
 	cat > /home/gpadmin/run_regression_gpcheckcloud.sh <<-EOF
 	set -exo pipefail
 
-	source /opt/gcc_env.sh
 	source /usr/local/greenplum-db-devel/greenplum_path.sh
 
-	if [ "$overwrite_gpcloud" = "true" ]
-	then
-		cd "\${1}/gpdb_src/gpAux/extensions/gpcloud"
-		make install -C bin/gpcheckcloud USE_PGXS=1
-	fi
-
-	cd "\${1}/gpdb_src/gpAux/extensions/gpcloud/regress"
+	cd "\${1}/gpdb_src/gpcontrib/gpcloud/regress"
 	bash gpcheckcloud_regress.sh
 	EOF
 
-	chown -R gpadmin:gpadmin $(pwd)
 	chown gpadmin:gpadmin /home/gpadmin/run_regression_gpcheckcloud.sh
 	chmod a+x /home/gpadmin/run_regression_gpcheckcloud.sh
 }
@@ -36,10 +28,9 @@ function setup_gpadmin_user() {
 }
 
 function _main() {
-	time configure
-        sed -i s/1024/unlimited/ /etc/security/limits.d/90-nproc.conf
-	time install_gpdb
+	time install_and_configure_gpdb
 	time setup_gpadmin_user
+	sed -i s/4096/unlimited/ /etc/security/limits.d/*-nproc.conf
 	time gen_env
 
 	time run_regression_gpcheckcloud

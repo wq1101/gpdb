@@ -24,15 +24,15 @@ CREATE
 -- Function to wait until a specific session is reported as waiting on
 -- a lock.  The session's mppsessionid is obtained from starve_helper
 -- table.  Timeout if no locks are awaited within 2 seconds.
-CREATE OR REPLACE FUNCTION wait_until_locks_awaited(sess_name varchar) /*in func*/ RETURNS bool AS $$ /*in func*/ declare /*in func*/ num_awaited int := 0; /*in func*/ iterations int := 0; /*in func*/ begin /*in func*/ while num_awaited = 0 and iterations < 20 loop /*in func*/ with locks_awaited as /*in func*/ (select * from pg_locks where granted = false and gp_segment_id = -1) /*in func*/ select count(*) into num_awaited from starve_helper s where /*in func*/ s.name = sess_name and s.sessionid in /*in func*/ (select mppsessionid from locks_awaited); /*in func*/ perform pg_sleep(.1); /*in func*/ iterations := iterations + 1; /*in func*/ end loop; /*in func*/ return num_awaited > 0; /*in func*/ end $$ /*in func*/ LANGUAGE plpgsql STABLE;
+CREATE OR REPLACE FUNCTION wait_until_locks_awaited(sess_name varchar) /*in func*/ RETURNS bool AS $$ /*in func*/ declare /*in func*/ num_awaited int := 0; /*in func*/ iterations int := 0; /*in func*/ sessions_waiting_for_locks int[]; /*in func*/ begin /*in func*/ while num_awaited = 0 and iterations < 20 loop /*in func*/ select array_agg(mppsessionid) into sessions_waiting_for_locks from pg_locks where granted = false and gp_segment_id = -1; /*in func*/ select count(*) into num_awaited from starve_helper s where /*in func*/ s.name = sess_name and s.sessionid = ANY (sessions_waiting_for_locks); /*in func*/ perform pg_sleep(.1); /*in func*/ iterations := iterations + 1; /*in func*/ end loop; /*in func*/ return num_awaited > 0; /*in func*/ end $$ /*in func*/ LANGUAGE plpgsql STABLE;
 CREATE
 
 -- Hold access shared lock, so that session2 must wait.
 1: begin;
 BEGIN
 1: select * from starve;
-c
--
+ c 
+---
 (0 rows)
 
 2: insert into starve_helper select 'session2', setting::int from pg_settings where name = 'gp_session_id';
@@ -43,9 +43,9 @@ BEGIN
 2>: alter table starve rename column c to d;  <waiting ...>
 
 select wait_until_locks_awaited('session2');
-wait_until_locks_awaited
-------------------------
-t                       
+ wait_until_locks_awaited 
+--------------------------
+ t                        
 (1 row)
 
 3: insert into starve_helper select 'session3', setting::int from pg_settings where name = 'gp_session_id';
@@ -59,18 +59,18 @@ BEGIN
 3>: select * from starve_helper, function_starve_volatile(5);  <waiting ...>
 
 select wait_until_locks_awaited('session3');
-wait_until_locks_awaited
-------------------------
-t                       
+ wait_until_locks_awaited 
+--------------------------
+ t                        
 (1 row)
 
 -- Check the lock table, expect both session2 and session3 to wait.
 -- expect: 2 rows with AccessExclusiveLock and AccessSharedLock
 select mode from pg_locks where granted=false and relation='starve'::regclass and gp_segment_id=-1;
-mode               
--------------------
-AccessShareLock    
-AccessExclusiveLock
+ mode                
+---------------------
+ AccessShareLock     
+ AccessExclusiveLock 
 (2 rows)
 
 -- Let everyone move forward.
@@ -81,9 +81,9 @@ COMMIT
 2<:  <... completed>
 ALTER
 2: select mode from pg_locks where granted=false and relation='starve'::regclass and gp_segment_id=-1;
-mode           
----------------
-AccessShareLock
+ mode            
+-----------------
+ AccessShareLock 
 (1 row)
 2: commit;
 COMMIT
@@ -92,7 +92,7 @@ COMMIT
 -- see error column 'c' doesn't exist because session2 renamed it.
 3<:  <... completed>
 ERROR:  column "c" does not exist  (entry db 127.0.0.1:15432 pid=94829)
-DETAIL:  PL/pgSQL function "function_starve_volatile" line 5 at SQL statement
+CONTEXT:  PL/pgSQL function "function_starve_volatile" line 5 at SQL statement
 3: commit;
 COMMIT
 
@@ -108,8 +108,8 @@ TRUNCATE
 1: begin;
 BEGIN
 1: select * from starve;
-d
--
+ d 
+---
 (0 rows)
 
 2: insert into starve_helper select 'session2', setting::int from pg_settings where name = 'gp_session_id';
@@ -120,9 +120,9 @@ BEGIN
 2>: alter table starve add column e int default 0;  <waiting ...>
 
 select wait_until_locks_awaited('session2');
-wait_until_locks_awaited
-------------------------
-t                       
+ wait_until_locks_awaited 
+--------------------------
+ t                        
 (1 row)
 
 3: insert into starve_helper select 'session3', setting::int from pg_settings where name = 'gp_session_id';
@@ -134,9 +134,9 @@ BEGIN
 3>: insert into starve values (1), (2);  <waiting ...>
 
 select wait_until_locks_awaited('session3');
-wait_until_locks_awaited
-------------------------
-t                       
+ wait_until_locks_awaited 
+--------------------------
+ t                        
 (1 row)
 
 1: commit;
@@ -146,9 +146,9 @@ COMMIT
 ALTER
 -- Ensure that session3 is still waiting.
 2: select mode from pg_locks where granted=false and relation='starve'::regclass and gp_segment_id=-1;
-mode            
-----------------
-RowExclusiveLock
+ mode             
+------------------
+ RowExclusiveLock 
 (1 row)
 2: commit;
 COMMIT

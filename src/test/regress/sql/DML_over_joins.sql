@@ -1,102 +1,19 @@
 -- ----------------------------------------------------------------------
 -- Test: setup_schema.sql
 -- ----------------------------------------------------------------------
--- start_ignore
 create schema DML_over_joins;
 set search_path to DML_over_joins;
--- end_ignore
--- ----------------------------------------------------------------------
--- Test: heap_motion0.sql
--- ----------------------------------------------------------------------
 
--- start_ignore
-------------------------------------------------------------
--- Update with Motion:
---   r,s colocated on join attributes
---      delete: using clause, subquery, initplan
---      update: join and subsubquery
-------------------------------------------------------------
--- end_ignore
-
--- start_ignore
-drop table if exists r;
-drop table if exists s;
--- end_ignore
-create table r (a int, b int) distributed by (a);
-create table s (a int, b int) distributed by (a);
-insert into r select generate_series(1, 10000), generate_series(1, 10000) * 3;
-insert into s select generate_series(1, 100), generate_series(1, 100) * 4;
-update r set b = r.b + 1 from s where r.a = s.a;
-
-update r set b = r.b + 1 from s where r.a in (select a from s);
-
-delete from r using s where r.a = s.a;
-
-delete from r;
-insert into r select generate_series(1, 10000), generate_series(1, 10000) * 3;
-delete from r where a in (select a from s);
-
-delete from r;
-insert into r select generate_series(1, 10000), generate_series(1, 10000) * 3;
-delete from r where a = (select max(a) from s);
-
-
-
--- start_ignore
-------------------------------------------------------------
--- Updates with motion:
--- 	Redistribute s
-------------------------------------------------------------
--- end_ignore
-
-delete from r;
-delete from s;
-insert into r select generate_series(1, 10000), generate_series(1, 10000) * 3;
-insert into s select generate_series(1, 100), generate_series(1, 100) * 4;
-
-update r set b = r.b + 4 from s where r.b = s.b;
-
-update r set b = b + 1 where b in (select b from s);
-
-delete from s using r where r.a = s.b;
-
-delete from r;
-delete from s;
-insert into r select generate_series(1, 10000), generate_series(1, 10000) * 3;
-insert into s select generate_series(1, 100), generate_series(1, 100) * 4;
-
-delete from r using s where r.b = s.b; 
-
-
--- start_ignore
-------------------------------------------------------------
--- 	Hash aggregate group by
-------------------------------------------------------------
--- end_ignore
-
-delete from r;
-delete from s;
-
-insert into r select generate_series(1, 10000), generate_series(1, 10000) * 3;
-insert into s select generate_series(1, 100), generate_series(1, 100) * 4;
-
-explain update s set b = b + 1 where exists (select 1 from r where s.a = r.b);
-update s set b = b + 1 where exists (select 1 from r where s.a = r.b);
-
-explain delete from s where exists (select 1 from r where s.a = r.b);
-delete from s where exists (select 1 from r where s.a = r.b);
 -- ----------------------------------------------------------------------
 -- Test: heap_motion1.sql
 -- ----------------------------------------------------------------------
 
--- start_ignore
 ------------------------------------------------------------
 -- Update with Motion:
 --   r,s colocated on join attributes
 --      delete: using clause, subquery, initplan
 --      update: join and subsubquery
 ------------------------------------------------------------
--- end_ignore
 
 -- start_ignore
 drop table if exists r;
@@ -122,13 +39,10 @@ delete from r where a = (select max(a) from s);
 
 
 
--- start_ignore
 ------------------------------------------------------------
 -- Updates with motion:
 -- 	Redistribute s
 ------------------------------------------------------------
--- end_ignore
-
 delete from r;
 delete from s;
 insert into r select generate_series(1, 10000), generate_series(1, 10000) * 3;
@@ -148,33 +62,32 @@ insert into s select generate_series(1, 100), generate_series(1, 100) * 4;
 delete from r using s where r.b = s.b; 
 
 
--- start_ignore
 ------------------------------------------------------------
 -- 	Hash aggregate group by
 ------------------------------------------------------------
--- end_ignore
-
 delete from r;
 delete from s;
 
 insert into r select generate_series(1, 10000), generate_series(1, 10000) * 3;
 insert into s select generate_series(1, 100), generate_series(1, 100) * 4;
 
+explain update s set b = b + 1 where exists (select 1 from r where s.a = r.b);
 update s set b = b + 1 where exists (select 1 from r where s.a = r.b);
 
+explain delete from s where exists (select 1 from r where s.a = r.b);
 delete from s where exists (select 1 from r where s.a = r.b);
+
+
 -- ----------------------------------------------------------------------
 -- Test: heap_motion2.sql
 -- ----------------------------------------------------------------------
 
--- start_ignore
 ------------------------------------------------------------
 -- Update with Motion:
 --   r,s colocated on join attributes
 --      delete: using clause, subquery, initplan
 --      update: join and subsubquery
 ------------------------------------------------------------
--- end_ignore
 
 -- start_ignore
 drop table if exists r;
@@ -199,14 +112,10 @@ insert into r select generate_series(1, 10000), generate_series(1, 10000) * 3;
 delete from r where a = (select max(a) from s);
 
 
-
--- start_ignore
 ------------------------------------------------------------
 -- Updates with motion:
 -- 	Redistribute s
 ------------------------------------------------------------
--- end_ignore
-
 delete from r;
 delete from s;
 insert into r select generate_series(1, 10000), generate_series(1, 10000) * 3;
@@ -226,12 +135,9 @@ insert into s select generate_series(1, 100), generate_series(1, 100) * 4;
 delete from r using s where r.b = s.b; 
 
 
--- start_ignore
 ------------------------------------------------------------
 -- 	Hash aggregate group by
 ------------------------------------------------------------
--- end_ignore
-
 delete from r;
 delete from s;
 
@@ -245,14 +151,12 @@ delete from s where exists (select 1 from r where s.a = r.b);
 -- Test: heap_motion3.sql
 -- ----------------------------------------------------------------------
 
--- start_ignore
 ------------------------------------------------------------
 -- Update with Motion:
 --   r,s colocated on join attributes
 --      delete: using clause, subquery, initplan
 --      update: join and subsubquery
 ------------------------------------------------------------
--- end_ignore
 
 -- start_ignore
 drop table if exists r;
@@ -277,14 +181,10 @@ insert into r select generate_series(1, 10000), generate_series(1, 10000) * 3;
 delete from r where a = (select max(a) from s);
 
 
-
--- start_ignore
 ------------------------------------------------------------
 -- Updates with motion:
 -- 	Redistribute s
 ------------------------------------------------------------
--- end_ignore
-
 delete from r;
 delete from s;
 insert into r select generate_series(1, 10000), generate_series(1, 10000) * 3;
@@ -304,12 +204,9 @@ insert into s select generate_series(1, 100), generate_series(1, 100) * 4;
 delete from r using s where r.b = s.b; 
 
 
--- start_ignore
 ------------------------------------------------------------
 -- 	Hash aggregate group by
 ------------------------------------------------------------
--- end_ignore
-
 delete from r;
 delete from s;
 
@@ -319,18 +216,18 @@ insert into s select generate_series(1, 100), generate_series(1, 100) * 4;
 update s set b = b + 1 where exists (select 1 from r where s.a = r.b);
 
 delete from s where exists (select 1 from r where s.a = r.b);
+
+
 -- ----------------------------------------------------------------------
 -- Test: heap_motion4.sql
 -- ----------------------------------------------------------------------
 
--- start_ignore
 ------------------------------------------------------------
 -- Update with Motion:
 --   r,s colocated on join attributes
 --      delete: using clause, subquery, initplan
 --      update: join and subsubquery
 ------------------------------------------------------------
--- end_ignore
 
 -- start_ignore
 drop table if exists r;
@@ -355,14 +252,10 @@ insert into r select generate_series(1, 10000), generate_series(1, 10000) * 3;
 delete from r where a = (select max(a) from s);
 
 
-
--- start_ignore
 ------------------------------------------------------------
 -- Updates with motion:
 -- 	Redistribute s
 ------------------------------------------------------------
--- end_ignore
-
 delete from r;
 delete from s;
 insert into r select generate_series(1, 10000), generate_series(1, 10000) * 3;
@@ -382,12 +275,9 @@ insert into s select generate_series(1, 100), generate_series(1, 100) * 4;
 delete from r using s where r.b = s.b; 
 
 
--- start_ignore
 ------------------------------------------------------------
 -- 	Hash aggregate group by
 ------------------------------------------------------------
--- end_ignore
-
 delete from r;
 delete from s;
 
@@ -401,14 +291,12 @@ delete from s where exists (select 1 from r where s.a = r.b);
 -- Test: heap_motion5.sql
 -- ----------------------------------------------------------------------
 
--- start_ignore
 ------------------------------------------------------------
 -- Update with Motion:
 --   r,s colocated on join attributes
 --      delete: using clause, subquery, initplan
 --      update: join and subsubquery
 ------------------------------------------------------------
--- end_ignore
 
 -- start_ignore
 drop table if exists r;
@@ -433,14 +321,10 @@ insert into r select generate_series(1, 10000), generate_series(1, 10000) * 3;
 delete from r where a = (select max(a) from s);
 
 
-
--- start_ignore
 ------------------------------------------------------------
 -- Updates with motion:
 -- 	Redistribute s
 ------------------------------------------------------------
--- end_ignore
-
 delete from r;
 delete from s;
 insert into r select generate_series(1, 10000), generate_series(1, 10000) * 3;
@@ -460,12 +344,9 @@ insert into s select generate_series(1, 100), generate_series(1, 100) * 4;
 delete from r using s where r.b = s.b; 
 
 
--- start_ignore
 ------------------------------------------------------------
 -- 	Hash aggregate group by
 ------------------------------------------------------------
--- end_ignore
-
 delete from r;
 delete from s;
 
@@ -475,65 +356,16 @@ insert into s select generate_series(1, 100), generate_series(1, 100) * 4;
 update s set b = b + 1 where exists (select 1 from r where s.a = r.b);
 
 delete from s where exists (select 1 from r where s.a = r.b);
--- ----------------------------------------------------------------------
--- Test: unsupported_cases0.sql
--- ----------------------------------------------------------------------
-
--- start_ignore
-------------------------------------------------------------
--- Update with Motion: unsupported cases
---     	Updating the distribution key
-------------------------------------------------------------
--- end_ignore
-
--- start_ignore
-drop table if exists r;
-drop table if exists s;
-drop table if exists p;
--- end_ignore
-
-create table r (a int, b int) distributed by (a);
-create table s (a int, b int) distributed by (a);
-insert into r select generate_series(1, 10000), generate_series(1, 10000) * 3;
-insert into s select generate_series(1, 100), generate_series(1, 100) * 4;
-
-create table p (a int, b int, c int) 
-	partition by range (c) (start(1) end(5) every(1), default partition extra);
-insert into p select generate_series(1,10000), generate_series(1,10000)*3, generate_series(1,10000)%6;
-
-update s set a = r.a from r where r.b = s.b;
 
 
--- start_ignore
-------------------------------------------------------------
---	Statement contains correlated subquery
-------------------------------------------------------------
--- end_ignore
-
-update s set b = (select min(a) from r where b = s.b);
-
-delete from s where b = (select min(a) from r where b = s.b);
-
-
--- start_ignore
-------------------------------------------------------------
---	Update partition key (requires moving tuples from one partition to another)
-------------------------------------------------------------
--- end_ignore
-
-update p set c = c + 1 where c = 0;
-
-update p set c = c + 1 where b in (select b from s) and c = 0;
 -- ----------------------------------------------------------------------
 -- Test: unsupported_cases1.sql
 -- ----------------------------------------------------------------------
 
--- start_ignore
 ------------------------------------------------------------
 -- Update with Motion: unsupported cases
 --     	Updating the distribution key
 ------------------------------------------------------------
--- end_ignore
 
 -- start_ignore
 drop table if exists r;
@@ -553,23 +385,17 @@ insert into p select generate_series(1,10000), generate_series(1,10000)*3, gener
 update s set a = r.a from r where r.b = s.b;
 
 
--- start_ignore
 ------------------------------------------------------------
 --	Statement contains correlated subquery
 ------------------------------------------------------------
--- end_ignore
-
 update s set b = (select min(a) from r where b = s.b);
 
 delete from s where b = (select min(a) from r where b = s.b);
 
 
--- start_ignore
 ------------------------------------------------------------
 --	Update partition key (requires moving tuples from one partition to another)
 ------------------------------------------------------------
--- end_ignore
-
 update p set c = c + 1 where c = 0;
 
 update p set c = c + 1 where b in (select b from s) and c = 0;
@@ -577,12 +403,10 @@ update p set c = c + 1 where b in (select b from s) and c = 0;
 -- Test: unsupported_cases2.sql
 -- ----------------------------------------------------------------------
 
--- start_ignore
 ------------------------------------------------------------
 -- Update with Motion: unsupported cases
 --     	Updating the distribution key
 ------------------------------------------------------------
--- end_ignore
 
 -- start_ignore
 drop table if exists r;
@@ -602,22 +426,17 @@ insert into p select generate_series(1,10000), generate_series(1,10000)*3, gener
 update s set a = r.a from r where r.b = s.b;
 
 
--- start_ignore
 ------------------------------------------------------------
 --	Statement contains correlated subquery
 ------------------------------------------------------------
--- end_ignore
-
 update s set b = (select min(a) from r where b = s.b);
 
 delete from s where b = (select min(a) from r where b = s.b);
 
 
--- start_ignore
 ------------------------------------------------------------
 --	Update partition key (requires moving tuples from one partition to another)
 ------------------------------------------------------------
--- end_ignore
 
 update p set c = c + 1 where c = 0;
 
@@ -626,12 +445,10 @@ update p set c = c + 1 where b in (select b from s where b = 36);
 -- Test: unsupported_cases3.sql
 -- ----------------------------------------------------------------------
 
--- start_ignore
 ------------------------------------------------------------
 -- Update with Motion: unsupported cases
 --     	Updating the distribution key
 ------------------------------------------------------------
--- end_ignore
 
 -- start_ignore
 drop table if exists r;
@@ -651,23 +468,17 @@ insert into p select generate_series(1,10000), generate_series(1,10000)*3, gener
 update s set a = r.a from r where r.b = s.b;
 
 
--- start_ignore
 ------------------------------------------------------------
 --	Statement contains correlated subquery
 ------------------------------------------------------------
--- end_ignore
-
 update s set b = (select min(a) from r where b = s.b);
 
 delete from s where b = (select min(a) from r where b = s.b);
 
 
--- start_ignore
 ------------------------------------------------------------
 --	Update partition key (requires moving tuples from one partition to another)
 ------------------------------------------------------------
--- end_ignore
-
 update p set c = c + 1 where c = 0;
 
 update p set c = c + 1 where b in (select b from s) and c = 0;
@@ -675,12 +486,10 @@ update p set c = c + 1 where b in (select b from s) and c = 0;
 -- Test: unsupported_cases4.sql
 -- ----------------------------------------------------------------------
 
--- start_ignore
 ------------------------------------------------------------
 -- Update with Motion: unsupported cases
 --     	Updating the distribution key
 ------------------------------------------------------------
--- end_ignore
 
 -- start_ignore
 drop table if exists r;
@@ -700,36 +509,30 @@ insert into p select generate_series(1,10000), generate_series(1,10000)*3, gener
 update s set a = r.a from r where r.b = s.b;
 
 
--- start_ignore
 ------------------------------------------------------------
 --	Statement contains correlated subquery
 ------------------------------------------------------------
--- end_ignore
-
 update s set b = (select min(a) from r where b = s.b);
 
 delete from s where b = (select min(a) from r where b = s.b);
 
 
--- start_ignore
 ------------------------------------------------------------
 --	Update partition key (requires moving tuples from one partition to another)
 ------------------------------------------------------------
--- end_ignore
-
 update p set c = c + 1 where c = 0;
 
 update p set c = c + 1 where b in (select b from s) and c = 0;
+
+
 -- ----------------------------------------------------------------------
 -- Test: unsupported_cases5.sql
 -- ----------------------------------------------------------------------
 
--- start_ignore
 ------------------------------------------------------------
 -- Update with Motion: unsupported cases
 --     	Updating the distribution key
 ------------------------------------------------------------
--- end_ignore
 
 -- start_ignore
 drop table if exists r;
@@ -749,101 +552,28 @@ insert into p select generate_series(1,10000), generate_series(1,10000)*3, gener
 update s set a = r.a from r where r.b = s.b;
 
 
--- start_ignore
 ------------------------------------------------------------
 --	Statement contains correlated subquery
 ------------------------------------------------------------
--- end_ignore
-
 update s set b = (select min(a) from r where b = s.b);
 
 delete from s where b = (select min(a) from r where b = s.b);
 
 
--- start_ignore
 ------------------------------------------------------------
 --	Update partition key (requires moving tuples from one partition to another)
 ------------------------------------------------------------
--- end_ignore
-
 update p set c = c + 1 where c = 0;
 
 update p set c = c + 1 where b in (select b from s) and c = 0;
--- ----------------------------------------------------------------------
--- Test: partition_motion0.sql
--- ----------------------------------------------------------------------
 
--- start_ignore
-------------------------------------------------------------
--- Update with Motion:
-------------------------------------------------------------
--- end_ignore
-
--- start_ignore
-drop table if exists r;
-drop table if exists s;
-drop table if exists p;
--- end_ignore
-create table r (a int, b int) distributed by (a);
-create table s (a int, b int) distributed by (a);
-insert into r select generate_series(1, 10000), generate_series(1, 10000) * 3;
-insert into s select generate_series(1, 100), generate_series(1, 100) * 3;
-
-create table p (a int, b int, c int)
-	distributed by (a)
-        partition by range (c) (start(1) end(5) every(1), default partition extra);
-	
-insert into p select generate_series(1,10000), generate_series(1,10000) * 3, generate_series(1,10000) % 6;
-
-
--- start_ignore
-------------------------------------------------------------
--- Update with Motion:
---	Motion on p, append node, hash agg
-------------------------------------------------------------
--- end_ignore
-
-update p set b = b + 1 where a in (select b from r where a = p.c);
-
-delete from p where p.a in (select b from r where a = p.c);
-
-delete from p using r where p.a = r.b and r.a = p.c;
-
-
-
--- start_ignore
-------------------------------------------------------------
--- Updates with motion:
--- 	No motion, colocated distribution key
-------------------------------------------------------------
--- end_ignore
-
-delete from p where a in (select a from r where a = p.c);
-
-delete from p using r where p.a = r.a and r.a = p.c;
-
-
-
--- start_ignore
-------------------------------------------------------------
--- 	No motion of s
-------------------------------------------------------------
--- end_ignore
-
-delete from s where a in (select a from p where p.b = s.b);
-
-select count(*) from s;
-select * from s;
-delete from s where b in (select a from p where p.c = s.b);
 -- ----------------------------------------------------------------------
 -- Test: partition_motion1.sql
 -- ----------------------------------------------------------------------
 
--- start_ignore
 ------------------------------------------------------------
 -- Update with Motion:
 ------------------------------------------------------------
--- end_ignore
 
 -- start_ignore
 drop table if exists r;
@@ -862,13 +592,10 @@ create table p (a int4, b int4, c int4)
 insert into p select generate_series(1,10000), generate_series(1,10000) * 3, generate_series(1,10000) % 6;
 
 
--- start_ignore
 ------------------------------------------------------------
 -- Update with Motion:
 --	Motion on p, append node, hash agg
 ------------------------------------------------------------
--- end_ignore
-
 update p set b = b + 1 where a in (select b from r where a = p.c);
 
 delete from p where p.a in (select b from r where a = p.c);
@@ -876,40 +603,32 @@ delete from p where p.a in (select b from r where a = p.c);
 delete from p using r where p.a = r.b and r.a = p.c;
 
 
-
--- start_ignore
 ------------------------------------------------------------
 -- Updates with motion:
 -- 	No motion, colocated distribution key
 ------------------------------------------------------------
--- end_ignore
-
 delete from p where a in (select a from r where a = p.c);
 
 delete from p using r where p.a = r.a and r.a = p.c;
 
 
-
--- start_ignore
 ------------------------------------------------------------
 -- 	No motion of s
 ------------------------------------------------------------
--- end_ignore
-
 delete from s where a in (select a from p where p.b = s.b);
 
 select count(*) from s;
 select * from s;
 delete from s where b in (select a from p where p.c = s.b);
+
+
 -- ----------------------------------------------------------------------
 -- Test: partition_motion2.sql
 -- ----------------------------------------------------------------------
 
--- start_ignore
 ------------------------------------------------------------
 -- Update with Motion:
 ------------------------------------------------------------
--- end_ignore
 
 -- start_ignore
 drop table if exists r;
@@ -928,13 +647,10 @@ create table p (a int8, b int8, c int8)
 insert into p select generate_series(1,10000), generate_series(1,10000) * 3, generate_series(1,10000) % 6;
 
 
--- start_ignore
 ------------------------------------------------------------
 -- Update with Motion:
 --	Motion on p, append node, hash agg
 ------------------------------------------------------------
--- end_ignore
-
 update p set b = b + 1 where a in (select b from r where a = p.c);
 
 delete from p where p.a in (select b from r where a = p.c);
@@ -942,40 +658,32 @@ delete from p where p.a in (select b from r where a = p.c);
 delete from p using r where p.a = r.b and r.a = p.c;
 
 
-
--- start_ignore
 ------------------------------------------------------------
 -- Updates with motion:
 -- 	No motion, colocated distribution key
 ------------------------------------------------------------
--- end_ignore
-
 delete from p where a in (select a from r where a = p.c);
 
 delete from p using r where p.a = r.a and r.a = p.c;
 
 
-
--- start_ignore
 ------------------------------------------------------------
 -- 	No motion of s
 ------------------------------------------------------------
--- end_ignore
-
 delete from s where a in (select a from p where p.b = s.b);
 
 select count(*) from s;
 select * from s;
 delete from s where b in (select a from p where p.c = s.b);
+
+
 -- ----------------------------------------------------------------------
 -- Test: partition_motion3.sql
 -- ----------------------------------------------------------------------
 
--- start_ignore
 ------------------------------------------------------------
 -- Update with Motion:
 ------------------------------------------------------------
--- end_ignore
 
 -- start_ignore
 drop table if exists r;
@@ -994,13 +702,10 @@ create table p (a float4, b float4, c float4)
 insert into p select generate_series(1,10000), generate_series(1,10000) * 3, generate_series(1,10000) % 6;
 
 
--- start_ignore
 ------------------------------------------------------------
 -- Update with Motion:
 --	Motion on p, append node, hash agg
 ------------------------------------------------------------
--- end_ignore
-
 update p set b = b + 1 where a in (select b from r where a = p.c);
 
 delete from p where p.a in (select b from r where a = p.c);
@@ -1008,40 +713,32 @@ delete from p where p.a in (select b from r where a = p.c);
 delete from p using r where p.a = r.b and r.a = p.c;
 
 
-
--- start_ignore
 ------------------------------------------------------------
 -- Updates with motion:
 -- 	No motion, colocated distribution key
 ------------------------------------------------------------
--- end_ignore
-
 delete from p where a in (select a from r where a = p.c);
 
 delete from p using r where p.a = r.a and r.a = p.c;
 
 
-
--- start_ignore
 ------------------------------------------------------------
 -- 	No motion of s
 ------------------------------------------------------------
--- end_ignore
-
 delete from s where a in (select a from p where p.b = s.b);
 
 select count(*) from s;
 select * from s;
 delete from s where b in (select a from p where p.c = s.b);
+
+
 -- ----------------------------------------------------------------------
 -- Test: partition_motion4.sql
 -- ----------------------------------------------------------------------
 
--- start_ignore
 ------------------------------------------------------------
 -- Update with Motion:
 ------------------------------------------------------------
--- end_ignore
 
 -- start_ignore
 drop table if exists r;
@@ -1060,13 +757,10 @@ create table p (a float(24), b float(24), c float(24))
 insert into p select generate_series(1,10000), generate_series(1,10000) * 3, generate_series(1,10000) % 6;
 
 
--- start_ignore
 ------------------------------------------------------------
 -- Update with Motion:
 --	Motion on p, append node, hash agg
 ------------------------------------------------------------
--- end_ignore
-
 update p set b = b + 1 where a in (select b from r where a = p.c);
 
 delete from p where p.a in (select b from r where a = p.c);
@@ -1074,40 +768,32 @@ delete from p where p.a in (select b from r where a = p.c);
 delete from p using r where p.a = r.b and r.a = p.c;
 
 
-
--- start_ignore
 ------------------------------------------------------------
 -- Updates with motion:
 -- 	No motion, colocated distribution key
 ------------------------------------------------------------
--- end_ignore
-
 delete from p where a in (select a from r where a = p.c);
 
 delete from p using r where p.a = r.a and r.a = p.c;
 
 
-
--- start_ignore
 ------------------------------------------------------------
 -- 	No motion of s
 ------------------------------------------------------------
--- end_ignore
-
 delete from s where a in (select a from p where p.b = s.b);
 
 select count(*) from s;
 select * from s;
 delete from s where b in (select a from p where p.c = s.b);
+
+
 -- ----------------------------------------------------------------------
 -- Test: partition_motion5.sql
 -- ----------------------------------------------------------------------
 
--- start_ignore
 ------------------------------------------------------------
 -- Update with Motion:
 ------------------------------------------------------------
--- end_ignore
 
 -- start_ignore
 drop table if exists r;
@@ -1126,13 +812,10 @@ create table p (a float(53), b float(53), c float(53))
 insert into p select generate_series(1,10000), generate_series(1,10000) * 3, generate_series(1,10000) % 6;
 
 
--- start_ignore
 ------------------------------------------------------------
 -- Update with Motion:
 --	Motion on p, append node, hash agg
 ------------------------------------------------------------
--- end_ignore
-
 update p set b = b + 1 where a in (select b from r where a = p.c);
 
 delete from p where p.a in (select b from r where a = p.c);
@@ -1140,31 +823,25 @@ delete from p where p.a in (select b from r where a = p.c);
 delete from p using r where p.a = r.b and r.a = p.c;
 
 
-
--- start_ignore
 ------------------------------------------------------------
 -- Updates with motion:
 -- 	No motion, colocated distribution key
 ------------------------------------------------------------
--- end_ignore
-
 delete from p where a in (select a from r where a = p.c);
 
 delete from p using r where p.a = r.a and r.a = p.c;
 
 
-
--- start_ignore
 ------------------------------------------------------------
 -- 	No motion of s
 ------------------------------------------------------------
--- end_ignore
-
 delete from s where a in (select a from p where p.b = s.b);
 
 select count(*) from s;
 select * from s;
 delete from s where b in (select a from p where p.c = s.b);
+
+
 -- ----------------------------------------------------------------------
 -- Test: mpp1070.sql
 -- ----------------------------------------------------------------------
@@ -1225,6 +902,8 @@ INSERT INTO t2 (id, data1, data2) VALUES (4, 3, 104);
 UPDATE t1 SET data2 = t2.data2 FROM t2 WHERE t1.data1 = t2.data1;
 
 SELECT * from t1;
+
+
 -- ----------------------------------------------------------------------
 -- Test: query00.sql
 -- ----------------------------------------------------------------------
@@ -1378,12 +1057,10 @@ SELECT InsertManyIntoSales(20,'sales_par_CO');
 -- Test: query01.sql
 -- ----------------------------------------------------------------------
 
--- start_ignore
 -- update/delete requires motion by joining 3 tables
 delete from r;
 delete from s;
 delete from sales;
--- end_ignore
 
 insert into r select generate_series(1, 10000), generate_series(1, 10000) * 3;
 insert into s select generate_series(1, 100), generate_series(1, 100) * 3;
@@ -1417,12 +1094,10 @@ select r.* from r,s,sales where s.a = sales.day and sales.month = r.b-1;
 -- ----------------------------------------------------------------------
 -- Test: query02.sql
 -- ----------------------------------------------------------------------
--- start_ignore
 -- 3 tables: heap and partition table
 delete from r;
 delete from s;
 delete from sales_par;
--- end_ignore
 
 insert into r select generate_series(1, 10000), generate_series(1, 10000) * 3;
 insert into s select generate_series(1, 100), generate_series(1, 100) * 3;
@@ -1452,13 +1127,11 @@ select s.* from s, r,sales_par where s.a = r.b and s.b = sales_par.id;
 -- ----------------------------------------------------------------------
 -- Test: query03.sql
 -- ----------------------------------------------------------------------
--- start_ignore
 -- 3 tables: heap and 2-level partition CO table + prepare
 -- direct dispatch
 delete from r;
 delete from s;
 delete from sales_par2;
--- end_ignore
 
 insert into r select generate_series(1, 10000), generate_series(1, 10000) * 3;
 insert into s select generate_series(1, 100), generate_series(1, 100) * 3;
@@ -1486,12 +1159,10 @@ select s.* from s, r,sales_par2 where s.a = r.b and s.b = sales_par2.id;
 -- Test: query05.sql
 -- ----------------------------------------------------------------------
 
--- start_ignore
 -- 4 tables: heap, AO, CO tables + duplicate distribution key
 delete from r;
 delete from s;
 drop table if exists s_ao;
--- end_ignore
 
 insert into r select generate_series(1, 10000), generate_series(1, 10000) * 3;
 insert into s select generate_series(1, 100), generate_series(1, 100) * 3;
@@ -1520,12 +1191,10 @@ select * from r where a in (select month from sales_par_CO, s_ao, s where sales_
 -- Test: query06.sql
 -- ----------------------------------------------------------------------
 
--- start_ignore
 -- 3 tables: direct dispatch + duplicate distribution key
 delete from s;
 delete from m;
 delete from sales_par;
--- end_ignore
 
 insert into s select generate_series(1, 100), generate_series(1, 100) * 3;
 insert into s select generate_series(1, 10), generate_series(1, 10) * 4;
@@ -1561,12 +1230,10 @@ select * from sales_par where region='asia' and id in (select b from m where a =
 -- Test: query08.sql
 -- ----------------------------------------------------------------------
 
--- start_ignore
 -- prepared statement: 3 tables: direct dispatch + duplicate distribution key
 delete from s;
 delete from m;
 delete from sales_par;
--- end_ignore
 
 insert into s select generate_series(1, 100), generate_series(1, 100) * 3;
 insert into s select generate_series(1, 10), generate_series(1, 10) * 4;
@@ -1602,27 +1269,43 @@ PREPARE plan5 AS delete from sales_par where region='asia' and id in (select b f
 EXECUTE plan5;
 select * from sales_par where region='asia' and id in (select b from m where a = 2);
 
-
 -- ----------------------------------------------------------------------
--- Test: query99.sql
+-- Test: Explicit redistributed motion may be removed.
 -- ----------------------------------------------------------------------
+create table tab1(a int, b int) distributed by (a);
+create table tab2(a int, b int) distributed by (a);
 
--- start_ignore
-drop table if exists r;
-drop table if exists s;
-drop table if exists p;
-drop table if exists t;
-drop table if exists m;
-drop table if exists s_ao;
+analyze tab1;
+analyze tab2;
 
-drop table if exists sales cascade;
-drop table if exists sales_par cascade;
-drop table if exists sales_par2 cascade;
-drop table if exists sales_par_CO cascade;
+-- colocate, no motion, thus no explicit redistributed motion
+explain (costs off) delete from tab1 using tab2 where tab1.a = tab2.a;
+-- redistribtued tab2, no motion above result relation, thus no explicit
+-- redistributed motion
+explain (costs off) delete from tab1 using tab2 where tab1.a = tab2.b;
+-- redistributed motion table, has to add explicit redistributed motion
+explain (costs off) delete from tab1 using tab2 where tab1.b = tab2.b;
 
-DROP FUNCTION InsertIntoSales(VARCHAR, INTEGER, VARCHAR);
-DROP FUNCTION InsertManyIntoSales(INTEGER, VARCHAR);
--- end_ignore
+alter table tab1 set distributed by (b);
+create table tab3 (a int, b int) distributed by (b);
+
+insert into tab1 values (1, 1);
+insert into tab2 values (1, 1);
+insert into tab3 values (1, 1);
+
+-- we must not write the WHERE condition as `relname='tab2'`, it matches tables
+-- in all the schemas, which will cause problems in other tests; we should use
+-- the `::regclass` way as it only matches the table in current search_path.
+set allow_system_table_mods=true;
+update pg_class set relpages = 10000 where oid='tab2'::regclass;
+update pg_class set reltuples = 100000000 where oid='tab2'::regclass;
+update pg_class set relpages = 100000000 where oid='tab3'::regclass;
+update pg_class set reltuples = 100000 where oid='tab3'::regclass;
+
+-- Planner: there is redistribute motion above tab1, however, we can also
+-- remove the explicit redistribute motion here because the final join
+-- co-locate with the result relation tab1.
+explain (costs off) delete from tab1 using tab2, tab3 where tab1.a = tab2.a and tab1.b = tab3.b;
 
 -- ----------------------------------------------------------------------
 -- Test: teardown.sql

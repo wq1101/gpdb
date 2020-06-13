@@ -1,7 +1,7 @@
 /*
  * insert_username.c
  * $Modified: Thu Oct 16 08:13:42 1997 by brook $
- * $PostgreSQL: pgsql/contrib/spi/insert_username.c,v 1.17 2009/01/07 13:44:36 tgl Exp $
+ * contrib/spi/insert_username.c
  *
  * insert user name in response to a trigger
  * usage:  insert_username (column_name)
@@ -13,10 +13,9 @@
 #include "executor/spi.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
+#include "utils/rel.h"
 
 PG_MODULE_MAGIC;
-
-extern Datum insert_username(PG_FUNCTION_ARGS);
 
 PG_FUNCTION_INFO_V1(insert_username);
 
@@ -38,10 +37,10 @@ insert_username(PG_FUNCTION_ARGS)
 	if (!CALLED_AS_TRIGGER(fcinfo))
 		/* internal error */
 		elog(ERROR, "insert_username: not fired by trigger manager");
-	if (TRIGGER_FIRED_FOR_STATEMENT(trigdata->tg_event))
+	if (!TRIGGER_FIRED_FOR_ROW(trigdata->tg_event))
 		/* internal error */
-		elog(ERROR, "insert_username: cannot process STATEMENT events");
-	if (TRIGGER_FIRED_AFTER(trigdata->tg_event))
+		elog(ERROR, "insert_username: must be fired for row");
+	if (!TRIGGER_FIRED_BEFORE(trigdata->tg_event))
 		/* internal error */
 		elog(ERROR, "insert_username: must be fired before event");
 
@@ -80,7 +79,7 @@ insert_username(PG_FUNCTION_ARGS)
 						args[0], relname)));
 
 	/* create fields containing name */
-	newval = CStringGetTextDatum(GetUserNameFromId(GetUserId()));
+	newval = CStringGetTextDatum(GetUserNameFromId(GetUserId(), false));
 
 	/* construct new tuple */
 	rettuple = SPI_modifytuple(rel, rettuple, 1, &attnum, &newval, NULL);

@@ -1,2 +1,0 @@
-bin/gpcheckmirrorseg.pl
-sbin/gprepairmirrorseg.py

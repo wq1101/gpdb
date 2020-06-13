@@ -211,7 +211,7 @@ extern AOCSScanDesc aocs_beginrangescan(Relation relation, Snapshot snapshot,
 extern void aocs_rescan(AOCSScanDesc scan);
 extern void aocs_endscan(AOCSScanDesc scan);
 
-extern void aocs_getnext(AOCSScanDesc scan, ScanDirection direction, TupleTableSlot *slot);
+extern bool aocs_getnext(AOCSScanDesc scan, ScanDirection direction, TupleTableSlot *slot);
 extern AOCSInsertDesc aocs_insert_init(Relation rel, int segno, bool update_mode);
 extern Oid aocs_insert_values(AOCSInsertDesc idesc, Datum *d, bool *null, AOTupleId *aoTupleId);
 static inline Oid aocs_insert(AOCSInsertDesc idesc, TupleTableSlot *slot)
@@ -255,7 +255,7 @@ extern AOCSAddColumnDesc aocs_addcol_init(
 		Relation rel, int num_newcols);
 extern void aocs_addcol_newsegfile(
 		AOCSAddColumnDesc desc, AOCSFileSegInfo *seginfo, char *basepath,
-		RelFileNode relfilenode);
+		RelFileNodeBackend relfilenode);
 extern void aocs_addcol_closefiles(AOCSAddColumnDesc desc);
 extern void aocs_addcol_endblock(AOCSAddColumnDesc desc, int64 firstRowNum);
 extern void aocs_addcol_insert_datum(AOCSAddColumnDesc desc,
@@ -264,4 +264,6 @@ extern void aocs_addcol_finish(AOCSAddColumnDesc desc);
 extern void aocs_addcol_emptyvpe(
 		Relation rel, AOCSFileSegInfo **segInfos,
 		int32 nseg, int num_newcols);
+extern void aocs_addcol_setfirstrownum(AOCSAddColumnDesc desc,
+		int64 firstRowNum);
 #endif   /* AOCSAM_H */

@@ -1,29 +1,25 @@
 -- Try to verify that rows end up in the right place.
 
-drop table if exists T;
-drop table if exists U;
-drop table if exists W;
+drop table if exists gpdist_T, gpdist_U, gpdist_W;
 
-create table T (a int, b int) distributed by (a);
-insert into T select i, 1 from generate_series(1, 5000) i;
+create table gpdist_T (a int, b int) distributed by (a);
+insert into gpdist_T select i, 1 from generate_series(1, 5000) i;
 
-create table U(segid int, a int, b int) distributed by (a);
-insert into U(segid, a, b) select gp_segment_id, * from T;
+create table gpdist_U(segid int, a int, b int) distributed by (a);
+insert into gpdist_U(segid, a, b) select gp_segment_id, * from gpdist_T;
 
-select * from U where segid <> gp_segment_id; -- should return 0 rows
+select * from gpdist_U where segid <> gp_segment_id; -- should return 0 rows
 
 -- Hash doesn't work quite like this.
 -- (numsegments can come from something like in jetpack.sql's __gp_number_of_segments view).
---select * from T where gp_segment_id <> a % numsegments; -- should return 0 rows
+--select * from gpdist_T where gp_segment_id <> a % numsegments; -- should return 0 rows
 
-create table W(segid int, a int) distributed by (a);
-insert into W(segid, a) select gp_segment_id, a*91 from T;
+create table gpdist_W(segid int, a int) distributed by (a);
+insert into gpdist_W(segid, a) select gp_segment_id, a*91 from gpdist_T;
 
-select * from T full join W on T.a = W.a/91 where T.gp_segment_id <> W.segid; -- should return 0 rows 
+select * from gpdist_T as T full join gpdist_W as W on T.a = W.a/91 where T.gp_segment_id <> W.segid; -- should return 0 rows 
 
-drop table T;
-drop table U;
-drop table W;
+drop table gpdist_T, gpdist_U, gpdist_W;
 
 drop table if exists customer_off;
 drop table if exists customer_on;
@@ -289,7 +285,7 @@ INSERT INTO customer_on VALUES (599, 'Customer#000000599', 'fIvpza0tlXAVjOAPkWN5
 
 SELECT * from customer_off a, customer_off b where a.gp_segment_id <> b.gp_segment_id and a.c_custkey = b.c_custkey;
 
--- Test partitioned tables which have child with different distribution policies
+-- Test partitioned tables which have child with same distribution policies
 
 set gp_enable_fast_sri to on;
 -- single level case
@@ -390,3 +386,150 @@ create table mpp5746_2 as select * from mpp5746 distributed by (c);
 select gp_segment_id, * from mpp5746 except
 select gp_segment_id, * from mpp5746_2;
 drop table mpp5746, mpp5746_2;
+
+--
+-- Test for disallowed combinations of DISTRIBUTED BY and PRIMARY KEY/UNIQUE
+-- constraints
+--
+create table distby_with_constraint (col1 int4 PRIMARY KEY, col2 int4) DISTRIBUTED RANDOMLY;
+create table distby_with_constraint (col1 int4 UNIQUE,      col2 int4) DISTRIBUTED RANDOMLY;
+create table distby_with_constraint (col1 int4 PRIMARY KEY, col2 int4) DISTRIBUTED BY (col2);
+create table distby_with_constraint (col1 int4 UNIQUE,      col2 int4) DISTRIBUTED BY (col2);
+
+create table distby_with_constraint (col1 int4, col2 int4, col3 int4, UNIQUE      (col1, col2)) distributed by (col3);
+create table distby_with_constraint (col1 int4, col2 int4, col3 int4, UNIQUE      (col1), UNIQUE (col2));
+create table distby_with_constraint (col1 int4, col2 int4, col3 int4, UNIQUE      (col1), PRIMARY KEY (col2));
+
+-- these are allowed
+create table distby_with_constraint01 (col1 int4 PRIMARY KEY, col2 int4) DISTRIBUTED BY (col1);
+create table distby_with_constraint02 (col1 int4 UNIQUE,      col2 int4) DISTRIBUTED BY (col1);
+create table distby_with_constraint03 (col1 int4 PRIMARY KEY, col2 int4) DISTRIBUTED REPLICATED;
+create table distby_with_constraint04 (col1 int4 UNIQUE,      col2 int4) DISTRIBUTED REPLICATED;
+
+-- More complicated cases. Allowed.
+create table distby_with_constraint11 (col1 int4, col2 int4, UNIQUE      (col1, col2)) distributed by (col1);
+create table distby_with_constraint12 (col1 int4, col2 int4, PRIMARY KEY (col1, col2)) distributed by (col1);
+create table distby_with_constraint13 (col1 int4, col2 int4, UNIQUE      (col1, col2)) distributed by (col2);
+create table distby_with_constraint14 (col1 int4, col2 int4, PRIMARY KEY (col1, col2)) distributed by (col2);
+
+create table distby_with_constraint15 (col1 int4, col2 int4, UNIQUE      (col1, col2)) distributed by (col2, col1);
+create table distby_with_constraint16 (col1 int4, col2 int4, PRIMARY KEY (col1, col2)) distributed by (col2, col1);
+create table distby_with_constraint17 (col1 int4, col2 int4, UNIQUE      (col1, col2)) distributed by (col1, col2);
+create table distby_with_constraint18 (col1 int4, col2 int4, PRIMARY KEY (col1, col2)) distributed by (col1, col2);
+
+-- Test deriving the distribution key from constraint columns.
+create table distby_with_constraint21 (col1 int4, col2 int4, col3 int4, UNIQUE      (col1, col2), UNIQUE (col3, col1));
+create table distby_with_constraint22 (col1 int4, col2 int4, col3 int4, UNIQUE      (col1, col2), PRIMARY KEY (col3, col1));
+
+-- Check what distribution key was chosen for all the cases above.
+select c.relname, policytype, distkey from pg_class c, gp_distribution_policy p where c.oid = p.localoid and relname LIKE 'distby_with_%' order by relname;
+
+
+--
+-- Test that DISTRIBUTED BY is interpreted correctly with inheritance.
+--
+CREATE TABLE inhdisttest_a (
+ssn integer,
+lastname character varying,
+junk integer
+) DISTRIBUTED BY (ssn);
+
+CREATE TABLE inhdisttest_b (
+id integer,
+lastname character varying,
+morejunk integer
+) DISTRIBUTED BY (id);
+
+CREATE TABLE inhdisttest_c (
+ssn integer,
+lastname character varying,
+junk integer,
+id integer,
+morejunk integer,
+uid1 integer,
+uid2 integer,
+uid3 integer
+) INHERITS (inhdisttest_a, inhdisttest_b) DISTRIBUTED BY (uid1, uid2, uid3);
+
+INSERT INTO inhdisttest_a VALUES (1, 'lastname a', 42);
+INSERT INTO inhdisttest_b VALUES (1, 'lastname b', 42);
+INSERT INTO inhdisttest_c (ssn, lastname, junk, id, morejunk, uid1, uid2, uid3) VALUES
+  (1, 'lastname c', 42, 1, 422, 1, 1, 1);
+
+select * from inhdisttest_a;
+select * from inhdisttest_b;
+
+
+--
+-- Test that NULLs are distributed correctly, by a CTAS involving an outer join
+--
+create temporary table even (i int4, j int4) distributed by (i);
+insert into even select g*2, g*2 from generate_series(1, 10) g;
+create temporary table odd (i int4, j int4) distributed by (i);
+insert into odd select g*2+1, g*2+1 from generate_series(1, 10) g;
+
+create temporary table ctas_x as
+  select even.j, even.i as a, odd.i as b from even full outer join odd on (even.i = odd.i)
+distributed by (a);
+
+-- Check that all the rows with NULL distribution key are stored on the same segment.
+select count(distinct gp_segment_id) from ctas_x where a is null;
+select a from ctas_x group by a;
+
+-- The same, but let the planner deduce the distribution key by itself. The
+-- codepaths to deduce it, and to check if the explicitly given distribution
+-- needs a Redistribute, are different. It should not choose 'a', even though
+-- the result is distributed on 'a', because there are NULLs on all segments.
+create temporary table ctas_y as
+  select even.j, even.i as a, odd.i as b
+  from even full outer join odd on (even.i = odd.i);
+
+select a from ctas_y group by a;
+
+-- Same for INSERT.
+create temporary table insert_z (j int4, a int4, b int4) distributed by (a);
+insert into insert_z
+  select even.j, even.i as a, odd.i as b
+  from even full outer join odd on (even.i = odd.i);
+
+select count(distinct gp_segment_id) from insert_z where a is null;
+select a from insert_z group by a;
+
+-- This doesn't need a Redistribute Motion.
+explain (costs off) select even.i from even left outer join odd on (even.i = odd.i) group by (even.i);
+
+-- But this does.
+explain (costs off) select even.i from even right outer join odd on (even.i = odd.i) group by (even.i);
+
+-- Check that we can track the distribution through multiple FULL OUTER JOINs.
+-- This query should not need Redistribute Motion.
+create temporary table a as select generate_series(1, 5) as i distributed by (i);
+create temporary table b as select generate_series(2, 6) as i distributed by (i);
+create temporary table c as select generate_series(3, 7) as i distributed by (i);
+explain (costs off) select * from a full join b on (a.i=b.i) full join c on (b.i=c.i);
+select * from a full join b on (a.i=b.i) full join c on (b.i=c.i);
+
+
+--
+-- 'xid' datatype has a hash opclass, but no b-tree operators. Test that.
+--
+-- While we don't particularly care about 'xid' datatype as such, let alone
+-- using it as distribution key, this case might arise for user-defined
+-- datatypes, too.
+--
+create table xidtab (x xid) distributed by (x);
+insert into xidtab select g::text::xid from generate_series(1,5) g;
+insert into xidtab values ('1'); -- insert a duplicate
+select * from xidtab a, xidtab b, xidtab c where a.x=b.x and b.x = c.x;
+select * from xidtab group by x;
+select distinct x from xidtab;
+
+-- Simple sanity tests for gp_dist_random()
+CREATE TEMP TABLE gp_dist_random_table (a int);
+INSERT INTO gp_dist_random_table SELECT generate_series(1,5);
+SELECT * FROM gp_dist_random('gp_dist_random_table');
+CREATE SCHEMA "gp.dist.random.schema";
+CREATE TABLE "gp.dist.random.schema".gp_dist_random_table_with_schema
+    AS SELECT * FROM gp_dist_random('"gp_dist_random_table"');
+SELECT * FROM gp_dist_random('"gp.dist.random.schema".gp_dist_random_table_with_schema');
+DROP SCHEMA "gp.dist.random.schema" CASCADE;

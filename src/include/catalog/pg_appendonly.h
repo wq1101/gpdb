@@ -26,11 +26,11 @@
 CATALOG(pg_appendonly,6105) BKI_WITHOUT_OIDS
 {
 	Oid				relid;				/* relation id */
-	int4			blocksize;			/* the max block size of this relation */
-	int4			safefswritesize;	/* min write size in bytes to prevent torn-write */
-	int2			compresslevel;		/* the (per seg) total number of varblocks */
+	int32			blocksize;			/* the max block size of this relation */
+	int32			safefswritesize;	/* min write size in bytes to prevent torn-write */
+	int16			compresslevel;		/* the (per seg) total number of varblocks */
 	bool			checksum;			/* true if checksum is stored with data and checked */
-	NameData		compresstype;		/* the compressor used (zlib, or quicklz) */
+	NameData		compresstype;		/* the compressor used (e.g. zlib) */
     bool            columnstore;        /* true if orientation is column */ 
     Oid             segrelid;           /* OID of aoseg table; 0 if none */
     Oid             blkdirrelid;        /* OID of aoblkdir table; 0 if none */
@@ -70,35 +70,6 @@ typedef FormData_pg_appendonly *Form_pg_appendonly;
 #define Anum_pg_appendonly_visimaprelid     11
 #define Anum_pg_appendonly_visimapidxid     12
 
-/*
- * pg_appendonly table values for FormData_pg_attribute.
- *
- * [Similar examples are Schema_pg_type, Schema_pg_proc, Schema_pg_attribute, etc, in
- *  pg_attribute.h]
- */
-#define Schema_pg_appendonly \
-{ AppendOnlyRelationId, {"relid"}, 					26, -1,	4, 1, 0, -1, -1, true, 'p', 'i', true, false, false, true, 0 }, \
-{ AppendOnlyRelationId, {"blocksize"}, 				23, -1, 4, 2, 0, -1, -1, true, 'p', 'i', true, false, false, true, 0 }, \
-{ AppendOnlyRelationId, {"safefswritesize"},		27, -1, 4, 3, 0, -1, -1, true, 'p', 'i', true, false, false, true, 0 }, \
-{ AppendOnlyRelationId, {"compresslevel"},			21, -1, 2, 4, 0, -1, -1, true, 'p', 's', true, false, false, true, 0 }, \
-{ AppendOnlyRelationId, {"checksum"},				16, -1, 1, 5, 0, -1, -1, true, 'p', 'c', true, false, false, true, 0 }, \
-{ AppendOnlyRelationId, {"compresstype"},			19, -1, NAMEDATALEN, 6, 0, -1, -1, false, 'p', 'c', true, false, false, true, 0 }, \
-{ AppendOnlyRelationId, {"columnstore"},			16, -1, 1, 7, 0, -1, -1, true, 'p', 'c', false, false, false, true, 0 }, \
-{ AppendOnlyRelationId, {"segrelid"},				26, -1, 4, 8, 0, -1, -1, true, 'p', 'i', false, false, false, true, 0 }, \
-{ AppendOnlyRelationId, {"blkdirrelid"},			26, -1, 4, 10, 0, -1, -1, true, 'p', 'i', false, false, false, true, 0 }, \
-{ AppendOnlyRelationId, {"blkdiridxid"},			26, -1, 4, 11, 0, -1, -1, true, 'p', 'i', false, false, false, true, 0 }, \
-{ AppendOnlyRelationId, {"visimaprelid"},			26, -1, 4, 12, 0, -1, -1, true, 'p', 'i', false, false, false, true, 0 }, \
-{ AppendOnlyRelationId, {"visimapidxid"},			26, -1, 4, 13, 0, -1, -1, true, 'p', 'i', false, false, false, true, 0 }
-
-/*
- * pg_appendonly table values for FormData_pg_class.
- */
-#define Class_pg_appendonly \
-  {"pg_appendonly"}, PG_CATALOG_NAMESPACE, 10293, BOOTSTRAP_SUPERUSERID, 0, \
-               AppendOnlyRelationId, DEFAULTTABLESPACE_OID, \
-               25, 10000, 0, 0, false, false, RELKIND_RELATION, RELSTORAGE_HEAP, Natts_pg_appendonly, \
-               0, 0, 0, 0, 0, false, false, false, false, FirstNormalTransactionId, {0}, {{{'\0','\0','\0','\0'},{'\0'}}}
-
 
 /* No initial contents. */
 
@@ -122,13 +93,16 @@ typedef enum AORelationVersion
 #define AORelationVersion_IsValid(version) \
 	(version > AORelationVersion_None && version < MaxAORelationVersion)
 
+extern bool Debug_appendonly_print_verify_write_block;
+
 static inline void AORelationVersion_CheckValid(int version)
 {
 	if (!AORelationVersion_IsValid(version))
 	{
-		ereport(ERROR,
-	 		    (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-	 		     errmsg("append-only table version %d is invalid", version)));
+		ereport(Debug_appendonly_print_verify_write_block?PANIC:ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("append-only table version %d is invalid", version),
+				 errprintstack(true)));
 	}
 }
 

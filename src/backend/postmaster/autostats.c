@@ -23,14 +23,17 @@
 #include "cdb/cdbpartition.h"
 #include "commands/vacuum.h"
 #include "executor/execdesc.h"
+#include "executor/executor.h"
+#include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/plannodes.h"
 #include "parser/parsetree.h"
 #include "postmaster/autostats.h"
 #include "utils/acl.h"
-#include "miscadmin.h"
+#include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
+#include "utils/timestamp.h"
 
 /*
  * Forward declarations.
@@ -64,15 +67,12 @@ autostats_issue_analyze(Oid relationOid)
 	relation = makeRangeVar(get_namespace_name(get_rel_namespace(relationOid)), get_rel_name(relationOid), -1);
 	analyzeStmt = makeNode(VacuumStmt);
 	/* Set up command parameters */
-	analyzeStmt->vacuum = false;
-	analyzeStmt->full = false;
-	analyzeStmt->analyze = true;
-	analyzeStmt->freeze_min_age = -1;
-	analyzeStmt->verbose = false;
-	analyzeStmt->rootonly = false;
+	analyzeStmt->options = VACOPT_ANALYZE;
 	analyzeStmt->relation = relation;	/* not used since we pass relids list */
 	analyzeStmt->va_cols = NIL;
-	vacuum(analyzeStmt, NIL, NULL, false, false);
+
+	ExecVacuum(analyzeStmt, false);
+
 	pfree(analyzeStmt);
 }
 
@@ -148,7 +148,27 @@ autostats_on_no_stats_check(AutoStatsCmdType cmdType, Oid relationOid)
 			 classForm->relpages,
 			 classForm->reltuples);
 
-		result = (classForm->relpages == 0 && classForm->reltuples < 1);
+		if (classForm->relkind == RELKIND_FOREIGN_TABLE &&
+			rel_is_external_table(relationOid))
+		{
+			/*
+			 * To keep the behaviour the same as in GPDB 6, don't try to
+			 * auto-analyze external tables. In GPDB 6, we used to populate
+			 * pg_class.relpages with a constant at CREATE EXTERNAL TABLE.
+			 * We don't do that anymore, for consistency with foreign tables,
+			 * but without this special case here, we would then try to
+			 * auto-analyze external tables. External tables don't have
+			 * an ANALYZE callback, so it wouldn't do anything, but it would
+			 * print an annoying "cannot analyze this foreign table" warning
+			 * every time you inserted to an external table.
+			 *
+			 * All foreign tables without an analyze callback have the same
+			 * problem, really, but we're not concerned about that right now.
+			 */
+			result = false;
+		}
+		else
+			result = (classForm->relpages == 0 && classForm->reltuples < 1);
 		ReleaseSysCache(tuple);
 		return result;
 	}
@@ -195,7 +215,6 @@ autostats_get_cmdtype(QueryDesc *queryDesc, AutoStatsCmdType * pcmdType, Oid *pr
 	PlannedStmt *stmt = queryDesc->plannedstmt;
 	Oid			relationOid = InvalidOid;		/* relation that is modified */
 	AutoStatsCmdType cmdType = AUTOSTATS_CMDTYPE_SENTINEL;		/* command type */
-	RangeTblEntry *rte = NULL;
 
 	switch (stmt->commandType)
 	{
@@ -203,30 +222,41 @@ autostats_get_cmdtype(QueryDesc *queryDesc, AutoStatsCmdType * pcmdType, Oid *pr
 			if (stmt->intoClause != NULL)
 			{
 				/* CTAS */
-				if (queryDesc->estate->es_into_relation_descriptor)
-					relationOid = RelationGetRelid(queryDesc->estate->es_into_relation_descriptor);
+				relationOid = GetIntoRelOid(queryDesc);
 				cmdType = AUTOSTATS_CMDTYPE_CTAS;
 			}
+			else if (stmt->copyIntoClause != NULL)
+			{
+				cmdType = AUTOSTATS_CMDTYPE_COPY;
+			}
 			break;
+
 		case CMD_INSERT:
-			rte = rt_fetch(lfirst_int(list_head(stmt->resultRelations)), stmt->rtable);
-			relationOid = rte->relid;
-			cmdType = AUTOSTATS_CMDTYPE_INSERT;
-			break;
 		case CMD_UPDATE:
-			rte = rt_fetch(lfirst_int(list_head(stmt->resultRelations)), stmt->rtable);
-			relationOid = rte->relid;
-			cmdType = AUTOSTATS_CMDTYPE_UPDATE;
-			break;
 		case CMD_DELETE:
-			rte = rt_fetch(lfirst_int(list_head(stmt->resultRelations)), stmt->rtable);
-			relationOid = rte->relid;
-			cmdType = AUTOSTATS_CMDTYPE_DELETE;
+			{
+				RangeTblEntry *rte;
+
+				if (stmt->resultRelations)
+				{
+					rte = rt_fetch(lfirst_int(list_head(stmt->resultRelations)), stmt->rtable);
+					relationOid = rte->relid;
+				}
+
+				if (stmt->commandType == CMD_INSERT)
+					cmdType = AUTOSTATS_CMDTYPE_INSERT;
+				else if (stmt->commandType == CMD_UPDATE)
+					cmdType = AUTOSTATS_CMDTYPE_UPDATE;
+				else
+					cmdType = AUTOSTATS_CMDTYPE_DELETE;
+			}
 			break;
+
 		case CMD_UTILITY:
 		case CMD_UNKNOWN:
 		case CMD_NOTHING:
 			break;
+
 		default:
 			Assert(false);
 			break;
@@ -253,7 +283,10 @@ auto_stats(AutoStatsCmdType cmdType, Oid relationOid, uint64 ntuples, bool inFun
 
 	start = GetCurrentTimestamp();
 
-	if (Gp_role != GP_ROLE_DISPATCH || relationOid == InvalidOid || rel_is_partitioned(relationOid))
+	if (Gp_role != GP_ROLE_DISPATCH || relationOid == InvalidOid
+		|| rel_is_partitioned(relationOid)
+		/* Updates on views are possible via triggers, but we can't analyze views. */
+		|| get_rel_relkind(relationOid) == RELKIND_VIEW)
 	{
 		return;
 	}
@@ -290,7 +323,7 @@ auto_stats(AutoStatsCmdType cmdType, Oid relationOid, uint64 ntuples, bool inFun
 	if (!policyCheck)
 	{
 		elog(DEBUG3, "In mode %s, command %s on (dboid,tableoid)=(%d,%d) modifying " UINT64_FORMAT " tuples did not issue Auto-ANALYZE.",
-			 gpvars_show_gp_autostats_mode(),
+			 lookup_autostats_mode_by_value(actual_gp_autostats_mode),
 			 autostats_cmdtype_to_string(cmdType),
 			 MyDatabaseId,
 			 relationOid,
@@ -301,18 +334,8 @@ auto_stats(AutoStatsCmdType cmdType, Oid relationOid, uint64 ntuples, bool inFun
 
 	if (log_autostats)
 	{
-		const char *autostats_mode;
-
-		if (inFunction)
-		{
-			autostats_mode = gpvars_show_gp_autostats_mode_in_functions();
-		}
-		else
-		{
-			autostats_mode = gpvars_show_gp_autostats_mode();
-		}
 		elog(LOG, "In mode %s, command %s on (dboid,tableoid)=(%d,%d) modifying " UINT64_FORMAT " tuples caused Auto-ANALYZE.",
-			 autostats_mode,
+			 lookup_autostats_mode_by_value(actual_gp_autostats_mode),
 			 autostats_cmdtype_to_string(cmdType),
 			 MyDatabaseId,
 			 relationOid,

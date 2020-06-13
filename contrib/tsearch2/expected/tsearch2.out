@@ -1,10 +1,4 @@
---
--- first, define the datatype.  Turn off echoing so that expected file
--- does not depend on contents of tsearch2.sql.
---
-SET client_min_messages = warning;
-\set ECHO none
-RESET client_min_messages;
+CREATE EXTENSION tsearch2;
 --tsvector
 SELECT '1'::tsvector;
  tsvector 
@@ -51,19 +45,19 @@ SELECT E'''1 \\''2'''::tsvector;
 SELECT E'''1 \\''2''3'::tsvector;
   tsvector   
 -------------
- '3' '1 ''2'
+ '1 ''2' '3'
 (1 row)
 
 SELECT E'''1 \\''2'' 3'::tsvector;
   tsvector   
 -------------
- '3' '1 ''2'
+ '1 ''2' '3'
 (1 row)
 
 SELECT E'''1 \\''2'' '' 3'' 4 '::tsvector;
      tsvector     
 ------------------
- '4' ' 3' '1 ''2'
+ ' 3' '1 ''2' '4'
 (1 row)
 
 select '''w'':4A,3B,2C,1D,5 a:8';
@@ -81,13 +75,13 @@ select 'a:3A b:2a'::tsvector || 'ba:1234 a:1B';
 select setweight('w:12B w:13* w:12,5,6 a:1,3* a:3 w asd:1dc asd zxc:81,567,222A'::tsvector, 'c');
                         setweight                         
 ----------------------------------------------------------
- 'a':1C,3C 'w':5C,6C,12C,13C 'asd':1C 'zxc':81C,222C,567C
+ 'a':1C,3C 'asd':1C 'w':5C,6C,12C,13C 'zxc':81C,222C,567C
 (1 row)
 
 select strip('w:12B w:13* w:12,5,6 a:1,3* a:3 w asd:1dc asd'::tsvector);
      strip     
 ---------------
- 'a' 'w' 'asd'
+ 'a' 'asd' 'w'
 (1 row)
 
 --tsquery
@@ -284,15 +278,15 @@ SELECT '(!1|2)&3'::tsquery;
 (1 row)
 
 SELECT '1|(2|(4|(5|6)))'::tsquery;
-                 tsquery                 
------------------------------------------
- '1' | ( '2' | ( '4' | ( '5' | '6' ) ) )
+           tsquery           
+-----------------------------
+ '1' | '2' | '4' | '5' | '6'
 (1 row)
 
 SELECT '1|2|4|5|6'::tsquery;
-                 tsquery                 
------------------------------------------
- ( ( ( '1' | '2' ) | '4' ) | '5' ) | '6'
+           tsquery           
+-----------------------------
+ '1' | '2' | '4' | '5' | '6'
 (1 row)
 
 SELECT '1&(2&(4&(5&6)))'::tsquery;
@@ -455,9 +449,9 @@ select count(*) from test_tsquery where keyword >  'new & york';
 
 set enable_seqscan=on;
 select rewrite('foo & bar & qq & new & york',  'new & york'::tsquery, 'big & apple | nyc | new & york & city');
-                                     rewrite                                      
-----------------------------------------------------------------------------------
- 'foo' & 'bar' & 'qq' & ( 'city' & 'new' & 'york' | ( 'nyc' | 'big' & 'apple' ) )
+                                   rewrite                                    
+------------------------------------------------------------------------------
+ 'foo' & 'bar' & 'qq' & ( 'city' & 'new' & 'york' | 'nyc' | 'big' & 'apple' )
 (1 row)
 
 select rewrite('moscow', 'select keyword, sample from test_tsquery'::text );
@@ -473,9 +467,9 @@ select rewrite('moscow & hotel', 'select keyword, sample from test_tsquery'::tex
 (1 row)
 
 select rewrite('bar &  new & qq & foo & york', 'select keyword, sample from test_tsquery'::text );
-                                       rewrite                                       
--------------------------------------------------------------------------------------
- 'citi' & 'foo' & ( 'bar' | 'qq' ) & ( 'nyc' | ( 'big' & 'appl' | 'new' & 'york' ) )
+                                     rewrite                                     
+---------------------------------------------------------------------------------
+ 'citi' & 'foo' & ( 'bar' | 'qq' ) & ( 'nyc' | 'big' & 'appl' | 'new' & 'york' )
 (1 row)
 
 select rewrite( ARRAY['moscow', keyword, sample] ) from test_tsquery;
@@ -491,9 +485,9 @@ select rewrite( ARRAY['moscow & hotel', keyword, sample] ) from test_tsquery;
 (1 row)
 
 select rewrite( ARRAY['bar &  new & qq & foo & york', keyword, sample] ) from test_tsquery;
-                                       rewrite                                       
--------------------------------------------------------------------------------------
- 'citi' & 'foo' & ( 'bar' | 'qq' ) & ( 'nyc' | ( 'big' & 'appl' | 'new' & 'york' ) )
+                                     rewrite                                     
+---------------------------------------------------------------------------------
+ 'citi' & 'foo' & ( 'bar' | 'qq' ) & ( 'nyc' | 'big' & 'appl' | 'new' & 'york' )
 (1 row)
 
 select keyword from test_tsquery where keyword @> 'new';
@@ -532,9 +526,9 @@ select rewrite( ARRAY[query, keyword, sample] ) from test_tsquery, to_tsquery('e
 (1 row)
 
 select rewrite( ARRAY[query, keyword, sample] ) from test_tsquery, to_tsquery('english', 'bar &  new & qq & foo & york') as query where keyword <@ query;
-                                       rewrite                                       
--------------------------------------------------------------------------------------
- 'citi' & 'foo' & ( 'bar' | 'qq' ) & ( 'nyc' | ( 'big' & 'appl' | 'new' & 'york' ) )
+                                     rewrite                                     
+---------------------------------------------------------------------------------
+ 'citi' & 'foo' & ( 'bar' | 'qq' ) & ( 'nyc' | 'big' & 'appl' | 'new' & 'york' )
 (1 row)
 
 select rewrite( ARRAY[query, keyword, sample] ) from test_tsquery, to_tsquery('english', 'moscow') as query where query @> keyword;
@@ -550,9 +544,9 @@ select rewrite( ARRAY[query, keyword, sample] ) from test_tsquery, to_tsquery('e
 (1 row)
 
 select rewrite( ARRAY[query, keyword, sample] ) from test_tsquery, to_tsquery('english', 'bar &  new & qq & foo & york') as query where query @> keyword;
-                                       rewrite                                       
--------------------------------------------------------------------------------------
- 'citi' & 'foo' & ( 'bar' | 'qq' ) & ( 'nyc' | ( 'big' & 'appl' | 'new' & 'york' ) )
+                                     rewrite                                     
+---------------------------------------------------------------------------------
+ 'citi' & 'foo' & ( 'bar' | 'qq' ) & ( 'nyc' | 'big' & 'appl' | 'new' & 'york' )
 (1 row)
 
 create index qq on test_tsquery using gist (keyword gist_tp_tsquery_ops);
@@ -593,9 +587,9 @@ select rewrite( ARRAY[query, keyword, sample] ) from test_tsquery, to_tsquery('e
 (1 row)
 
 select rewrite( ARRAY[query, keyword, sample] ) from test_tsquery, to_tsquery('english', 'bar &  new & qq & foo & york') as query where keyword <@ query;
-                                       rewrite                                       
--------------------------------------------------------------------------------------
- 'citi' & 'foo' & ( 'bar' | 'qq' ) & ( 'nyc' | ( 'big' & 'appl' | 'new' & 'york' ) )
+                                     rewrite                                     
+---------------------------------------------------------------------------------
+ 'citi' & 'foo' & ( 'bar' | 'qq' ) & ( 'nyc' | 'big' & 'appl' | 'new' & 'york' )
 (1 row)
 
 select rewrite( ARRAY[query, keyword, sample] ) from test_tsquery, to_tsquery('english', 'moscow') as query where query @> keyword;
@@ -611,9 +605,9 @@ select rewrite( ARRAY[query, keyword, sample] ) from test_tsquery, to_tsquery('e
 (1 row)
 
 select rewrite( ARRAY[query, keyword, sample] ) from test_tsquery, to_tsquery('english', 'bar &  new & qq & foo & york') as query where query @> keyword;
-                                       rewrite                                       
--------------------------------------------------------------------------------------
- 'citi' & 'foo' & ( 'bar' | 'qq' ) & ( 'nyc' | ( 'big' & 'appl' | 'new' & 'york' ) )
+                                     rewrite                                     
+---------------------------------------------------------------------------------
+ 'citi' & 'foo' & ( 'bar' | 'qq' ) & ( 'nyc' | 'big' & 'appl' | 'new' & 'york' )
 (1 row)
 
 set enable_seqscan='on';
@@ -691,8 +685,10 @@ select * from parse('default', '345 qwe@efd.r '' http://www.com/ http://aew.werc
      6 | 4aew.werc.ewr
     12 |  
     14 | http://
+     5 | 5aew.werc.ewr:8100/?
      6 | 5aew.werc.ewr:8100
-    12 | /?  
+    18 | /?
+    12 |   
      1 | ad
     12 | =
      1 | qwe
@@ -748,8 +744,8 @@ select * from parse('default', '345 qwe@efd.r '' http://www.com/ http://aew.werc
      3 | ewri2
     12 |  
     13 | <a href="qwe<qwe>">
-    12 | 
-       : 
+    12 |                                     +
+       | 
     19 | /usr/local/fff
     12 |  
     19 | /awdf/dwqe/4325
@@ -781,8 +777,8 @@ select * from parse('default', '345 qwe@efd.r '' http://www.com/ http://aew.werc
     20 | -4.2
     12 | . 
     22 | 234
-    12 |  
-       : 
+    12 |                                     +
+       | 
     12 | <
      1 | i
     12 |  
@@ -795,14 +791,14 @@ select * from parse('default', '345 qwe@efd.r '' http://www.com/ http://aew.werc
     12 |  
     12 | <> 
      1 | qwerty
-(131 rows)
+(133 rows)
 
 SELECT to_tsvector('english', '345 qwe@efd.r '' http://www.com/ http://aew.werc.ewr/?ad=qwe&dw 1aew.werc.ewr/?ad=qwe&dw 2aew.werc.ewr http://3aew.werc.ewr/?ad=qwe&dw http://4aew.werc.ewr http://5aew.werc.ewr:8100/?  ad=qwe&dw 6aew.werc.ewr:8100/?ad=qwe&dw 7aew.werc.ewr:8100/?ad=qwe&dw=%20%32 +4.0e-10 qwe qwe qwqwe 234.435 455 5.005 teodor@stack.net qwe-wer asdf <fr>qwer jf sdjk<we hjwer <werrwe> ewr1> ewri2 <a href="qwe<qwe>">
 /usr/local/fff /awdf/dwqe/4325 rewt/ewr wefjn /wqe-324/ewr gist.h gist.h.c gist.c. readline 4.2 4.2. 4.2, readline-4.2 readline-4.2. 234 
 <i <b> wow  < jqw <> qwerty');
-                                                                                                                                                                                                                                                                                                                                                                                                                      to_tsvector                                                                                                                                                                                                                                                                                                                                                                                                                       
---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- 'ad':17 'dw':19 'jf':39 '234':61 '345':1 '4.2':54,55,56 '455':31 'jqw':64 'qwe':2,18,27,28,35 'wer':36 'wow':63 '-4.2':58,60 'asdf':37 'ewr1':43 'qwer':38 'sdjk':40 '5.005':32 'efd.r':3 'ewri2':44 'hjwer':42 'qwqwe':29 'wefjn':48 'gist.c':52 'gist.h':50 'qwerti':65 '234.435':30 'qwe-wer':34 'readlin':53,57,59 'www.com':4 '+4.0e-10':26 'gist.h.c':51 'rewt/ewr':47 '/?ad=qwe&dw':7,10,14,22 '/wqe-324/ewr':49 'aew.werc.ewr':6 '1aew.werc.ewr':9 '2aew.werc.ewr':11 '3aew.werc.ewr':13 '4aew.werc.ewr':15 '/usr/local/fff':45 '/awdf/dwqe/4325':46 'teodor@stack.net':33 '/?ad=qwe&dw=%20%32':25 '5aew.werc.ewr:8100':16 '6aew.werc.ewr:8100':21 '7aew.werc.ewr:8100':24 'aew.werc.ewr/?ad=qwe&dw':5 '1aew.werc.ewr/?ad=qwe&dw':8 '3aew.werc.ewr/?ad=qwe&dw':12 '6aew.werc.ewr:8100/?ad=qwe&dw':20 '7aew.werc.ewr:8100/?ad=qwe&dw=%20%32':23
+                                                                                                                                                                                                                                                                                                                                                                                                                                       to_tsvector                                                                                                                                                                                                                                                                                                                                                                                                                                        
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ '+4.0e-10':28 '-4.2':60,62 '/?':18 '/?ad=qwe&dw':7,10,14,24 '/?ad=qwe&dw=%20%32':27 '/awdf/dwqe/4325':48 '/usr/local/fff':47 '/wqe-324/ewr':51 '1aew.werc.ewr':9 '1aew.werc.ewr/?ad=qwe&dw':8 '234':63 '234.435':32 '2aew.werc.ewr':11 '345':1 '3aew.werc.ewr':13 '3aew.werc.ewr/?ad=qwe&dw':12 '4.2':56,57,58 '455':33 '4aew.werc.ewr':15 '5.005':34 '5aew.werc.ewr:8100':17 '5aew.werc.ewr:8100/?':16 '6aew.werc.ewr:8100':23 '6aew.werc.ewr:8100/?ad=qwe&dw':22 '7aew.werc.ewr:8100':26 '7aew.werc.ewr:8100/?ad=qwe&dw=%20%32':25 'ad':19 'aew.werc.ewr':6 'aew.werc.ewr/?ad=qwe&dw':5 'asdf':39 'dw':21 'efd.r':3 'ewr1':45 'ewri2':46 'gist.c':54 'gist.h':52 'gist.h.c':53 'hjwer':44 'jf':41 'jqw':66 'qwe':2,20,29,30,37 'qwe-wer':36 'qwer':40 'qwerti':67 'qwqwe':31 'readlin':55,59,61 'rewt/ewr':49 'sdjk':42 'teodor@stack.net':35 'wefjn':50 'wer':38 'wow':65 'www.com':4
 (1 row)
 
 SELECT length(to_tsvector('english', '345 qw'));
@@ -816,16 +812,16 @@ SELECT length(to_tsvector('english', '345 qwe@efd.r '' http://www.com/ http://ae
 <i <b> wow  < jqw <> qwerty'));
  length 
 --------
-     51
+     53
 (1 row)
 
-select to_tsquery('english', 'qwe & sKies '); 
+select to_tsquery('english', 'qwe & sKies ');
   to_tsquery   
 ---------------
  'qwe' & 'sky'
 (1 row)
 
-select to_tsquery('simple', 'qwe & sKies '); 
+select to_tsquery('simple', 'qwe & sKies ');
    to_tsquery    
 -----------------
  'qwe' & 'skies'
@@ -1077,7 +1073,7 @@ select rank(' a:1 s:2 d g'::tsvector, 'a & s');
 
 insert into test_tsvector (t) values ('foo bar foo the over foo qq bar');
 drop trigger tsvectorupdate on test_tsvector;
-select * from stat('select a from test_tsvector') order by ndoc desc, nentry desc, word;
+select * from stat('select a from test_tsvector') order by ndoc desc, nentry desc, word collate "C";
    word    | ndoc | nentry 
 -----------+------+--------
  qq        |  109 |    109
@@ -2230,28 +2226,28 @@ select * from stat('select a from test_tsvector') order by ndoc desc, nentry des
 
 insert into test_tsvector values ('1', 'a:1a,2,3b b:5a,6a,7c,8');
 insert into test_tsvector values ('1', 'a:1a,2,3c b:5a,6b,7c,8b');
-select * from stat('select a from test_tsvector','a') order by ndoc desc, nentry desc, word;
+select * from stat('select a from test_tsvector','a') order by ndoc desc, nentry desc, word collate "C";
  word | ndoc | nentry 
 ------+------+--------
  b    |    2 |      3
  a    |    2 |      2
 (2 rows)
 
-select * from stat('select a from test_tsvector','b') order by ndoc desc, nentry desc, word;
+select * from stat('select a from test_tsvector','b') order by ndoc desc, nentry desc, word collate "C";
  word | ndoc | nentry 
 ------+------+--------
  b    |    1 |      2
  a    |    1 |      1
 (2 rows)
 
-select * from stat('select a from test_tsvector','c') order by ndoc desc, nentry desc, word;
+select * from stat('select a from test_tsvector','c') order by ndoc desc, nentry desc, word collate "C";
  word | ndoc | nentry 
 ------+------+--------
  b    |    2 |      2
  a    |    1 |      1
 (2 rows)
 
-select * from stat('select a from test_tsvector','d') order by ndoc desc, nentry desc, word;
+select * from stat('select a from test_tsvector','d') order by ndoc desc, nentry desc, word collate "C";
    word    | ndoc | nentry 
 -----------+------+--------
  a         |    2 |      2
@@ -2264,7 +2260,7 @@ select * from stat('select a from test_tsvector','d') order by ndoc desc, nentry
  qwerti    |    1 |      1
 (8 rows)
 
-select * from stat('select a from test_tsvector','ad') order by ndoc desc, nentry desc, word;
+select * from stat('select a from test_tsvector','ad') order by ndoc desc, nentry desc, word collate "C";
    word    | ndoc | nentry 
 -----------+------+--------
  a         |    2 |      4
@@ -2336,12 +2332,11 @@ Upon a woman s face. E.  J.  Pratt  (1882 1964)
 ', to_tsquery('sea&thousand&years'));
                   headline                  
 --------------------------------------------
- <b>sea</b> a <b>thousand</b> <b>years</b>,
- A <b>thousand</b> <b>years</b> to trace
+ <b>sea</b> a <b>thousand</b> <b>years</b>,+
+ A <b>thousand</b> <b>years</b> to trace   +
  The granite features of this cliff
 (1 row)
 
- 
 select headline('Erosion It took the sea a thousand years,
 A thousand years to trace
 The granite features of this cliff
@@ -2353,12 +2348,11 @@ Upon a woman s face. E.  J.  Pratt  (1882 1964)
 ', to_tsquery('granite&sea'));
                  headline                  
 -------------------------------------------
- <b>sea</b> a thousand years,
- A thousand years to trace
+ <b>sea</b> a thousand years,             +
+ A thousand years to trace                +
  The <b>granite</b> features of this cliff
 (1 row)
 
- 
 select headline('Erosion It took the sea a thousand years,
 A thousand years to trace
 The granite features of this cliff
@@ -2370,8 +2364,8 @@ Upon a woman s face. E.  J.  Pratt  (1882 1964)
 ', to_tsquery('sea'));
               headline              
 ------------------------------------
- <b>sea</b> a thousand years,
- A thousand years to trace
+ <b>sea</b> a thousand years,      +
+ A thousand years to trace         +
  The granite features of this cliff
 (1 row)
 
@@ -2386,21 +2380,21 @@ ff-bg
        document.write(15);
 </script>
 </body>
-</html>', 
+</html>',
 to_tsquery('sea&foo'), 'HighlightAll=true');
                                   headline                                   
 -----------------------------------------------------------------------------
- 
- <html>
- <!-- some comment -->
- <body>
- <b>Sea</b> view wow <u><b>foo</b> bar</u> <i>qq</i>
- <a href="http://www.google.com/foo.bar.html" target="_blank">YES &nbsp;</a>
-  ff-bg
- <script>
-        document.write(15);
- </script>
- </body>
+                                                                            +
+ <html>                                                                     +
+ <!-- some comment -->                                                      +
+ <body>                                                                     +
+ <b>Sea</b> view wow <u><b>foo</b> bar</u> <i>qq</i>                        +
+ <a href="http://www.google.com/foo.bar.html" target="_blank">YES &nbsp;</a>+
+ ff-bg                                                                      +
+ <script>                                                                   +
+        document.write(15);                                                 +
+ </script>                                                                  +
+ </body>                                                                    +
  </html>
 (1 row)
 
@@ -2435,8 +2429,8 @@ select a is null, a from test_tsvector order by a;
  f        | 
  f        | 'a':1A,2,3B 'b':5A,6A,7C,8
  f        | 'a':1A,2,3C 'b':5A,6B,7C,8B
- f        | 'qq':7 'bar':2,8 'foo':1,3,6
- f        | '345':1 'qwerti':2 'copyright':3
+ f        | 'bar':2,8 'foo':1,3,6 'qq':7
+ f        | '345':1 'copyright':3 'qwerti':2
  f        | '7w' 'ch' 'd7' 'eo' 'gw' 'i4' 'lq' 'o6' 'qt' 'y0'
  f        | 'ar' 'ei' 'kq' 'ma' 'qa' 'qh' 'qq' 'qz' 'rx' 'st'
  f        | 'gs' 'i6' 'i9' 'j2' 'l0' 'oq' 'qx' 'sc' 'xe' 'yu'

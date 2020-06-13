@@ -2,7 +2,7 @@
  * colorings of characters
  * This file is #included by regcomp.c.
  *
- * Copyright (c) 1998, 1999 Henry Spencer.	All rights reserved.
+ * Copyright (c) 1998, 1999 Henry Spencer.  All rights reserved.
  *
  * Development of this software was funded, in part, by Cray Research Inc.,
  * UUNET Communications Services Inc., Sun Microsystems Inc., and Scriptics
@@ -28,7 +28,7 @@
  * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
  * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
- * $PostgreSQL: pgsql/src/backend/regex/regc_color.c,v 1.9 2008/02/14 17:33:37 tgl Exp $
+ * src/backend/regex/regc_color.c
  *
  *
  * Note that there are some incestuous relationships between this code and
@@ -247,7 +247,15 @@ newcolor(struct colormap * cm)
 		/* oops, must allocate more */
 		struct colordesc *newCd;
 
+		if (cm->max == MAX_COLOR)
+		{
+			CERR(REG_ECOLORS);
+			return COLORLESS;	/* too many colors */
+		}
+
 		n = cm->ncds * 2;
+		if (n > MAX_COLOR + 1)
+			n = MAX_COLOR + 1;
 		if (cm->cd == cm->cdspace)
 		{
 			newCd = (struct colordesc *) MALLOC(n * sizeof(struct colordesc));

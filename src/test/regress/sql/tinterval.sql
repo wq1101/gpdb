@@ -23,7 +23,7 @@ INSERT INTO TINTERVAL_TBL (f1)
    VALUES ('["Feb 15 1990 12:15:03" "2001-09-23 11:12:13"]');
 
 
--- badly formatted tintervals 
+-- badly formatted tintervals
 INSERT INTO TINTERVAL_TBL (f1)
    VALUES ('["bad time specifications" ""]');
 
@@ -32,43 +32,43 @@ INSERT INTO TINTERVAL_TBL (f1)
 
 -- test tinterval operators
 
-SELECT '' AS five, * FROM TINTERVAL_TBL ORDER BY 2;
+SELECT '' AS five, * FROM TINTERVAL_TBL;
 
 -- length ==
 SELECT '' AS one, t.*
    FROM TINTERVAL_TBL t
-   WHERE t.f1 #= '@ 1 months' ORDER BY 2;
+   WHERE t.f1 #= '@ 1 months';
 
 -- length <>
 SELECT '' AS three, t.*
    FROM TINTERVAL_TBL t
-   WHERE t.f1 #<> '@ 1 months' ORDER BY 2;
+   WHERE t.f1 #<> '@ 1 months';
 
 -- length <
 SELECT '' AS zero, t.*
    FROM TINTERVAL_TBL t
-   WHERE t.f1 #< '@ 1 month' ORDER BY 2;
+   WHERE t.f1 #< '@ 1 month';
 
 -- length <=
 SELECT '' AS one, t.*
    FROM TINTERVAL_TBL t
-   WHERE t.f1 #<= '@ 1 month' ORDER BY 2;
+   WHERE t.f1 #<= '@ 1 month';
 
 -- length >
 SELECT '' AS three, t.*
    FROM TINTERVAL_TBL t
-   WHERE t.f1 #> '@ 1 year' ORDER BY 2;
+   WHERE t.f1 #> '@ 1 year';
 
 -- length >=
 SELECT '' AS three, t.*
    FROM TINTERVAL_TBL t
-   WHERE t.f1 #>= '@ 3 years' ORDER BY 2;
+   WHERE t.f1 #>= '@ 3 years';
 
 -- overlaps
 SELECT '' AS three, t1.*
    FROM TINTERVAL_TBL t1
    WHERE t1.f1 &&
-        tinterval '["Aug 15 14:23:19 1983" "Sep 16 14:23:19 1983"]' ORDER BY 2;
+        tinterval '["Aug 15 14:23:19 1983" "Sep 16 14:23:19 1983"]';
 
 SELECT '' AS five, t1.f1, t2.f1
    FROM TINTERVAL_TBL t1, TINTERVAL_TBL t2
@@ -84,7 +84,7 @@ SELECT '' AS fourteen, t1.f1 AS interval1, t2.f1 AS interval2
 -- contains
 SELECT '' AS five, t1.f1
    FROM TINTERVAL_TBL t1
-   WHERE not t1.f1 << 
+   WHERE not t1.f1 <<
         tinterval '["Aug 15 14:23:19 1980" "Sep 16 14:23:19 1990"]'
    ORDER BY t1.f1;
 

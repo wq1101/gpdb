@@ -27,7 +27,6 @@ alter table addcol1
    add column b varchar default 'I am in a small content varblock';
 
 -- verification on master catalog
--- TODO: How to run this on segments, through a TINC test?
 -- Moreover, gp_toolkit schema is not populated in regression database
 -- select segno,column_num,physical_segno,tupcount,modcount,state
 --    from gp_toolkit.__gp_aocsseg(aocs_oid('addcol1')) order by segno,column_num;
@@ -286,7 +285,7 @@ alter table addcol1_renamed rename to addcol1;
 -- try renaming columns and see if stuff still works
 alter table addcol1 rename column f to f_renamed;
 alter table addcol1 alter column f_renamed set default 10;
-select adsrc from pg_attrdef pdef, pg_attribute pattr
+select pg_get_expr(adbin, adrelid) from pg_attrdef pdef, pg_attribute pattr
     where pdef.adrelid='addcol1'::regclass and pdef.adrelid=pattr.attrelid and pdef.adnum=pattr.attnum and pattr.attname='f_renamed';
 insert into addcol1 values (999);
 select a, f_renamed from addcol1 where a = 999;
@@ -407,7 +406,43 @@ select count(*) from pg_attribute where attrelid='aocs_multi_level_part_table'::
 -- splitting top partition of a multi-level partition should not work
 alter table aocs_multi_level_part_table split partition part3 at (date '2011-01-01') into (partition part3, partition part4);
 
+-- Test case: alter table add column with FirstRowNumber > 1
+create table aocs_first_row_number (a int, b int) with (appendonly=true, orientation=column);
+create index i_aocs_first_row_number on aocs_first_row_number using btree(b);
+-- abort an insert transaction to generate a first row number > 1
+begin;
+insert into aocs_first_row_number select i,i from generate_series(1,100)i;
+abort;
+insert into aocs_first_row_number select i,i from generate_series(101, 200)i;
+alter table aocs_first_row_number add column c int default -1;
+-- At this point, block directory entry for column c starts from first row number = 1, 
+-- which is not the same as first row number for columns a and b.  
+-- correct result using base table
+set enable_seqscan=on;
+set enable_indexscan=off;
+select c from aocs_first_row_number where b = 10;
+set enable_seqscan=off;
+set enable_indexscan=on;
+-- Used to have wrong result using index: this select returns 1 tuple when no tuples should be returned.
+-- expect: same result as scanning the base table
+select c from aocs_first_row_number where b = 10;
+reset enable_seqscan;
+reset enable_indexscan;
+
 -- cleanup so as not to affect other installcheck tests
 -- (e.g. column_compression).
 set client_min_messages='WARNING';
 drop schema aocs_addcol cascade;
+
+-- Test case: alter column on a table after reorganize
+-- For an AOCS table with columns using rle_type compression, the
+-- implementation of 'reorganize' at 62d66c063fd did not set compression type
+-- for dropped columns. This led to an error 'Bad datum stream Dense block
+-- version'.
+create table aocs_with_compress(a smallint, b smallint, c smallint) with (appendonly=true, orientation=column, compresstype=rle_type);
+insert into aocs_with_compress values (1, 1, 1), (2, 2, 2);
+alter table aocs_with_compress drop column b;
+alter table aocs_with_compress set with (reorganize=true);
+-- The following operation must not fail
+alter table aocs_with_compress alter column c type integer;
+

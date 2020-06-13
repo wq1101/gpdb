@@ -3,11 +3,11 @@
  * ts_parse.c
  *		main parse functions for tsearch
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/tsearch/ts_parse.c,v 1.7.2.2 2009/08/30 16:53:45 tgl Exp $
+ *	  src/backend/tsearch/ts_parse.c
  *
  *-------------------------------------------------------------------------
  */
@@ -15,7 +15,6 @@
 #include "postgres.h"
 
 #include "tsearch/ts_cache.h"
-#include "tsearch/ts_public.h"
 #include "tsearch/ts_utils.h"
 
 #define IGNORE_LONGLEXEME	1
@@ -29,7 +28,6 @@ typedef struct ParsedLex
 	int			type;
 	char	   *lemm;
 	int			lenlemm;
-	bool		resfollow;
 	struct ParsedLex *next;
 } ParsedLex;
 
@@ -181,13 +179,15 @@ LexizeExec(LexizeData *ld, ParsedLex **correspondLexem)
 	if (ld->curDictId == InvalidOid)
 	{
 		/*
-		 * usial mode: dictionary wants only one word, but we should keep in
+		 * usual mode: dictionary wants only one word, but we should keep in
 		 * mind that we should go through all stack
 		 */
 
 		while (ld->towork.head)
 		{
 			ParsedLex  *curVal = ld->towork.head;
+			char	   *curValLemm = curVal->lemm;
+			int			curValLenLemm = curVal->lenlemm;
 
 			map = ld->cfg->map + curVal->type;
 
@@ -203,12 +203,12 @@ LexizeExec(LexizeData *ld, ParsedLex **correspondLexem)
 				dict = lookup_ts_dictionary_cache(map->dictIds[i]);
 
 				ld->dictState.isend = ld->dictState.getnext = false;
-				ld->dictState.private = NULL;
+				ld->dictState.private_state = NULL;
 				res = (TSLexeme *) DatumGetPointer(FunctionCall4(
 															 &(dict->lexize),
 											 PointerGetDatum(dict->dictData),
-											   PointerGetDatum(curVal->lemm),
-											  Int32GetDatum(curVal->lenlemm),
+												 PointerGetDatum(curValLemm),
+												Int32GetDatum(curValLenLemm),
 											  PointerGetDatum(&ld->dictState)
 																 ));
 
@@ -229,6 +229,13 @@ LexizeExec(LexizeData *ld, ParsedLex **correspondLexem)
 
 				if (!res)		/* dictionary doesn't know this lexeme */
 					continue;
+
+				if (res->flags & TSL_FILTER)
+				{
+					curValLemm = res->lexeme;
+					curValLenLemm = strlen(res->lexeme);
+					continue;
+				}
 
 				RemoveHead(ld);
 				setCorrLex(ld, correspondLexem);
@@ -265,7 +272,7 @@ LexizeExec(LexizeData *ld, ParsedLex **correspondLexem)
 
 				/*
 				 * We should be sure that current type of lexeme is recognized
-				 * by our dictinonary: we just check is it exist in list of
+				 * by our dictionary: we just check is it exist in list of
 				 * dictionaries ?
 				 */
 				for (i = 0; i < map->len && !dictExists; i++)
@@ -414,6 +421,7 @@ parsetext(Oid cfgId, ParsedText *prs, char *buf, int buflen)
 				prs->words[prs->curwords].len = strlen(ptr->lexeme);
 				prs->words[prs->curwords].word = ptr->lexeme;
 				prs->words[prs->curwords].nvariant = ptr->nvariant;
+				prs->words[prs->curwords].flags = ptr->flags & TSL_PREFIX;
 				prs->words[prs->curwords].alen = 0;
 				prs->words[prs->curwords].pos.pos = LIMITPOS(prs->pos);
 				ptr++;
@@ -446,7 +454,7 @@ hladdword(HeadlineParsedText *prs, char *buf, int buflen, int type)
 }
 
 static void
-hlfinditem(HeadlineParsedText *prs, TSQuery query, char *buf, int buflen)
+hlfinditem(HeadlineParsedText *prs, TSQuery query, int32 pos, char *buf, int buflen)
 {
 	int			i;
 	QueryItem  *item = GETQUERY(query);
@@ -459,21 +467,22 @@ hlfinditem(HeadlineParsedText *prs, TSQuery query, char *buf, int buflen)
 	}
 
 	word = &(prs->words[prs->curwords - 1]);
+	word->pos = LIMITPOS(pos);
 	for (i = 0; i < query->size; i++)
 	{
 		if (item->type == QI_VAL &&
-			item->operand.length == buflen &&
-		strncmp(GETOPERAND(query) + item->operand.distance, buf, buflen) == 0)
+			tsCompareString(GETOPERAND(query) + item->qoperand.distance, item->qoperand.length,
+							buf, buflen, item->qoperand.prefix) == 0)
 		{
 			if (word->item)
 			{
 				memcpy(&(prs->words[prs->curwords]), word, sizeof(HeadlineWordEntry));
-				prs->words[prs->curwords].item = &item->operand;
+				prs->words[prs->curwords].item = &item->qoperand;
 				prs->words[prs->curwords].repeated = 1;
 				prs->curwords++;
 			}
 			else
-				word->item = &item->operand;
+				word->item = &item->qoperand;
 		}
 		item++;
 	}
@@ -484,17 +493,20 @@ addHLParsedLex(HeadlineParsedText *prs, TSQuery query, ParsedLex *lexs, TSLexeme
 {
 	ParsedLex  *tmplexs;
 	TSLexeme   *ptr;
+	int32		savedpos;
 
 	while (lexs)
 	{
-
 		if (lexs->type > 0)
 			hladdword(prs, lexs->lemm, lexs->lenlemm, lexs->type);
 
 		ptr = norms;
+		savedpos = prs->vectorpos;
 		while (ptr && ptr->lexeme)
 		{
-			hlfinditem(prs, query, ptr->lexeme, strlen(ptr->lexeme));
+			if (ptr->flags & TSL_ADDPOS)
+				savedpos++;
+			hlfinditem(prs, query, savedpos, ptr->lexeme, strlen(ptr->lexeme));
 			ptr++;
 		}
 
@@ -508,6 +520,8 @@ addHLParsedLex(HeadlineParsedText *prs, TSQuery query, ParsedLex *lexs, TSLexeme
 		ptr = norms;
 		while (ptr->lexeme)
 		{
+			if (ptr->flags & TSL_ADDPOS)
+				prs->vectorpos++;
 			pfree(ptr->lexeme);
 			ptr++;
 		}
@@ -567,7 +581,10 @@ hlparsetext(Oid cfgId, HeadlineParsedText *prs, TSQuery query, char *buf, int bu
 		do
 		{
 			if ((norms = LexizeExec(&ldata, &lexs)) != NULL)
+			{
+				prs->vectorpos++;
 				addHLParsedLex(prs, query, lexs, norms);
+			}
 			else
 				addHLParsedLex(prs, query, lexs, NULL);
 		} while (norms);
@@ -581,8 +598,11 @@ text *
 generateHeadline(HeadlineParsedText *prs)
 {
 	text	   *out;
-	int			len = 128;
 	char	   *ptr;
+	int			len = 128;
+	int			numfragments = 0;
+	int16		infrag = 0;
+
 	HeadlineWordEntry *wrd = prs->words;
 
 	out = (text *) palloc(len);
@@ -590,7 +610,7 @@ generateHeadline(HeadlineParsedText *prs)
 
 	while (wrd - prs->words < prs->curwords)
 	{
-		while (wrd->len + prs->stopsellen + prs->startsellen + (ptr - ((char *) out)) >= len)
+		while (wrd->len + prs->stopsellen + prs->startsellen + prs->fragdelimlen + (ptr - ((char *) out)) >= len)
 		{
 			int			dist = ptr - ((char *) out);
 
@@ -601,6 +621,20 @@ generateHeadline(HeadlineParsedText *prs)
 
 		if (wrd->in && !wrd->repeated)
 		{
+			if (!infrag)
+			{
+
+				/* start of a new fragment */
+				infrag = 1;
+				numfragments++;
+				/* add a fragment delimiter if this is after the first one */
+				if (numfragments > 1)
+				{
+					memcpy(ptr, prs->fragdelim, prs->fragdelimlen);
+					ptr += prs->fragdelimlen;
+				}
+
+			}
 			if (wrd->replace)
 			{
 				*ptr = ' ';
@@ -623,7 +657,11 @@ generateHeadline(HeadlineParsedText *prs)
 			}
 		}
 		else if (!wrd->repeated)
+		{
+			if (infrag)
+				infrag = 0;
 			pfree(wrd->word);
+		}
 
 		wrd++;
 	}

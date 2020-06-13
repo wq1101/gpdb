@@ -1,24 +1,17 @@
+/*
+ * contrib/intarray/_int.h
+ */
 #ifndef ___INT_H__
 #define ___INT_H__
 
-#include "postgres.h"
-
-#include <float.h>
-
-#include "access/gist.h"
-#include "access/itup.h"
-#include "access/skey.h"
-#include "catalog/pg_type.h"
 #include "utils/array.h"
-#include "utils/builtins.h"
-#include "storage/bufpage.h"
-#include "lib/stringinfo.h"
+#include "utils/memutils.h"
 
 /* number ranges for compression */
 #define MAXNUMRANGE 100
 
 /* useful macros for accessing int4 arrays */
-#define ARRPTR(x)  ( (int4 *) ARR_DATA_PTR(x) )
+#define ARRPTR(x)  ( (int32 *) ARR_DATA_PTR(x) )
 #define ARRNELEMS(x)  ArrayGetNItems(ARR_NDIM(x), ARR_DIMS(x))
 
 /* reject arrays we can't handle; to wit, those containing nulls */
@@ -79,15 +72,15 @@ typedef char *BITVECP;
 typedef struct
 {
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
-	int4		flag;
-	char		data[1];
-}	GISTTYPE;
+	int32		flag;
+	char		data[FLEXIBLE_ARRAY_MEMBER];
+} GISTTYPE;
 
 #define ALLISTRUE		0x04
 
 #define ISALLTRUE(x)	( ((GISTTYPE*)x)->flag & ALLISTRUE )
 
-#define GTHDRSIZE		(VARHDRSZ + sizeof(int4))
+#define GTHDRSIZE		(VARHDRSZ + sizeof(int32))
 #define CALCGTSIZE(flag) ( GTHDRSIZE+(((flag) & ALLISTRUE) ? 0 : SIGLEN) )
 
 #define GETSIGN(x)		( (BITVECP)( (char*)x+GTHDRSIZE ) )
@@ -101,7 +94,7 @@ typedef void (*formfloat) (ArrayType *, float *);
 /*
  * useful functions
  */
-bool		isort(int4 *a, int len);
+bool		isort(int32 *a, int len);
 ArrayType  *new_intArrayType(int num);
 ArrayType  *copy_intArrayType(ArrayType *a);
 ArrayType  *resize_intArrayType(ArrayType *a, int num);
@@ -131,20 +124,21 @@ void		gensign(BITVEC sign, int *a, int len);
  */
 typedef struct ITEM
 {
-	int2		type;
-	int2		left;
-	int4		val;
-}	ITEM;
+	int16		type;
+	int16		left;
+	int32		val;
+} ITEM;
 
 typedef struct QUERYTYPE
 {
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
-	int4		size;			/* number of ITEMs */
-	ITEM		items[1];		/* variable length array */
-}	QUERYTYPE;
+	int32		size;			/* number of ITEMs */
+	ITEM		items[FLEXIBLE_ARRAY_MEMBER];
+} QUERYTYPE;
 
 #define HDRSIZEQT	offsetof(QUERYTYPE, items)
 #define COMPUTESIZE(size)	( HDRSIZEQT + (size) * sizeof(ITEM) )
+#define QUERYTYPEMAXITEMS	((MaxAllocSize - HDRSIZEQT) / sizeof(ITEM))
 #define GETQUERY(x)  ( (x)->items )
 
 /* "type" codes for ITEM */
@@ -161,14 +155,13 @@ typedef struct QUERYTYPE
 #define PG_GETARG_QUERYTYPE_P(n)	  DatumGetQueryTypeP(PG_GETARG_DATUM(n))
 #define PG_GETARG_QUERYTYPE_P_COPY(n) DatumGetQueryTypePCopy(PG_GETARG_DATUM(n))
 
-bool		signconsistent(QUERYTYPE * query, BITVEC sign, bool calcnot);
-bool		execconsistent(QUERYTYPE * query, ArrayType *array, bool calcnot);
+bool		signconsistent(QUERYTYPE *query, BITVEC sign, bool calcnot);
+bool		execconsistent(QUERYTYPE *query, ArrayType *array, bool calcnot);
+
 bool		gin_bool_consistent(QUERYTYPE *query, bool *check);
 bool		query_has_required_values(QUERYTYPE *query);
-int4		shorterquery(ITEM * q, int4 len);
 
 int			compASC(const void *a, const void *b);
-
 int			compDESC(const void *a, const void *b);
 
 /* sort, either ascending or descending */
@@ -176,8 +169,8 @@ int			compDESC(const void *a, const void *b);
 	do { \
 		int		_nelems_ = ARRNELEMS(a); \
 		if (_nelems_ > 1) \
-			qsort((void*) ARRPTR(a), _nelems_, sizeof(int4), \
+			qsort((void*) ARRPTR(a), _nelems_, sizeof(int32), \
 				  (direction) ? compASC : compDESC ); \
 	} while(0)
 
-#endif
+#endif   /* ___INT_H__ */

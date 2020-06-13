@@ -15,14 +15,10 @@
 #ifndef CDBHASH_H
 #define CDBHASH_H
 
-/*
- * hashing algorithms.
- */
-typedef enum
-{
-	HASH_FNV_1 = 1,
-	HASH_FNV_1A
-} CdbHashAlg;
+#include "utils/rel.h"
+
+/* GUC */
+extern bool gp_use_legacy_hashops;
 
 /*
  * reduction methods.
@@ -30,7 +26,8 @@ typedef enum
 typedef enum
 {
 	REDUCE_LAZYMOD = 1,
-	REDUCE_BITMASK
+	REDUCE_BITMASK,
+	REDUCE_JUMP_HASH
 } CdbHashReduce;
 
 /*
@@ -42,21 +39,17 @@ typedef struct CdbHash
 	int			numsegs;		/* number of segments in Greenplum Database used for
 								 * partitioning  */
 	CdbHashReduce reducealg;	/* the algorithm used for reducing to buckets		*/
-	uint32		rrindex;		/* round robin index for empty policy tables		*/
+	bool		is_legacy_hash;
 
+	int			natts;
+	FmgrInfo   *hashfuncs;
 } CdbHash;
-
-
-typedef void (*datumHashFunction)(void *clientData, void *buf, size_t len);
-
-extern void hashDatum(Datum datum, Oid type, datumHashFunction hashFn, void *clientData);
-extern void hashNullDatum(datumHashFunction hashFn, void *clientData);
 
 /*
  * Create and initialize a CdbHash in the current memory context.
- * Parameter numsegs - number of segments in Greenplum Database.
  */
-extern CdbHash *makeCdbHash(int numsegs);
+extern CdbHash *makeCdbHash(int numsegs, int natts, Oid *typeoids);
+extern CdbHash *makeCdbHashForRelation(Relation rel);
 
 /*
  * Initialize CdbHash for hashing the next tuple values.
@@ -66,17 +59,7 @@ extern void cdbhashinit(CdbHash *h);
 /*
  * Add an attribute to the hash calculation.
  */
-extern void cdbhash(CdbHash *h, Datum val, Oid typid);
-
-/*
- * Add a NULL attribute to the hash calculation.
- */
-extern void cdbhashnull(CdbHash *h);
-
-/*
- * Hash a tuple for a relation with an empty (no hash keys) partitioning policy.
- */
-extern void cdbhashnokey(CdbHash *h);
+extern void cdbhash(CdbHash *h, int attno, Datum datum, bool isnull);
 
 /*
  * Reduce the hash to a segment number.
@@ -84,17 +67,29 @@ extern void cdbhashnokey(CdbHash *h);
 extern unsigned int cdbhashreduce(CdbHash *h);
 
 /*
- * Return true if Oid is hashable internally in Greenplum Database.
+ * Return a random segment number, for a randomly distributed policy.
  */
-extern bool isGreenplumDbHashable(Oid typid);
+extern unsigned int cdbhashrandomseg(int numsegs);
 
 /*
- * Return true if the Oid is an array type.  This can be used prior
- *   to hashing the datum because array typeoids are expected to
- *   have been converted to any array oid.
+ * Catalog lookup functions related to distribution keys and hash opclasses.
  */
-extern bool typeIsArrayType(Oid typeoid);
+extern Oid cdb_get_opclass_for_column_def(List *opclass, Oid attrType);
+extern Oid cdb_default_distribution_opfamily_for_type(Oid typid);
+extern Oid cdb_default_distribution_opclass_for_type(Oid typid);
+extern Oid cdb_hashproc_in_opfamily(Oid opfamily, Oid typeoid);
+extern Oid cdb_eqop_in_hash_opfamily(Oid opfamily, Oid typeoid);
 
-extern bool typeIsEnumType(Oid typeoid);
+/* prototypes and other things, from cdblegacyhash.c */
+
+/* 32 bit FNV-1  non-zero initial basis */
+#define FNV1_32_INIT ((uint32)0x811c9dc5)
+
+extern uint32 magic_hash_stash;
+
+extern bool isLegacyCdbHashFunction(Oid funcid);
+
+extern Oid get_legacy_cdbhash_opclass_for_base_type(Oid typid);
+extern uint32 cdblegacyhash_null(void);
 
 #endif   /* CDBHASH_H */

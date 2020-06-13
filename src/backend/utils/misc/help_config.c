@@ -7,10 +7,10 @@
  * or GUC_DISALLOW_IN_FILE are not displayed, unless the user specifically
  * requests that variable by name
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/misc/help_config.c,v 1.20 2008/02/23 19:23:33 tgl Exp $
+ *	  src/backend/utils/misc/help_config.c
  *
  *-------------------------------------------------------------------------
  */
@@ -31,10 +31,11 @@
 typedef union
 {
 	struct config_generic generic;
-	struct config_bool bool;
+	struct config_bool _bool;
 	struct config_real real;
 	struct config_int integer;
 	struct config_string string;
+	struct config_enum _enum;
 } mixedStruct;
 
 
@@ -42,7 +43,7 @@ static void printMixedStruct(mixedStruct *structToPrint);
 static bool displayStruct(mixedStruct *structToDisplay);
 
 
-int
+void
 GucInfoMain(void)
 {
 	struct config_generic **guc_vars;
@@ -63,7 +64,7 @@ GucInfoMain(void)
 			printMixedStruct(var);
 	}
 
-	return 0;
+	exit(0);
 }
 
 
@@ -97,7 +98,7 @@ printMixedStruct(mixedStruct *structToPrint)
 
 		case PGC_BOOL:
 			printf("BOOLEAN\t%s\t\t\t",
-				   (structToPrint->bool.reset_val == 0) ?
+				   (structToPrint->_bool.reset_val == 0) ?
 				   "FALSE" : "TRUE");
 			break;
 
@@ -118,6 +119,12 @@ printMixedStruct(mixedStruct *structToPrint)
 		case PGC_STRING:
 			printf("STRING\t%s\t\t\t",
 				   structToPrint->string.boot_val ? structToPrint->string.boot_val : "");
+			break;
+
+		case PGC_ENUM:
+			printf("ENUM\t%s\t\t\t",
+				   config_enum_lookup_by_value(&structToPrint->_enum,
+											 structToPrint->_enum.boot_val));
 			break;
 
 		default:

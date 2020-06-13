@@ -85,11 +85,6 @@ extern void WaitInterconnectQuit(void);
 void
 checkForCancelFromQD(ChunkTransportState *pTransportStates);
 
-/* Returns the fd of the socket that connects to the seqserver.  This value
- * is -1 if it has not been setup.
- */
-extern int  GetSeqServerFD(void);
-
 /* The SetupInterconnect() function should be called at the beginning of
  * executing any DML statement that will need to use the interconnect.
  *
@@ -122,11 +117,9 @@ extern void SetupInterconnect(struct EState *estate);
  *
  */
 extern void TeardownInterconnect(ChunkTransportState *transportStates,
-								 MotionLayerState *mlStates,
-								 bool forceEOS, bool hasError);
+								 bool hasErrors);
 
-extern void SetupSequenceServer(const char *host, int port);
-extern void TeardownSequenceServer(void);
+extern void WaitInterconnectQuit(void);
 
 
 /* Sends a tuple chunk from the Postgres process to the local AMS process via
@@ -278,13 +271,13 @@ extern void putTransportDirectBuffer(ChunkTransportState *transportStates,
  *	 pEntry - ChunkTransportState context that contains everything we need to send.
  *	 tcItem - TupleChunk to send.
  */
-#define doBroadcast(mlStates, transportStates, pEntry, tcItem, inactiveCountPtr) \
+#define doBroadcast(transportStates, pEntry, tcItem, inactiveCountPtr) \
 	do { \
 		MotionConn *conn; \
 		int			*p_inactive = inactiveCountPtr; \
 		int			i, index, inactive = 0; \
 		/* add our tcItem to each of the outgoing buffers. */ \
-		index = Max(0, Gp_segment); /* entry-db has -1 */ \
+		index = Max(0, GpIdentity.segindex); /* entry-db has -1 */ \
 		for (i = 0; i < pEntry->numConns; i++, index++) \
 		{ \
 			if (index >= pEntry->numConns) \
@@ -293,7 +286,7 @@ extern void putTransportDirectBuffer(ChunkTransportState *transportStates,
 			/* only send to still interested receivers. */ \
 			if (conn->stillActive) \
 			{ \
-				transportStates->SendChunk(mlStates, transportStates, pEntry, conn, tcItem, pEntry->motNodeId); \
+				transportStates->SendChunk(transportStates, pEntry, conn, tcItem, pEntry->motNodeId); \
 				if (!conn->stillActive) \
 					inactive++; \
 			} \
@@ -304,16 +297,12 @@ extern void putTransportDirectBuffer(ChunkTransportState *transportStates,
 
 
 extern ChunkTransportStateEntry *createChunkTransportState(ChunkTransportState *transportStates,
-														   Slice *sendSlice,
-														   Slice *recvSlice,
-														   int numPrimaryConns);
+														   ExecSlice *sendSlice,
+														   ExecSlice *recvSlice,
+														   int numConns);
 
 extern ChunkTransportStateEntry *removeChunkTransportState(ChunkTransportState *transportStates,
 														   int16 motNodeID);
-
-extern void forceEosToPeers(MotionLayerState       *mlStates,
-							ChunkTransportState    *transportStates,
-							int                     motNodeID);
 
 extern TupleChunkListItem RecvTupleChunk(MotionConn *conn, ChunkTransportState *transportStates);
 
@@ -323,16 +312,15 @@ extern void markUDPConnInactiveIFC(MotionConn *conn);
 extern void CleanupMotionTCP(void);
 extern void CleanupMotionUDPIFC(void);
 extern void WaitInterconnectQuitUDPIFC(void);
-extern void SetupTCPInterconnect(struct EState *estate);
-extern void SetupUDPIFCInterconnect(struct EState *estate);
+extern void SetupTCPInterconnect(EState *estate);
+extern void SetupUDPIFCInterconnect(EState *estate);
 extern void TeardownTCPInterconnect(ChunkTransportState *transportStates,
-								 MotionLayerState *mlStates,
-								 bool forceEOS, bool hasError);
+									bool hasErrors);
 extern void TeardownUDPIFCInterconnect(ChunkTransportState *transportStates,
-								 MotionLayerState *mlStates,
-								 bool forceEOS);
+								 bool hasErrors);
 
 extern uint32 getActiveMotionConns(void);
-extern void adjustMasterRouting(Slice *recvSlice);
+
+extern char *format_sockaddr(struct sockaddr_storage *sa, char *buf, size_t len);
 
 #endif   /* ML_IPC_H */

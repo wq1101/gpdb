@@ -54,8 +54,10 @@ EXECUTE prepstmt2(123);
 ALTER TABLE pcachetest ADD COLUMN q3 bigint;
 EXECUTE prepstmt;
 ERROR:  cached plan must not change result type
+DETAIL:  resultDesc is not NULL. plansource->resulDesc is not NULL.
 EXECUTE prepstmt2(123);
 ERROR:  cached plan must not change result type
+DETAIL:  resultDesc is not NULL. plansource->resulDesc is not NULL.
 -- but we're nice guys and will let you undo your mistake
 ALTER TABLE pcachetest DROP COLUMN q3;
 EXECUTE prepstmt;
@@ -163,7 +165,7 @@ select cache_test_2();
         10007
 (1 row)
 
---- Check that change of search_path is ignored by replans
+--- Check that change of search_path is honored when re-using cached plan
 create schema s1
   create table abc (f1 int);
 create schema s2
@@ -188,14 +190,14 @@ select f1 from abc;
 execute p1;
  f1  
 -----
- 123
+ 456
 (1 row)
 
 alter table s1.abc add column f2 float8;   -- force replan
 execute p1;
  f1  
 -----
- 123
+ 456
 (1 row)
 
 drop schema s1 cascade;
@@ -240,8 +242,6 @@ begin
 end$$ language plpgsql;
 select cachebug();
 NOTICE:  table "temptable" does not exist, skipping
-CONTEXT:  SQL statement "drop table if exists temptable cascade"
-PL/pgSQL function "cachebug" line 3 at SQL statement
 NOTICE:  1
 NOTICE:  2
 NOTICE:  3
@@ -251,12 +251,7 @@ NOTICE:  3
 (1 row)
 
 select cachebug();
-NOTICE:  drop cascades to rule _RETURN on view vv
-CONTEXT:  SQL statement "drop table if exists temptable cascade"
-PL/pgSQL function "cachebug" line 3 at SQL statement
 NOTICE:  drop cascades to view vv
-CONTEXT:  SQL statement "drop table if exists temptable cascade"
-PL/pgSQL function "cachebug" line 3 at SQL statement
 NOTICE:  1
 NOTICE:  2
 NOTICE:  3
@@ -265,3 +260,89 @@ NOTICE:  3
  
 (1 row)
 
+-- Test plan_cache_mode
+create table test_mode (a int);
+insert into test_mode select 1 from generate_series(1,1000) union all select 2;
+create index on test_mode (a);
+analyze test_mode;
+prepare test_mode_pp (int) as select count(*) from test_mode where a = $1;
+-- up to 5 executions, custom plan is used
+explain (costs off) execute test_mode_pp(2);
+                        QUERY PLAN                        
+----------------------------------------------------------
+ Aggregate
+   ->  Gather Motion 1:1  (slice1; segments: 1)
+         ->  Index Only Scan using test_mode_a_idx on test_mode
+               Index Cond: (a = 2)
+ Optimizer: Postgres query optimizer
+(5 rows)
+
+-- force generic plan
+set plan_cache_mode to force_generic_plan;
+explain (costs off) execute test_mode_pp(2);
+                   QUERY PLAN                   
+------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on test_mode
+                     Filter: (a = $1)
+ Optimizer: Postgres query optimizer
+(6 rows)
+
+-- get to generic plan by 5 executions
+set plan_cache_mode to auto;
+execute test_mode_pp(1); -- 1x
+ count 
+-------
+  1000
+(1 row)
+
+execute test_mode_pp(1); -- 2x
+ count 
+-------
+  1000
+(1 row)
+
+execute test_mode_pp(1); -- 3x
+ count 
+-------
+  1000
+(1 row)
+
+execute test_mode_pp(1); -- 4x
+ count 
+-------
+  1000
+(1 row)
+
+execute test_mode_pp(1); -- 5x
+ count 
+-------
+  1000
+(1 row)
+
+-- we should now get a really bad plan
+explain (costs off) execute test_mode_pp(2);
+         QUERY PLAN          
+-----------------------------
+ Aggregate
+   ->  Gather Motion 1:1  (slice1; segments: 1)
+         ->  Index Only Scan using test_mode_a_idx on test_mode
+               Index Cond: (a = 2)
+ Optimizer: Postgres query optimizer
+(5 rows)
+
+-- but we can force a custom plan
+set plan_cache_mode to force_custom_plan;
+explain (costs off) execute test_mode_pp(2);
+                        QUERY PLAN                        
+----------------------------------------------------------
+ Aggregate
+   ->  Gather Motion 1:1  (slice1; segments: 1)
+         ->  Index Only Scan using test_mode_a_idx on test_mode
+               Index Cond: (a = 2)
+ Optimizer: Postgres query optimizer
+(5 rows)
+
+drop table test_mode;

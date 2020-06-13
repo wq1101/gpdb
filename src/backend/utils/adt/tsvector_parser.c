@@ -3,22 +3,19 @@
  * tsvector_parser.c
  *	  Parser for tsvector
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/adt/tsvector_parser.c,v 1.6 2008/01/01 19:45:53 momjian Exp $
+ *	  src/backend/utils/adt/tsvector_parser.c
  *
  *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
 
-#include "libpq/pqformat.h"
-#include "tsearch/ts_type.h"
 #include "tsearch/ts_locale.h"
 #include "tsearch/ts_utils.h"
-#include "utils/memutils.h"
 
 
 /*
@@ -92,7 +89,15 @@ do { \
 	} \
 } while (0)
 
-#define ISOPERATOR(x)	( pg_mblen(x)==1 && ( *(x)=='!' || *(x)=='&' || *(x)=='|' || *(x)=='(' || *(x)==')' ) )
+/* phrase operator begins with '<' */
+#define ISOPERATOR(x) \
+	( pg_mblen(x) == 1 && ( *(x) == '!' ||	\
+							*(x) == '&' ||	\
+							*(x) == '|' ||	\
+							*(x) == '(' ||	\
+							*(x) == ')' ||	\
+							*(x) == '<'		\
+						  ) )
 
 /* Fills gettoken_tsvector's output parameters, and returns true */
 #define RETURN_TOKEN \
@@ -365,6 +370,4 @@ gettoken_tsvector(TSVectorParseState state,
 		/* get next char */
 		state->prsbuf += pg_mblen(state->prsbuf);
 	}
-
-	return false;
 }

@@ -2,7 +2,7 @@
 
 # Will build a static library libpq(d).lib
 #        and a dynamic library libpq(d).dll with import library libpq(d)dll.lib
-# USE_SSL=1 will compile with OpenSSL
+# USE_OPENSSL=1 will compile with OpenSSL
 # USE_KFW=1 will compile with kfw(kerberos for Windows)
 # DEBUG=1 compiles with debugging symbols
 # ENABLE_THREAD_SAFETY=1 compiles with threading enabled
@@ -16,7 +16,7 @@ CPU=i386
 !MESSAGE Building the Win32 static library...
 !MESSAGE
 !ELSEIF ("$(CPU)" == "IA64")||("$(CPU)" == "AMD64")
-ADD_DEFINES=/D "WIN64" /Wp64 /GS
+ADD_DEFINES=/Wp64 /GS
 ADD_SECLIB=bufferoverflowU.lib
 !MESSAGE Building the Win64 static library...
 !MESSAGE
@@ -38,7 +38,7 @@ DEBUGDEF=/D NDEBUG
 OUTFILENAME=libpq
 !ENDIF
 
-!IF "$(SSL_INC)" == "" 
+!IF "$(SSL_INC)" == ""
 SSL_INC=C:\OpenSSL\include
 !MESSAGE Using default OpenSSL Include directory: $(SSL_INC)
 !ENDIF
@@ -48,7 +48,7 @@ SSL_LIB_PATH=C:\OpenSSL\lib\VC
 !MESSAGE Using default OpenSSL Library directory: $(SSL_LIB_PATH)
 !ENDIF
 
-!IF "$(KFW_INC)" == "" 
+!IF "$(KFW_INC)" == ""
 KFW_INC=C:\kfw-2.6.5\inc
 !MESSAGE Using default Kerberos Include directory: $(KFW_INC)
 !ENDIF
@@ -60,9 +60,9 @@ KFW_LIB_PATH=C:\kfw-2.6.5\lib\$(CPU)
 
 !IF "$(OS)" == "Windows_NT"
 NULL=
-!ELSE 
+!ELSE
 NULL=nul
-!ENDIF 
+!ENDIF
 
 CPP=cl.exe
 RSC=rc.exe
@@ -83,10 +83,13 @@ ALL : config "$(OUTDIR)\$(OUTFILENAME).lib" "$(OUTDIR)\$(OUTFILENAME).dll"
 CLEAN :
 	-@erase "$(INTDIR)\getaddrinfo.obj"
 	-@erase "$(INTDIR)\pgstrcasecmp.obj"
+	-@erase "$(INTDIR)\pqsignal.obj"
 	-@erase "$(INTDIR)\thread.obj"
 	-@erase "$(INTDIR)\inet_aton.obj"
 	-@erase "$(INTDIR)\crypt.obj"
 	-@erase "$(INTDIR)\noblock.obj"
+	-@erase "$(INTDIR)\chklocale.obj"
+	-@erase "$(INTDIR)\inet_net_ntop.obj"
 	-@erase "$(INTDIR)\md5.obj"
 	-@erase "$(INTDIR)\ip.obj"
 	-@erase "$(INTDIR)\fe-auth.obj"
@@ -100,7 +103,6 @@ CLEAN :
 	-@erase "$(INTDIR)\fe-secure.obj"
 	-@erase "$(INTDIR)\libpq-events.obj"
 	-@erase "$(INTDIR)\pqexpbuffer.obj"
-	-@erase "$(INTDIR)\pqsignal.obj"
 	-@erase "$(INTDIR)\win32.obj"
 	-@erase "$(INTDIR)\wchar.obj"
 	-@erase "$(INTDIR)\encnames.obj"
@@ -111,7 +113,9 @@ CLEAN :
 	-@erase "$(INTDIR)\dirmod.obj"
 	-@erase "$(INTDIR)\pgsleep.obj"
 	-@erase "$(INTDIR)\open.obj"
+	-@erase "$(INTDIR)\system.obj"
 	-@erase "$(INTDIR)\win32error.obj"
+	-@erase "$(INTDIR)\win32setlocale.obj"
 	-@erase "$(OUTDIR)\$(OUTFILENAME).lib"
 	-@erase "$(OUTDIR)\$(OUTFILENAME)dll.lib"
 	-@erase "$(OUTDIR)\libpq.res"
@@ -120,18 +124,24 @@ CLEAN :
 	-@erase "$(OUTDIR)\$(OUTFILENAME).dll.manifest"
 	-@erase "$(OUTDIR)\*.idb"
 	-@erase pg_config_paths.h"
+!IFDEF USE_OPENSSL
+	-@erase "$(INTDIR)\fe-secure-openssl.obj"
+!ENDIF
 
 
 LIB32=link.exe -lib
-LIB32_FLAGS=$(LOPT) /nologo /out:"$(OUTDIR)\$(OUTFILENAME).lib" 
+LIB32_FLAGS=$(LOPT) /nologo /out:"$(OUTDIR)\$(OUTFILENAME).lib"
 LIB32_OBJS= \
 	"$(INTDIR)\win32.obj" \
 	"$(INTDIR)\getaddrinfo.obj" \
 	"$(INTDIR)\pgstrcasecmp.obj" \
+	"$(INTDIR)\pqsignal.obj" \
 	"$(INTDIR)\thread.obj" \
 	"$(INTDIR)\inet_aton.obj" \
 	"$(INTDIR)\crypt.obj" \
 	"$(INTDIR)\noblock.obj" \
+	"$(INTDIR)\chklocale.obj" \
+	"$(INTDIR)\inet_net_ntop.obj" \
 	"$(INTDIR)\md5.obj" \
 	"$(INTDIR)\ip.obj" \
 	"$(INTDIR)\fe-auth.obj" \
@@ -145,7 +155,6 @@ LIB32_OBJS= \
 	"$(INTDIR)\fe-secure.obj" \
 	"$(INTDIR)\libpq-events.obj" \
 	"$(INTDIR)\pqexpbuffer.obj" \
-	"$(INTDIR)\pqsignal.obj" \
 	"$(INTDIR)\wchar.obj" \
 	"$(INTDIR)\encnames.obj" \
 	"$(INTDIR)\snprintf.obj" \
@@ -154,14 +163,23 @@ LIB32_OBJS= \
 	"$(INTDIR)\dirmod.obj" \
 	"$(INTDIR)\pgsleep.obj" \
 	"$(INTDIR)\open.obj" \
+	"$(INTDIR)\system.obj" \
 	"$(INTDIR)\win32error.obj" \
+	"$(INTDIR)\win32setlocale.obj" \
 	"$(INTDIR)\pthread-win32.obj"
 
+!IFDEF USE_OPENSSL
+LIB32_OBJS=$(LIB32_OBJS) "$(INTDIR)\fe-secure-openssl.obj"
+!ENDIF
 
-config: ..\..\include\pg_config.h pg_config_paths.h  ..\..\include\pg_config_os.h
+
+config: ..\..\include\pg_config.h ..\..\include\pg_config_ext.h pg_config_paths.h  ..\..\include\pg_config_os.h
 
 ..\..\include\pg_config.h: ..\..\include\pg_config.h.win32
 	copy ..\..\include\pg_config.h.win32 ..\..\include\pg_config.h
+
+..\..\include\pg_config_ext.h: ..\..\include\pg_config_ext.h.win32
+	copy ..\..\include\pg_config_ext.h.win32 ..\..\include\pg_config_ext.h
 
 ..\..\include\pg_config_os.h:
 	copy ..\..\include\port\win32.h ..\..\include\pg_config_os.h
@@ -178,8 +196,8 @@ CPP_PROJ=/nologo /W3 /EHsc $(OPT) /I "..\..\include" /I "..\..\include\port\win3
  /Fo"$(INTDIR)\\" /Fd"$(INTDIR)\\" /FD /c  \
  /D "_CRT_SECURE_NO_DEPRECATE" $(ADD_DEFINES)
 
-!IFDEF USE_SSL
-CPP_PROJ=$(CPP_PROJ) /D USE_SSL
+!IFDEF USE_OPENSSL
+CPP_PROJ=$(CPP_PROJ) /D USE_OPENSSL
 SSL_LIBS=ssleay32.lib libeay32.lib gdi32.lib
 !ENDIF
 
@@ -197,7 +215,7 @@ CPP_SBRS=.
 RSC_PROJ=/l 0x409 /fo"$(INTDIR)\libpq.res"
 
 LINK32=link.exe
-LINK32_FLAGS=kernel32.lib user32.lib advapi32.lib shfolder.lib wsock32.lib ws2_32.lib secur32.lib $(SSL_LIBS)  $(KFW_LIB) $(ADD_SECLIB) \
+LINK32_FLAGS=kernel32.lib user32.lib advapi32.lib shell32.lib ws2_32.lib secur32.lib $(SSL_LIBS)  $(KFW_LIB) $(ADD_SECLIB) \
  /nologo /subsystem:windows /dll $(LOPT) /incremental:no \
  /pdb:"$(OUTDIR)\libpqdll.pdb" /machine:$(CPU) \
  /out:"$(OUTDIR)\$(OUTFILENAME).dll"\
@@ -240,6 +258,11 @@ LINK32_OBJS= \
 	$(CPP_PROJ) ..\..\port\pgstrcasecmp.c
 <<
 
+"$(INTDIR)\pqsignal.obj" : ..\..\port\pqsignal.c
+	$(CPP) @<<
+	$(CPP_PROJ) ..\..\port\pqsignal.c
+<<
+
 "$(INTDIR)\thread.obj" : ..\..\port\thread.c
 	$(CPP) @<<
 	$(CPP_PROJ) ..\..\port\thread.c
@@ -258,6 +281,16 @@ LINK32_OBJS= \
 "$(INTDIR)\noblock.obj" : ..\..\port\noblock.c
 	$(CPP) @<<
 	$(CPP_PROJ) ..\..\port\noblock.c
+<<
+
+"$(INTDIR)\chklocale.obj" : ..\..\port\chklocale.c
+	$(CPP) @<<
+	$(CPP_PROJ) ..\..\port\chklocale.c
+<<
+
+"$(INTDIR)\inet_net_ntop.obj" : ..\..\port\inet_net_ntop.c
+	$(CPP) @<<
+	$(CPP_PROJ) ..\..\port\inet_net_ntop.c
 <<
 
 "$(INTDIR)\md5.obj" : ..\..\backend\libpq\md5.c
@@ -311,9 +344,19 @@ LINK32_OBJS= \
 	$(CPP_PROJ) /I"." ..\..\port\open.c
 <<
 
+"$(INTDIR)\system.obj" : ..\..\port\system.c
+	$(CPP) @<<
+	$(CPP_PROJ) /I"." ..\..\port\system.c
+<<
+
 "$(INTDIR)\win32error.obj" : ..\..\port\win32error.c
 	$(CPP) @<<
 	$(CPP_PROJ) /I"." ..\..\port\win32error.c
+<<
+
+"$(INTDIR)\win32setlocale.obj" : ..\..\port\win32setlocale.c
+	$(CPP) @<<
+	$(CPP_PROJ) /I"." ..\..\port\win32setlocale.c
 <<
 
 .c{$(CPP_OBJS)}.obj:

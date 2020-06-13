@@ -1,3 +1,13 @@
+/*
+ * contrib/intarray/_int_gist.c
+ */
+#include "postgres.h"
+
+#include <limits.h>
+
+#include "access/gist.h"
+#include "access/stratnum.h"
+
 #include "_int.h"
 
 #define GETENTRY(vec,pos) ((ArrayType *) DatumGetPointer((vec)->vector[(pos)].key))
@@ -13,14 +23,6 @@ PG_FUNCTION_INFO_V1(g_int_picksplit);
 PG_FUNCTION_INFO_V1(g_int_union);
 PG_FUNCTION_INFO_V1(g_int_same);
 
-Datum		g_int_consistent(PG_FUNCTION_ARGS);
-Datum		g_int_compress(PG_FUNCTION_ARGS);
-Datum		g_int_decompress(PG_FUNCTION_ARGS);
-Datum		g_int_penalty(PG_FUNCTION_ARGS);
-Datum		g_int_picksplit(PG_FUNCTION_ARGS);
-Datum		g_int_union(PG_FUNCTION_ARGS);
-Datum		g_int_same(PG_FUNCTION_ARGS);
-
 
 /*
 ** The GiST Consistent method for _intments
@@ -32,9 +34,15 @@ Datum
 g_int_consistent(PG_FUNCTION_ARGS)
 {
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
-	ArrayType  *query = (ArrayType *) PG_GETARG_ARRAYTYPE_P_COPY(1);
+	ArrayType  *query = PG_GETARG_ARRAYTYPE_P_COPY(1);
 	StrategyNumber strategy = (StrategyNumber) PG_GETARG_UINT16(2);
-	bool		retval = false;
+
+	/* Oid		subtype = PG_GETARG_OID(3); */
+	bool	   *recheck = (bool *) PG_GETARG_POINTER(4);
+	bool		retval;
+
+	/* this is exact except for RTSameStrategyNumber */
+	*recheck = (strategy == RTSameStrategyNumber);
 
 	if (strategy == BooleanSearchStrategy)
 	{
@@ -92,7 +100,7 @@ g_int_union(PG_FUNCTION_ARGS)
 {
 	GistEntryVector *entryvec = (GistEntryVector *) PG_GETARG_POINTER(0);
 	int		   *size = (int *) PG_GETARG_POINTER(1);
-	int4		i,
+	int32		i,
 			   *ptr;
 	ArrayType  *res;
 	int			totlen = 0;
@@ -114,7 +122,7 @@ g_int_union(PG_FUNCTION_ARGS)
 		int			nel;
 
 		nel = ARRNELEMS(ent);
-		memcpy(ptr, ARRPTR(ent), nel * sizeof(int4));
+		memcpy(ptr, ARRPTR(ent), nel * sizeof(int32));
 		ptr += nel;
 	}
 
@@ -185,7 +193,7 @@ g_int_compress(PG_FUNCTION_ARGS)
 		cand = 1;
 		while (len > MAXNUMRANGE * 2)
 		{
-			min = 0x7fffffff;
+			min = INT_MAX;
 			for (i = 2; i < len; i += 2)
 				if (min > (dr[i] - dr[i - 1]))
 				{
@@ -203,8 +211,6 @@ g_int_compress(PG_FUNCTION_ARGS)
 	}
 	else
 		PG_RETURN_POINTER(entry);
-
-	PG_RETURN_POINTER(entry);
 }
 
 Datum
@@ -303,8 +309,8 @@ g_int_same(PG_FUNCTION_ARGS)
 	ArrayType  *a = PG_GETARG_ARRAYTYPE_P(0);
 	ArrayType  *b = PG_GETARG_ARRAYTYPE_P(1);
 	bool	   *result = (bool *) PG_GETARG_POINTER(2);
-	int4		n = ARRNELEMS(a);
-	int4	   *da,
+	int32		n = ARRNELEMS(a);
+	int32	   *da,
 			   *db;
 
 	CHECKARRVALID(a);
@@ -343,10 +349,10 @@ typedef struct
 static int
 comparecost(const void *a, const void *b)
 {
-	if (((SPLITCOST *) a)->cost == ((SPLITCOST *) b)->cost)
+	if (((const SPLITCOST *) a)->cost == ((const SPLITCOST *) b)->cost)
 		return 0;
 	else
-		return (((SPLITCOST *) a)->cost > ((SPLITCOST *) b)->cost) ? 1 : -1;
+		return (((const SPLITCOST *) a)->cost > ((const SPLITCOST *) b)->cost) ? 1 : -1;
 }
 
 /*
@@ -412,9 +418,7 @@ g_int_picksplit(PG_FUNCTION_ARGS)
 			size_waste = size_union - size_inter;
 
 			pfree(union_d);
-
-			if (inter_d != (ArrayType *) NULL)
-				pfree(inter_d);
+			pfree(inter_d);
 
 			/*
 			 * are these a more promising split that what we've already seen?
@@ -468,7 +472,7 @@ g_int_picksplit(PG_FUNCTION_ARGS)
 	qsort((void *) costvector, maxoff, sizeof(SPLITCOST), comparecost);
 
 	/*
-	 * Now split up the regions between the two seeds.	An important property
+	 * Now split up the regions between the two seeds.  An important property
 	 * of this split algorithm is that the split vector v has the indices of
 	 * items to be split in order in its left and right vectors.  We exploit
 	 * this property by doing a merge in the code that actually splits the
@@ -486,7 +490,7 @@ g_int_picksplit(PG_FUNCTION_ARGS)
 
 		/*
 		 * If we've already decided where to place this item, just put it on
-		 * the right list.	Otherwise, we need to figure out which page needs
+		 * the right list.  Otherwise, we need to figure out which page needs
 		 * the least enlargement in order to store the item.
 		 */
 
@@ -513,10 +517,8 @@ g_int_picksplit(PG_FUNCTION_ARGS)
 		/* pick which page to add it to */
 		if (size_alpha - size_l < size_beta - size_r + WISH_F(v->spl_nleft, v->spl_nright, 0.01))
 		{
-			if (datum_l)
-				pfree(datum_l);
-			if (union_dr)
-				pfree(union_dr);
+			pfree(datum_l);
+			pfree(union_dr);
 			datum_l = union_dl;
 			size_l = size_alpha;
 			*left++ = i;
@@ -524,10 +526,8 @@ g_int_picksplit(PG_FUNCTION_ARGS)
 		}
 		else
 		{
-			if (datum_r)
-				pfree(datum_r);
-			if (union_dl)
-				pfree(union_dl);
+			pfree(datum_r);
+			pfree(union_dl);
 			datum_r = union_dr;
 			size_r = size_beta;
 			*right++ = i;

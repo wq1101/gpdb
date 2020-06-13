@@ -33,7 +33,7 @@ create index direct_test_bitmap_idx on direct_test_bitmap using bitmap (ind, dt)
 
 CREATE TABLE direct_test_partition (trans_id int, date date, amount decimal(9,2), region text) DISTRIBUTED BY (trans_id) PARTITION BY RANGE (date) (START (date '2008-01-01') INCLUSIVE END (date '2009-01-01') EXCLUSIVE EVERY (INTERVAL '1month') );
 
-create unique index direct_test_uk on direct_test_partition(trans_id);
+create unique index direct_test_uk on direct_test_partition(trans_id,date);
 
 create table direct_test_range_partition (a int, b int, c int, d int) distributed by (a) partition by range(d) (start(1) end(10) every(1));
 insert into direct_test_range_partition select i, i+1, i+2, i+3 from generate_series(1, 2) i;
@@ -70,7 +70,7 @@ insert into direct_test values (NULL, 'cow');
 select * from direct_test order by key, value;
 
 -- DELETE with an IS NULL predicate
--- Doesn't do direct dispatch, currently.
+-- DO direct dispatch
 delete from direct_test where key is null;
 
 -- Same single-row insert as above, but with DEFAULT instead of an explicit values.
@@ -202,6 +202,9 @@ SELECT * from direct_dispatch_foo WHERE id * id = 1;
 SELECT * from direct_dispatch_foo WHERE id * id = 1 OR id = 1;
 SELECT * from direct_dispatch_foo where id * id = 1 AND id = 1;
 
+-- main plan is direct dispatch and also has init plans
+update direct_dispatch_bar set id2 = 1 where id1 = 1 and exists (select * from direct_dispatch_foo where id = 2);
+
 -- init plan to see how transaction escalation happens
 -- Known_opt_diff: MPP-21346
 delete from direct_dispatch_foo where id = (select max(id2) from direct_dispatch_bar where id1 = 5);
@@ -258,6 +261,37 @@ insert into ddtesttab values (1, 1, 5 + nextval('ddtestseq'));
 drop table ddtesttab;
 drop sequence ddtestseq;
 
+-- Test prepare statement will choose custom plan instead of generic plan when
+-- considering no direct dispatch cost.
+create table test_prepare(i int, j int);
+-- insert case
+prepare p1 as insert into test_prepare values($1, 1);
+execute p1(1);
+execute p1(1);
+execute p1(1);
+execute p1(1);
+execute p1(1);
+-- the first 5 execute will always use custom plan, focus on the 6th one.
+execute p1(1);
+
+-- update case
+prepare p2 as update test_prepare set j =2 where i =$1;
+execute p2(1);
+execute p2(1);
+execute p2(1);
+execute p2(1);
+execute p2(1);
+execute p2(1);
+
+-- select case
+prepare p3 as select * from test_prepare where i =$1;
+execute p3(1);
+execute p3(1);
+execute p3(1);
+execute p3(1);
+execute p3(1);
+execute p3(1);
+drop table test_prepare;
 
 -- cleanup
 set test_print_direct_dispatch_info=off;

@@ -20,26 +20,22 @@
 #define CDBVARS_H
 
 #include "access/xlogdefs.h"  /*XLogRecPtr*/
-#include "utils/guc.h"
+#include "catalog/gp_segment_config.h" /* MASTER_CONTENT_ID */
 
 /*
  * ----- Declarations of Greenplum-specific global variables ------
  */
 
-#ifdef sparc
-#define TUPLE_CHUNK_ALIGN	4
-#else
-#define TUPLE_CHUNK_ALIGN	1
-#endif
+#define WRITER_IS_MISSING_MSG "reader could not find writer proc entry"
 
 #ifndef PRIO_MAX
 #define PRIO_MAX 20
 #endif
 /*
- * Parameters gp_session_role and gp_role
+ * Parameters gp_role
  *
- * The run-time parameters (GUC variables) gp_session_role and
- * gp_role report and provide control over the role assumed by a
+ * The run-time parameters (GUC variables) gp_role
+ * reports and provides control over the role assumed by a
  * postgres process.
  *
  * Valid  roles are the following:
@@ -48,88 +44,29 @@
  *	execute		The process acts as a parallel SQL executor.
  *	utility		The process acts as a simple SQL engine.
  *
- * Both parameters are initialized to the same value at connection
- * time and are local to the backend process resulting from the
- * connection.	The default is dispatch which is the normal setting
- * for a user of Greenplum connecting to a node of  the Greenplum cluster.
- * Neither parameter appears in the configuration file.
+ * For postmaster, the parameter is initialized by '-c' (required).
  *
- * gp_session_role
+ * For normal connections to cluster, you can connect to QD directly,
+ * but can not connect to QE directly unless specifying the utility role.
  *
- * - does not affect the operation of the backend, and
- * - does not change during the lifetime of PostgreSQL session.
- *
- * gp_role
- *
- * - determines the operating role of the backend, and
- * - may be changed by a superuser via the SET command.
- *
- * The connection time value of gp_session_role used by a
- * libpq-based client application can be specified using the
- * environment variable PGOPTIONS.	For example, this is how to
- * invoke psql on database test as a utility:
- *
- *	PGOPTIONS='-c gp_session_role=utility' psql test
- *
+ * For utility role connection to either QD or QE, PGOPTIONS could be used.
  * Alternatively, libpq-based applications can be modified to set
  * the value directly via an argument to one of the libpq functions
  * PQconnectdb, PQsetdbLogin or PQconnectStart.
  *
- * Don't try to set gp_role this way.  At the time options are
- * processed it is unknown whether the user is a superuser, so
- * the attempt will be rejected.
- *
- * ----------
- *
- * Greenplum Developers can access the values of these parameters via the
- * global variables Gp_session_role and Gp_role of type
- * GpRoleValue. For example
- *
- *	#include "cdb/cdbvars.h"
- *
- *	switch ( Gp_role  )
- *	{
- *		case GP_ROLE_DISPATCH:
- *			... Act like a query dispatcher ...
- *			break;
- *		case GP_ROLE_EXECUTE:
- *			... Act like a query executor ...
- *			break;
- *		case GP_ROLE_UTILITY:
- *			... Act like an unmodified PostgreSQL backend. ...
- *			break;
- *		default:
- *			... Won't happen ..
- *			break;
- *	}
- *
- * You can also modify Gp_role (even if the session doesn't have
- * superuser privileges) by setting it to one of the three valid
- * values, however this must be well documented to avoid
- * disagreements between modules.  Don't modify the value  of
- * Gp_session_role.
- *
+ * For single backend connection, utility role is enforced in code.
  */
 
 typedef enum
 {
-	GP_ROLE_UTILITY = 0,		/* Operating as a simple database engine */
+	GP_ROLE_UNDEFINED = 0,		/* Should never see this role in use */
+	GP_ROLE_UTILITY,			/* Operating as a simple database engine */
 	GP_ROLE_DISPATCH,			/* Operating as the parallel query dispatcher */
 	GP_ROLE_EXECUTE,			/* Operating as a parallel query executor */
-	GP_ROLE_UNDEFINED			/* Should never see this role in use */
 } GpRoleValue;
-
-
-extern GpRoleValue Gp_session_role;	/* GUC var - server startup mode.  */
-extern char *gp_session_role_string;	/* Use by guc.c as staging area for
-										 * value. */
-extern const char *assign_gp_session_role(const char *newval, bool doit, GucSource source);
-extern const char *show_gp_session_role(void);
 
 extern GpRoleValue Gp_role;	/* GUC var - server operating mode.  */
 extern char *gp_role_string;	/* Use by guc.c as staging area for value. */
-extern const char *assign_gp_role(const char *newval, bool doit, GucSource source);
-extern const char *show_gp_role(void);
 
 extern bool gp_reraise_signal; /* try to force a core dump ?*/
 
@@ -153,6 +90,7 @@ extern bool Gp_is_writer;
  * session throughout the entire Greenplum array.
  */
 extern int gp_session_id;
+#define InvalidGpSessionId	(-1)
 
 /* The Hostname where this segment's QD is located. This variable is NULL for the QD itself */
 extern char * qdHostname;
@@ -176,17 +114,6 @@ extern int			gp_cached_gang_threshold;
  * some other number if it makes more sense in certain situations.
  */
 extern int			gp_reject_percent_threshold;
-
-/*
- * gp_max_csv_line_length
- *
- * maximum csv line length for COPY and external tables. It is best to keep
- * the default value of 64K to as it protects against a never ending rejection
- * of valid csv data as a result of a quote related formatting error. however,
- * there may be cases where data lines are indeed larger than 64K and that's
- * when this guc must be increased in order to be able to load the data.
- */
-extern int 			gp_max_csv_line_length;
 
 /*
  * For use while debugging DTM issues: alter MVCC semantics such that
@@ -223,8 +150,8 @@ extern bool gp_debug_pgproc;
  * This run-time parameter is closely related to the PostgreSQL parameter
  * debug_print_plan which, if true, causes the final plan to display on the
  * server log prior to execution.  This parameter, if true, causes the
- * preliminary plan (from the optimizer prior to cdbparallelize) to display
- * on the log.
+ * preliminary plan (from the optimizer prior to adding Motions for subplans)
+ * to display on the log.
  */
 extern bool Debug_print_prelim_plan;
 
@@ -239,21 +166,7 @@ extern bool Debug_print_slice_table;
 
 extern bool Debug_resource_group;
 
-/*
- * gp_backup_directIO
- *
- * when set to 'true' the dump with direct I\O is enabled
- */
-extern bool gp_backup_directIO;
-
-
-/*
- * gp_backup_directIO_readChunk
- *
- *  This parameter controls the readChunk that is used during directI\O backup
- *  The value of this parameter is in megabyte
- */
-extern int gp_backup_directIO_read_chunk_mb;
+extern bool Debug_burn_xids;
 
 /*
  * gp_external_enable_exec
@@ -275,6 +188,12 @@ extern bool gp_external_enable_exec;
  * server resources better while not harming performance.
  */
 extern int gp_external_max_segs;
+
+/*
+ * This option determines whether curl verifies the authenticity of the
+ * gpfdist's certificate.
+ */
+extern bool verify_gpfdists_cert;
 
 /*
  * gp_command_count
@@ -311,56 +230,14 @@ extern int gp_safefswritesize;
  */
 extern bool Gp_write_shared_snapshot;
 
-/*
- * Request a pause to the fault-prober.
- */
-extern bool gp_fts_probe_pause;
-
 extern int gp_fts_transition_retries;
 extern int gp_fts_transition_timeout;
-
-extern bool gpvars_assign_gp_fts_probe_pause(bool newval, bool doit, GucSource source);
-
-
-/*
- * Parameter gp_connections_per_thread
- *
- * The run-time parameter (GUC variables) gp_connections_per_thread
- * controls how many libpq connections to qExecs are processed in each
- * thread.
- *
- * Any number >= 1 is valid.
- *
- * 1 means each connection has its own thread.
- *
- * This can be set in the config file, or at runtime by a superuser using
- * SQL: set gp_connections_per_thread = x;
- *
- * The default is 256.	So, if there are fewer than 256 segdbs, all would be handled
- * by the same thread.
- *
- * Currently, this is used in two situation:
- *		1) In cdblink_setup, when the libpq connections are obtained by the dispatcher
- *				to the qExecs.
- *		2) In CdbDispatchCommand, when commands are sent from the dispatcher to the qExecs.
- *
- */
-extern int	gp_connections_per_thread; /* GUC var - server operating mode.  */
-
-extern bool assign_gp_connections_per_thread(int newval, bool doit, GucSource source);
-extern const char *show_gp_connections_per_thread(void);
 
 /*
  * If number of subtransactions within a transaction exceed this limit,
  * then a warning is given to the user.
  */
 extern int32 gp_subtrans_warn_limit;
-
-extern bool assign_gp_write_shared_snapshot(bool newval, bool doit, GucSource source);
-
-extern char *gp_fault_action_string;	/* Use by guc.c as user defined fault
-										 * action */
-extern bool gp_set_read_only;
 
 extern const char *role_to_string(GpRoleValue role);
 
@@ -370,8 +247,7 @@ extern int	gp_snapshotadd_timeout; /* GUC var - timeout specifier for snapshot-c
 extern int	gp_fts_probe_retries; /* GUC var - specifies probe number of retries for FTS */
 extern int	gp_fts_probe_timeout; /* GUC var - specifies probe timeout for FTS */
 extern int	gp_fts_probe_interval; /* GUC var - specifies polling interval for FTS */
-extern int	gp_fts_probe_threadcount; /* GUC var - specifies number of threads to use for FTS probes */
-extern bool	gp_fts_transition_parallel; /* GUC var - controls parallel segment transition for FTS */
+extern int gp_fts_mark_mirror_down_grace_period;
 
 extern int gp_gang_creation_retry_count; /* How many retries ? */
 extern int gp_gang_creation_retry_timer; /* How long between retries */
@@ -399,22 +275,21 @@ extern int	Gp_max_packet_size;	/* GUC var */
 /*
  * Support for multiple "types" of interconnect
  */
-
-#define INTERCONNECT_TYPE_TCP    (0)
-#define INTERCONNECT_TYPE_UDPIFC (1)
+typedef enum GpVars_Interconnect_Type
+{
+	INTERCONNECT_TYPE_TCP = 0,
+	INTERCONNECT_TYPE_UDPIFC,
+} GpVars_Interconnect_Type;
 
 extern int Gp_interconnect_type;
 
-extern const char *gpvars_assign_gp_interconnect_type(const char *newval, bool doit, GucSource source __attribute__((unused)) );
-extern const char *gpvars_show_gp_interconnect_type(void);
-
-#define INTERCONNECT_FC_METHOD_CAPACITY (0)
-#define INTERCONNECT_FC_METHOD_LOSS     (2)
+typedef enum GpVars_Interconnect_Method
+{
+	INTERCONNECT_FC_METHOD_CAPACITY = 0,
+	INTERCONNECT_FC_METHOD_LOSS = 2,
+} GpVars_Interconnect_Method;
 
 extern int Gp_interconnect_fc_method;
-
-extern const char *gpvars_assign_gp_interconnect_fc_method(const char *newval, bool doit, GucSource source __attribute__((unused)) );
-extern const char *gpvars_show_gp_interconnect_fc_method(void);
 
 /*
  * Parameter Gp_interconnect_queue_depth
@@ -450,17 +325,6 @@ extern int	Gp_interconnect_debug_retry_interval;
 extern int 	Gp_udp_bufsize_k;
 
 /*
- * Parameter Gp_interconnect_hash_multiplier
- *
- * The run-time parameter Gp_interconnect_hash_multiplier
- * controls the number of hash buckets used to track 'connections.'
- *
- * This guc is specific to the UDP-interconnect.
- *
- */
-extern int	Gp_interconnect_hash_multiplier;
-
-/*
  * Parameter gp_interconnect_aggressive_retry
  *
  * The run-time parameter gp_interconnect_aggressive_retry controls the
@@ -479,26 +343,13 @@ extern bool gp_interconnect_full_crc;
 /*
  * Parameter gp_interconnect_log_stats
  *
- * Emit inteconnect statistics at log-level, instead of debug1
+ * Emit interconnect statistics at log-level, instead of debug1
  */
 extern bool gp_interconnect_log_stats;
 
 extern bool gp_interconnect_cache_future_packets;
 
-/*
- * Parameter gp_segment
- *
- * The segment (content) controlled by this QE
- * content indicator: -1 for entry database, 0, ..., n-1 for segment database
- *
- * This variable is in the PGC_BACKEND context; it is set internally by the
- * Query Dispatcher, and is propagated to Query Executors in the connection
- * parameters.	It is not modifiable by any user, ever.
- */
 #define UNDEF_SEGMENT -2
-extern int	Gp_segment;		/* GUC var */
-
-extern int	getgpsegmentCount(void);
 
 /*
  * Parameter interconnect_setup_timeout
@@ -554,7 +405,7 @@ extern bool gp_enable_direct_dispatch;
 #define GP_DIST_RANDOM_NAME "GP_DIST_RANDOM"
 
 /*
- * gp_log_gang (string)
+ * gp_log_gang
  *
  * Should creation, reallocation and cleanup of gangs of QE processes be logged?
  * "OFF"     -> only errors are logged
@@ -565,13 +416,10 @@ extern bool gp_enable_direct_dispatch;
  * The messages that are enabled by the TERSE and VERBOSE settings are
  * written with a severity level of LOG.
  */
-extern GpVars_Verbosity    gp_log_gang;
-
-const char *gpvars_assign_gp_log_gang(const char *newval, bool doit, GucSource source);
-const char *gpvars_show_gp_log_gang(void);
+extern int gp_log_gang;
 
 /*
- * gp_log_fts (string)
+ * gp_log_fts
  *
  * What kind of messages should be logged by the fault-prober
  * "OFF"     -> only errors are logged
@@ -582,13 +430,10 @@ const char *gpvars_show_gp_log_gang(void);
  * The messages that are enabled by the TERSE and VERBOSE settings are
  * written with a severity level of LOG.
  */
-extern GpVars_Verbosity    gp_log_fts;
-
-const char *gpvars_assign_gp_log_fts(const char *newval, bool doit, GucSource source);
-const char *gpvars_show_gp_log_fts(void);
+extern int gp_log_fts;
 
 /*
- * gp_log_interconnect (string)
+ * gp_log_interconnect
  *
  * Should connections between internal processes be logged?  (qDisp/qExec/etc)
  * "OFF"     -> connection errors are logged
@@ -599,10 +444,7 @@ const char *gpvars_show_gp_log_fts(void);
  * The messages that are enabled by the TERSE and VERBOSE settings are
  * written with a severity level of LOG.
  */
-extern GpVars_Verbosity    gp_log_interconnect;
-
-const char *gpvars_assign_gp_log_interconnect(const char *newval, bool doit, GucSource source __attribute__((unused)) );
-const char *gpvars_show_gp_log_interconnect(void);
+extern int gp_log_interconnect;
 
 /* --------------------------------------------------------------------------------------------------
  * Greenplum Optimizer GUCs
@@ -623,6 +465,12 @@ extern double   gp_motion_cost_per_row;
  * estimates.  If 0, estimates are based on the actual number of segment dbs.
  */
 extern int      gp_segments_for_planner;
+
+/*
+ * Enable/disable the special optimization of MIN/MAX aggregates as
+ * Index Scan with limit.
+ */
+extern bool gp_enable_minmax_optimization;
 
 /*
  * "gp_enable_multiphase_agg"
@@ -649,13 +497,6 @@ extern bool gp_adjust_selectivity_for_outerjoins;
  */
 extern int gp_hashjoin_tuples_per_bucket;
 extern int gp_hashagg_groups_per_bucket;
-
-/*
- * Capping the amount of memory used for metadata (buckets and batches pointers)
- * for spilling HashJoins. This is in addition to the operator memory quota,
- * which is used only for storing tuples (MPP-22417)
- */
-extern int gp_hashjoin_metadata_memory_percent;
 
 /*
  * Damping of selectivities of clauses which pertain to the same base
@@ -700,70 +541,9 @@ extern bool gp_enable_agg_distinct;
  * prune values from DISTINCT-qualified aggregate function arguments?
  *
  * The code uses planner estimates to decide whether to use this feature,
- * when enabled.  See, however, gp_eager_dqa_pruning.
+ * when enabled.
  */
 extern bool gp_enable_dqa_pruning;
-
-/*
- * "gp_eager_agg_distinct_pruning"
- *
- * Should Greenplum bias planner estimates so as to favor the use of grouping
- * in the first phases of 3-phase aggregation to prune values from DISTINCT-
- * qualified aggregate function arguments?
- *
- * Note that this has effect only when gp_enable_dqa_pruning it true.  It
- * provided to facilitate testing and is not a tuning parameter.
- */
-extern bool gp_eager_dqa_pruning;
-
-/*
- * "gp_eager_one_phase_agg"
- *
- * Should Greenplum bias planner estimates so as to favor the use of one
- * phase aggregation?
- *
- * It is provided to facilitate testing and is not a tuning parameter.
- */
-extern bool gp_eager_one_phase_agg;
-
-/*
- * "gp_eager_two_phase_agg"
- *
- * Should Greenplum bias planner estimates so as to favor the use of two
- * phase aggregation?
- *
- * It is provided to facilitate testing and is not a tuning parameter.
- */
-extern bool gp_eager_two_phase_agg;
-
-/*
- * "gp_enable_groupext_distinct_pruning"
- *
- * Should Greenplum bias planner estimates so as to favor the use of
- * grouping in the first phases of 3-phase aggregation to prune values
- * from DISTINCT-qualified aggregate function arguments on a grouping
- * extension query?
- */
-extern bool gp_enable_groupext_distinct_pruning;
-
-/*
- * "gp_enable_groupext_distinct_gather"
- *
- * Should Greenplum bias planner estimates so as to favor the use of
- * gathering motion to gather the data into a single node to compute
- * DISTINCT-qualified aggregates on a grouping extension query?
- */
-extern bool gp_enable_groupext_distinct_gather;
-
-/*
- * "gp_distinct_grouping_sets_threshold"
- *
- * The planner will treat gp_enable_groupext_distinct_pruning as 'off'
- * when the number of grouping sets that have been rewritten based
- * on the multi-phrase aggregation exceeds the threshold value here divided by
- * the number of distinct-qualified aggregates.
- */
-extern int gp_distinct_grouping_sets_threshold;
 
 /* May Greenplum apply Unique operator (and possibly a Sort) in parallel prior
  * to the collocation motion for a Unique operator?  The idea is to reduce
@@ -781,19 +561,16 @@ extern bool gp_enable_preunique;
  */
 extern bool gp_eager_preunique;
 
-/* May Greenplum use sequential window plans instead of parallel window
- * plans? (OLAP Experimental.)
- *
- * The code does not currently use planner estimates for this.  If enabled,
- * the tactic is used whenever possible.
- */
-extern bool gp_enable_sequential_window_plans;
-
 /* May Greenplum dump statistics for all segments as a huge ugly string
  * during EXPLAIN ANALYZE?
  *
  */
 extern bool gp_enable_explain_allstat;
+
+/*
+ * What level of details of the memory accounting information to show during EXPLAIN ANALYZE?
+ */
+extern int explain_memory_verbosity;
 
 /* May Greenplum restrict ORDER BY sorts to the first N rows if the ORDER BY
  * is wrapped by a LIMIT clause (where N=OFFSET+LIMIT)?
@@ -813,7 +590,6 @@ extern bool gp_enable_sort_distinct;
 
 /* Greenplum MK Sort */
 extern bool gp_enable_mk_sort;
-extern bool gp_enable_motion_mk_sort;
 
 #ifdef USE_ASSERT_CHECKING
 extern bool gp_mk_sort_check;
@@ -834,26 +610,18 @@ extern int gp_sort_flags;
  */
 extern int gp_sort_max_distinct;
 
-/* turn the hash partitioned tables on */
-
-extern bool	gp_enable_hash_partitioned_tables;
-
 /**
  * Enable dynamic pruning of partitions based on join condition.
  */
 extern bool gp_dynamic_partition_pruning;
 
-/**
- * Sharing of plan fragments for common table expressions
- */
+/* Sharing of plan fragments for common table expressions */
 extern bool gp_cte_sharing;
+/* Enable RECURSIVE clauses in common table expressions */
+extern bool gp_recursive_cte;
 
-/* MPP-7770: disallow altering storage using SET WITH */
-
-extern bool	gp_setwith_alter_storage;
-
-/* MPP-9772, MPP-9773: remove support for CREATE INDEX CONCURRENTLY */
-extern bool	gp_create_index_concurrently;
+/* Enable check for compatibility of encoding and locale in createdb */
+extern bool gp_encoding_check_locale_compatibility;
 
 /* Priority for the segworkers relative to the postmaster's priority */
 extern int gp_segworker_relative_priority;
@@ -861,24 +629,10 @@ extern int gp_segworker_relative_priority;
 /*  Max size of dispatched plans; 0 if no limit */
 extern int gp_max_plan_size;
 
-/* The maximum number of times on average that the hybrid hashed aggregation
- * algorithm will plan to spill an input row to disk before including it in
- * an aggregation.  Increasing this parameter will cause the planner to choose
- * hybrid hashed aggregation at lower settings of work_mem than it otherwise
- * would.
- */
-extern double gp_hashagg_rewrite_limit;
-
-/* If we use two stage hashagg, we can stream the bottom half */
-extern bool gp_hashagg_streambottom;
-
 /* The default number of batches to use when the hybrid hashed aggregation
  * algorithm (re-)spills in-memory groups to disk.
  */
 extern int gp_hashagg_default_nbatches;
-
-/* Hashjoin use bloom filter */
-extern int gp_hashjoin_bloomfilter;
 
 /* Get statistics for partitioned parent from a child */
 extern bool 	gp_statistics_pullup_from_child_partition;
@@ -886,93 +640,46 @@ extern bool 	gp_statistics_pullup_from_child_partition;
 /* Extract numdistinct from foreign key relationship */
 extern bool		gp_statistics_use_fkeys;
 
-/* Analyze related gucs */
-extern int 		gp_statistics_blocks_target;
-extern double	gp_statistics_ndistinct_scaling_ratio_threshold;
-extern double	gp_statistics_sampling_threshold;
-
 /* Analyze tools */
 extern int gp_motion_slice_noop;
 
 /* Disable setting of hint-bits while reading db pages */
 extern bool gp_disable_tuple_hints;
 
-/* Enable gpmon */
-extern bool gpvars_assign_gp_enable_gpperfmon(bool newval, bool doit, GucSource source);
-extern bool gpvars_assign_gp_gpperfmon_send_interval(int newval, bool doit, GucSource source);
-extern bool gp_enable_gpperfmon;
-extern int gp_gpperfmon_send_interval;
-extern bool force_bitmap_table_scan;
+/* Enable metrics */
+extern bool gp_enable_query_metrics;
+extern int gp_instrument_shmem_size;
 
 extern bool dml_ignore_target_partition_check;
 
-/*gpmon alert level*/
-/* control log alert level used by gpperfmon */
-typedef enum 
-{
-	GPPERFMON_LOG_ALERT_LEVEL_NONE,
-	GPPERFMON_LOG_ALERT_LEVEL_WARNING,
-	GPPERFMON_LOG_ALERT_LEVEL_ERROR,
-	GPPERFMON_LOG_ALERT_LEVEL_FATAL,
-	GPPERFMON_LOG_ALERT_LEVEL_PANIC
-} GpperfmonLogAlertLevel;
-extern GpperfmonLogAlertLevel gpperfmon_log_alert_level;
-extern const char *gpperfmon_log_alert_level_to_string(GpperfmonLogAlertLevel level);
-extern GpperfmonLogAlertLevel gpperfmon_log_alert_level_from_string(const char *level_string);
-extern const char *gpvars_assign_gp_gpperfmon_log_alert_level(const char *newval, bool doit, GucSource source);
-extern const char *gpvars_show_gp_gpperfmon_log_alert_level(void);
-
-
-extern int gp_workfile_compress_algorithm;
-extern bool gp_workfile_checksumming;
-extern double gp_workfile_limit_per_segment;
-extern double gp_workfile_limit_per_query;
+extern int gp_workfile_limit_per_segment;
+extern int gp_workfile_limit_per_query;
 extern int gp_workfile_limit_files_per_query;
 extern int gp_workfile_caching_loglevel;
 extern int gp_sessionstate_loglevel;
-extern bool gp_workfile_faultinject;
 extern int gp_workfile_bytes_to_checksum;
-/* The type of work files that HashJoin should use */
-extern int gp_workfile_type_hashjoin;
 
-/* Disable logging while creating mapreduce views */
-extern bool gp_mapreduce_define;
 extern bool coredump_on_memerror;
 
-/* Autostats feature for MPP-4082. */
+/*
+ * Autostats feature, whether or not to to automatically run ANALYZE after 
+ * insert/delete/update/ctas or after ctas/copy/insert in case the target
+ * table has no statistics
+ */
 typedef enum
 {
-	GP_AUTOSTATS_NONE = 0,		/* Autostats is switched off */
-	GP_AUTOSTATS_ON_CHANGE,		/* Autostats is enabled on change (insert/delete/update/ctas) */
-	GP_AUTOSTATS_ON_NO_STATS,		/* Autostats is enabled on ctas or copy or insert if no stats are present */
+	GP_AUTOSTATS_NONE = 0,			/* Autostats is switched off */
+	GP_AUTOSTATS_ON_CHANGE,			/* Autostats is enabled on change
+									 * (insert/delete/update/ctas) */
+	GP_AUTOSTATS_ON_NO_STATS,		/* Autostats is enabled on ctas or copy or
+									 * insert if no stats are present */
 } GpAutoStatsModeValue;
-extern GpAutoStatsModeValue gp_autostats_mode;
-extern char                *gp_autostats_mode_string;
-extern GpAutoStatsModeValue gp_autostats_mode_in_functions;
-extern char                *gp_autostats_mode_in_functions_string;
-extern int                  gp_autostats_on_change_threshold;
-extern bool					log_autostats;
-/* hook functions to set gp_autostats_mode and gp_autostats_mode_in_functions */
-extern const char *gpvars_assign_gp_autostats_mode(const char *newval, bool doit, GucSource source);
-extern const char *gpvars_show_gp_autostats_mode(void);
-extern const char *gpvars_assign_gp_autostats_mode_in_functions(const char *newval, bool doit, GucSource source);
-extern const char *gpvars_show_gp_autostats_mode_in_functions(void);
 
+extern int	gp_autostats_mode;
+extern int	gp_autostats_mode_in_functions;
+extern int	gp_autostats_on_change_threshold;
+extern bool	log_autostats;
 
-/* --------------------------------------------------------------------------------------------------
- * Miscellaneous developer use
- */
-
-/*
- * gp_dev_notice_agg_cost (bool)
- *
- * Issue aggregation optimizer cost estimates as NOTICE level messages
- * during GPDB aggregation planning.  This is intended to facilitate
- * tuning the cost algorithm.  The presence of this switch should not
- * be published.  The name is intended to suggest that it is for developer
- * use only.
- */
-extern bool  gp_dev_notice_agg_cost;
 
 /* --------------------------------------------------------------------------------------------------
  * Server debugging
@@ -994,9 +701,6 @@ extern int  gp_debug_linger;
 #define UNSET_SLICE_ID -1
 extern int	currentSliceId;
 
-/* Segment id where singleton gangs are to be dispatched. */
-extern int  gp_singleton_segindex;
-
 extern int cdb_total_plans;
 /* Enable ading the cost for walking the chain in the hash join. */
 extern bool gp_cost_hashjoin_chainwalk;
@@ -1006,9 +710,8 @@ extern int cdb_max_slices;
 
 typedef struct GpId
 {
-	int4		numsegments;	/* count of distinct segindexes */
-	int4		dbid;			/* the dbid of this database */
-	int4		segindex;		/* content indicator: -1 for entry database,
+	int32		dbid;			/* the dbid of this database */
+	int32		segindex;		/* content indicator: -1 for entry database,
 								 * 0, ..., n-1 for segment database *
 								 * a primary and its mirror have the same segIndex */
 } GpId;
@@ -1017,57 +720,29 @@ typedef struct GpId
  * Global variable declaration for the data for the single row of gp_id table
  */
 extern GpId GpIdentity;
+extern int get_dbid_string_length(void);
 #define UNINITIALIZED_GP_IDENTITY_VALUE (-10000)
-extern int GpStandbyDbid;
+#define IS_QUERY_DISPATCHER() (GpIdentity.segindex == MASTER_CONTENT_ID)
 
+#define IS_QUERY_EXECUTOR_BACKEND() (Gp_role == GP_ROLE_EXECUTE && gp_session_id > 0)
 
 /* Stores the listener port that this process uses to listen for incoming
  * Interconnect connections from other Motion nodes.
  */
 extern uint32 Gp_listener_port;
 
-
-
-/* SequenceServer information to be shared with everyone */
-typedef struct SeqServerControlBlock
-{
-	int4		seqServerPort;
-	XLogRecPtr  lastXlogEntry;
-}	SeqServerControlBlock;
-
-extern SeqServerControlBlock *seqServerCtl;
-
 /*
  * Thread-safe routine to write to the log
  */
-extern void write_log(const char *fmt,...) __attribute__((format(printf, 1, 2)));
+extern void write_log(const char *fmt,...) pg_attribute_printf(1, 2);
 
-extern void verifyGpIdentityIsSet(void);
-
-extern const char *gpvars_assign_gp_resource_manager_policy(const char *newval, bool doit, GucSource source __attribute__((unused)) );
-
-extern const char *gpvars_show_gp_resource_manager_policy(void);
-
-extern bool gpvars_assign_max_resource_groups(int newval, bool doit, GucSource source __attribute__((unused)));
-
-extern const char *gpvars_assign_gp_resqueue_memory_policy(const char *newval, bool doit, GucSource source __attribute__((unused)) );
-
-extern const char *gpvars_show_gp_resqueue_memory_policy(void);
-
-extern const char *gpvars_assign_gp_resgroup_memory_policy(const char *newval, bool doit, GucSource source __attribute__((unused)) );
-
-extern const char *gpvars_show_gp_resgroup_memory_policy(void);
-
-extern bool gpvars_assign_statement_mem(int newval, bool doit, GucSource source __attribute__((unused)) );
 
 extern void increment_command_count(void);
 
-/*
- * switch to control inverse distribution function strategy.
- */
-extern char *gp_idf_deduplicate_str;
-
 /* default to RANDOM distribution for CREATE TABLE without DISTRIBUTED BY */
 extern bool gp_create_table_random_default_distribution;
+
+/* Functions in guc_gp.c to lookup values in enum GUCs */
+extern const char * lookup_autostats_mode_by_value(GpAutoStatsModeValue val);
 
 #endif   /* CDBVARS_H */

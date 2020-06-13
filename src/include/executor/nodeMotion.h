@@ -17,19 +17,11 @@
 
 #include "nodes/execnodes.h"
 
-extern int	ExecCountSlotsMotion(Motion *node);
 extern MotionState *ExecInitMotion(Motion *node, EState *estate, int eflags);
 extern TupleTableSlot *ExecMotion(MotionState *node);
 extern void ExecEndMotion(MotionState *node);
-extern void ExecReScanMotion(MotionState *node, ExprContext *exprCtxt);
+extern void ExecReScanMotion(MotionState *node);
 
-extern void ExecStopMotion(MotionState *node);
-
-extern bool isMotionGather(const Motion *m);
-
-static inline gpmon_packet_t * GpmonPktFromMotionState(MotionState *node)
-{
-	return &node->ps.gpmon_pkt;
-}
+extern void ExecSquelchMotion(MotionState *node);
 
 #endif   /* NODEMOTION_H */

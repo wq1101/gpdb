@@ -8,7 +8,7 @@ DROP RESOURCE GROUP rg_test_group;
 
 -- helper view to check the resgroup status
 CREATE OR REPLACE VIEW rg_test_monitor AS
-	SELECT groupname, concurrency, proposed_concurrency, cpu_rate_limit
+	SELECT groupname, concurrency, cpu_rate_limit
 	FROM gp_toolkit.gp_resgroup_config
 	WHERE groupname='rg_test_group';
 
@@ -131,18 +131,6 @@ DROP RESOURCE GROUP rg_test_group;
 DROP FUNCTION rg_create_func();
 DROP FUNCTION rg_alter_func();
 DROP FUNCTION rg_drop_func();
-
--- ----------------------------------------------------------------------
--- Test: Create index concurrently under the control of resource group
--- ----------------------------------------------------------------------
--- GPDB will commit a transaction and restart a transaction when defining
--- index concurrently. We need to verify resource group can handle this
--- case.
-CREATE TABLE concur_table (f1 text, f2 text, dk text) distributed by (dk);
-SET gp_create_index_concurrently = TRUE;
-CREATE INDEX CONCURRENTLY idx_concur_table ON concur_table(f2,f1);
-DROP INDEX idx_concur_table;
-DROP TABLE concur_table;
 
 -- cleanup
 DROP VIEW rg_test_monitor;

@@ -2,19 +2,25 @@
  *	Definitions for pg_backup_db.c
  *
  *	IDENTIFICATION
- *		$PostgreSQL: pgsql/src/bin/pg_dump/pg_backup_db.h,v 1.13 2006/07/18 17:42:01 momjian Exp $
+ *		src/bin/pg_dump/pg_backup_db.h
  */
 
 #ifndef PG_BACKUP_DB_H
 #define PG_BACKUP_DB_H
 
-#include "pg_backup_archiver.h"
+#include "pg_backup.h"
 
-extern int	ExecuteSqlCommandBuf(ArchiveHandle *AH, const char *buf, size_t bufLen);
 
-extern void EndDBCopyMode(ArchiveHandle *AH, struct _tocEntry * te);
+extern int	ExecuteSqlCommandBuf(Archive *AHX, const char *buf, size_t bufLen);
 
-extern void StartTransaction(ArchiveHandle *AH);
-extern void CommitTransaction(ArchiveHandle *AH);
+extern void ExecuteSqlStatement(Archive *AHX, const char *query);
+extern PGresult *ExecuteSqlQuery(Archive *AHX, const char *query,
+				ExecStatusType status);
+extern PGresult *ExecuteSqlQueryForSingleRow(Archive *fout, char *query);
+
+extern void EndDBCopyMode(Archive *AHX, const char *tocEntryTag);
+
+extern void StartTransaction(Archive *AHX);
+extern void CommitTransaction(Archive *AHX);
 
 #endif

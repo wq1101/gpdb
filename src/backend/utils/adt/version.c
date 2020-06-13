@@ -3,11 +3,11 @@
  * version.c
  *	 Returns the PostgreSQL version string
  *
- * Copyright (c) 1998-2009, PostgreSQL Global Development Group
+ * Copyright (c) 1998-2016, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *
- * $PostgreSQL: pgsql/src/backend/utils/adt/version.c,v 1.18 2009/01/01 17:23:50 momjian Exp $
+ * src/backend/utils/adt/version.c
  *
  *-------------------------------------------------------------------------
  */
@@ -18,7 +18,7 @@
 
 
 Datum
-pgsql_version(PG_FUNCTION_ARGS __attribute__((unused)) )
+pgsql_version(PG_FUNCTION_ARGS pg_attribute_unused() )
 {
 	char version[512];
 

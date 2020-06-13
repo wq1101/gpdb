@@ -51,7 +51,7 @@ struct sqlca_t
 	/* Element 0: set to 'W' if at least one other is 'W'	*/
 	/* 1: if 'W' at least one character string		*/
 	/* value was truncated when it was			*/
-	/* stored into a host variable.				*/
+	/* stored into a host variable.             */
 
 	/*
 	 * 2: if 'W' a (hopefully) non-fatal notice occurred
@@ -104,8 +104,8 @@ int main()
 
 
    ECPGdebug(1,stderr);
-   
-   { ECPGconnect(__LINE__, 0, "regress1" , NULL, NULL , NULL, 0); }
+
+   { ECPGconnect(__LINE__, 0, "ecpg1_regression" , NULL, NULL , NULL, 0); }
 #line 15 "code100.pgc"
 
    if (sqlca.sqlcode) printf("%ld:%s\n",sqlca.sqlcode,sqlca.sqlerrm.sqlerrmc);
@@ -118,7 +118,7 @@ int main()
 #line 22 "code100.pgc"
 
    if (sqlca.sqlcode) printf("%ld:%s\n",sqlca.sqlcode,sqlca.sqlerrm.sqlerrmc);
-   
+
    for (index=0;index<10;++index)
    {  { ECPGdo(__LINE__, 0, 1, NULL, 0, ECPGst_normal, "insert into test ( payload , index ) values ( 0 , $1  )", 
 	ECPGt_int,&(index),(long)1,(long)1,sizeof(int), 
@@ -131,12 +131,12 @@ int main()
 #line 31 "code100.pgc"
 
    if (sqlca.sqlcode) printf("%ld:%s\n",sqlca.sqlcode,sqlca.sqlerrm.sqlerrmc);
-   
+
    { ECPGdo(__LINE__, 0, 1, NULL, 0, ECPGst_normal, "update test set payload = payload + 1 where index = - 1", ECPGt_EOIT, ECPGt_EORT);}
 #line 35 "code100.pgc"
 
    if (sqlca.sqlcode!=100) printf("%ld:%s\n",sqlca.sqlcode,sqlca.sqlerrm.sqlerrmc);
-   
+
    { ECPGdo(__LINE__, 0, 1, NULL, 0, ECPGst_normal, "delete from test where index = - 1", ECPGt_EOIT, ECPGt_EORT);}
 #line 38 "code100.pgc"
 
@@ -155,7 +155,7 @@ int main()
 #line 46 "code100.pgc"
 
    if (sqlca.sqlcode) printf("%ld:%s\n",sqlca.sqlcode,sqlca.sqlerrm.sqlerrmc);
-   
+
    { ECPGdisconnect(__LINE__, "CURRENT");}
 #line 49 "code100.pgc"
 

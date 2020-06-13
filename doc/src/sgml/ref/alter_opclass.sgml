@@ -1,30 +1,37 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/alter_opclass.sgml,v 1.8 2007/01/23 05:07:17 tgl Exp $
+doc/src/sgml/ref/alter_opclass.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-ALTEROPCLASS">
+ <indexterm zone="sql-alteropclass">
+  <primary>ALTER OPERATOR CLASS</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="SQL-ALTEROPCLASS-TITLE">ALTER OPERATOR CLASS</refentrytitle>
+  <refentrytitle>ALTER OPERATOR CLASS</refentrytitle>
+  <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
 
  <refnamediv>
   <refname>ALTER OPERATOR CLASS</refname>
   <refpurpose>change the definition of an operator class</refpurpose>
- </refnamediv>  
-  
- <indexterm zone="sql-alteropclass">
-  <primary>ALTER OPERATOR CLASS</primary>
- </indexterm>
+ </refnamediv>
 
  <refsynopsisdiv>
 <synopsis>
-ALTER OPERATOR CLASS <replaceable>name</replaceable> USING <replaceable class="parameter">index_method</replaceable> RENAME TO <replaceable>newname</replaceable>
-ALTER OPERATOR CLASS <replaceable>name</replaceable> USING <replaceable class="parameter">index_method</replaceable> OWNER TO <replaceable>newowner</replaceable>
+ALTER OPERATOR CLASS <replaceable>name</replaceable> USING <replaceable class="parameter">index_method</replaceable>
+    RENAME TO <replaceable>new_name</replaceable>
+
+ALTER OPERATOR CLASS <replaceable>name</replaceable> USING <replaceable class="parameter">index_method</replaceable>
+    OWNER TO { <replaceable>new_owner</replaceable> | CURRENT_USER | SESSION_USER }
+
+ALTER OPERATOR CLASS <replaceable>name</replaceable> USING <replaceable class="parameter">index_method</replaceable>
+    SET SCHEMA <replaceable>new_schema</replaceable>
 </synopsis>
  </refsynopsisdiv>
-  
+
  <refsect1>
   <title>Description</title>
 
@@ -43,7 +50,7 @@ ALTER OPERATOR CLASS <replaceable>name</replaceable> USING <replaceable class="p
    class anyway.)
   </para>
  </refsect1>
-  
+
  <refsect1>
   <title>Parameters</title>
 
@@ -68,7 +75,7 @@ ALTER OPERATOR CLASS <replaceable>name</replaceable> USING <replaceable class="p
    </varlistentry>
 
    <varlistentry>
-    <term><replaceable class="parameter">newname</replaceable></term>
+    <term><replaceable class="parameter">new_name</replaceable></term>
     <listitem>
      <para>
       The new name of the operator class.
@@ -77,10 +84,19 @@ ALTER OPERATOR CLASS <replaceable>name</replaceable> USING <replaceable class="p
    </varlistentry>
 
    <varlistentry>
-    <term><replaceable class="parameter">newowner</replaceable></term>
+    <term><replaceable class="parameter">new_owner</replaceable></term>
     <listitem>
      <para>
       The new owner of the operator class.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><replaceable class="parameter">new_schema</replaceable></term>
+    <listitem>
+     <para>
+      The new schema for the operator class.
      </para>
     </listitem>
    </varlistentry>
@@ -100,9 +116,9 @@ ALTER OPERATOR CLASS <replaceable>name</replaceable> USING <replaceable class="p
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-createopclass" endterm="sql-createopclass-title"></member>
-   <member><xref linkend="sql-dropopclass" endterm="sql-dropopclass-title"></member>
-   <member><xref linkend="sql-alteropfamily" endterm="sql-alteropfamily-title"></member>
+   <member><xref linkend="sql-createopclass"></member>
+   <member><xref linkend="sql-dropopclass"></member>
+   <member><xref linkend="sql-alteropfamily"></member>
   </simplelist>
  </refsect1>
 </refentry>

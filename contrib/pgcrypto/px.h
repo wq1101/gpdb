@@ -26,7 +26,7 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $PostgreSQL: pgsql/contrib/pgcrypto/px.h,v 1.19 2009/06/11 14:48:52 momjian Exp $
+ * contrib/pgcrypto/px.h
  */
 
 #ifndef __PX_H
@@ -190,7 +190,6 @@ int			px_find_cipher(const char *name, PX_Cipher **res);
 int			px_find_combo(const char *name, PX_Combo **res);
 
 int			px_get_random_bytes(uint8 *dst, unsigned count);
-int			px_get_pseudo_random_bytes(uint8 *dst, unsigned count);
 int			px_add_entropy(const uint8 *data, unsigned count);
 
 unsigned	px_acquire_system_randomness(uint8 *dst);
@@ -200,10 +199,11 @@ const char *px_strerror(int err);
 const char *px_resolve_alias(const PX_Alias *aliases, const char *name);
 
 void		px_set_debug_handler(void (*handler) (const char *));
+
 void		px_memset(void *ptr, int c, size_t len);
 
 #ifdef PX_DEBUG
-void		px_debug(const char *fmt,...);
+void		px_debug(const char *fmt,...) pg_attribute_printf(1, 2);
 #else
 #define px_debug(...)
 #endif

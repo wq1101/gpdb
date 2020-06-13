@@ -2,9 +2,22 @@ use strict;
 use warnings;
 use PostgresNode;
 use TestLib;
-use Test::More tests => 29;
+use Test::More tests => 40;
 use ServerSetup;
 use File::Copy;
+
+# Like TestLib.pm, we use IPC::Run
+BEGIN
+{
+	eval {
+		require IPC::Run;
+		import IPC::Run qw(run start);
+		1;
+	} or do
+	{
+		plan skip_all => "IPC::Run not available";
+	  }
+}
 
 #### Some configuration
 
@@ -22,9 +35,11 @@ sub run_test_psql
 	my $connstr   = $_[0];
 	my $logstring = $_[1];
 
+	local $ENV{PGOPTIONS} = '-c gp_role=utility';
+
 	my $cmd = [
-		'psql', '-X', '-A', '-t', '-c', "'SELECT version();'",
-		'-d', "'" . "$connstr" . "'" ];
+		'psql', '-X', '-A', '-t', '-c', "SELECT 'connected with $connstr'",
+		'-d', "$connstr" ];
 
 	my $result = run_log($cmd);
 	return $result;
@@ -34,6 +49,8 @@ sub run_test_psql
 # The first argument is a (part of a) connection string, and it's also printed
 # out as the test case name. It is appended to $common_connstr global variable,
 # which also contains a libpq connection string.
+#
+# The second argument is a hostname to connect to.
 sub test_connect_ok
 {
 	my $connstr = $_[0];
@@ -59,9 +76,14 @@ chmod 0600, "ssl/client_tmp.key";
 #### Part 0. Set up the server.
 
 note "setting up data directory";
-my $node = get_new_demo_node();
-
+my $node = get_new_node('master');
 $node->init;
+
+# PGHOST is enforced here to set up the node, subsequent connections
+# will use a dedicated connection string.
+$ENV{PGHOST} = $node->host;
+$ENV{PGPORT} = $node->port;
+$node->start;
 configure_test_server_for_ssl($node, $SERVERHOSTADDR);
 switch_server_cert($node, 'server-cn-only');
 
@@ -136,46 +158,43 @@ test_connect_ok("sslmode=verify-ca host=wronghost.test");
 test_connect_fails("sslmode=verify-full host=wronghost.test");
 
 # Test Subject Alternative Names.
-#switch_server_cert($node, 'server-multiple-alt-names');
-#
-#note "test hostname matching with X.509 Subject Alternative Names";
-#print "test hostname matching with X.509 Subject Alternative Names";
-#$common_connstr =
-#"user=ssltestuser dbname=trustdb sslcert=invalid sslrootcert=ssl/root+server_ca.crt hostaddr=$SERVERHOSTADDR sslmode=verify-full";
-#
-#test_connect_ok("host=dns1.alt-name.pg-ssltest.test");
-#test_connect_ok("host=dns2.alt-name.pg-ssltest.test");
-#test_connect_ok("host=foo.wildcard.pg-ssltest.test");
-#
-#test_connect_fails("host=wronghost.alt-name.pg-ssltest.test");
-#test_connect_fails("host=deep.subdomain.wildcard.pg-ssltest.test");
-#
-## Test certificate with a single Subject Alternative Name. (this gives a
-## slightly different error message, that's all)
-#switch_server_cert($node, 'server-single-alt-name');
+switch_server_cert($node, 'server-multiple-alt-names');
 
-#note "test hostname matching with a single X.509 Subject Alternative Name";
-#print "test hostname matching with a single X.509 Subject Alternative Name";
-#$common_connstr =
-#"user=ssltestuser dbname=trustdb sslcert=invalid sslrootcert=ssl/root+server_ca.crt hostaddr=$SERVERHOSTADDR sslmode=verify-full";
-#
-#test_connect_ok("host=single.alt-name.pg-ssltest.test");
-#
-#test_connect_fails("host=wronghost.alt-name.pg-ssltest.test");
-#test_connect_fails("host=deep.subdomain.wildcard.pg-ssltest.test");
+diag "test hostname matching with X509 Subject Alternative Names";
+$common_connstr =
+"user=ssltestuser dbname=trustdb sslcert=invalid sslrootcert=ssl/root+server_ca.crt hostaddr=$SERVERHOSTADDR sslmode=verify-full";
+
+test_connect_ok("host=dns1.alt-name.pg-ssltest.test");
+test_connect_ok("host=dns2.alt-name.pg-ssltest.test");
+test_connect_ok("host=foo.wildcard.pg-ssltest.test");
+
+test_connect_fails("host=wronghost.alt-name.pg-ssltest.test");
+test_connect_fails("host=deep.subdomain.wildcard.pg-ssltest.test");
+
+# Test certificate with a single Subject Alternative Name. (this gives a
+# slightly different error message, that's all)
+switch_server_cert($node, 'server-single-alt-name');
+
+diag "test hostname matching with a single X509 Subject Alternative Name";
+$common_connstr =
+"user=ssltestuser dbname=trustdb sslcert=invalid sslrootcert=ssl/root+server_ca.crt hostaddr=$SERVERHOSTADDR sslmode=verify-full";
+
+test_connect_ok("host=single.alt-name.pg-ssltest.test");
+
+test_connect_fails("host=wronghost.alt-name.pg-ssltest.test");
+test_connect_fails("host=deep.subdomain.wildcard.pg-ssltest.test");
 
 # Test server certificate with a CN and SANs. Per RFCs 2818 and 6125, the CN
 # should be ignored when the certificate has both.
-#switch_server_cert($node, 'server-cn-and-alt-names');
-#
-#note "test certificate with both a CN and SANs";
-#print "test certificate with both a CN and SANs";
-#$common_connstr =
-#"user=ssltestuser dbname=trustdb sslcert=invalid sslrootcert=ssl/root+server_ca.crt hostaddr=$SERVERHOSTADDR sslmode=verify-full";
-#
-#test_connect_ok("host=dns1.alt-name.pg-ssltest.test");
-#test_connect_ok("host=dns2.alt-name.pg-ssltest.test");
-#test_connect_fails("host=common-name.pg-ssltest.test");
+switch_server_cert($node, 'server-cn-and-alt-names');
+
+diag "test certificate with both a CN and SANs";
+$common_connstr =
+"user=ssltestuser dbname=trustdb sslcert=invalid sslrootcert=ssl/root+server_ca.crt hostaddr=$SERVERHOSTADDR sslmode=verify-full";
+
+test_connect_ok("host=dns1.alt-name.pg-ssltest.test");
+test_connect_ok("host=dns2.alt-name.pg-ssltest.test");
+test_connect_fails("host=common-name.pg-ssltest.test");
 
 # Finally, test a server certificate that has no CN or SANs. Of course, that's
 # not a very sensible certificate, but libpq should handle it gracefully.

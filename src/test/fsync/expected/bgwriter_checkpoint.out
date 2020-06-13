@@ -12,6 +12,12 @@
 --     corresponding to fsync_test1 and fsync_test2 tables.
 --   * Verify that at least two files were fsync'ed by checkpointer.
 --
+-- the hit times of fsync_counter is undetermined, both 5, 6 or 7 are
+-- correct, so mark them out to make case stable.
+-- start_matchsubs
+-- m/num times hit:\'[4-7]\'/
+-- s/num times hit:\'[4-7]\'/num times hit:\'greater_than_two\'/
+-- end_matchsubs
 begin;
 create function num_dirty(relid oid) returns bigint as
 $$
@@ -22,7 +28,7 @@ $$
             where oid=$1);
 $$ language sql;
 -- Wait until number of dirty buffers for the specified relfiles drops
--- to 0 or timeout occurs.  Returns false if timeout occured.
+-- to 0 or timeout occurs.  Returns false if timeout occurred.
 create function wait_for_bgwriter(
    relid oid,
    timeout int)
@@ -51,52 +57,49 @@ create table fsync_test2(a int, b int) distributed by (a);
 insert into fsync_test1 select i, i from generate_series(1,100)i;
 insert into fsync_test2 select -i, i from generate_series(1,100)i;
 end;
+vacuum pg_proc;
 -- Reset all faults.
-select gp_inject_fault('all', 'reset', '', '', '', 0, 0, dbid) from gp_segment_configuration;
-NOTICE:  Success:
-NOTICE:  Success:
-NOTICE:  Success:
-NOTICE:  Success:
-NOTICE:  Success:
-NOTICE:  Success:
-NOTICE:  Success:
- gp_inject_fault 
------------------
- t
- t
- t
- t
- t
- t
- t
-(7 rows)
+-- 
+-- NOTICE: important.
+--
+-- we use gp_inject_fault_infinite here instead of
+-- gp_inject_fault so cache of pg_proc that contains
+-- gp_inject_fault_infinite is loaded before checkpoint and
+-- the following gp_inject_fault_infinite don't dirty the
+-- buffer again.
+select gp_inject_fault_infinite('all', 'reset', dbid) from gp_segment_configuration;
+ gp_inject_fault_infinite 
+--------------------------
+ Success:
+ Success:
+ Success:
+ Success:
+ Success:
+ Success:
+ Success:
+ Success:
+(8 rows)
 
 -- Start with a clean slate (no dirty buffers).
 checkpoint;
 -- Skip checkpoints.
-select gp_inject_fault('checkpoint', 'skip', '', '', '', 0, 0, dbid)
+select gp_inject_fault_infinite('checkpoint', 'skip', dbid)
 from gp_segment_configuration where role = 'p' and content > -1;
-NOTICE:  Success:
-NOTICE:  Success:
-NOTICE:  Success:
- gp_inject_fault 
------------------
- t
- t
- t
+ gp_inject_fault_infinite 
+--------------------------
+ Success:
+ Success:
+ Success:
 (3 rows)
 
 -- Suspend bgwriter.
-select gp_inject_fault('fault_in_background_writer_main', 'suspend', '', '', '', 0, 0, dbid)
+select gp_inject_fault_infinite('fault_in_background_writer_main', 'suspend', dbid)
 from gp_segment_configuration where role = 'p' and content > -1;
-NOTICE:  Success:
-NOTICE:  Success:
-NOTICE:  Success:
- gp_inject_fault 
------------------
- t
- t
- t
+ gp_inject_fault_infinite 
+--------------------------
+ Success:
+ Success:
+ Success:
 (3 rows)
 
 -- Ensure no buffers are dirty before we start.
@@ -132,29 +135,23 @@ select sum(num_dirty('fsync_test2'::regclass)) > 0 as passed
 (1 row)
 
 -- Flush all dirty pages by BgBufferSync()
-select gp_inject_fault('bg_buffer_sync_default_logic', 'skip', '', '', '', 0, 0, dbid)
+select gp_inject_fault_infinite('bg_buffer_sync_default_logic', 'skip', dbid)
 from gp_segment_configuration where role = 'p' and content > -1;
-NOTICE:  Success:
-NOTICE:  Success:
-NOTICE:  Success:
- gp_inject_fault 
------------------
- t
- t
- t
+ gp_inject_fault_infinite 
+--------------------------
+ Success:
+ Success:
+ Success:
 (3 rows)
 
 -- Resume bgwriter.
-select gp_inject_fault('fault_in_background_writer_main', 'resume', '', '', '', 0, 0, dbid)
+select gp_inject_fault('fault_in_background_writer_main', 'resume', dbid)
 from gp_segment_configuration where role = 'p' and content > -1;
-NOTICE:  Success:
-NOTICE:  Success:
-NOTICE:  Success:
  gp_inject_fault 
 -----------------
- t
- t
- t
+ Success:
+ Success:
+ Success:
 (3 rows)
 
 -- Wait until bgwriter sweeps through and writes out dirty buffers.
@@ -174,29 +171,23 @@ select wait_for_bgwriter('fsync_test2'::regclass, 25) as passed;
 (1 row)
 
 -- Inject fault to count relfiles fsync'ed by checkpointer.
-select gp_inject_fault('fsync_counter', 'skip', '', '', '', 0, 0, dbid)
+select gp_inject_fault_infinite('fsync_counter', 'skip', dbid)
 from gp_segment_configuration where role = 'p' and content > -1;
-NOTICE:  Success:
-NOTICE:  Success:
-NOTICE:  Success:
- gp_inject_fault 
------------------
- t
- t
- t
+ gp_inject_fault_infinite 
+--------------------------
+ Success:
+ Success:
+ Success:
 (3 rows)
 
 -- Resume checkpoints.
-select gp_inject_fault('checkpoint', 'reset', '', '', '', 0, 0, dbid)
+select gp_inject_fault('checkpoint', 'reset', dbid)
 from gp_segment_configuration where role = 'p' and content > -1;
-NOTICE:  Success:
-NOTICE:  Success:
-NOTICE:  Success:
  gp_inject_fault 
 -----------------
- t
- t
- t
+ Success:
+ Success:
+ Success:
 (3 rows)
 
 checkpoint;
@@ -211,30 +202,24 @@ select dirty_buffers() from gp_dist_random('gp_id')
 -- least 2.  The two files fsync'ed should be corresponding to
 -- fsync_test1 and fsync_test2 tables. `num times hit` is corresponding
 -- to the number of files synced by `fsync_counter` fault type.
-select gp_inject_fault('fsync_counter', 'status', '', '', '', 0, 0, 2::smallint);
-NOTICE:  Success: fault name:'fsync_counter' fault type:'skip' ddl statement:'' database name:'' table name:'' occurrence:'-1' sleep time:'0' fault injection state:'triggered'  num times hit:'5'
- gp_inject_fault 
------------------
- t
+select gp_inject_fault('fsync_counter', 'status', 2::smallint);
+                                                                                                  gp_inject_fault                                                                                                   
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Success: fault name:'fsync_counter' fault type:'skip' ddl statement:'' database name:'' table name:'' start occurrence:'1' end occurrence:'-1' extra arg:'0' fault injection state:'triggered'  num times hit:'6' +
+ 
 (1 row)
 
 -- Reset all faults.
-select gp_inject_fault('all', 'reset', '', '', '', 0, 0, dbid) from gp_segment_configuration;
-NOTICE:  Success:
-NOTICE:  Success:
-NOTICE:  Success:
-NOTICE:  Success:
-NOTICE:  Success:
-NOTICE:  Success:
-NOTICE:  Success:
+select gp_inject_fault('all', 'reset', dbid) from gp_segment_configuration;
  gp_inject_fault 
 -----------------
- t
- t
- t
- t
- t
- t
- t
-(7 rows)
+ Success:
+ Success:
+ Success:
+ Success:
+ Success:
+ Success:
+ Success:
+ Success:
+(8 rows)
 

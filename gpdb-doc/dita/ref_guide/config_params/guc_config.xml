@@ -21,11 +21,14 @@
   <topic id="topic_vsn_22l_z4">
     <title>Parameter Types and Values</title>
     <body>
-      <p>All parameter names are case-insensitive. Every parameter takes a value of one of four
-        types: <codeph>Boolean</codeph>, <codeph>integer</codeph>, <codeph>floating point</codeph>,
-        or <codeph>string</codeph>. Boolean values may be written as <codeph>ON</codeph>,
+      <p>All parameter names are case-insensitive. Every parameter takes a value of one of the
+        following types: <codeph>Boolean</codeph>, <codeph>integer</codeph>, <codeph>floating point</codeph>,
+        <codeph>enum</codeph>, or <codeph>string</codeph>.</p>
+      <p>Boolean values may be specified as <codeph>ON</codeph>,
           <codeph>OFF</codeph>, <codeph>TRUE</codeph>, <codeph>FALSE</codeph>, <codeph>YES</codeph>,
           <codeph>NO</codeph>, <codeph>1</codeph>, <codeph>0</codeph> (all case-insensitive).</p>
+      <p>Enum-type parameters are specified in the same manner as string parameters, but are
+        restricted to a limited set of values. Enum parameter values are case-insensitive.</p> 
       <p>Some settings specify a memory size or time value. Each of these has an implicit unit,
         which is either kilobytes, blocks (typically eight kilobytes), milliseconds, seconds, or
         minutes. Valid memory size units are <codeph>kB</codeph> (kilobytes), <codeph>MB</codeph>
@@ -47,7 +50,8 @@
         Database superuser. Other parameters require a restart of the system for the changes to take
         effect. A parameter that is classified as <i>session</i> can be set at the system level (in
         the <codeph>postgresql.conf</codeph> file), at the database-level (using <codeph>ALTER
-          DATABASE</codeph>), at the role-level (using <codeph>ALTER ROLE</codeph>), or at the
+          DATABASE</codeph>), at the role-level (using <codeph>ALTER ROLE</codeph>), at the
+           database- and role-level (<codeph>ALTER ROLE...IN DATABASE...SET</codeph>, or at the
         session-level (using <codeph>SET</codeph>). System parameters can only be set in the
           <codeph>postgresql.conf</codeph> file.</p>
       <p>In Greenplum Database, the master and each segment instance has its own
@@ -87,9 +91,10 @@
                 database session, and can have a hierarchy of settings: at the system level
                   (<codeph>postgresql.conf</codeph>), at the database level (<codeph>ALTER
                   DATABASE...SET</codeph>), at the role level (<codeph>ALTER ROLE...SET</codeph>),
+                at the database and role level (<codeph>ALTER ROLE...IN DATABASE...SET</codeph>),
                 or at the session level (<codeph>SET</codeph>). If the parameter is set at multiple
                 levels, then the most granular setting takes precedence (for example, session
-                overrides role, role overrides database, and database overrides system).<p>A
+                overrides database and role, database and role overrides role, role overrides database, and database overrides system).<p>A
                     <i>system</i> parameter can only be changed via the <codeph>postgresql.conf
                   </codeph>file(s).</p></entry>
             </row>

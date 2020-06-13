@@ -2,11 +2,11 @@
  *
  *	  ASCII <--> UTF8
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/mb/conversion_procs/utf8_and_ascii/utf8_and_ascii.c,v 1.18 2009/01/29 19:23:39 tgl Exp $
+ *	  src/backend/utils/mb/conversion_procs/utf8_and_ascii/utf8_and_ascii.c
  *
  *-------------------------------------------------------------------------
  */
@@ -19,9 +19,6 @@ PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(ascii_to_utf8);
 PG_FUNCTION_INFO_V1(utf8_to_ascii);
-
-extern Datum ascii_to_utf8(PG_FUNCTION_ARGS);
-extern Datum utf8_to_ascii(PG_FUNCTION_ARGS);
 
 /* ----------
  * conv_proc(

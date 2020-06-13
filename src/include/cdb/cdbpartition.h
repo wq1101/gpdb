@@ -33,31 +33,6 @@ typedef enum
 	PART_STATUS_LEAF	/* a leaf part of a partitioned table */
 } PartStatus;
 
-/* cache of function lookups for range partition selection */
-typedef struct PartitionRangeState
-{
-	FmgrInfo *ltfuncs_direct; /* comparator expr < partRule */
-	FmgrInfo *lefuncs_direct; /* comparator expr <= partRule */
-	FmgrInfo *ltfuncs_inverse; /* comparator partRule < expr */
-	FmgrInfo *lefuncs_inverse; /* comparator partRule <= expr */
-	int last_rule; /* cache offset to the last rule and test if it matches */
-	PartitionRule **rules;
-} PartitionRangeState;
-
-/* likewise, for list */
-typedef struct PartitionListState
-{
-	FmgrInfo *eqfuncs;
-	bool *eqinit;
-} PartitionListState;
-
-/* likewise, for hash */
-typedef struct PartitionHashState
-{
-	FmgrInfo *hashfuncs;
-	bool *hashinit;
-} PartitionHashState;
-
 typedef struct LogicalIndexes
 {
 	int			numLogicalIndexes;
@@ -79,6 +54,8 @@ extern bool rel_has_external_partition(Oid relid);
 extern bool rel_has_appendonly_partition(Oid relid);
 
 extern bool rel_is_child_partition(Oid relid);
+
+extern bool rel_is_interior_partition(Oid relid);
 
 extern bool rel_is_leaf_partition(Oid relid);
 
@@ -139,13 +116,8 @@ rel_get_part_path_pretty(Oid relid, char *separator, char *lastsep);
 extern bool 
 partition_policies_equal(GpPolicy *p, PartitionNode *pn);
 
-extern void 
-partition_get_policies_attrs(PartitionNode *pn,
-										 GpPolicy *master_policy,
-							             List **cols);
-
 /* RelationBuildPartitionDesc is built from get_parts */
-extern PartitionNode *get_parts(Oid relid, int2 level, Oid parent, bool inctemplate,
+extern PartitionNode *get_parts(Oid relid, int16 level, Oid parent, bool inctemplate,
 		  bool includesubparts);
 
 extern PartitionNode *RelationBuildPartitionDesc(Relation rel,
@@ -190,17 +162,6 @@ exchange_part_rule(Oid oldrelid, Oid newrelid);
 extern void
 exchange_permissions(Oid oldrelid, Oid newrelid);
 
-extern bool
-atpxModifyListOverlap (Relation rel,
-					   AlterPartitionId *pid,
-					   PgPartRule   	*prule,
-					   PartitionElem 	*pelem,
-					   bool bAdd);
-extern bool
-atpxModifyRangeOverlap (Relation 		 		 rel,
-						AlterPartitionId 		*pid,
-						PgPartRule   			*prule,
-						PartitionElem 			*pelem);
 extern List *
 atpxRenameList(PartitionNode *pNode,
 			   char *old_parentname, const char *new_parentname, int *skipped);
@@ -209,14 +170,13 @@ extern List *
 basic_AT_oids(Relation rel, AlterTableCmd *cmd);
 
 extern AlterTableCmd *basic_AT_cmd(AlterTableCmd *cmd);
-extern bool can_implement_dist_on_part(Relation rel, List *dist_cnames);
+extern bool can_implement_dist_on_part(Relation rel, DistributedBy *dist);
 extern bool is_exchangeable(Relation rel, Relation oldrel, Relation newrel, bool fthrow);
 
 extern void
 fixCreateStmtForPartitionedTable(CreateStmt *stmt);
 
-extern void
-checkUniqueConstraintVsPartitioning(Relation rel, AttrNumber *indattr, int nidxatts, bool primary);
+extern void index_check_partitioning_compatible(Relation rel, AttrNumber *indattr, Oid *exclops, int nidxatts, bool primary);
 
 extern List *
 selectPartitionMulti(PartitionNode *partnode, Datum *values, bool *isnull,

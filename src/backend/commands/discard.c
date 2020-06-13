@@ -3,11 +3,11 @@
  * discard.c
  *	  The implementation of the DISCARD command
  *
- * Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Copyright (c) 1996-2016, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/commands/discard.c,v 1.4.2.1 2008/11/27 00:34:49 tgl Exp $
+ *	  src/backend/commands/discard.c
  *
  *-------------------------------------------------------------------------
  */
@@ -18,15 +18,18 @@
 #include "commands/async.h"
 #include "commands/discard.h"
 #include "commands/prepare.h"
-#include "commands/variable.h"
-#include "storage/lock.h"
-#include "utils/plancache.h"
+#include "commands/sequence.h"
+#include "utils/guc.h"
 #include "utils/portal.h"
+
+#include "cdb/cdbdisp_query.h"
+#include "cdb/cdbgang.h"
+#include "cdb/cdbvars.h"
 
 static void DiscardAll(bool isTopLevel);
 
 /*
- * DISCARD { ALL | TEMP | PLANS }
+ * DISCARD { ALL | SEQUENCES | TEMP | PLANS }
  */
 void
 DiscardCommand(DiscardStmt *stmt, bool isTopLevel)
@@ -35,14 +38,34 @@ DiscardCommand(DiscardStmt *stmt, bool isTopLevel)
 	{
 		case DISCARD_ALL:
 			DiscardAll(isTopLevel);
+
+			/*
+			 * DISCARD ALL is not allowed in a transaction block. It is not
+			 * currently possible to safeguard from side-effecs of errors.
+			 *
+			 * Do not dispatch.
+			 */
 			break;
 
 		case DISCARD_PLANS:
 			ResetPlanCache();
+			/* no dispatch, there should be no cached plans in segments */
+			break;
+
+		case DISCARD_SEQUENCES:
+			ResetSequenceCaches();
+			/* no dispatch, there should be no sequence caches in segments */
 			break;
 
 		case DISCARD_TEMP:
 			ResetTempTableNamespace();
+
+			/*
+			 * Dispatch using two-phase commit, so that the effect of DISCARD
+			 * TEMP can be rolled back if it's run in a transaction.
+			 */
+			if (Gp_role == GP_ROLE_DISPATCH)
+				CdbDispatchCommand("DISCARD TEMP", DF_NEED_TWO_PHASE, NULL);
 			break;
 
 		default:
@@ -62,12 +85,29 @@ DiscardAll(bool isTopLevel)
 	 */
 	PreventTransactionChain(isTopLevel, "DISCARD ALL");
 
+	/*
+	 * GPDB: It is not possible to safely dispatch DISCARD ALL and safe guard
+	 * from errors. Advice users (very frequently connection pooling
+	 * applications e.g. pgbouncer) to use a lighter and safer version e.g.
+	 * DEALLOCATE ALL, or DISCARD TEMP
+	 *
+	 */
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		ereport(NOTICE,
+				(errcode(ERRCODE_GP_FEATURE_NOT_YET),
+				 errmsg("command without clusterwide effect"),
+				 errhint("Consider alternatives as DEALLOCATE ALL, or DISCARD TEMP if a clusterwide effect is desired.")));
+	}
+
+	/* Closing portals might run user-defined code, so do that first. */
+	PortalHashTableDeleteAll();
 	SetPGVariable("session_authorization", NIL, false);
 	ResetAllOptions();
 	DropAllPreparedStatements();
-	PortalHashTableDeleteAll();
 	Async_UnlistenAll();
 	LockReleaseAll(USER_LOCKMETHOD, true);
 	ResetPlanCache();
 	ResetTempTableNamespace();
+	ResetSequenceCaches();
 }

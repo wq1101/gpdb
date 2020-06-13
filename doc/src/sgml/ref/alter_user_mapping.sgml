@@ -1,11 +1,15 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/alter_user_mapping.sgml,v 1.4 2009/09/19 10:23:26 petere Exp $
+doc/src/sgml/ref/alter_user_mapping.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-ALTERUSERMAPPING">
+ <indexterm zone="sql-alterusermapping">
+  <primary>ALTER USER MAPPING</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="sql-alterusermapping-title">ALTER USER MAPPING</refentrytitle>
+  <refentrytitle>ALTER USER MAPPING</refentrytitle>
   <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
@@ -15,13 +19,9 @@ PostgreSQL documentation
   <refpurpose>change the definition of a user mapping</refpurpose>
  </refnamediv>
 
- <indexterm zone="sql-alterusermapping">
-  <primary>ALTER USER MAPPING</primary>
- </indexterm>
-
  <refsynopsisdiv>
 <synopsis>
-ALTER USER MAPPING FOR { <replaceable class="parameter">user_name</replaceable> | USER | CURRENT_USER | PUBLIC }
+ALTER USER MAPPING FOR { <replaceable class="parameter">user_name</replaceable> | USER | CURRENT_USER | SESSION_USER | PUBLIC }
     SERVER <replaceable class="parameter">server_name</replaceable>
     OPTIONS ( [ ADD | SET | DROP ] <replaceable class="PARAMETER">option</replaceable> ['<replaceable class="PARAMETER">value</replaceable>'] [, ... ] )
 </synopsis>
@@ -38,7 +38,7 @@ ALTER USER MAPPING FOR { <replaceable class="parameter">user_name</replaceable> 
   <para>
    The owner of a foreign server can alter user mappings for that
    server for any user.  Also, a user can alter a user mapping for
-   his own user name if <literal>USAGE</> privilege on the server has
+   their own user name if <literal>USAGE</> privilege on the server has
    been granted to the user.
   </para>
  </refsect1>
@@ -89,11 +89,10 @@ ALTER USER MAPPING FOR { <replaceable class="parameter">user_name</replaceable> 
   <title>Examples</title>
 
   <para>
-   Change the password for user mapping <literal>bob</>, server<literal> foo</>:
+   Change the password for user mapping <literal>bob</>, server <literal>foo</>:
 <programlisting>
-ALTER USER MAPPING FOR bob SERVER foo OPTIONS (user 'bob', password 'public');
-</programlisting>
-  </para>
+ALTER USER MAPPING FOR bob SERVER foo OPTIONS (SET password 'public');
+</programlisting></para>
 
  </refsect1>
 
@@ -117,8 +116,8 @@ ALTER USER MAPPING FOR bob SERVER foo OPTIONS (user 'bob', password 'public');
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-createusermapping" endterm="sql-createusermapping-title"></member>
-   <member><xref linkend="sql-dropusermapping" endterm="sql-dropusermapping-title"></member>
+   <member><xref linkend="sql-createusermapping"></member>
+   <member><xref linkend="sql-dropusermapping"></member>
   </simplelist>
  </refsect1>
 

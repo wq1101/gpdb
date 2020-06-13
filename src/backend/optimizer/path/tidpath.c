@@ -19,7 +19,7 @@
  * representation all the way through to execution.
  *
  * There is currently no special support for joins involving CTID; in
- * particular nothing corresponding to best_inner_indexscan().	Since it's
+ * particular nothing corresponding to best_inner_indexscan().  Since it's
  * not very useful to store TIDs of one table in another table, there
  * doesn't seem to be enough use-case to justify adding a lot of code
  * for that.
@@ -27,24 +27,24 @@
  *
  * Portions Copyright (c) 2007-2008, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/optimizer/path/tidpath.c,v 1.31 2008/01/01 19:45:50 momjian Exp $
+ *	  src/backend/optimizer/path/tidpath.c
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
-#include "access/htup.h"
+#include "access/sysattr.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
+#include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
-#include "parser/parse_expr.h"
 
 
 static bool IsTidEqualClause(OpExpr *node, int varno);
@@ -59,7 +59,7 @@ static List *TidQualFromRestrictinfo(List *restrictinfo, int varno);
  * or
  *		pseudoconstant = CTID
  *
- * We check that the CTID Var belongs to relation "varno".	That is probably
+ * We check that the CTID Var belongs to relation "varno".  That is probably
  * redundant considering this is only applied to restriction clauses, but
  * let's be safe.
  */
@@ -248,18 +248,24 @@ TidQualFromRestrictinfo(List *restrictinfo, int varno)
  *
  *	  Candidate paths are added to the rel's pathlist (using add_path).
  *
- * CDB: Instead of handing the paths to add_path(), we append them to a List
- * (*ppathlist) belonging to the caller.
- *
  * CDB TODO: Set rel->onerow if at most one tid is to be fetched.
  */
 void
-create_tidscan_paths(PlannerInfo *root, RelOptInfo *rel, List** ppathlist)
+create_tidscan_paths(PlannerInfo *root, RelOptInfo *rel)
 {
+	Relids		required_outer;
 	List	   *tidquals;
+
+	/*
+	 * We don't support pushing join clauses into the quals of a tidscan, but
+	 * it could still have required parameterization due to LATERAL refs in
+	 * its tlist.
+	 */
+	required_outer = rel->lateral_relids;
 
 	tidquals = TidQualFromRestrictinfo(rel->baserestrictinfo, rel->relid);
 
 	if (tidquals)
-		*ppathlist = lappend(*ppathlist, create_tidscan_path(root, rel, tidquals));
+		add_path(rel, (Path *) create_tidscan_path(root, rel, tidquals,
+												   required_outer));
 }

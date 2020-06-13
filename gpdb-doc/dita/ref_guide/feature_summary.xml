@@ -40,7 +40,7 @@
               EXISTS</codeph> clauses that Greenplum's parallel optimizer cannot rewrite into
             joins.</li>
           <li id="ik264484">Backwards scrolling cursors, including the use of <codeph>FETCH
-              PRIOR</codeph>, <codeph>FETCH FIRST</codeph>, <codeph>FETCH ABOLUTE</codeph>, and
+              PRIOR</codeph>, <codeph>FETCH FIRST</codeph>, <codeph>FETCH ABSOLUTE</codeph>, and
               <codeph>FETCH RELATIVE</codeph>.</li>
           <li id="ik264507">In <codeph>CREATE TABLE</codeph> statements (on hash-distributed
             tables): a <codeph>UNIQUE</codeph> or <codeph>PRIMARY KEY</codeph> clause must include
@@ -82,8 +82,6 @@
           <li id="ik264840"><codeph>INTERVAL</codeph> literals are supported in Greenplum Database,
             but do not conform to the standard.</li>
           <li id="ik264841"><codeph>GET DIAGNOSTICS</codeph> statement.</li>
-          <li id="ik264842"><codeph>GRANT INSERT</codeph> or <codeph>UPDATE</codeph> privileges on
-            columns. Privileges can only be granted on tables in Greenplum Database.</li>
           <li id="ik264843"><codeph>GLOBAL TEMPORARY TABLE</codeph>s and <codeph>LOCAL TEMPORARY
               TABLE</codeph>s. Greenplum <codeph>TEMPORARY TABLE</codeph>s do not conform to the SQL
             standard, but many commercial database systems have implemented temporary tables in the
@@ -161,8 +159,6 @@
             as a work-around to get random samples from tables.</li>
           <li id="ik265712">The <i>partitioned join tables</i> construct (<codeph>PARTITION
               BY</codeph> in a join).</li>
-          <li id="ik265713"><codeph>GRANT SELECT</codeph> privileges on columns. Privileges can only
-            be granted on tables in Greenplum Database. Views can be used as a work-around.</li>
           <li id="ik265714">For <codeph>CREATE TABLE x (LIKE(y))</codeph> statements, Greenplum does
             not support the
               <codeph>[INCLUDING|EXCLUDING]</codeph><codeph>[DEFAULTS|CONSTRAINTS|INDEXES]</codeph>
@@ -202,14 +198,19 @@ NEXT 10 ROWS ONLY; </codeblock><p>Greenplum
   <topic id="topic8" xml:lang="en">
     <title id="ik264019">Greenplum and PostgreSQL Compatibility</title>
     <body>
-      <p>Greenplum Database is based on PostgreSQL 8.3 with additional features from newer
-        PostgreSQL releases. To support the distributed nature and typical workload of a Greenplum
-        Database system, some SQL commands have been added or modified, and there are a few
-        PostgreSQL features that are not supported. Greenplum has also added features not found in
-        PostgreSQL, such as physical data distribution, parallel query optimization, external
-        tables, resource queues for workload management and enhanced table partitioning. For full
+      <p>Greenplum Database is based on PostgreSQL 9.4. To support the distributed nature and
+        typical workload of a Greenplum Database system, some SQL commands have been added or
+        modified, and there are a few PostgreSQL features that are not supported. Greenplum has also
+        added features not found in PostgreSQL, such as physical data distribution, parallel query
+        optimization, external tables, resource queues, and enhanced table partitioning. For full
         SQL syntax and references, see the <xref href="sql_commands/sql_ref.xml#topic1" type="topic"
-          format="dita"/>.</p>
+          format="dita"/>.<note>Greenplum Database does not support the PostgreSQL <xref
+            href="https://www.postgresql.org/docs/9.4/largeobjects.html" format="html"
+            scope="external">large object facility</xref> for streaming user data that is stored in
+          large-object structures.</note><note otherprops="pivotal">Pivotal does not support using
+            <codeph>WITH OIDS</codeph> or <codeph>oids=TRUE</codeph> to assign an OID system column
+          when creating or altering a table.  This syntax is deprecated and will be removed in a
+          future Greenplum release.</note></p>
       <table id="ik213423">
         <title>SQL Support in Greenplum Database</title>
         <tgroup cols="3">
@@ -249,12 +250,6 @@ NEXT 10 ROWS ONLY; </codeblock><p>Greenplum
               <entry colname="col2">YES</entry>
               <entry colname="col3">Changes the definition of a Greenplum Database extension - based
                 on PostgreSQL 9.6. </entry>
-            </row>
-            <row>
-              <entry colname="col1"><codeph>ALTER FILESPACE</codeph></entry>
-              <entry colname="col2">YES</entry>
-              <entry colname="col3">Greenplum Database parallel tablespace feature - not in
-                PostgreSQL 8.3.</entry>
             </row>
             <row>
               <entry colname="col1"><codeph>ALTER FUNCTION</codeph></entry>
@@ -300,7 +295,7 @@ NEXT 10 ROWS ONLY; </codeblock><p>Greenplum
             <row>
               <entry colname="col1"><codeph>ALTER RESOURCE QUEUE</codeph></entry>
               <entry colname="col2">YES</entry>
-              <entry colname="col3">Greenplum Database workload management feature - not in
+              <entry colname="col3">Greenplum Database resource management feature - not in
                 PostgreSQL.</entry>
             </row>
             <row>
@@ -318,6 +313,11 @@ NEXT 10 ROWS ONLY; </codeblock><p>Greenplum
               <entry colname="col1"><codeph>ALTER SEQUENCE</codeph></entry>
               <entry colname="col2">YES</entry>
               <entry colname="col3"/>
+            </row>
+            <row>
+              <entry><codeph>ALTER SYSTEM</codeph></entry>
+              <entry><b>NO</b></entry>
+              <entry/>
             </row>
             <row>
               <entry colname="col1"><codeph>ALTER TABLE</codeph></entry>
@@ -342,7 +342,8 @@ NEXT 10 ROWS ONLY; </codeblock><p>Greenplum
             <row>
               <entry colname="col1"><codeph>ALTER TYPE</codeph></entry>
               <entry colname="col2">YES</entry>
-              <entry colname="col3"/>
+              <entry colname="col3"><b>Greenplum Database Clauses:</b><p><codeph>SET DEFAULT
+                    ENCODING</codeph></p></entry>
             </row>
             <row>
               <entry colname="col1"><codeph>ALTER USER</codeph></entry>
@@ -408,7 +409,7 @@ NEXT 10 ROWS ONLY; </codeblock><p>Greenplum
               <entry colname="col2">YES</entry>
               <entry colname="col3"><b>Unsupported Clauses / Options:</b><p><codeph>[ , SORTOP =
                     </codeph><i>sort_operator</i><codeph> ]</codeph></p><p><b>Greenplum Database
-                    Clauses:</b></p><p><codeph>[ , PREFUNC = </codeph><i>prefunc</i><codeph>
+                    Clauses:</b></p><p><codeph>[ , COMBINEFUNC = </codeph><i>combinefunc</i><codeph>
                     ]</codeph></p><p><b>Limitations:</b></p><p>The functions used to implement the
                   aggregate must be <codeph>IMMUTABLE</codeph> functions.</p></entry>
             </row>
@@ -440,14 +441,14 @@ NEXT 10 ROWS ONLY; </codeblock><p>Greenplum
             <row>
               <entry colname="col1"><codeph>CREATE EXTENSION</codeph></entry>
               <entry colname="col2">YES</entry>
-              <entry colname="col3">Loads a new extension into Greenplum Database -  based on
+              <entry colname="col3">Loads a new extension into Greenplum Database - based on
                 PostgreSQL 9.6.</entry>
             </row>
             <row>
               <entry colname="col1"><codeph>CREATE EXTERNAL TABLE</codeph></entry>
               <entry colname="col2">YES</entry>
               <entry colname="col3">Greenplum Database parallel ETL feature - not in PostgreSQL
-                8.3.</entry>
+                9.4.</entry>
             </row>
             <row>
               <entry colname="col1"><codeph>CREATE FUNCTION</codeph></entry>
@@ -482,6 +483,11 @@ NEXT 10 ROWS ONLY; </codeblock><p>Greenplum
               <entry colname="col3"/>
             </row>
             <row>
+              <entry><codeph>CREATE MATERIALIZED VIEW</codeph></entry>
+              <entry>YES</entry>
+              <entry>Based on PostgreSQL 9.4.</entry>
+            </row>
+            <row>
               <entry colname="col1"><codeph>CREATE OPERATOR</codeph></entry>
               <entry colname="col2">YES</entry>
               <entry colname="col3"><b>Limitations:</b><p>The function used to implement the
@@ -505,8 +511,8 @@ NEXT 10 ROWS ONLY; </codeblock><p>Greenplum
             <row>
               <entry colname="col1"><codeph>CREATE RESOURCE QUEUE</codeph></entry>
               <entry colname="col2">YES</entry>
-              <entry colname="col3">Greenplum Database workload management feature - not in
-                PostgreSQL 8.3.</entry>
+              <entry colname="col3">Greenplum Database resource management feature - not in
+                PostgreSQL 9.4.</entry>
             </row>
             <row>
               <entry colname="col1"><codeph>CREATE ROLE</codeph></entry>
@@ -527,10 +533,10 @@ NEXT 10 ROWS ONLY; </codeblock><p>Greenplum
             <row>
               <entry colname="col1"><codeph>CREATE SEQUENCE</codeph></entry>
               <entry colname="col2">YES</entry>
-              <entry colname="col3"><b>Limitations:</b><p>The <codeph>lastval</codeph> and
-                    <codeph>currval</codeph> functions are not supported.</p><p>The
-                    <codeph>setval</codeph> function is only allowed in queries that do not operate
-                  on distributed data.</p></entry>
+              <entry colname="col3"><b>Limitations:</b><p>The <codeph>lastval()</codeph> and
+                    <codeph>currval()</codeph> functions are not supported.</p><p>The
+                    <codeph>setval()</codeph> function is only allowed in queries that do not
+                  operate on distributed data.</p></entry>
             </row>
             <row>
               <entry colname="col1"><codeph>CREATE TABLE</codeph></entry>
@@ -547,7 +553,7 @@ NEXT 10 ROWS ONLY; </codeblock><p>Greenplum
                       (<i>column</i>, [ ... ] ) |</codeph></p><p><codeph>DISTRIBUTED
                     RANDOMLY</codeph></p><p><codeph>PARTITION BY <i>type</i> (<i>column</i> [, ...])
                        ( <i>partition_specification</i>, [...] )</codeph></p><p><codeph>WITH
-                    (appendonly=true      [,compresslevel=value,blocksize=value]
+                    (appendoptimized=true      [,compresslevel=value,blocksize=value]
                 )</codeph></p></entry>
             </row>
             <row>
@@ -558,9 +564,10 @@ NEXT 10 ROWS ONLY; </codeblock><p>Greenplum
             </row>
             <row>
               <entry colname="col1"><codeph>CREATE TABLESPACE</codeph></entry>
-              <entry colname="col2"><b otherprops="red">NO</b></entry>
-              <entry colname="col3"><b>Greenplum Database Clauses:</b><p><codeph>FILESPACE
-                    </codeph><i>filespace_name</i></p></entry>
+              <entry colname="col2"><b otherprops="red">YES</b></entry>
+              <entry colname="col3"><b>Greenplum Database Clauses:</b><p>Specify host file system
+                  locations for specific segment instances.</p><p><codeph>WITH
+                      (content<varname>ID_1</varname>='<varname>/path/to/dir1</varname>...)</codeph></p></entry>
             </row>
             <row>
               <entry colname="col1"><codeph>CREATE TRIGGER</codeph></entry>
@@ -570,8 +577,10 @@ NEXT 10 ROWS ONLY; </codeblock><p>Greenplum
             <row>
               <entry colname="col1"><codeph>CREATE TYPE</codeph></entry>
               <entry colname="col2">YES</entry>
-              <entry colname="col3"><b>Limitations:</b><p>The functions used to implement a new base
-                  type must be <codeph>IMMUTABLE</codeph> functions.</p></entry>
+              <entry colname="col3"><b>Greenplum Database Clauses:</b><p><codeph>COMPRESSTYPE |
+                    COMPRESSLEVEL | BLOCKSIZE</codeph></p><p><b>Limitations:</b></p><p>The functions
+                  used to implement a new base type must be <codeph>IMMUTABLE</codeph>
+                  functions.</p></entry>
             </row>
             <row>
               <entry colname="col1"><codeph>CREATE USER</codeph></entry>
@@ -601,13 +610,15 @@ NEXT 10 ROWS ONLY; </codeblock><p>Greenplum
             <row>
               <entry colname="col1"><codeph>DELETE</codeph></entry>
               <entry colname="col2">YES</entry>
-              <entry colname="col3"><b>Unsupported Clauses /
-                    Options:</b><p><codeph>RETURNING</codeph></p></entry>
+              <entry colname="col3"/>
             </row>
             <row>
               <entry colname="col1"><codeph>DISCARD</codeph></entry>
               <entry colname="col2">YES</entry>
-              <entry colname="col3"/>
+              <entry colname="col3">
+                <p><b>Limitation:</b>
+                  <codeph>DISCARD ALL</codeph> is not supported.</p>
+              </entry>
             </row>
             <row>
               <entry colname="col1"><codeph>DO</codeph></entry>
@@ -649,13 +660,7 @@ NEXT 10 ROWS ONLY; </codeblock><p>Greenplum
               <entry colname="col1"><codeph>DROP EXTERNAL TABLE</codeph></entry>
               <entry colname="col2">YES</entry>
               <entry colname="col3">Greenplum Database parallel ETL feature - not in PostgreSQL
-                8.3.</entry>
-            </row>
-            <row>
-              <entry colname="col1"><codeph>DROP FILESPACE</codeph></entry>
-              <entry colname="col2">YES</entry>
-              <entry colname="col3">Greenplum Database parallel tablespace feature - not in
-                PostgreSQL 8.3.</entry>
+                9.4.</entry>
             </row>
             <row>
               <entry colname="col1"><codeph>DROP FUNCTION</codeph></entry>
@@ -706,8 +711,8 @@ NEXT 10 ROWS ONLY; </codeblock><p>Greenplum
             <row>
               <entry colname="col1"><codeph>DROP RESOURCE QUEUE</codeph></entry>
               <entry colname="col2">YES</entry>
-              <entry colname="col3">Greenplum Database workload management feature - not in
-                PostgreSQL 8.3.</entry>
+              <entry colname="col3">Greenplum Database resource management feature - not in
+                PostgreSQL 9.4.</entry>
             </row>
             <row>
               <entry colname="col1"><codeph>DROP ROLE</codeph></entry>
@@ -736,7 +741,7 @@ NEXT 10 ROWS ONLY; </codeblock><p>Greenplum
             </row>
             <row>
               <entry colname="col1"><codeph>DROP TABLESPACE</codeph></entry>
-              <entry colname="col2"><b otherprops="red">NO</b></entry>
+              <entry colname="col2">YES</entry>
               <entry colname="col3"/>
             </row>
             <row>
@@ -791,8 +796,12 @@ NEXT 10 ROWS ONLY; </codeblock><p>Greenplum
             <row>
               <entry colname="col1"><codeph>INSERT</codeph></entry>
               <entry colname="col2">YES</entry>
-              <entry colname="col3"><b>Unsupported Clauses /
-                    Options:</b><p><codeph>RETURNING</codeph></p></entry>
+              <entry colname="col3"/>
+            </row>
+            <row>
+              <entry><codeph>LATERAL</codeph> Join Type</entry>
+              <entry><b>NO</b></entry>
+              <entry/>
             </row>
             <row>
               <entry colname="col1"><codeph>LISTEN</codeph></entry>
@@ -833,6 +842,11 @@ NEXT 10 ROWS ONLY; </codeblock><p>Greenplum
               <entry colname="col1"><codeph>REASSIGN OWNED</codeph></entry>
               <entry colname="col2">YES</entry>
               <entry colname="col3"/>
+            </row>
+            <row>
+              <entry><codeph>REFRESH MATERIALIZED VIEW</codeph></entry>
+              <entry>YES</entry>
+              <entry>Based on PostgreSQL 9.4.</entry>
             </row>
             <row>
               <entry colname="col1"><codeph>REINDEX</codeph></entry>
@@ -919,7 +933,9 @@ NEXT 10 ROWS ONLY; </codeblock><p>Greenplum
             <row>
               <entry colname="col1"><codeph>SET TRANSACTION</codeph></entry>
               <entry colname="col2">YES</entry>
-              <entry colname="col3"/>
+              <entry colname="col3"><b>Limitations:</b><p><codeph>DEFERRABLE</codeph> clause has no
+                  effect.</p><p><codeph>SET TRANSACTION SNAPSHOT</codeph> command is not
+                  supported.</p></entry>
             </row>
             <row>
               <entry colname="col1"><codeph>SHOW</codeph></entry>
@@ -944,9 +960,8 @@ NEXT 10 ROWS ONLY; </codeblock><p>Greenplum
             <row>
               <entry colname="col1"><codeph>UPDATE</codeph></entry>
               <entry colname="col2">YES</entry>
-              <entry colname="col3"><b>Unsupported
-                    Clauses:</b><p><codeph>RETURNING</codeph></p><p><b>Limitations:</b></p><p><codeph>SET</codeph>
-                  not allowed for Greenplum distribution key columns.</p></entry>
+              <entry colname="col3"><b>Limitations:</b><p><codeph>SET</codeph> not allowed for
+                  Greenplum distribution key columns.</p></entry>
             </row>
             <row>
               <entry colname="col1"><codeph>VACUUM</codeph></entry>

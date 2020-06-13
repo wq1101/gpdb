@@ -234,9 +234,9 @@ HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sur
 insert into x values (456),(12),(901),(678),(789),(345);
 insert into x values (456),(12),(901),(678),(789),(345);
 select avg(foo.b) from (select test1.b from test,test1 where test.col=test1.a and test1.b in (select x from x)) as foo;
-       avg        
-------------------
- 530.166666666667
+         avg          
+----------------------
+ 530.1666666666666667
 (1 row)
 
 CREATE FUNCTION complexquery() RETURNS float AS $$
@@ -365,40 +365,10 @@ select tbl16369_func9();
 select tbl16369_func10(5);
 NOTICE:  Yo there I'm number 5, next: 4
 NOTICE:  Yo there I'm number 4, next: 3
-CONTEXT:  SQL statement "SELECT  tbl16369_func10( $1  - 1)"
-PL/pgSQL function "tbl16369_func10" line 7 at assignment
 NOTICE:  Yo there I'm number 3, next: 2
-CONTEXT:  SQL statement "SELECT  tbl16369_func10( $1  - 1)"
-PL/pgSQL function "tbl16369_func10" line 7 at assignment
-SQL statement "SELECT  tbl16369_func10( $1  - 1)"
-PL/pgSQL function "tbl16369_func10" line 7 at assignment
 NOTICE:  Yo there I'm number 2, next: 1
-CONTEXT:  SQL statement "SELECT  tbl16369_func10( $1  - 1)"
-PL/pgSQL function "tbl16369_func10" line 7 at assignment
-SQL statement "SELECT  tbl16369_func10( $1  - 1)"
-PL/pgSQL function "tbl16369_func10" line 7 at assignment
-SQL statement "SELECT  tbl16369_func10( $1  - 1)"
-PL/pgSQL function "tbl16369_func10" line 7 at assignment
 NOTICE:  Yo there I'm number 1, next: 0
-CONTEXT:  SQL statement "SELECT  tbl16369_func10( $1  - 1)"
-PL/pgSQL function "tbl16369_func10" line 7 at assignment
-SQL statement "SELECT  tbl16369_func10( $1  - 1)"
-PL/pgSQL function "tbl16369_func10" line 7 at assignment
-SQL statement "SELECT  tbl16369_func10( $1  - 1)"
-PL/pgSQL function "tbl16369_func10" line 7 at assignment
-SQL statement "SELECT  tbl16369_func10( $1  - 1)"
-PL/pgSQL function "tbl16369_func10" line 7 at assignment
 INFO:  Alas we are at the end of our journey
-CONTEXT:  SQL statement "SELECT  tbl16369_func10( $1  - 1)"
-PL/pgSQL function "tbl16369_func10" line 7 at assignment
-SQL statement "SELECT  tbl16369_func10( $1  - 1)"
-PL/pgSQL function "tbl16369_func10" line 7 at assignment
-SQL statement "SELECT  tbl16369_func10( $1  - 1)"
-PL/pgSQL function "tbl16369_func10" line 7 at assignment
-SQL statement "SELECT  tbl16369_func10( $1  - 1)"
-PL/pgSQL function "tbl16369_func10" line 7 at assignment
-SQL statement "SELECT  tbl16369_func10( $1  - 1)"
-PL/pgSQL function "tbl16369_func10" line 7 at assignment
  tbl16369_func10 
 -----------------
  (789)
@@ -410,40 +380,10 @@ PL/pgSQL function "tbl16369_func10" line 7 at assignment
 select tbl16369_func11(5);
 NOTICE:  Yo there I'm number 5, next: 4
 NOTICE:  Yo there I'm number 4, next: 3
-CONTEXT:  SQL statement "SELECT  tbl16369_func11( $1  - 1)"
-PL/pgSQL function "tbl16369_func11" line 7 at assignment
 NOTICE:  Yo there I'm number 3, next: 2
-CONTEXT:  SQL statement "SELECT  tbl16369_func11( $1  - 1)"
-PL/pgSQL function "tbl16369_func11" line 7 at assignment
-SQL statement "SELECT  tbl16369_func11( $1  - 1)"
-PL/pgSQL function "tbl16369_func11" line 7 at assignment
 NOTICE:  Yo there I'm number 2, next: 1
-CONTEXT:  SQL statement "SELECT  tbl16369_func11( $1  - 1)"
-PL/pgSQL function "tbl16369_func11" line 7 at assignment
-SQL statement "SELECT  tbl16369_func11( $1  - 1)"
-PL/pgSQL function "tbl16369_func11" line 7 at assignment
-SQL statement "SELECT  tbl16369_func11( $1  - 1)"
-PL/pgSQL function "tbl16369_func11" line 7 at assignment
 NOTICE:  Yo there I'm number 1, next: 0
-CONTEXT:  SQL statement "SELECT  tbl16369_func11( $1  - 1)"
-PL/pgSQL function "tbl16369_func11" line 7 at assignment
-SQL statement "SELECT  tbl16369_func11( $1  - 1)"
-PL/pgSQL function "tbl16369_func11" line 7 at assignment
-SQL statement "SELECT  tbl16369_func11( $1  - 1)"
-PL/pgSQL function "tbl16369_func11" line 7 at assignment
-SQL statement "SELECT  tbl16369_func11( $1  - 1)"
-PL/pgSQL function "tbl16369_func11" line 7 at assignment
 INFO:  Alas we are at the end of our journey
-CONTEXT:  SQL statement "SELECT  tbl16369_func11( $1  - 1)"
-PL/pgSQL function "tbl16369_func11" line 7 at assignment
-SQL statement "SELECT  tbl16369_func11( $1  - 1)"
-PL/pgSQL function "tbl16369_func11" line 7 at assignment
-SQL statement "SELECT  tbl16369_func11( $1  - 1)"
-PL/pgSQL function "tbl16369_func11" line 7 at assignment
-SQL statement "SELECT  tbl16369_func11( $1  - 1)"
-PL/pgSQL function "tbl16369_func11" line 7 at assignment
-SQL statement "SELECT  tbl16369_func11( $1  - 1)"
-PL/pgSQL function "tbl16369_func11" line 7 at assignment
  tbl16369_func11 
 -----------------
  (789)
@@ -453,9 +393,9 @@ PL/pgSQL function "tbl16369_func11" line 7 at assignment
 -- Test: test12_funtion_with_complex_query.sql
 -- ----------------------------------------------------------------------
 select avg(foo.b) from (select test1.b from test,test1 where test.col=test1.a and test1.b in (select x from x)) as foo;
-       avg        
-------------------
- 530.166666666667
+         avg          
+----------------------
+ 530.1666666666666667
 (1 row)
 
 select complexquery();
@@ -479,76 +419,136 @@ select tbl16369_func12();
 select tbl16369_func1(),tbl16369_func2(),tbl16369_func4(),tbl16369_func5(),tbl16369_func10(5), tbl16369_func11(5), tbl16369_func12(), generate_series(1,10);
 NOTICE:  Yo there I'm number 5, next: 4
 NOTICE:  Yo there I'm number 4, next: 3
-CONTEXT:  SQL statement "SELECT  tbl16369_func10( $1  - 1)"
-PL/pgSQL function "tbl16369_func10" line 7 at assignment
 NOTICE:  Yo there I'm number 3, next: 2
-CONTEXT:  SQL statement "SELECT  tbl16369_func10( $1  - 1)"
-PL/pgSQL function "tbl16369_func10" line 7 at assignment
-SQL statement "SELECT  tbl16369_func10( $1  - 1)"
-PL/pgSQL function "tbl16369_func10" line 7 at assignment
 NOTICE:  Yo there I'm number 2, next: 1
-CONTEXT:  SQL statement "SELECT  tbl16369_func10( $1  - 1)"
-PL/pgSQL function "tbl16369_func10" line 7 at assignment
-SQL statement "SELECT  tbl16369_func10( $1  - 1)"
-PL/pgSQL function "tbl16369_func10" line 7 at assignment
-SQL statement "SELECT  tbl16369_func10( $1  - 1)"
-PL/pgSQL function "tbl16369_func10" line 7 at assignment
 NOTICE:  Yo there I'm number 1, next: 0
-CONTEXT:  SQL statement "SELECT  tbl16369_func10( $1  - 1)"
-PL/pgSQL function "tbl16369_func10" line 7 at assignment
-SQL statement "SELECT  tbl16369_func10( $1  - 1)"
-PL/pgSQL function "tbl16369_func10" line 7 at assignment
-SQL statement "SELECT  tbl16369_func10( $1  - 1)"
-PL/pgSQL function "tbl16369_func10" line 7 at assignment
-SQL statement "SELECT  tbl16369_func10( $1  - 1)"
-PL/pgSQL function "tbl16369_func10" line 7 at assignment
 INFO:  Alas we are at the end of our journey
-CONTEXT:  SQL statement "SELECT  tbl16369_func10( $1  - 1)"
-PL/pgSQL function "tbl16369_func10" line 7 at assignment
-SQL statement "SELECT  tbl16369_func10( $1  - 1)"
-PL/pgSQL function "tbl16369_func10" line 7 at assignment
-SQL statement "SELECT  tbl16369_func10( $1  - 1)"
-PL/pgSQL function "tbl16369_func10" line 7 at assignment
-SQL statement "SELECT  tbl16369_func10( $1  - 1)"
-PL/pgSQL function "tbl16369_func10" line 7 at assignment
-SQL statement "SELECT  tbl16369_func10( $1  - 1)"
-PL/pgSQL function "tbl16369_func10" line 7 at assignment
 NOTICE:  Yo there I'm number 5, next: 4
 NOTICE:  Yo there I'm number 4, next: 3
-CONTEXT:  SQL statement "SELECT  tbl16369_func11( $1  - 1)"
-PL/pgSQL function "tbl16369_func11" line 7 at assignment
 NOTICE:  Yo there I'm number 3, next: 2
-CONTEXT:  SQL statement "SELECT  tbl16369_func11( $1  - 1)"
-PL/pgSQL function "tbl16369_func11" line 7 at assignment
-SQL statement "SELECT  tbl16369_func11( $1  - 1)"
-PL/pgSQL function "tbl16369_func11" line 7 at assignment
 NOTICE:  Yo there I'm number 2, next: 1
-CONTEXT:  SQL statement "SELECT  tbl16369_func11( $1  - 1)"
-PL/pgSQL function "tbl16369_func11" line 7 at assignment
-SQL statement "SELECT  tbl16369_func11( $1  - 1)"
-PL/pgSQL function "tbl16369_func11" line 7 at assignment
-SQL statement "SELECT  tbl16369_func11( $1  - 1)"
-PL/pgSQL function "tbl16369_func11" line 7 at assignment
 NOTICE:  Yo there I'm number 1, next: 0
-CONTEXT:  SQL statement "SELECT  tbl16369_func11( $1  - 1)"
-PL/pgSQL function "tbl16369_func11" line 7 at assignment
-SQL statement "SELECT  tbl16369_func11( $1  - 1)"
-PL/pgSQL function "tbl16369_func11" line 7 at assignment
-SQL statement "SELECT  tbl16369_func11( $1  - 1)"
-PL/pgSQL function "tbl16369_func11" line 7 at assignment
-SQL statement "SELECT  tbl16369_func11( $1  - 1)"
-PL/pgSQL function "tbl16369_func11" line 7 at assignment
 INFO:  Alas we are at the end of our journey
-CONTEXT:  SQL statement "SELECT  tbl16369_func11( $1  - 1)"
-PL/pgSQL function "tbl16369_func11" line 7 at assignment
-SQL statement "SELECT  tbl16369_func11( $1  - 1)"
-PL/pgSQL function "tbl16369_func11" line 7 at assignment
-SQL statement "SELECT  tbl16369_func11( $1  - 1)"
-PL/pgSQL function "tbl16369_func11" line 7 at assignment
-SQL statement "SELECT  tbl16369_func11( $1  - 1)"
-PL/pgSQL function "tbl16369_func11" line 7 at assignment
-SQL statement "SELECT  tbl16369_func11( $1  - 1)"
-PL/pgSQL function "tbl16369_func11" line 7 at assignment
+NOTICE:  Yo there I'm number 5, next: 4
+NOTICE:  Yo there I'm number 4, next: 3
+NOTICE:  Yo there I'm number 3, next: 2
+NOTICE:  Yo there I'm number 2, next: 1
+NOTICE:  Yo there I'm number 1, next: 0
+INFO:  Alas we are at the end of our journey
+NOTICE:  Yo there I'm number 5, next: 4
+NOTICE:  Yo there I'm number 4, next: 3
+NOTICE:  Yo there I'm number 3, next: 2
+NOTICE:  Yo there I'm number 2, next: 1
+NOTICE:  Yo there I'm number 1, next: 0
+INFO:  Alas we are at the end of our journey
+NOTICE:  Yo there I'm number 5, next: 4
+NOTICE:  Yo there I'm number 4, next: 3
+NOTICE:  Yo there I'm number 3, next: 2
+NOTICE:  Yo there I'm number 2, next: 1
+NOTICE:  Yo there I'm number 1, next: 0
+INFO:  Alas we are at the end of our journey
+NOTICE:  Yo there I'm number 5, next: 4
+NOTICE:  Yo there I'm number 4, next: 3
+NOTICE:  Yo there I'm number 3, next: 2
+NOTICE:  Yo there I'm number 2, next: 1
+NOTICE:  Yo there I'm number 1, next: 0
+INFO:  Alas we are at the end of our journey
+NOTICE:  Yo there I'm number 5, next: 4
+NOTICE:  Yo there I'm number 4, next: 3
+NOTICE:  Yo there I'm number 3, next: 2
+NOTICE:  Yo there I'm number 2, next: 1
+NOTICE:  Yo there I'm number 1, next: 0
+INFO:  Alas we are at the end of our journey
+NOTICE:  Yo there I'm number 5, next: 4
+NOTICE:  Yo there I'm number 4, next: 3
+NOTICE:  Yo there I'm number 3, next: 2
+NOTICE:  Yo there I'm number 2, next: 1
+NOTICE:  Yo there I'm number 1, next: 0
+INFO:  Alas we are at the end of our journey
+NOTICE:  Yo there I'm number 5, next: 4
+NOTICE:  Yo there I'm number 4, next: 3
+NOTICE:  Yo there I'm number 3, next: 2
+NOTICE:  Yo there I'm number 2, next: 1
+NOTICE:  Yo there I'm number 1, next: 0
+INFO:  Alas we are at the end of our journey
+NOTICE:  Yo there I'm number 5, next: 4
+NOTICE:  Yo there I'm number 4, next: 3
+NOTICE:  Yo there I'm number 3, next: 2
+NOTICE:  Yo there I'm number 2, next: 1
+NOTICE:  Yo there I'm number 1, next: 0
+INFO:  Alas we are at the end of our journey
+NOTICE:  Yo there I'm number 5, next: 4
+NOTICE:  Yo there I'm number 4, next: 3
+NOTICE:  Yo there I'm number 3, next: 2
+NOTICE:  Yo there I'm number 2, next: 1
+NOTICE:  Yo there I'm number 1, next: 0
+INFO:  Alas we are at the end of our journey
+NOTICE:  Yo there I'm number 5, next: 4
+NOTICE:  Yo there I'm number 4, next: 3
+NOTICE:  Yo there I'm number 3, next: 2
+NOTICE:  Yo there I'm number 2, next: 1
+NOTICE:  Yo there I'm number 1, next: 0
+INFO:  Alas we are at the end of our journey
+NOTICE:  Yo there I'm number 5, next: 4
+NOTICE:  Yo there I'm number 4, next: 3
+NOTICE:  Yo there I'm number 3, next: 2
+NOTICE:  Yo there I'm number 2, next: 1
+NOTICE:  Yo there I'm number 1, next: 0
+INFO:  Alas we are at the end of our journey
+NOTICE:  Yo there I'm number 5, next: 4
+NOTICE:  Yo there I'm number 4, next: 3
+NOTICE:  Yo there I'm number 3, next: 2
+NOTICE:  Yo there I'm number 2, next: 1
+NOTICE:  Yo there I'm number 1, next: 0
+INFO:  Alas we are at the end of our journey
+NOTICE:  Yo there I'm number 5, next: 4
+NOTICE:  Yo there I'm number 4, next: 3
+NOTICE:  Yo there I'm number 3, next: 2
+NOTICE:  Yo there I'm number 2, next: 1
+NOTICE:  Yo there I'm number 1, next: 0
+INFO:  Alas we are at the end of our journey
+NOTICE:  Yo there I'm number 5, next: 4
+NOTICE:  Yo there I'm number 4, next: 3
+NOTICE:  Yo there I'm number 3, next: 2
+NOTICE:  Yo there I'm number 2, next: 1
+NOTICE:  Yo there I'm number 1, next: 0
+INFO:  Alas we are at the end of our journey
+NOTICE:  Yo there I'm number 5, next: 4
+NOTICE:  Yo there I'm number 4, next: 3
+NOTICE:  Yo there I'm number 3, next: 2
+NOTICE:  Yo there I'm number 2, next: 1
+NOTICE:  Yo there I'm number 1, next: 0
+INFO:  Alas we are at the end of our journey
+NOTICE:  Yo there I'm number 5, next: 4
+NOTICE:  Yo there I'm number 4, next: 3
+NOTICE:  Yo there I'm number 3, next: 2
+NOTICE:  Yo there I'm number 2, next: 1
+NOTICE:  Yo there I'm number 1, next: 0
+INFO:  Alas we are at the end of our journey
+NOTICE:  Yo there I'm number 5, next: 4
+NOTICE:  Yo there I'm number 4, next: 3
+NOTICE:  Yo there I'm number 3, next: 2
+NOTICE:  Yo there I'm number 2, next: 1
+NOTICE:  Yo there I'm number 1, next: 0
+INFO:  Alas we are at the end of our journey
+NOTICE:  Yo there I'm number 5, next: 4
+NOTICE:  Yo there I'm number 4, next: 3
+NOTICE:  Yo there I'm number 3, next: 2
+NOTICE:  Yo there I'm number 2, next: 1
+NOTICE:  Yo there I'm number 1, next: 0
+INFO:  Alas we are at the end of our journey
+NOTICE:  Yo there I'm number 5, next: 4
+NOTICE:  Yo there I'm number 4, next: 3
+NOTICE:  Yo there I'm number 3, next: 2
+NOTICE:  Yo there I'm number 2, next: 1
+NOTICE:  Yo there I'm number 1, next: 0
+INFO:  Alas we are at the end of our journey
+NOTICE:  Yo there I'm number 5, next: 4
+NOTICE:  Yo there I'm number 4, next: 3
+NOTICE:  Yo there I'm number 3, next: 2
+NOTICE:  Yo there I'm number 2, next: 1
+NOTICE:  Yo there I'm number 1, next: 0
+INFO:  Alas we are at the end of our journey
  tbl16369_func1 | tbl16369_func2 | tbl16369_func4 | tbl16369_func5 | tbl16369_func10 | tbl16369_func11 | tbl16369_func12 | generate_series 
 ----------------+----------------+----------------+----------------+-----------------+-----------------+-----------------+-----------------
  (789)          | (789)          | ("(789)")      | ("(789)")      | (789)           | (789)           |             789 |               1

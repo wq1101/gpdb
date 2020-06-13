@@ -36,16 +36,16 @@ create table T_dta2 (
 
 
 --
--- Function to check key existance in T_pkey1
+-- Function to check key existence in T_pkey1
 --
 create function check_pkey1_exists(int4, bpchar) returns bool as E'
     if {![info exists GD]} {
         set GD(plan) [spi_prepare				\\
 	    "select 1 from T_pkey1				\\
 	        where key1 = \\$1 and key2 = \\$2"		\\
-    	    {int4 bpchar}]
+	    {int4 bpchar}]
     }
-    
+
     set n [spi_execp -count 1 $GD(plan) [list $1 $2]]
 
     if {$n > 0} {
@@ -60,17 +60,19 @@ create function check_pkey1_exists(int4, bpchar) returns bool as E'
 CREATE TABLE trigger_test
     (i int, v text );
 
+CREATE VIEW trigger_test_view AS SELECT * FROM trigger_test;
+
 CREATE FUNCTION trigger_data() returns trigger language pltcl as $_$
 
 	if { [info exists TG_relid] } {
-    	set TG_relid "bogus:12345"
-   	}
+	set TG_relid "bogus:12345"
+	}
 
 	set dnames [info locals {[a-zA-Z]*} ]
 
 	foreach key [lsort $dnames] {
-    
-		if { [array exists $key] } { 
+
+		if { [array exists $key] } {
 			set str "{"
 			foreach akey [lsort [ array names $key ] ] {
 				if {[string length $str] > 1} { set str "$str, " }
@@ -80,22 +82,25 @@ CREATE FUNCTION trigger_data() returns trigger language pltcl as $_$
 				set str "$str$akey: $val"
 			}
 			set str "$str}"
-    		elog NOTICE "$key: $str"
+		elog NOTICE "$key: $str"
 		} else {
 			set val [eval list "\$$key" ]
-    		elog NOTICE "$key: $val"
+		elog NOTICE "$key: $val"
 		}
 	}
 
 
-	return OK  
+	return OK
 
 $_$;
 
-CREATE TRIGGER show_trigger_data_trig 
+CREATE TRIGGER show_trigger_data_trig
 BEFORE INSERT OR UPDATE OR DELETE ON trigger_test
 FOR EACH ROW EXECUTE PROCEDURE trigger_data(23,'skidoo');
 
+CREATE TRIGGER show_trigger_data_view_trig
+INSTEAD OF INSERT OR UPDATE OR DELETE ON trigger_test_view
+FOR EACH ROW EXECUTE PROCEDURE trigger_data(24,'skidoo view');
 
 --
 -- Trigger function on every change to T_pkey1
@@ -424,6 +429,24 @@ create trigger dta2_before before insert or update on T_dta2
 	check_primkey('ref1', 'ref2', 'T_pkey2', 'key1', 'key2');
 
 
+create function tcl_composite_arg_ref1(T_dta1) returns int as '
+    return $1(ref1)
+' language pltcl;
+
+create function tcl_composite_arg_ref2(T_dta1) returns text as '
+    return $1(ref2)
+' language pltcl;
+
+create function tcl_argisnull(text) returns bool as '
+    argisnull 1
+' language pltcl;
+
+create function tcl_lastoid(tabname text) returns int8 as '
+    spi_exec "insert into $1 default values"
+    spi_lastoid
+' language pltcl;
+
+
 create function tcl_int4add(int4,int4) returns int4 as '
     return [expr $1 + $2]
 ' language pltcl;
@@ -552,5 +575,47 @@ create function tcl_date_week(int4,int4,int4) returns text as $$
     return [clock format [clock scan "$2/$3/$1"] -format "%U"]
 $$ language pltcl immutable;
 
-select tcl_date_week(2010,1,24);
+select tcl_date_week(2010,1,26);
 select tcl_date_week(2001,10,24);
+
+-- test pltcl event triggers
+create or replace function tclsnitch() returns event_trigger language pltcl as $$
+  elog NOTICE "tclsnitch: $TG_event $TG_tag"
+$$;
+
+create event trigger tcl_a_snitch on ddl_command_start execute procedure tclsnitch();
+create event trigger tcl_b_snitch on ddl_command_end execute procedure tclsnitch();
+
+create or replace function foobar() returns int language sql as $$select 1;$$;
+alter function foobar() cost 77;
+drop function foobar();
+
+create table foo();
+drop table foo;
+
+drop event trigger tcl_a_snitch;
+drop event trigger tcl_b_snitch;
+
+-- test use of errorCode in error handling
+
+create function tcl_error_handling_test() returns text as $$
+    global errorCode
+    if {[catch { spi_exec "select no_such_column from foo;" }]} {
+        array set errArray $errorCode
+        if {$errArray(condition) == "undefined_table"} {
+            return "expected error: $errArray(message)"
+        } else {
+            return "unexpected error: $errArray(condition) $errArray(message)"
+        }
+    } else {
+        return "no error"
+    }
+$$ language pltcl;
+
+select tcl_error_handling_test();
+
+create temp table foo(f1 int);
+
+select tcl_error_handling_test();
+
+drop table foo;

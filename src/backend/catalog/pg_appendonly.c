@@ -32,7 +32,6 @@
 #include "utils/syscache.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
-#include "cdb/cdbpersistentfilesysobj.h"
 
 /*
  * Adds an entry into the pg_appendonly catalog table. The entry
@@ -113,6 +112,9 @@ InsertAppendOnlyEntry(Oid relid,
  *
  * The OIDs will be retrieved only when the corresponding output variable is
  * not NULL.
+ *
+ * 'appendOnlyMetaDataSnapshot' can be passed as NULL, which means use the
+ * latest snapshot, like in systable_beginscan.
  */
 void
 GetAppendOnlyEntryAuxOids(Oid relid,
@@ -263,7 +265,7 @@ UpdateAppendOnlyEntryAuxOids(Oid relid,
 				ObjectIdGetDatum(relid));
 
 	scan = systable_beginscan(pg_appendonly, AppendOnlyRelidIndexId, true,
-							  SnapshotNow, 1, key);
+							  NULL, 1, key);
 	tuple = systable_getnext(scan);
 	if (!HeapTupleIsValid(tuple))
 		ereport(ERROR,
@@ -346,7 +348,7 @@ RemoveAppendonlyEntry(Oid relid)
 				ObjectIdGetDatum(relid));
 
 	scan = systable_beginscan(pg_appendonly_rel, AppendOnlyRelidIndexId, true,
-							  SnapshotNow, 1, key);
+							  NULL, 1, key);
 	tuple = systable_getnext(scan);
 	if (!HeapTupleIsValid(tuple))
 		ereport(ERROR,
@@ -430,7 +432,7 @@ GetAppendEntryForMove(
 				ObjectIdGetDatum(relId));
 
 	scan = systable_beginscan(pg_appendonly_rel, AppendOnlyRelidIndexId, true,
-							  SnapshotNow, 1, key);
+							  NULL, 1, key);
 	tuple = systable_getnext(scan);
 	if (!HeapTupleIsValid(tuple))
 		ereport(ERROR,
@@ -549,15 +551,6 @@ TransferAppendonlyEntry(Oid sourceRelId, Oid targetRelId)
 	{
 		TransferDependencyLink(targetRelId, aovisimaprelid, "aovisimap");
 	}
-
-	if (Debug_persistent_print)
-		elog(Persistent_DebugPrintLevel(), 
-			 "TransferAppendonlyEntry: source relation id %u, target relation id %u, aosegrelid %u, aoblkdirrelid %u, aovisimaprelid %u",
-			 sourceRelId,
-			 targetRelId,
-			 aosegrelid,
-			 aoblkdirrelid,
-			 aovisimaprelid);
 }
 
 /*
@@ -685,18 +678,5 @@ SwapAppendonlyEntries(Oid entryRelId1, Oid entryRelId2)
 			TransferDependencyLink(entryRelId1, aovisimaprelid2, "aovisimap");
 		}
 	}
-
-	if (Debug_persistent_print)
-		elog(Persistent_DebugPrintLevel(), 
-			 "SwapAppendonlyEntries: relation id #1 %u, aosegrelid1 %u, aoblkdirrelid1 %u, aovisimaprelid1 %u"
-			 "relation id #2 %u, aosegrelid2 %u, aoblkdirrelid2 %u, aovisimaprelid2 %u",
-			 entryRelId1,
-			 aosegrelid1,
-			 aoblkdirrelid1,
-			 aovisimaprelid1,
-			 entryRelId2,
-			 aosegrelid2,
-			 aoblkdirrelid2,
-			 aovisimaprelid2);
 }
 

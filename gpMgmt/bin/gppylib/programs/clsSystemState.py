@@ -6,21 +6,22 @@
 # THIS IMPORT SHOULD COME FIRST
 from gppylib.mainUtils import *
 
-from optparse import Option, OptionGroup, OptionParser, OptionValueError, SUPPRESS_USAGE
-import os, sys, getopt, socket, StringIO, signal
-import datetime
+from optparse import OptionGroup
+import sys
+import collections
+from contextlib import closing
 
-from gppylib import gparray, gplog, pgconf, userinput, utils
-from gppylib.commands import base, gp, pg, unix
-from gppylib.db import catalog, dbconn
+from pygresql import pgdb
+
+from gppylib import gparray, gplog
+from gppylib.commands import base, gp
+from gppylib.db import dbconn
 from gppylib.gpparseopts import OptParser, OptChecker
 from gppylib.operations.startSegments import *
 from gppylib.operations.buildMirrorSegments import *
-from gppylib.programs import programIoUtils
 from gppylib.system import configurationInterface as configInterface
 from gppylib.system.environment import GpMasterEnvironment
-from gppylib.testold.testUtils import *
-from gppylib.utils import toNonNoneString, checkNotNone, readAllLinesFromFile, writeLinesToFile, TableLogger
+from gppylib.utils import TableLogger
 
 logger = gplog.get_default_logger()
 
@@ -55,21 +56,15 @@ CATEGORY__MIRRORING_INFO = "Mirroring Info"
 VALUE__CURRENT_ROLE = FieldDefinition("Current role", "role", "text") # can't use current_role as name -- it's a reserved word
 VALUE__PREFERRED_ROLE = FieldDefinition("Preferred role", "preferred_role", "text")
 VALUE__MIRROR_STATUS = FieldDefinition("Mirror status", "mirror_status", "text")
+VALUE__MIRROR_RECOVERY_START = FieldDefinition("Mirror recovery start", "mirror_recovery_start", "text")
 
 CATEGORY__ERROR_GETTING_SEGMENT_STATUS = "Error Getting Segment Status"
 VALUE__ERROR_GETTING_SEGMENT_STATUS = FieldDefinition("Error Getting Segment Status", "error_getting_status", "text")
 
-CATEGORY__CHANGE_TRACKING_INFO = "Change Tracking Info"
-VALUE__CHANGE_TRACKING_DATA_SIZE = FieldDefinition("Change tracking data size", "change_tracking_data_size", "text", "Change tracking size")
-
-CATEGORY__RESYNCHRONIZATION_INFO = "Resynchronization Info"
-VALUE__RESYNC_MODE = FieldDefinition("Resynchronization mode", "resync_mode", "text", "Resync mode")
-VALUE__RESYNC_DATA_SYNCHRONIZED = FieldDefinition("Data synchronized", "data_synced_str", "text", "Data synced")
-VALUE__RESYNC_EST_TOTAL_DATA = FieldDefinition("Estimated total data to synchronize", "est_total_bytes_to_sync_str", "text", "Est. total to sync")
-VALUE__RESYNC_EST_PROGRESS_WITH_MIRROR = FieldDefinition("Estimated resync progress with mirror", "est_resync_progress_str", "text", "Est. resync progress")
-VALUE__TOTAL_RESYNC_OBJECT_COUNT = FieldDefinition("Total resync objects", "totalResyncObjectCount", "text", "Total resync objects")
-VALUE__RESYNC_OBJECT_COUNT = FieldDefinition("Objects to resync", "curResyncObjectCount", "text", "Objects to resync")
-VALUE__RESYNC_EST_COMPLETION_TIME = FieldDefinition("Estimated resync end time", "est_resync_end_time_str", "text", "Est. resync end time")
+CATEGORY__REPLICATION_INFO = "Replication Info"
+VALUE__REPL_SENT_LOCATION = FieldDefinition("WAL Sent Location", "sent_location", "text")
+VALUE__REPL_FLUSH_LOCATION = FieldDefinition("WAL Flush Location", "flush_location", "text")
+VALUE__REPL_REPLAY_LOCATION = FieldDefinition("WAL Replay Location", "replay_location", "text")
 
 CATEGORY__STATUS = "Status"
 VALUE__MASTER_REPORTS_STATUS = FieldDefinition("Configuration reports status as", "status_in_config", "text", "Config status")
@@ -81,12 +76,6 @@ VALUE__ACTIVE_PID = FieldDefinition("PID", "active_pid", "text") # int would be 
 VALUE__SEGMENT_STATUS = FieldDefinition("Instance status", "instance_status", "text", "Status")
 VALUE__DBID = FieldDefinition("dbid", "dbid", "int")
 VALUE__CONTENTID = FieldDefinition("contentid", "contentid", "int")
-VALUE__RESYNC_DATA_SYNCHRONIZED_BYTES = FieldDefinition("Data synchronized (bytes)", "bytes_synced", "int8")
-VALUE__RESYNC_EST_TOTAL_DATA_BYTES = FieldDefinition("Estimated total data to synchronize (bytes)", "est_total_bytes_to_sync", "int8")
-VALUE__RESYNC_EST_PROGRESS_WITH_MIRROR_NUMERIC = FieldDefinition("Estimated resync progress with mirror (numeric)", "est_resync_progress_pct", "float")
-VALUE__TOTAL_RESYNC_OBJECT_COUNT_INT = FieldDefinition("Total Resync Object Count (int)", "totalResyncObjCount", "int")
-VALUE__RESYNC_OBJECT_COUNT_INT = FieldDefinition("Resync Object Count (int)", "curResyncObjCount", "int")
-VALUE__RESYNC_EST_COMPLETION_TIME_TIMESTAMP = FieldDefinition("Estimated resync end time (timestamp)", "est_resync_end_time", "timestamp")
 VALUE__HAS_DATABASE_STATUS_WARNING = FieldDefinition("Has database status warning", "has_status_warning", "bool")
 VALUE__VERSION_STRING = FieldDefinition("Version", "version", "text")
 
@@ -94,8 +83,6 @@ VALUE__POSTMASTER_PID_FILE_EXISTS = FieldDefinition("File postmaster.pid (boolea
 VALUE__POSTMASTER_PID_VALUE_INT = FieldDefinition("PID from postmaster.pid file (int)", "postmaster_pid", "int", "pid file PID")
 VALUE__LOCK_FILES_EXIST = FieldDefinition("Lock files in /tmp (boolean)", "lock_files_exist", "bool", "local files exist")
 VALUE__ACTIVE_PID_INT = FieldDefinition("Active PID (int)", "active_pid", "int")
-
-VALUE__CHANGE_TRACKING_DATA_SIZE_BYTES = FieldDefinition("Change tracking data size (bytes)", "change_tracking_bytes", "int8")
 
 VALUE__POSTMASTER_PID_FILE = FieldDefinition("File postmaster.pid", "postmaster_pid_file_exists", "text", "pid file exists") # boolean would be nice
 VALUE__POSTMASTER_PID_VALUE = FieldDefinition("PID from postmaster.pid file", "postmaster_pid", "text", "pid file PID") # int would be better, but we print error messages here sometimes
@@ -123,8 +110,7 @@ class GpStateData:
                     CATEGORY__SEGMENT_INFO,
                     CATEGORY__MIRRORING_INFO,
                     CATEGORY__ERROR_GETTING_SEGMENT_STATUS,
-                    CATEGORY__CHANGE_TRACKING_INFO,
-                    CATEGORY__RESYNCHRONIZATION_INFO,
+                    CATEGORY__REPLICATION_INFO,
                     CATEGORY__STATUS]
         self.__entriesByCategory = {}
 
@@ -137,37 +123,29 @@ class GpStateData:
         self.__entriesByCategory[CATEGORY__MIRRORING_INFO] = \
                 [VALUE__CURRENT_ROLE,
                 VALUE__PREFERRED_ROLE,
-                VALUE__MIRROR_STATUS]
+                VALUE__MIRROR_STATUS,
+                VALUE__MIRROR_RECOVERY_START]
 
         self.__entriesByCategory[CATEGORY__ERROR_GETTING_SEGMENT_STATUS] = \
                 [VALUE__ERROR_GETTING_SEGMENT_STATUS]
 
-        self.__entriesByCategory[CATEGORY__CHANGE_TRACKING_INFO] = \
-                [VALUE__CHANGE_TRACKING_DATA_SIZE]
-
-        self.__entriesByCategory[CATEGORY__RESYNCHRONIZATION_INFO] = \
-                [VALUE__RESYNC_MODE,
-                VALUE__RESYNC_DATA_SYNCHRONIZED,
-                VALUE__RESYNC_EST_TOTAL_DATA,
-                VALUE__RESYNC_EST_PROGRESS_WITH_MIRROR,
-                VALUE__TOTAL_RESYNC_OBJECT_COUNT,
-                VALUE__RESYNC_OBJECT_COUNT,
-                VALUE__RESYNC_EST_COMPLETION_TIME]
+        self.__entriesByCategory[CATEGORY__REPLICATION_INFO] = [
+            VALUE__REPL_SENT_LOCATION,
+            VALUE__REPL_FLUSH_LOCATION,
+            VALUE__REPL_REPLAY_LOCATION,
+        ]
 
         self.__entriesByCategory[CATEGORY__STATUS] = \
                 [VALUE__ACTIVE_PID,
                 VALUE__MASTER_REPORTS_STATUS,
                 VALUE__MIRROR_SEGMENT_STATUS,
                 VALUE__NONMIRROR_DATABASE_STATUS]
-                
+
         self.__allValues = {}
         for k in [VALUE__SEGMENT_STATUS, VALUE__DBID, VALUE__CONTENTID,
-                    VALUE__RESYNC_DATA_SYNCHRONIZED_BYTES, VALUE__RESYNC_EST_TOTAL_DATA_BYTES,
-                    VALUE__RESYNC_EST_PROGRESS_WITH_MIRROR_NUMERIC, VALUE__TOTAL_RESYNC_OBJECT_COUNT_INT,
-                    VALUE__RESYNC_OBJECT_COUNT_INT, VALUE__RESYNC_EST_COMPLETION_TIME_TIMESTAMP, VALUE__HAS_DATABASE_STATUS_WARNING,
+                    VALUE__HAS_DATABASE_STATUS_WARNING,
                     VALUE__VERSION_STRING, VALUE__POSTMASTER_PID_FILE_EXISTS, VALUE__LOCK_FILES_EXIST,
                     VALUE__ACTIVE_PID_INT, VALUE__POSTMASTER_PID_VALUE_INT,
-                    VALUE__CHANGE_TRACKING_DATA_SIZE_BYTES,
                     VALUE__POSTMASTER_PID_FILE, VALUE__POSTMASTER_PID_VALUE, VALUE__LOCK_FILES
                     ]:
             self.__allValues[k] = True
@@ -183,6 +161,10 @@ class GpStateData:
 
         self.__segmentData.append(self.__currentSegmentData)
         self.__segmentDbIdToSegmentData[segment.getSegmentDbId()] = self.__currentSegmentData
+
+    def switchSegment(self, segment):
+        dbid = segment.getSegmentDbId()
+        self.__currentSegmentData = self.__segmentDbIdToSegmentData[dbid]
 
     def addValue(self, key, value, isWarning=False):
         self.__currentSegmentData["values"][key] = value
@@ -266,6 +248,14 @@ class GpStateData:
                     val = str(val)
                 tabLog.infoOrWarn(isWarningMap[k], ["%s%s" %(indent, k), "= %s" % val])
 
+
+def replication_state_to_string(state):
+    if state == 'backup':
+        return 'Copying files from primary'
+    else:
+        return state.capitalize()
+
+
 #-------------------------------------------------------------------------
 class GpSystemStateProgram:
 
@@ -316,7 +306,7 @@ class GpSystemStateProgram:
 
             tabLog = TableLogger().setWarnWithArrows(True)
             tabLog.info(["Status", "Data State", "Primary", "Datadir", "Port", "Mirror", "Datadir", "Port"])
-            numInChangeTracking = 0
+            numUnsynchronized = 0
             numMirrorsActingAsPrimaries = 0
             for primary in primarySegments:
                 mirror = contentIdToMirror[primary.getSegmentContentId()][0]
@@ -338,9 +328,9 @@ class GpSystemStateProgram:
                     actMirrorStatus = "Available" if actingMirror.isSegmentUp() else "Failed"
                     status = "Primary Active, Mirror %s" % (actMirrorStatus)
 
-                if actingPrimary.isSegmentModeInChangeLogging():
+                if not actingPrimary.isSegmentModeSynchronized():
                     doWarn = True
-                    numInChangeTracking += 1
+                    numUnsynchronized += 1
 
                 dataStatus = gparray.getDataModeLabel(actingPrimary.getSegmentMode())
                 line = [status, dataStatus]
@@ -353,8 +343,8 @@ class GpSystemStateProgram:
             logger.info("-------------------------------------------------------------" )
             if numMirrorsActingAsPrimaries > 0:
                 logger.warn( "%s segment(s) configured as mirror(s) are acting as primaries" % numMirrorsActingAsPrimaries )
-            if numInChangeTracking > 0:
-                logger.warn( "%s segment(s) are in change tracking" % numInChangeTracking)
+            if numUnsynchronized > 0:
+                logger.warn("%s primary segment(s) are not synchronized" % numUnsynchronized)
 
         else:
             logger.info("-------------------------------------------------------------" )
@@ -384,7 +374,7 @@ class GpSystemStateProgram:
             mirrorSegments = [ seg for seg in gpArray.getSegDbList() if seg.isSegmentMirror(False) ]
             numMirrorsActingAsPrimaries = 0
             numFailedMirrors = 0
-            numChangeTrackingMirrors = 0
+            numUnsynchronizedMirrors = 0
             for seg in mirrorSegments:
                 doWarn = False
                 status = ""
@@ -392,8 +382,8 @@ class GpSystemStateProgram:
                 if seg.isSegmentPrimary(True):
                     status = "Acting as Primary"
 
-                    if seg.isSegmentModeInChangeLogging():
-                        numChangeTrackingMirrors += 1
+                    if not seg.isSegmentModeSynchronized():
+                        numUnsynchronizedMirrors += 1
 
                     numMirrorsActingAsPrimaries += 1
                 elif seg.isSegmentUp():
@@ -424,8 +414,8 @@ class GpSystemStateProgram:
                 logger.warn( "%s segment(s) configured as mirror(s) are acting as primaries" % numMirrorsActingAsPrimaries )
             if numFailedMirrors > 0:
                 logger.warn( "%s segment(s) configured as mirror(s) have failed" % numFailedMirrors )
-            if numChangeTrackingMirrors > 0:
-                logger.warn( "%s mirror segment(s) acting as primaries are in change tracking" % numChangeTrackingMirrors)
+            if numUnsynchronizedMirrors > 0:
+                logger.warn( "%s mirror segment(s) acting as primaries are not synchronized" % numUnsynchronizedMirrors)
 
         else:
             logger.warn("-------------------------------------------------------------" )
@@ -560,6 +550,7 @@ class GpSystemStateProgram:
                 tabLog.info( ["Total number mirror segments acting as mirror segments", "= %d" % numMirrorsPassive])
 
             tabLog.addSeparator()
+        self.__showExpandStatusSummary(gpEnv, tabLog, showPostSep=True)
         tabLog.outputTable()
 
     def __fetchAllSegmentData(self, gpArray):
@@ -568,8 +559,6 @@ class GpSystemStateProgram:
         """
         logger.info("Gathering data from segments...")
         segmentsByHost = GpArray.getSegmentsByHostName(gpArray.getDbList())
-        segmentData = {}
-        dispatchCount = 0
         hostNameToCmd = {}
         for hostName, segments in segmentsByHost.iteritems():
             cmd = gp.GpGetSegmentStatusValues("get segment version status", segments,
@@ -584,8 +573,7 @@ class GpSystemStateProgram:
                                remoteHost=segments[0].getSegmentAddress())
             hostNameToCmd[hostName] = cmd
             self.__pool.addCommand(cmd)
-            dispatchCount+=1
-        self.__poolWait(dispatchCount)
+        self.__poolWait()
 
         hostNameToResults = {}
         for hostName, cmd in hostNameToCmd.iteritems():
@@ -606,11 +594,9 @@ class GpSystemStateProgram:
             logger.info("Physical mirroring is not configured")
             return 1
 
-        primarySegments = [ seg for seg in gpArray.getSegDbList() if seg.isSegmentPrimary(current_role=True) ]
         mirrorSegments = [ seg for seg in gpArray.getSegDbList() if seg.isSegmentMirror(current_role=True) ]
         contentIdToMirror = GpArray.getSegmentsByContentId(mirrorSegments)
 
-        hasWarnings = False
         hostNameToResults = self.__fetchAllSegmentData(gpArray)
         data = self.__buildGpStateData(gpArray, hostNameToResults)
 
@@ -656,41 +642,22 @@ class GpSystemStateProgram:
         else:
             pass # logger.info( "No segment pairs with switched roles")
 
-        # segment pairs that are in changetracking
-        primariesInChangeTracking = [s for s in gpArray.getSegDbList() if s.isSegmentPrimary(current_role=True) and \
-                                                    s.isSegmentModeInChangeLogging()]
-        if primariesInChangeTracking:
+        # segments that are not synchronized
+        unsyncedPrimaries = [s for s in gpArray.getSegDbList() if s.isSegmentPrimary(current_role=True) and \
+                                                    not s.isSegmentModeSynchronized()]
+        if unsyncedPrimaries:
             logger.info("----------------------------------------------------")
-            logger.info("Primaries in Change Tracking")
-            logSegments(primariesInChangeTracking, logAsPairs=True, additionalFieldsToLog=[VALUE__CHANGE_TRACKING_DATA_SIZE])
-            exitCode = 1
-        else:
-            pass # logger.info( "No segment pairs are in change tracking")
-
-        # segments that are in resync
-        primariesInResync = [s for s in gpArray.getSegDbList() if s.isSegmentPrimary(current_role=True) and \
-                                                    s.isSegmentModeInResynchronization()]
-        if primariesInResync:
-            logger.info("----------------------------------------------------")
-            logger.info("Segment Pairs in Resynchronization")
-            logSegments(primariesInResync, logAsPairs=True, additionalFieldsToLog=[VALUE__RESYNC_MODE, \
-                        VALUE__RESYNC_EST_PROGRESS_WITH_MIRROR, VALUE__TOTAL_RESYNC_OBJECT_COUNT, VALUE__RESYNC_OBJECT_COUNT, VALUE__RESYNC_DATA_SYNCHRONIZED, \
-                        VALUE__RESYNC_EST_TOTAL_DATA, VALUE__RESYNC_EST_COMPLETION_TIME, VALUE__CHANGE_TRACKING_DATA_SIZE])
+            logger.info("Unsynchronized Segment Pairs")
+            logSegments(unsyncedPrimaries, logAsPairs=True)
             exitCode = 1
         else:
             pass # logger.info( "No segment pairs are in resynchronization")
 
-        # segments that are down (excluding those that are part of changetracking)
-        changeTrackingMirrors = [contentIdToMirror[s.getSegmentContentId()][0] for s in primariesInChangeTracking]
-        changeTrackingMirrorsByDbId = GpArray.getSegmentsGroupedByValue(changeTrackingMirrors, gparray.GpDB.getSegmentDbId)
-        segmentsThatAreDown = [s for s in gpArray.getSegDbList() if \
-                            not s.getSegmentDbId() in changeTrackingMirrorsByDbId and \
-                            data.isSegmentProbablyDown(s)]
+        # segments that are down
+        segmentsThatAreDown = [s for s in gpArray.getSegDbList() if data.isSegmentProbablyDown(s)]
         if segmentsThatAreDown:
             logger.info("----------------------------------------------------")
-            logger.info("Downed Segments (this excludes mirrors whose primaries are in change tracking" )
-            logger.info("                  -- these, if any, are reported separately above")
-            logger.info("                  also, this may include segments where status could not be retrieved)")
+            logger.info("Downed Segments (may include segments where status could not be retrieved)")
             logSegments(segmentsThatAreDown, False, [VALUE__MASTER_REPORTS_STATUS, VALUE__SEGMENT_STATUS])
             exitCode = 1
         else:
@@ -725,6 +692,7 @@ class GpSystemStateProgram:
                 VALUE__CURRENT_ROLE,
                 VALUE__PREFERRED_ROLE,
                 VALUE__MIRROR_STATUS,
+                VALUE__MIRROR_RECOVERY_START,
 
                 VALUE__MASTER_REPORTS_STATUS,
                 VALUE__SEGMENT_STATUS,
@@ -732,20 +700,11 @@ class GpSystemStateProgram:
 
                 VALUE__ERROR_GETTING_SEGMENT_STATUS,
 
-                VALUE__CHANGE_TRACKING_DATA_SIZE_BYTES,
-
-                VALUE__RESYNC_MODE,
-                VALUE__RESYNC_DATA_SYNCHRONIZED_BYTES,
-                VALUE__RESYNC_EST_TOTAL_DATA_BYTES,
-                VALUE__RESYNC_EST_PROGRESS_WITH_MIRROR_NUMERIC,
-                VALUE__RESYNC_EST_COMPLETION_TIME_TIMESTAMP,
-
                 VALUE__POSTMASTER_PID_FILE_EXISTS,
                 VALUE__POSTMASTER_PID_VALUE_INT,
                 VALUE__LOCK_FILES_EXIST,
                 VALUE__ACTIVE_PID_INT,
 
-                VALUE__RESYNC_EST_TOTAL_DATA,
                 VALUE__VERSION_STRING
                 ]
 
@@ -772,6 +731,81 @@ class GpSystemStateProgram:
         # output rows and fieldNames!
         self.__writePipeSeparated(rows, printToLogger=False)
         return 0
+
+
+    def __showExpandProgress(self, gpEnv, st):
+        st.get_progress()
+
+        # group uncompleted tables by dbname
+        uncompleted = collections.defaultdict(int)
+        for dbname, _, _ in st.uncompleted:
+            uncompleted[dbname] += 1
+
+        tabLog = TableLogger().setWarnWithArrows(True)
+        tabLog.addSeparator()
+        tabLog.outputTable()
+        tabLog = None
+
+        if uncompleted:
+            tabLog = TableLogger().setWarnWithArrows(True)
+            logger.info("Number of tables to be redistributed")
+            tabLog.info(["  Database", "Count of Tables to redistribute"])
+            for dbname, count in uncompleted.iteritems():
+                tabLog.info(["  %s" % dbname, "%d" % count])
+            tabLog.addSeparator()
+            tabLog.outputTable()
+
+        if st.inprogress:
+            tabLog = TableLogger().setWarnWithArrows(True)
+            logger.info("Active redistributions = %d" % len(st.inprogress))
+            tabLog.info(["  Action", "Database", "Table"])
+            for dbname, fq_name, _ in st.inprogress:
+                tabLog.info(["  Redistribute", "%s" % dbname, "%s" % fq_name])
+            tabLog.addSeparator()
+            tabLog.outputTable()
+
+    def __showExpandStatus(self, gpEnv):
+        st = gp.get_gpexpand_status()
+
+        if st.phase == 0:
+            logger.info("Cluster Expansion State = No Expansion Detected")
+        elif st.phase == 1:
+            logger.info("Cluster Expansion State = Replicating Meta Data")
+            logger.info("  Some database tools and functionality")
+            logger.info("  are disabled during this process")
+        else:
+            assert st.phase == 2
+            st.get_progress()
+
+            if st.status == "SETUP DONE" or st.status == "EXPANSION STOPPED":
+                logger.info("Cluster Expansion State = Data Distribution - Paused")
+                self.__showExpandProgress(gpEnv, st)
+            elif st.status == "EXPANSION STARTED":
+                logger.info("Cluster Expansion State = Data Distribution - Active")
+                self.__showExpandProgress(gpEnv, st)
+            elif st.status == "EXPANSION COMPLETE":
+                logger.info("Cluster Expansion State = Expansion Complete")
+            else:
+                # unknown phase2 status
+                logger.info("Cluster Expansion State = Data Distribution - Unknown")
+
+        return 0
+
+    def __showExpandStatusSummary(self, gpEnv, tabLog, showPreSep=False, showPostSep=False):
+        st = gp.get_gpexpand_status()
+
+        if st.phase == 0:
+            # gpexpand is not detected
+            return
+
+        if showPreSep:
+            tabLog.addSeparator()
+
+        tabLog.info(["Cluster Expansion", "= In Progress"])
+
+        if showPostSep:
+            tabLog.addSeparator()
+
 
     def __printSampleExternalTableSqlForSegmentStatus(self, gpEnv):
         scriptName = "%s/gpstate --segmentStatusPipeSeparatedForTableUse -q -d %s" % \
@@ -876,20 +910,17 @@ class GpSystemStateProgram:
         logger.info("Segment Instance Status Report")
 
         tabLog = TableLogger().setWarnWithArrows(True)
-        categoriesToIgnoreOnMirror = {CATEGORY__CHANGE_TRACKING_INFO:True, CATEGORY__RESYNCHRONIZATION_INFO:True}
-        categoriesToIgnoreWithoutMirroring = {CATEGORY__CHANGE_TRACKING_INFO:True, CATEGORY__MIRRORING_INFO:True,
-                CATEGORY__RESYNCHRONIZATION_INFO:True}
+        categoriesToIgnoreWithoutMirroring = {CATEGORY__MIRRORING_INFO:True}
         for seg in gpArray.getSegDbList():
             tabLog.addSeparator()
-            if gpArray.hasMirrors:
-                toSuppress = categoriesToIgnoreOnMirror if seg.isSegmentMirror(current_role=True) else {}
-            else: toSuppress = categoriesToIgnoreWithoutMirroring
+            toSuppress = {} if gpArray.hasMirrors else categoriesToIgnoreWithoutMirroring
             data.addSegmentToTableLogger(tabLog, seg, toSuppress)
+        self.__showExpandStatusSummary(gpEnv, tabLog, showPreSep=True, showPostSep=True)
         tabLog.outputTable()
         hasWarnings = hasWarnings or tabLog.hasWarnings()
 
         self.__addClusterDownWarning(gpArray, data)
-        
+
         if hasWarnings:
             logger.warn("*****************************************************" )
             logger.warn("Warnings have been generated during status processing" )
@@ -898,118 +929,165 @@ class GpSystemStateProgram:
 
         return 1 if hasWarnings else 0
 
-    def __addResyncProgressFields(self, data, primary, primarySegmentData, isMirror):
+    @staticmethod
+    def _add_replication_info(data, primary, mirror):
         """
-        Add progress fields to the current segment in data, using the primary information provided.
+        Adds WAL replication information for a segment to GpStateData.
 
-        @param isMirror True if the current segment is a mirror, False otherwise.  Not all fields from the primary
-                                    data should be inserted (for example, change tracking size is not
-                                    considered to apply to the pair but only to the primary so it will not be
-                                    inserted for the mirror)
+        If segment is a mirror, peer should be set to its corresponding primary.
+        Otherwise, peer is ignored.
         """
+        # Preload the mirror's replication info with Unknowns so that we'll
+        # still have usable UI information on an early exit from this function.
+        GpSystemStateProgram._set_mirror_replication_values(data, mirror)
 
-        mirrorData = primarySegmentData[gp.SEGMENT_STATUS__GET_MIRROR_STATUS]
+        # Even though this information is considered part of the mirror's state,
+        # we have to connect to the primary to get it.
+        if not primary.isSegmentUp():
+            return
 
-        #
-        # populate change tracking fields
-        #
-        if not isMirror: # we don't populate CHANGE_TRACKING values for the mirror
+        # Query pg_stat_replication for the info we want.
+        rows = []
+        rewind_start_time = None
+        rewinding = False
+        try:
+            url = dbconn.DbURL(hostname=primary.hostname, port=primary.port, dbname='template1')
+            conn = dbconn.connect(url, utility=True)
 
-            if primary.getSegmentMode() == gparray.MODE_RESYNCHRONIZATION or \
-                primary.getSegmentMode() == gparray.MODE_CHANGELOGGING:
+            with closing(conn) as conn:
+                cursor = dbconn.execSQL(conn,
+                    "SELECT application_name, state, sent_location, "
+                           "flush_location, "
+                           "sent_location - flush_location AS flush_left, "
+                           "replay_location, "
+                           "sent_location - replay_location AS replay_left, "
+                           "backend_start "
+                    "FROM pg_stat_replication;"
+                )
 
-                if mirrorData is None or mirrorData["changeTrackingBytesUsed"] < 0:
-                    # server returns <0 if there was an error calculating size
-                    data.addValue(VALUE__CHANGE_TRACKING_DATA_SIZE, "unable to retrieve data size", isWarning=True)
-                    data.addValue(VALUE__CHANGE_TRACKING_DATA_SIZE_BYTES, "", isWarning=True)
-                else:
-                    data.addValue(VALUE__CHANGE_TRACKING_DATA_SIZE,
-                            self.__abbreviateBytes(mirrorData["changeTrackingBytesUsed"]))
-                    data.addValue(VALUE__CHANGE_TRACKING_DATA_SIZE_BYTES, mirrorData["changeTrackingBytesUsed"])
-                    
-            if mirrorData is None:
-                # MPP-14054
-                pass
+                rows = cursor.fetchall()
+                cursor.close()
 
-        #
-        # populate resync modes on primary and mirror
-        #
-        if primary.getSegmentMode() == gparray.MODE_RESYNCHRONIZATION:
+                if mirror.isSegmentDown():
+                    cursor = dbconn.execSQL(conn,
+                        "SELECT backend_start "
+                        "FROM pg_stat_activity "
+                        "WHERE application_name = '%s'" % gp.RECOVERY_REWIND_APPNAME
+                    )
 
-            if mirrorData is None:
-                data.addValue(VALUE__RESYNC_EST_PROGRESS_WITH_MIRROR, "unable to retrieve progress", isWarning=True)
-            else:
-                totalResyncObjectCount =  mirrorData['totalResyncObjectCount']
-                if totalResyncObjectCount == -1:
-                    totalResyncObjectCountStr = "Not Available"
-                else:
-                    totalResyncObjectCountStr = str(totalResyncObjectCount)
-		
-                resyncObjectCount =  mirrorData['curResyncObjectCount']
-                if resyncObjectCount == -1:
-                    resyncObjectCountStr = "Not Available"
-                else:
-                    resyncObjectCountStr = str(resyncObjectCount)
-		
-                dataSynchronizedBytes = mirrorData["resyncNumCompleted"] * 32L * 1024
-                dataSynchronizedStr = self.__abbreviateBytes( dataSynchronizedBytes )
-                resyncDataBytes = None
-                resyncProgressNumeric = None
-                totalDataToSynchronizeBytes = None
-                estimatedEndTimeTimestamp = None
+                    if cursor.rowcount > 0:
+                        rewinding = True
 
-                if mirrorData["dataState"] == "InSync":
-                    totalDataToSynchronizeStr = "Sync complete; awaiting config change"
-                    resyncProgressNumeric = 1
-                    resyncProgressStr = "100%"
-                    estimatedEndTimeStr = ""
-                elif mirrorData["estimatedCompletionTimeSecondsSinceEpoch"] == 0:
-                    totalDataToSynchronizeStr = "Not Available"
-                    resyncProgressStr = "Not Available"
-                    estimatedEndTimeStr = "Not Available"
-                else:
+                        if cursor.rowcount > 1:
+                            logger.warning('pg_stat_activity has more than one rewinding mirror')
 
-                    if mirrorData["resyncTotalToComplete"] == 0:
-                        resyncProgressStr = "Not Available"
-                    else:
-                        resyncProgressNumeric = mirrorData["resyncNumCompleted"] / float(mirrorData["resyncTotalToComplete"])
-                        percentComplete = 100 * resyncProgressNumeric
-                        resyncProgressStr = "%.2f%%" % percentComplete
+                        stat_activity_row = cursor.fetchone()
+                        rewind_start_time = stat_activity_row[0]
 
-                    totalDataToSynchronizeBytes = mirrorData["resyncTotalToComplete"] * 32L * 1024
-                    totalDataToSynchronizeStr = self.__abbreviateBytes( totalDataToSynchronizeBytes )
+                    cursor.close()
 
-                    endTime = datetime.datetime.fromtimestamp(mirrorData["estimatedCompletionTimeSecondsSinceEpoch"])
-                    estimatedEndTimeStr = str(endTime)
-                    estimatedEndTimeTimestamp = endTime.isoformat()
+        except pgdb.InternalError:
+            logger.warning('could not query segment {} ({}:{})'.format(
+                    primary.dbid, primary.hostname, primary.port
+            ))
+            return
 
-                data.addValue(VALUE__RESYNC_MODE, "Full" if mirrorData['isFullResync'] else "Incremental")
+        # Successfully queried pg_stat_replication. If there are any backup
+        # or pg_rewind connections, mention them in the primary status.
+        state = None
+        start_time = None
+        backup_connections = [r for r in rows if r[1] == 'backup']
 
-                data.addValue(VALUE__RESYNC_DATA_SYNCHRONIZED, dataSynchronizedStr)
-                data.addValue(VALUE__RESYNC_DATA_SYNCHRONIZED_BYTES, dataSynchronizedBytes)
+        if backup_connections:
+            row = backup_connections[0]
+            state = replication_state_to_string(row[1])
+            start_time = row[7]
+        elif rewinding:
+            state = "Rewinding history to match primary timeline"
+            start_time = rewind_start_time
 
-                data.addValue(VALUE__RESYNC_EST_TOTAL_DATA, totalDataToSynchronizeStr)
-                data.addValue(VALUE__RESYNC_EST_TOTAL_DATA_BYTES, totalDataToSynchronizeBytes)
+        data.switchSegment(primary)
+        if state:
+            data.addValue(VALUE__MIRROR_STATUS, state)
+        if start_time:
+            data.addValue(VALUE__MIRROR_RECOVERY_START, start_time)
 
-                data.addValue(VALUE__RESYNC_EST_PROGRESS_WITH_MIRROR, resyncProgressStr)
-                data.addValue(VALUE__RESYNC_EST_PROGRESS_WITH_MIRROR_NUMERIC, resyncProgressNumeric)
+        # Now fill in the information for the standby connection. There should
+        # be exactly one such entry; otherwise we bail.
+        standby_connections = [r for r in rows if r[0] == 'gp_walreceiver']
+        if not standby_connections:
+            logger.warning('pg_stat_replication shows no standby connections')
+            return
+        elif len(standby_connections) > 1:
+            logger.warning('pg_stat_replication shows more than one standby connection')
+            return
 
-                data.addValue(VALUE__TOTAL_RESYNC_OBJECT_COUNT, totalResyncObjectCountStr)
-                data.addValue(VALUE__TOTAL_RESYNC_OBJECT_COUNT_INT, totalResyncObjectCount)
+        row = standby_connections[0]
 
-                data.addValue(VALUE__RESYNC_OBJECT_COUNT, resyncObjectCountStr)
-                data.addValue(VALUE__RESYNC_OBJECT_COUNT_INT, resyncObjectCount)
+        GpSystemStateProgram._set_mirror_replication_values(data, mirror,
+            state=row[1],
+            sent_location=row[2],
+            flush_location=row[3],
+            flush_left=row[4],
+            replay_location=row[5],
+            replay_left=row[6],
+        )
 
-                data.addValue(VALUE__RESYNC_EST_COMPLETION_TIME, estimatedEndTimeStr)
-                data.addValue(VALUE__RESYNC_EST_COMPLETION_TIME_TIMESTAMP, estimatedEndTimeTimestamp)
+    @staticmethod
+    def _set_mirror_replication_values(data, mirror, **kwargs):
+        """
+        Fill GpStateData with replication information for a mirror. We have to
+        sanely handle not only the case where we couldn't connect, but also
+        cases where pg_stat_replication is incomplete or contains unexpected
+        data, so any or all of the keyword arguments may be None.
+
+        This is tightly coupled to _add_replication_info()'s SQL query; see that
+        implementation for the kwargs that may be passed.
+        """
+        data.switchSegment(mirror)
+
+        state = kwargs.pop('state', None)
+        sent_location = kwargs.pop('sent_location', None)
+        flush_location = kwargs.pop('flush_location', None)
+        flush_left = kwargs.pop('flush_left', None)
+        replay_location = kwargs.pop('replay_location', None)
+        replay_left = kwargs.pop('replay_left', None)
+
+        if kwargs:
+            raise TypeError('unexpected keyword argument {!r}'.format(kwargs.keys()[0]))
+
+        if state:
+            # Sharp eyes will notice that we may have already set the
+            # replication status in the output at this point, but that was a
+            # broad "synchronized vs. not synchronized" determination; we can do
+            # better if we have access to pg_stat_replication.
+            data.addValue(VALUE__MIRROR_STATUS, replication_state_to_string(state))
+
+        data.addValue(VALUE__REPL_SENT_LOCATION,
+                      sent_location if sent_location else 'Unknown',
+                      isWarning=(not sent_location))
+
+        if flush_location and flush_left:
+            flush_location += " ({} bytes left)".format(flush_left)
+        data.addValue(VALUE__REPL_FLUSH_LOCATION,
+                      flush_location if flush_location else 'Unknown',
+                      isWarning=(not flush_location))
+
+        if replay_location and replay_left:
+            replay_location += " ({} bytes left)".format(replay_left)
+        data.addValue(VALUE__REPL_REPLAY_LOCATION,
+                      replay_location if replay_location else 'Unknown',
+                      isWarning=(not replay_location))
 
     def __buildGpStateData(self, gpArray, hostNameToResults):
         data = GpStateData()
         primaryByContentId = GpArray.getSegmentsByContentId(\
                                 [s for s in gpArray.getSegDbList() if s.isSegmentPrimary(current_role=True)])
-        for seg in gpArray.getSegDbList():
-            (statusFetchWarning, outputFromCmd) = hostNameToResults[seg.getSegmentHostName()]
 
+        segments = gpArray.getSegDbList()
+
+        # Create segment entries in the state data.
+        for seg in segments:
             data.beginSegment(seg)
             data.addValue(VALUE__DBID, seg.getSegmentDbId())
             data.addValue(VALUE__CONTENTID, seg.getSegmentContentId())
@@ -1017,23 +1095,29 @@ class GpSystemStateProgram:
             data.addValue(VALUE__ADDRESS, seg.getSegmentAddress())
             data.addValue(VALUE__DATADIR, seg.getSegmentDataDirectory())
             data.addValue(VALUE__PORT, seg.getSegmentPort())
-
-            peerPrimary = None
             data.addValue(VALUE__CURRENT_ROLE, "Primary" if seg.isSegmentPrimary(current_role=True) else "Mirror")
             data.addValue(VALUE__PREFERRED_ROLE, "Primary" if seg.isSegmentPrimary(current_role=False) else "Mirror")
-            if gpArray.hasMirrors:
 
-                if seg.isSegmentPrimary(current_role=True):
-                    data.addValue(VALUE__MIRROR_STATUS, gparray.getDataModeLabel(seg.getSegmentMode()))
-                else:
-                    peerPrimary = primaryByContentId[seg.getSegmentContentId()][0]
-                    if peerPrimary.isSegmentModeInChangeLogging():
-                        data.addValue(VALUE__MIRROR_STATUS, "Out of Sync", isWarning=True)
-                    else:
-                        data.addValue(VALUE__MIRROR_STATUS, gparray.getDataModeLabel(seg.getSegmentMode()))
+            if gpArray.hasMirrors:
+                data.addValue(VALUE__MIRROR_STATUS, gparray.getDataModeLabel(seg.getSegmentMode()))
             else:
                 data.addValue(VALUE__MIRROR_STATUS, "Physical replication not configured")
 
+        # Add replication info on a per-pair basis.
+        if gpArray.hasMirrors:
+            for pair in gpArray.segmentPairs:
+                primary, mirror = pair.primaryDB, pair.mirrorDB
+                data.switchSegment(mirror)
+                self._add_replication_info(data, primary, mirror)
+
+        for seg in segments:
+            data.switchSegment(seg)
+
+            peerPrimary = None
+            if gpArray.hasMirrors and seg.isSegmentMirror(current_role=True):
+                peerPrimary = primaryByContentId[seg.getSegmentContentId()][0]
+
+            (statusFetchWarning, outputFromCmd) = hostNameToResults[seg.getSegmentHostName()]
             if statusFetchWarning is not None:
                 segmentData = None
                 data.addValue(VALUE__ERROR_GETTING_SEGMENT_STATUS, statusFetchWarning)
@@ -1041,25 +1125,7 @@ class GpSystemStateProgram:
                 segmentData = outputFromCmd[seg.getSegmentDbId()]
 
                 #
-                # Able to fetch from that segment, proceed
-                #
-
-                #
-                # mirror info
-                #
-                if gpArray.hasMirrors:
-                    # print out mirroring state from the segment itself
-                    if seg.isSegmentPrimary(current_role=True):
-                        self.__addResyncProgressFields(data, seg, segmentData, False)
-                    else:
-                        (primaryStatusFetchWarning, primaryOutputFromCmd) = hostNameToResults[peerPrimary.getSegmentHostName()]
-                        if primaryStatusFetchWarning is not None:
-                            data.addValue(VALUE__ERROR_GETTING_SEGMENT_STATUS, "Primary resync status error:" + str(primaryStatusFetchWarning))
-                        else:
-                            self.__addResyncProgressFields(data, peerPrimary, primaryOutputFromCmd[peerPrimary.getSegmentDbId()], True)
-
-                #
-                # Now PID status
+                # Able to fetch from that segment, proceed with PID status
                 #
                 pidData = segmentData[gp.SEGMENT_STATUS__GET_PID]
 
@@ -1078,7 +1144,7 @@ class GpSystemStateProgram:
                 data.addValue(VALUE__LOCK_FILES_EXIST, "t" if found else "f", isWarning=not found)
 
                 if pidData['error'] is None:
-                    data.addValue(VALUE__ACTIVE_PID, pidData["pid"])
+                    data.addValue(VALUE__ACTIVE_PID, abs(pidData["pid"]))
                     data.addValue(VALUE__ACTIVE_PID_INT, pidValueForSql)
                 else:
                     data.addValue(VALUE__ACTIVE_PID, "Not found", True)
@@ -1104,7 +1170,7 @@ class GpSystemStateProgram:
                 databaseStatusIsWarning = True
             else:
                 databaseStatus = segmentData[gp.SEGMENT_STATUS__GET_MIRROR_STATUS]["databaseStatus"]
-                databaseStatusIsWarning = databaseStatus == "Uninitialized" or databaseStatus == "Down"
+                databaseStatusIsWarning = databaseStatus != "Up"
 
             if seg.isSegmentMirror(current_role=True):
                 data.addValue(VALUE__MIRROR_SEGMENT_STATUS, databaseStatus, databaseStatusIsWarning)
@@ -1115,67 +1181,6 @@ class GpSystemStateProgram:
 
             data.setSegmentProbablyDown(seg, peerPrimary, databaseStatusIsWarning)
         return data
-
-    def __abbreviateBytes(self, numBytes):
-        """
-        Abbreviate bytes with 3 bytes of precision (so 1.45GB but also 12.3GB), except for numBytes < 1024
-
-
-        SAMPLE TEST:
-
-        def testAbbreviateBytes(bytes, expected=""):
-            # logger.info(" %s abbreviates to %s" % (bytes, self.__abbreviateBytes(bytes)))
-            if expected != self.__abbreviateBytes(bytes):
-                raise Exception("Invalid abbreviation for %s : %s" % (bytes, self.__abbreviateBytes(bytes)))
-
-        testAbbreviateBytes(0, "0 bytes")
-        testAbbreviateBytes(1, "1 byte")
-        testAbbreviateBytes(2, "2 bytes")
-        testAbbreviateBytes(13, "13 bytes")
-        testAbbreviateBytes(656, "656 bytes")
-        testAbbreviateBytes(999, "999 bytes")
-        testAbbreviateBytes(1000, "1000 bytes")
-        testAbbreviateBytes(1001, "1001 bytes")
-        testAbbreviateBytes(1024, "1.00 kB")
-        testAbbreviateBytes(1301, "1.27 kB")
-        testAbbreviateBytes(13501, "13.2 kB")
-        testAbbreviateBytes(135401, "132 kB")
-        testAbbreviateBytes(1354015, "1.29 MB")
-        testAbbreviateBytes(13544015, "12.9 MB")
-        testAbbreviateBytes(135440154, "129 MB")
-        testAbbreviateBytes(1354401574, "1.26 GB")
-        testAbbreviateBytes(13544015776, "12.6 GB")
-        testAbbreviateBytes(135440157769, "126 GB")
-        testAbbreviateBytes(1354401577609, "1.23 TB")
-        testAbbreviateBytes(13544015776094, "12.3 TB")
-        testAbbreviateBytes(135440157760944, "123 TB")
-        testAbbreviateBytes(1754401577609464, "1.56 PB")
-        testAbbreviateBytes(17544015776094646, "15.6 PB")
-        testAbbreviateBytes(175440157760946475, "156 PB")
-        testAbbreviateBytes(175440157760945555564, "155822 PB")
-
-
-        """
-        abbreviations = [
-            (1024L*1024*1024*1024*1024, "PB"),
-            (1024L*1024*1024*1024, "TB"),
-            (1024L*1024*1024, "GB"),
-            (1024L*1024, "MB"),
-            (1024L, "kB"),
-            (1, "bytes")]
-
-        if numBytes == 1:
-            return "1 byte"
-        for factor, suffix in abbreviations:
-            if numBytes >= factor:
-                break
-
-        precision = 3
-        precisionForDisplay = precision - len('%d' % int(numBytes/factor))
-        if precisionForDisplay < 0 or numBytes < 1024:
-            precisionForDisplay = 0
-
-        return '%.*f %s' % (precisionForDisplay, float(numBytes) / factor, suffix)
 
     def __showQuickStatus(self, gpEnv, gpArray):
 
@@ -1293,8 +1298,11 @@ class GpSystemStateProgram:
 
         # done printing pg_stat_replication table
 
-    def __poolWait(self, dispatchCount):
-        self.__pool.wait_and_printdots(dispatchCount, self.__options.quiet)
+    def __poolWait(self):
+        if self.__options.quiet:
+            self.__pool.join()
+        else:
+            base.join_and_indicate_progress(self.__pool)
 
     def __showVersionInfo(self, gpEnv, gpArray):
 
@@ -1306,7 +1314,6 @@ class GpSystemStateProgram:
 
         # fetch from hosts
         segmentsByHost = GpArray.getSegmentsByHostName(upSegmentsAndMaster)
-        dispatchCount = 0
         for hostName, segments in segmentsByHost.iteritems():
             cmd = gp.GpGetSegmentStatusValues("get segment version status", segments,
                                [gp.SEGMENT_STATUS__GET_VERSION],
@@ -1314,9 +1321,8 @@ class GpSystemStateProgram:
                                ctxt=base.REMOTE,
                                remoteHost=segments[0].getSegmentAddress())
             self.__pool.addCommand(cmd)
-            dispatchCount+=1
 
-        self.__poolWait(dispatchCount)
+        self.__poolWait()
 
         # group output
         dbIdToVersion = {}
@@ -1409,6 +1415,8 @@ class GpSystemStateProgram:
             exitCode = self.__showPortInfo(gpEnv, gpArray)
         elif self.__options.segmentStatusPipeSeparatedForTableUse:
             exitCode = self.__segmentStatusPipeSeparatedForTableUse(gpEnv, gpArray)
+        elif self.__options.showExpandStatus:
+            exitCode = self.__showExpandStatus(gpEnv)
         else:
             # self.__options.showStatusStatistics OR default:
             exitCode = self.__showStatusStatistics(gpEnv, gpArray)
@@ -1475,6 +1483,10 @@ class GpSystemStateProgram:
                          dest="showSummaryOfSegmentsWhichRequireAttention",
                          metavar="<showSummaryOfSegmentsWhichRequireAttention>",
                          help="Show summary of segments needing attention")
+        addTo.add_option("-x", None, default=False, action="store_true",
+                         dest="showExpandStatus",
+                         metavar="<showExpandStatus>",
+                         help="Show gpexpand status")
 
         #
         # two experimental options for exposing segment status as a queryable web table
@@ -1512,6 +1524,3 @@ class GpSystemStateProgram:
             raise ProgramArgumentValidationException(\
                             "too many arguments: only options may be specified", True)
         return GpSystemStateProgram(options)
-    
-        
-    

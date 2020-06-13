@@ -14,6 +14,8 @@
 #ifndef AOVISIMAP_H
 #define AOVISIMAP_H
 
+#include "storage/lock.h"
+
 /*
  * Macros to the attribute number for each attribute
  * in the AO visimap relation.
@@ -23,6 +25,7 @@
 #define Anum_pg_aovisimap_firstrownum   2
 #define Anum_pg_aovisimap_visimap       3
 
-extern void AlterTableCreateAoVisimapTable(Oid relOid, bool is_part_child);
+extern void AlterTableCreateAoVisimapTable(Oid relOid, bool is_part_child,
+										   bool is_part_parent);
 
 #endif

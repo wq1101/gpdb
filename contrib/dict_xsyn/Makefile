@@ -1,10 +1,13 @@
-# $PostgreSQL: pgsql/contrib/dict_xsyn/Makefile,v 1.3 2007/12/02 21:15:38 tgl Exp $
+# contrib/dict_xsyn/Makefile
 
 MODULE_big = dict_xsyn
-OBJS = dict_xsyn.o
-DATA_built = dict_xsyn.sql
-DATA = uninstall_dict_xsyn.sql
+OBJS = dict_xsyn.o $(WIN32RES)
+
+EXTENSION = dict_xsyn
+DATA = dict_xsyn--1.0.sql dict_xsyn--unpackaged--1.0.sql
 DATA_TSEARCH = xsyn_sample.rules
+PGFILEDESC = "dict_xsyn - add-on dictionary template for full-text search"
+
 REGRESS = dict_xsyn
 
 ifdef USE_PGXS

@@ -9,12 +9,12 @@
  *
  * Portions Copyright (c) 2006-2008, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/executor/nodeSubqueryscan.c,v 1.39 2008/01/01 19:45:49 momjian Exp $
+ *	  src/backend/executor/nodeSubqueryscan.c
  *
  *-------------------------------------------------------------------------
  */
@@ -24,16 +24,13 @@
  *		ExecSubqueryNext			retrieve next tuple in sequential order.
  *		ExecInitSubqueryScan		creates and initializes a subqueryscan node.
  *		ExecEndSubqueryScan			releases any storage allocated.
- *		ExecSubqueryReScan			rescans the relation
+ *		ExecReScanSubqueryScan		rescans the relation
  *
  */
 #include "postgres.h"
 
-#include "cdb/cdbvars.h"
 #include "executor/execdebug.h"
 #include "executor/nodeSubqueryscan.h"
-#include "optimizer/var.h"              /* CDB: contain_var_reference() */
-#include "parser/parsetree.h"
 
 static TupleTableSlot *SubqueryNext(SubqueryScanState *node);
 
@@ -53,37 +50,26 @@ SubqueryNext(SubqueryScanState *node)
 	TupleTableSlot *slot;
 
 	/*
-	 * We need not support EvalPlanQual here, since we are not scanning a real
-	 * relation.
-	 */
-
-	/*
 	 * Get the next tuple from the sub-query.
 	 */
 	slot = ExecProcNode(node->subplan);
 
 	/*
-	 * We just overwrite our ScanTupleSlot with the subplan's result slot,
-	 * rather than expending the cycles for ExecCopySlot().
+	 * We just return the subplan's result slot, rather than expending extra
+	 * cycles for ExecCopySlot().  (Our own ScanTupleSlot is used only for
+	 * EvalPlanQual rechecks.)
 	 */
-	node->ss.ss_ScanTupleSlot = slot;
-
-    /*
-     * CDB: Label each row with a synthetic ctid if needed for subquery dedup.
-     */
-    if (node->cdb_want_ctid &&
-        !TupIsNull(slot))
-    {
-    	slot_set_ctid_from_fake(slot, &node->cdb_fake_ctid);
-    }
-
-    if (!TupIsNull(slot))
-    {
-        Gpmon_Incr_Rows_Out(GpmonPktFromSubqueryScanState(node));
-        CheckSendPlanStateGpmonPkt(&node->ss.ps);
-    }
-
 	return slot;
+}
+
+/*
+ * SubqueryRecheck -- access method routine to recheck a tuple in EvalPlanQual
+ */
+static bool
+SubqueryRecheck(SubqueryScanState *node, TupleTableSlot *slot)
+{
+	/* nothing to check */
+	return true;
 }
 
 /* ----------------------------------------------------------------
@@ -91,18 +77,16 @@ SubqueryNext(SubqueryScanState *node)
  *
  *		Scans the subquery sequentially and returns the next qualifying
  *		tuple.
- *		It calls the ExecScan() routine and passes it the access method
- *		which retrieve tuples sequentially.
- *
+ *		We call the ExecScan() routine and pass it the appropriate
+ *		access method functions.
+ * ----------------------------------------------------------------
  */
-
 TupleTableSlot *
 ExecSubqueryScan(SubqueryScanState *node)
 {
-	/*
-	 * use SubqueryNext as access method
-	 */
-	return ExecScan(&node->ss, (ExecScanAccessMtd) SubqueryNext);
+	return ExecScan(&node->ss,
+					(ExecScanAccessMtd) SubqueryNext,
+					(ExecScanRecheckMtd) SubqueryRecheck);
 }
 
 /* ----------------------------------------------------------------
@@ -117,21 +101,9 @@ ExecInitSubqueryScan(SubqueryScan *node, EState *estate, int eflags)
 	/* check for unsupported flags */
 	Assert(!(eflags & EXEC_FLAG_MARK));
 
-	/*
-	 * SubqueryScan should not have any "normal" children.	Also, if planner
-	 * left anything in subrtable, it's fishy.
-	 */
+	/* SubqueryScan should not have any "normal" children */
 	Assert(outerPlan(node) == NULL);
 	Assert(innerPlan(node) == NULL);
-	Assert(node->subrtable == NIL);
-
-	/*
-	 * Since subquery nodes create its own executor state,
-	 * and pass it down to its child nodes, we always
-	 * initialize the subquery node. However, some
-	 * fields are not initialized if not necessary, see
-	 * below.
-	 */
 
 	/*
 	 * create state structure
@@ -157,12 +129,6 @@ ExecInitSubqueryScan(SubqueryScan *node, EState *estate, int eflags)
 		ExecInitExpr((Expr *) node->scan.plan.qual,
 					 (PlanState *) subquerystate);
 
-	/* Check if targetlist or qual contains a var node referencing the ctid column */
-	subquerystate->cdb_want_ctid = contain_ctid_var_reference(&node->scan);
-	ItemPointerSetInvalid(&subquerystate->cdb_fake_ctid);
-
-#define SUBQUERYSCAN_NSLOTS 2
-
 	/*
 	 * tuple table initialization
 	 */
@@ -186,18 +152,7 @@ ExecInitSubqueryScan(SubqueryScan *node, EState *estate, int eflags)
 	ExecAssignResultTypeFromTL(&subquerystate->ss.ps);
 	ExecAssignScanProjectionInfo(&subquerystate->ss);
 
-	initGpmonPktForSubqueryScan((Plan *)node, &subquerystate->ss.ps.gpmon_pkt, estate);
-
 	return subquerystate;
-}
-
-int
-ExecCountSlotsSubqueryScan(SubqueryScan *node)
-{
-	Assert(outerPlan(node) == NULL);
-	Assert(innerPlan(node) == NULL);
-	return ExecCountSlotsNode(node->subplan) +
-		SUBQUERYSCAN_NSLOTS;
 }
 
 /* ----------------------------------------------------------------
@@ -220,11 +175,8 @@ ExecEndSubqueryScan(SubqueryScanState *node)
 	if (node->ss.ss_ScanTupleSlot != NULL)
 	{
 		ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
-		node->ss.ss_ScanTupleSlot = NULL;	/* not ours to clear */
+		ExecClearTuple(node->ss.ss_ScanTupleSlot);
 	}
-
-	/* gpmon */
-	EndPlanStateGpmonPkt(&node->ss.ps);
 
 	/*
 	 * close down subquery
@@ -233,23 +185,19 @@ ExecEndSubqueryScan(SubqueryScanState *node)
 }
 
 /* ----------------------------------------------------------------
- *		ExecSubqueryReScan
+ *		ExecReScanSubqueryScan
  *
  *		Rescans the relation.
  * ----------------------------------------------------------------
  */
 void
-ExecSubqueryReScan(SubqueryScanState *node, ExprContext *exprCtxt)
+ExecReScanSubqueryScan(SubqueryScanState *node)
 {
-	EState	   *estate;
-
-	estate = node->ss.ps.state;
-
-	ItemPointerSet(&node->cdb_fake_ctid, 0, 0);
+	ExecScanReScan(&node->ss);
 
 	/*
 	 * ExecReScan doesn't know about my subplan, so I have to do
-	 * changed-parameter signaling myself.	This is just as well, because the
+	 * changed-parameter signaling myself.  This is just as well, because the
 	 * subplan has its own memory context in which its chgParam state lives.
 	 */
 	if (node->ss.ps.chgParam != NULL)
@@ -260,17 +208,12 @@ ExecSubqueryReScan(SubqueryScanState *node, ExprContext *exprCtxt)
 	 * first ExecProcNode.
 	 */
 	if (node->subplan->chgParam == NULL)
-		ExecReScan(node->subplan, NULL);
-
-	node->ss.ss_ScanTupleSlot = NULL;
-	/*node->ss.ps.ps_TupFromTlist = false;*/
-
-	CheckSendPlanStateGpmonPkt(&node->ss.ps);
+		ExecReScan(node->subplan);
 }
-	
+
 void
-initGpmonPktForSubqueryScan(Plan *planNode, gpmon_packet_t *gpmon_pkt, EState *estate)
+ExecSquelchSubqueryScan(SubqueryScanState *node)
 {
-	Assert(planNode != NULL && gpmon_pkt != NULL && IsA(planNode, SubqueryScan));
-	InitPlanNodeGpmonPkt(planNode, gpmon_pkt, estate);
+	/* Recurse to subquery */
+	ExecSquelchNode(node->subplan);
 }

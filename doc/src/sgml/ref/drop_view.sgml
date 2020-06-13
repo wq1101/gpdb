@@ -1,11 +1,16 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/drop_view.sgml,v 1.24 2007/07/03 01:30:35 neilc Exp $
+doc/src/sgml/ref/drop_view.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-DROPVIEW">
+ <indexterm zone="sql-dropview">
+  <primary>DROP VIEW</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="SQL-DROPVIEW-TITLE">DROP VIEW</refentrytitle>
+  <refentrytitle>DROP VIEW</refentrytitle>
+  <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
 
@@ -13,10 +18,6 @@ PostgreSQL documentation
   <refname>DROP VIEW</refname>
   <refpurpose>remove a view</refpurpose>
  </refnamediv>
-
- <indexterm zone="sql-dropview">
-  <primary>DROP VIEW</primary>
- </indexterm>
 
  <refsynopsisdiv>
 <synopsis>
@@ -32,7 +33,7 @@ DROP VIEW [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> [, ...
    this command you must be the owner of the view.
   </para>
  </refsect1>
-  
+
  <refsect1>
   <title>Parameters</title>
 
@@ -41,7 +42,7 @@ DROP VIEW [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> [, ...
     <term><literal>IF EXISTS</literal></term>
     <listitem>
      <para>
-      Do not throw an error if the view does not exist. A notice is issued 
+      Do not throw an error if the view does not exist. A notice is issued
       in this case.
      </para>
     </listitem>
@@ -61,7 +62,9 @@ DROP VIEW [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> [, ...
     <listitem>
      <para>
       Automatically drop objects that depend on the view (such as
-      other views).
+      other views),
+      and in turn all objects that depend on those objects
+      (see <xref linkend="ddl-depend">).
      </para>
     </listitem>
    </varlistentry>
@@ -85,18 +88,17 @@ DROP VIEW [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> [, ...
    This command will remove the view called <literal>kinds</literal>:
 <programlisting>
 DROP VIEW kinds;
-</programlisting>
-  </para>
+</programlisting></para>
  </refsect1>
- 
+
  <refsect1>
   <title>Compatibility</title>
 
   <para>
    This command conforms to the SQL standard, except that the standard only
-   allows one view to be dropped per command, and apart from the 
-   <literal>IF EXISTS</> option, which is a <productname>PostgreSQL</> 
-   extension. 
+   allows one view to be dropped per command, and apart from the
+   <literal>IF EXISTS</> option, which is a <productname>PostgreSQL</>
+   extension.
   </para>
  </refsect1>
 
@@ -104,8 +106,8 @@ DROP VIEW kinds;
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-alterview" endterm="sql-alterview-title"></member>
-   <member><xref linkend="sql-createview" endterm="sql-createview-title"></member>
+   <member><xref linkend="sql-alterview"></member>
+   <member><xref linkend="sql-createview"></member>
   </simplelist>
  </refsect1>
 

@@ -51,6 +51,7 @@ SELECT ' INFINITY    x'::float8;
 SELECT 'Infinity'::float8 + 100.0;
 SELECT 'Infinity'::float8 / 'Infinity'::float8;
 SELECT 'nan'::float8 / 'nan'::float8;
+SELECT 'nan'::numeric::float8;
 
 SELECT '' AS five, f1 FROM FLOAT8_TBL ORDER BY 2;
 
@@ -66,7 +67,7 @@ SELECT '' AS four, f.f1 FROM FLOAT8_TBL f WHERE '1004.3' >= f.f1 ORDER BY 2;
 
 SELECT '' AS four, f.f1 FROM FLOAT8_TBL f WHERE  f.f1 <= '1004.3' ORDER BY 2;
 
-SELECT '' AS three, f.f1, f.f1 * '-10' AS x 
+SELECT '' AS three, f.f1, f.f1 * '-10' AS x
    FROM FLOAT8_TBL f
    WHERE f.f1 > '0.0' ORDER BY 2;
 
@@ -85,15 +86,15 @@ SELECT '' AS three, f.f1, f.f1 - '-10' AS x
 SELECT '' AS one, f.f1 ^ '2.0' AS square_f1
    FROM FLOAT8_TBL f where f.f1 = '1004.3';
 
--- absolute value 
-SELECT '' AS five, f.f1, @f.f1 AS abs_f1 
-   FROM FLOAT8_TBL f ORDER BY 2;
+-- absolute value
+SELECT '' AS five, f.f1, @f.f1 AS abs_f1
+   FROM FLOAT8_TBL f;
 
--- truncate 
+-- truncate
 SELECT '' AS five, f.f1, trunc(f.f1) AS trunc_f1
    FROM FLOAT8_TBL f ORDER BY 2;
 
--- round 
+-- round
 SELECT '' AS five, f.f1, round(f.f1) AS round_f1
    FROM FLOAT8_TBL f ORDER BY 2;
 
@@ -107,7 +108,7 @@ select floor(f1) as floor_f1 from float8_tbl f ORDER BY 1;
 -- sign
 select sign(f1) as sign_f1 from float8_tbl f ORDER BY 1;
 
--- square root 
+-- square root
 SELECT sqrt(float8 '64') AS eight;
 
 SELECT |/ float8 '64' AS eight;
@@ -119,12 +120,12 @@ SELECT '' AS three, f.f1, |/f.f1 AS sqrt_f1
 -- power
 SELECT power(float8 '144', float8 '0.5');
 
--- take exp of ln(f.f1) 
+-- take exp of ln(f.f1)
 SELECT '' AS three, f.f1, exp(ln(f.f1)) AS exp_ln_f1
    FROM FLOAT8_TBL f
    WHERE f.f1 > '0.0' ORDER BY 2;
 
--- cube root 
+-- cube root
 SELECT ||/ float8 '27' AS three;
 
 SELECT '' AS five, f.f1, ||/f.f1 AS cbrt_f1 FROM FLOAT8_TBL f ORDER BY 2;
@@ -140,6 +141,8 @@ SELECT '' AS bad, f.f1 * '1e200' from FLOAT8_TBL f;
 
 SELECT '' AS bad, f.f1 ^ '1e200' from FLOAT8_TBL f;
 
+SELECT 0 ^ 0 + 0 ^ 1 + 0 ^ 0.0 + 0 ^ 0.5;
+
 SELECT '' AS bad, ln(f.f1) from FLOAT8_TBL f where f.f1 = '0.0' ;
 
 SELECT '' AS bad, ln(f.f1) from FLOAT8_TBL f where f.f1 < '0.0' ;
@@ -150,7 +153,7 @@ SELECT '' AS bad, f.f1 / '0.0' from FLOAT8_TBL f;
 
 SELECT '' AS five, f1 FROM FLOAT8_TBL ORDER BY 2;
 
--- test for over- and underflow 
+-- test for over- and underflow
 INSERT INTO FLOAT8_TBL(f1) VALUES ('10e400');
 
 INSERT INTO FLOAT8_TBL(f1) VALUES ('-10e400');
@@ -256,21 +259,48 @@ INSERT INTO FLOAT8_TBL(f1) VALUES ('-1.2345678901234e-200');
 
 SELECT '' AS five, f1 FROM FLOAT8_TBL ORDER BY 2;
 
--- test if you can dump/restore subnormal (1e-323) values
--- using COPY
+-- test exact cases for trigonometric functions in degrees
+SET extra_float_digits = 3;
 
-CREATE TABLE FLOATS(a float8);
+SELECT x,
+       sind(x),
+       sind(x) IN (-1,-0.5,0,0.5,1) AS sind_exact
+FROM (VALUES (0), (30), (90), (150), (180),
+      (210), (270), (330), (360)) AS t(x);
 
-INSERT INTO FLOATS select 1e-307::float8 / 10^i FROM generate_series(1,16) i;
+SELECT x,
+       cosd(x),
+       cosd(x) IN (-1,-0.5,0,0.5,1) AS cosd_exact
+FROM (VALUES (0), (60), (90), (120), (180),
+      (240), (270), (300), (360)) AS t(x);
 
-SELECT * FROM FLOATS ORDER BY a;
+SELECT x,
+       tand(x),
+       tand(x) IN ('-Infinity'::float8,-1,0,
+                   1,'Infinity'::float8) AS tand_exact,
+       cotd(x),
+       cotd(x) IN ('-Infinity'::float8,-1,0,
+                   1,'Infinity'::float8) AS cotd_exact
+FROM (VALUES (0), (45), (90), (135), (180),
+      (225), (270), (315), (360)) AS t(x);
 
-SELECT float8in(float8out(a)) FROM FLOATS ORDER BY a;
+SELECT x,
+       asind(x),
+       asind(x) IN (-90,-30,0,30,90) AS asind_exact,
+       acosd(x),
+       acosd(x) IN (0,60,90,120,180) AS acosd_exact
+FROM (VALUES (-1), (-0.5), (0), (0.5), (1)) AS t(x);
 
-COPY FLOATS TO '/tmp/floats';
+SELECT x,
+       atand(x),
+       atand(x) IN (-90,-45,0,45,90) AS atand_exact
+FROM (VALUES ('-Infinity'::float8), (-1), (0), (1),
+      ('Infinity'::float8)) AS t(x);
 
-TRUNCATE FLOATS;
+SELECT x, y,
+       atan2d(y, x),
+       atan2d(y, x) IN (-90,0,90,180) AS atan2d_exact
+FROM (SELECT 10*cosd(a), 10*sind(a)
+      FROM generate_series(0, 360, 90) AS t(a)) AS t(x,y);
 
-COPY FLOATS FROM '/tmp/floats';
-
-SELECT * FROM FLOATS ORDER BY a;
+RESET extra_float_digits;

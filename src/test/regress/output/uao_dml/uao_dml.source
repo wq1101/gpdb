@@ -6,6 +6,10 @@ set gp_default_storage_options='orientation=@orientation@';
 -- The queries in this test are not interesting from the point of view of
 -- testing the optimizer, so just disable ORCA to work around that.
 set optimizer=off;
+-- With gp_select_invisible set true, the snapshot will be SnapshotAnyData.
+-- But in one case of IndexOnlyScan, only MVCC snapshots are supported.
+-- So we disable IndexOnlyScan here, as what we want to test is gp_select_invisible.
+set enable_indexonlyscan=off;
 -- @Description Tests basic delete feature with two AO blocks
 -- 
 DROP TABLE IF EXISTS foo;
@@ -225,19 +229,29 @@ CREATE INDEX foo_index ON foo(b);
 INSERT INTO foo SELECT i as a, i as b, 'hello world' as c FROM generate_series(1,1000) AS i;
 BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
 DELETE FROM foo WHERE a < 4;
-ERROR:  Deletes on append-only tables are not supported in serializable transactions.  (seg0 gesameistd1m1.corp.emc.com:40000 pid=96582)
+ERROR:  deletes on append-only tables are not supported in serializable transactions  (seg0 gesameistd1m1.corp.emc.com:40000 pid=96582)
+ROLLBACK;
+-- @Description Tests that update in a serializable transaction is not supported
+-- 
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+UPDATE foo SET b = 1 WHERE a < 4;
+ERROR:  updates on append-only tables are not supported in serializable transactions  (seg0 gesameistd1m1.corp.emc.com:40000 pid=73392)
 ROLLBACK;
 -- @Description Tests that delete in a serializable transaction is not supported
 -- even in a subtransaction.
 -- 
-DROP TABLE IF EXISTS foo;
-CREATE TABLE foo (a INT, b INT, c CHAR(128)) WITH (appendonly=true);
-CREATE INDEX foo_index ON foo(b);
-INSERT INTO foo SELECT i as a, i as b, 'hello world' as c FROM generate_series(1,1000) AS i;
 BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
 SAVEPOINT my_savepoint;
 DELETE FROM foo WHERE a < 4;
-ERROR:  Deletes on append-only tables are not supported in serializable transactions.  (seg0 gesameistd1m1.corp.emc.com:40000 pid=96582)
+ERROR:  deletes on append-only tables are not supported in serializable transactions  (seg0 gesameistd1m1.corp.emc.com:40000 pid=96582)
+ROLLBACK;
+-- @Description Tests that update in a serializable transaction is not supported
+-- even in a subtransaction.
+-- 
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+SAVEPOINT my_savepoint;
+UPDATE foo SET b = 1 WHERE a < 4;
+ERROR:  updates on append-only tables are not supported in serializable transactions  (seg0 gesameistd1m1.corp.emc.com:40000 pid=73392)
 ROLLBACK;
 -- @Description Tests that delete with sub transactions
 -- 
@@ -397,52 +411,52 @@ set gp_autostats_on_change_threshold=1;
 set gp_autostats_mode=on_change;
 insert into ao2_@orientation@ select i,'aa'||i from generate_series(21,30) as i;
 select reltuples from pg_class where relname = 'ao2_@orientation@';
- reltuples
+ reltuples 
 -----------
         10
 (1 row)
 
 select count(*)  from ao2_@orientation@;
- count
+ count 
 -------
     10
 (1 row)
 
 insert into ao2_@orientation@ select i,'aa'||i from generate_series(21,30) as i;
 select count(*)  from ao2_@orientation@;
- count
+ count 
 -------
     20
 (1 row)
 
 select reltuples from pg_class where relname = 'ao2_@orientation@';
- reltuples
+ reltuples 
 -----------
         20
 (1 row)
 
 insert into ao2_@orientation@ select i,'aa'||i from generate_series(21,30) as i;
 select reltuples from pg_class where relname = 'ao2_@orientation@';
- reltuples
+ reltuples 
 -----------
         30
 (1 row)
 
 select count(*)  from ao2_@orientation@;
- count
+ count 
 -------
     30
 (1 row)
 
 delete from ao2_@orientation@ where i < 27;
 select count(*)  from ao2_@orientation@;
- count
+ count 
 -------
     12
 (1 row)
 
 select reltuples from pg_class where relname = 'ao2_@orientation@';
- reltuples
+ reltuples 
 -----------
         12
 (1 row)
@@ -580,8 +594,13 @@ create table bar2 ( a int, b int) with (appendonly = true);
 insert into bar2 select x , x from generate_series(1,10) as x;
 SET gp_select_invisible=false;
 set gp_select_invisible = true;
-select * from bar2 order by 1;
- a  | b
+-- The test framework assumes that the output of `select ... order by`
+-- is in order. It is true but not enought because the order of the
+-- tuples with the same order-by key might be different in other cols.
+-- To make these kind of test cases not flaky, we should order the
+-- results in all the cols. 
+select * from (select * from bar2 order by 1) r order by 1, 2;
+ a  | b  
 ----+----
   1 |  1
   2 |  2
@@ -596,15 +615,15 @@ select * from bar2 order by 1;
 (10 rows)
 
 update bar2 set b = b+200 where a = 5;
-select * from bar2 order by 1;
- a  |  b
+select * from (select * from bar2 order by 1) r order by 1, 2;
+ a  |  b  
 ----+-----
   1 |   1
   2 |   2
   3 |   3
   4 |   4
-  5 | 205
   5 |   5
+  5 | 205
   6 |   6
   7 |   7
   8 |   8
@@ -613,15 +632,15 @@ select * from bar2 order by 1;
 (11 rows)
 
 insert into bar2 select x , x from generate_series(11,20) as x;
-select * from bar2 order by 1;
- a  |  b
+select * from bar2 order by 1, 2;
+ a  |  b  
 ----+-----
   1 |   1
   2 |   2
   3 |   3
   4 |   4
-  5 | 205
   5 |   5
+  5 | 205
   6 |   6
   7 |   7
   8 |   8
@@ -884,7 +903,7 @@ CREATE TABLE mytab_@orientation@(
 Create index mytab_int_idx1_@orientation@ on mytab_@orientation@(col_int);
 insert into mytab_@orientation@ values(1,'aa',1001,101),(2,'bb',1002,102);
 select * from mytab_@orientation@;
- col_int | col_text | col_numeric | col_unq
+ col_int | col_text | col_numeric | col_unq 
 ---------+----------+-------------+---------
        1 | aa       |        1001 |     101
        2 | bb       |        1002 |     102
@@ -892,7 +911,7 @@ select * from mytab_@orientation@;
 
 update mytab_@orientation@ set col_text=' new value' where col_int = 1;
 select * from mytab_@orientation@;
- col_int |  col_text  | col_numeric | col_unq
+ col_int |  col_text  | col_numeric | col_unq 
 ---------+------------+-------------+---------
        2 | bb         |        1002 |     102
        1 |  new value |        1001 |     101
@@ -900,13 +919,13 @@ select * from mytab_@orientation@;
 
 vacuum mytab_@orientation@;
 SELECT reltuples FROM pg_class WHERE relname = 'mytab_@orientation@';
- reltuples
+ reltuples 
 -----------
          2
 (1 row)
 
 SELECT reltuples FROM pg_class WHERE relname = 'mytab_int_idx1_@orientation@';
- reltuples
+ reltuples 
 -----------
          2
 (1 row)
@@ -1079,7 +1098,7 @@ DELETE FROM foo USING BAR WHERE foo.b = bar.b AND foo.a = bar.a AND
 -- This query should return the same output irrespective of GPDB
 -- configuration (1 segdb, 2 or more segdbs).
 SELECT distinct(a) FROM foo
-WHERE gp_segment_id = 0 AND foo.a IN (12, 80001, 1001)
+WHERE gp_segment_id = 1 AND foo.a IN (12, 80001, 1001)
 ORDER BY a;
    a   
 -------
@@ -1111,14 +1130,14 @@ INSERT INTO bar SELECT i as a, 2 as b, '' as c  FROM generate_series(1, 100000) 
 ANALYZE foo;
 ANALYZE bar;
 -- MPP-23546.  The following update statements ensure that
--- appendonly_udpate() sees tuples out of order with respect to their
+-- appendonly_update() sees tuples out of order with respect to their
 -- row numbers / tuple ids and also that the tuples seen by update
 -- span more than one visimap entry.
 set enable_nestloop=false;
 UPDATE foo SET a = 0 FROM bar WHERE foo.b = bar.b AND foo.a = bar.a AND
 (bar.a = 10 OR bar.a = 40000 OR bar.a = 20000);
 -- Ensure that tuples to be updated are all from the same GPDB segment.
-SELECT distinct(a) FROM foo WHERE gp_segment_id = 0 AND
+SELECT distinct(a) FROM foo WHERE gp_segment_id = 1 AND
 foo.a IN (12, 80001, 1001) ORDER BY a;
    a   
 -------
@@ -1137,7 +1156,6 @@ DROP TABLE IF EXISTS uao_orders_into;
 DROP TABLE IF EXISTS new_uao_orders_into;
 CREATE TABLE uao_orders_into(order_id serial , customer_id integer,
       order_datetime timestamp, order_total numeric(10,2)) with (appendonly=true);
-NOTICE:  CREATE TABLE will create implicit sequence "uao_orders_into_order_id_seq" for serial column "uao_orders_into.order_id"
 NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column(s) named 'order_id' as the Greenplum Database data distribution key for this table.
 HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
 INSERT INTO uao_orders_into(customer_id, order_datetime, order_total)
@@ -1219,7 +1237,7 @@ SELECT reltuples FROM pg_class WHERE relname = 'foo_@orientation@_index';
 
 set enable_seqscan=false;
 SELECT COUNT(*) FROM foo_@orientation@ WHERE b=42;
- count
+ count 
 -------
    100
 (1 row)
@@ -1751,7 +1769,7 @@ SELECT SUM(b) FROM foo WHERE a = 17;
  187
 (1 row)
 
-UPDATE foo SET b = 2 * b WHERE a = 17;
+UPDATE foo SET b = 2*b WHERE a = 17;
 SELECT SUM(b) FROM foo WHERE a = 17;
  sum 
 -----
@@ -1801,16 +1819,6 @@ reset enable_nestloop;
 reset enable_seqscan;
 reset enable_bitmapscan;
 reset enable_mergejoin;
--- @Description Tests that update in a serializable transaction is not supported
--- 
-DROP TABLE IF EXISTS foo;
-CREATE TABLE foo (a INT, b INT, c CHAR(128)) WITH (appendonly=true);
-CREATE INDEX foo_index ON foo(b);
-INSERT INTO foo SELECT i as a, i as b, 'hello world' as c FROM generate_series(1,1000) AS i;
-BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
-UPDATE foo SET b = 1 WHERE a < 4;
-ERROR:  Updates on append-only tables are not supported in serializable transactions.  (seg0 gesameistd1m1.corp.emc.com:40000 pid=73392)
-ROLLBACK;
 -- @Description Tests that update is supported in a subtransaction.
 -- 
 DROP TABLE IF EXISTS foo;
@@ -1868,15 +1876,3 @@ SELECT COUNT(*) FROM foo WHERE b = 1;
 (1 row)
 
 COMMIT;
--- @Description Tests that update in a serializable transaction is not supported
--- even in a subtransaction.
--- 
-DROP TABLE IF EXISTS foo;
-CREATE TABLE foo (a INT, b INT, c CHAR(128)) WITH (appendonly=true);
-CREATE INDEX foo_index ON foo(b);
-INSERT INTO foo SELECT i as a, i as b, 'hello world' as c FROM generate_series(1,1000) AS i;
-BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
-SAVEPOINT my_savepoint;
-UPDATE foo SET b = 1 WHERE a < 4;
-ERROR:  Updates on append-only tables are not supported in serializable transactions.  (seg0 gesameistd1m1.corp.emc.com:40000 pid=73392)
-ROLLBACK;

@@ -5,10 +5,10 @@
  *
  * See logtape.c for explanations.
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/utils/logtape.h,v 1.17 2008/01/01 19:45:59 momjian Exp $
+ * src/include/utils/logtape.h
  *
  *-------------------------------------------------------------------------
  */
@@ -16,6 +16,7 @@
 #ifndef LOGTAPE_H
 #define LOGTAPE_H
 
+#include "storage/buffile.h"
 #include "utils/workfile_mgr.h"
 
 typedef struct LogicalTapePos
@@ -34,16 +35,16 @@ typedef struct LogicalTapeSet LogicalTapeSet;
  */
 
 extern LogicalTape *LogicalTapeCreate(LogicalTapeSet *lts, LogicalTape *lt); 
-extern LogicalTapeSet *LogicalTapeSetCreate(int ntapes, bool del_on_close);
-extern LogicalTapeSet *LogicalTapeSetCreate_File(ExecWorkFile *ewfile, int ntapes);
-extern LogicalTapeSet *LoadLogicalTapeSetState(ExecWorkFile *pfile, ExecWorkFile *tapefile);
+extern LogicalTapeSet *LogicalTapeSetCreate(int ntapes);
+extern LogicalTapeSet *LogicalTapeSetCreate_File(BufFile *ewfile, int ntapes);
+extern LogicalTapeSet *LoadLogicalTapeSetState(BufFile *pfile, BufFile *tapefile);
 
 extern void LogicalTapeSetClose(LogicalTapeSet *lts, workfile_set *workset);
 extern void LogicalTapeSetForgetFreeSpace(LogicalTapeSet *lts);
 
 extern size_t LogicalTapeRead(LogicalTapeSet *lts, LogicalTape *lt, void *ptr, size_t size);
 extern void LogicalTapeWrite(LogicalTapeSet *lts, LogicalTape *lt, void *ptr, size_t size);
-extern void LogicalTapeFlush(LogicalTapeSet *lts, LogicalTape *lt, ExecWorkFile *pstatefile);
+extern void LogicalTapeFlush(LogicalTapeSet *lts, LogicalTape *lt, BufFile *pstatefile);
 extern void LogicalTapeRewind(LogicalTapeSet *lts, LogicalTape *lt, bool forWrite);
 extern void LogicalTapeFreeze(LogicalTapeSet *lts, LogicalTape *lt);
 extern bool LogicalTapeBackspace(LogicalTapeSet *lts, LogicalTape *lt, size_t size);
@@ -55,6 +56,7 @@ extern long LogicalTapeSetBlocks(LogicalTapeSet *lts);
 extern void LogicalTapeSetForgetFreeSpace(LogicalTapeSet *lts);
 
 extern LogicalTape *LogicalTapeSetGetTape(LogicalTapeSet *lts, int tapenum);
+extern int LogicalTapeGetTapeNum(LogicalTapeSet *lts, LogicalTape *lt);
 extern LogicalTape *LogicalTapeSetDuplicateTape(LogicalTapeSet *lts, LogicalTape *lt);
 
 #endif   /* LOGTAPE_H */

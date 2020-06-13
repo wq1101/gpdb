@@ -27,7 +27,7 @@ class ComputeCatalogUpdate:
 
     mirror_to_remove	     - to be removed (e.g. via gp_remove_segment_mirror())
     primary_to_remove	     - to be removed (e.g. via gp_remove_segment())
-    primary_to_add	     - to be added (e.g. via gp_add_segment())
+    primary_to_add	     - to be added (e.g. via gp_add_segment_primary())
     mirror_to_add	     - to be added (e.g. via gp_add_segment_mirror())
     mirror_to_remove_and_add - change or force list requires this mirror
                                 to be removed and then added back
@@ -96,14 +96,14 @@ class ComputeCatalogUpdate:
 
         # create a map of the segments which we can't update in the 
         # ordinary way either because they were on the forceMap or
-        # they differ in an attribute other than mode, status or replication port
+        # they differ in an attribute other than mode or status
         removeandaddmap = {}
         for seg in initial_segment_to_update:
             dbid = seg.getSegmentDbId()
             if dbid in forceMap:
                 removeandaddmap[dbid] = seg
                 continue
-            if not seg.equalIgnoringModeAndStatusAndReplicationPort(self.dbsegmap[dbid]):
+            if not seg.equalIgnoringModeAndStatus(self.dbsegmap[dbid]):
                 removeandaddmap[dbid] = seg
                 continue
 
@@ -174,7 +174,8 @@ class ComputeCatalogUpdate:
 
         # Validate that if we have any mirrors, that all primaries have mirrors
         #
-        if len(final[ ROLE_MIRROR ]) > 0:
+        only_contains_standby_mirror = (len(final[ ROLE_MIRROR ]) == 1 and final[ ROLE_MIRROR ].get(-1) != None)
+        if len(final[ ROLE_MIRROR ]) > 0 and not only_contains_standby_mirror:
             for contentId in final[ ROLE_PRIMARY ]:
                 if contentId != MASTER_CONTENT_ID and final[ ROLE_MIRROR ].get( contentId ) is None:
                     seg = final[ ROLE_PRIMARY ][ contentId ]
@@ -252,10 +253,8 @@ if __name__ == '__main__':
         def getSegmentMode(self):                  return self.mode
         def getSegmentRole(self):                  return self.role
         def getSegmentStatus(self):                return self.status
-        def getSegmentReplicationPort(self):       return self.rport
         def setSegmentMode(self,mode):             self.mode = mode
         def setSegmentStatus(self,status):         self.status = status
-        def setSegmentReplicationPort(self,rport): self.rport = rport
         def isSegmentPrimary(self, current_role=False):
             role = self.role if current_role else self.preferred_role
             return self.content >= 0 and role == ROLE_PRIMARY
@@ -271,11 +270,10 @@ if __name__ == '__main__':
         def __cmp__(self,other):                   return cmp(repr(self), repr(other))
         def __repr__(s): 
             return '(%s,%s,%s,%s,%s,%s,%s,%s)' % (s.dbid, s.content, s.preferred_role, s.mode, s.role, s.status, s.rport, s.misc)
-        def equalIgnoringModeAndStatusAndReplicationPort(self, other):
+        def equalIgnoringModeAndStatus(self, other):
             tmp = copy.copy(self)
             tmp.setSegmentMode( other.getSegmentMode() )
             tmp.setSegmentStatus( other.getSegmentStatus() )
-            tmp.setSegmentReplicationPort( other.getSegmentReplicationPort() )
             return tmp == other
 
     class xxx:

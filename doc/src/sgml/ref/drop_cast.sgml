@@ -1,8 +1,13 @@
-<!-- $PostgreSQL: pgsql/doc/src/sgml/ref/drop_cast.sgml,v 1.8 2006/09/16 00:30:18 momjian Exp $ -->
+<!-- doc/src/sgml/ref/drop_cast.sgml -->
 
 <refentry id="SQL-DROPCAST">
+ <indexterm zone="sql-dropcast">
+  <primary>DROP CAST</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="SQL-DROPCAST-TITLE">DROP CAST</refentrytitle>
+  <refentrytitle>DROP CAST</refentrytitle>
+  <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
 
@@ -11,16 +16,12 @@
   <refpurpose>remove a cast</refpurpose>
  </refnamediv>
 
- <indexterm zone="sql-dropcast">
-  <primary>DROP CAST</primary>
- </indexterm>
-
  <refsynopsisdiv>
 <synopsis>
-DROP CAST [ IF EXISTS ] (<replaceable>sourcetype</replaceable> AS <replaceable>targettype</replaceable>) [ CASCADE | RESTRICT ]
+DROP CAST [ IF EXISTS ] (<replaceable>source_type</replaceable> AS <replaceable>target_type</replaceable>) [ CASCADE | RESTRICT ]
 </synopsis>
  </refsynopsisdiv>
-  
+
  <refsect1 id="sql-dropcast-description">
   <title>Description</title>
 
@@ -44,14 +45,14 @@ DROP CAST [ IF EXISTS ] (<replaceable>sourcetype</replaceable> AS <replaceable>t
     <term><literal>IF EXISTS</literal></term>
     <listitem>
      <para>
-      Do not throw an error if the cast does not exist. A notice is issued 
+      Do not throw an error if the cast does not exist. A notice is issued
       in this case.
      </para>
     </listitem>
    </varlistentry>
 
     <varlistentry>
-     <term><replaceable>sourcetype</replaceable></term>
+     <term><replaceable>source_type</replaceable></term>
 
      <listitem>
       <para>
@@ -61,7 +62,7 @@ DROP CAST [ IF EXISTS ] (<replaceable>sourcetype</replaceable> AS <replaceable>t
     </varlistentry>
 
     <varlistentry>
-     <term><replaceable>targettype</replaceable></term>
+     <term><replaceable>target_type</replaceable></term>
 
      <listitem>
       <para>
@@ -91,10 +92,9 @@ DROP CAST [ IF EXISTS ] (<replaceable>sourcetype</replaceable> AS <replaceable>t
    To drop the cast from type <type>text</type> to type <type>int</type>:
 <programlisting>
 DROP CAST (text AS int);
-</programlisting>
-  </para>
+</programlisting></para>
  </refsect1>
- 
+
  <refsect1 id="sql-dropcast-compat">
   <title>Compatibility</title>
 
@@ -107,7 +107,7 @@ DROP CAST (text AS int);
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-createcast" endterm="sql-createcast-title"></member>
+   <member><xref linkend="sql-createcast"></member>
   </simplelist>
  </refsect1>
 

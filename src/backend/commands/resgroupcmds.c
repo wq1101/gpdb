@@ -14,7 +14,7 @@
 #include "postgres.h"
 
 #include "funcapi.h"
-#include "gp-libpq-fe.h"
+#include "libpq-fe.h"
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/xact.h"
@@ -22,6 +22,7 @@
 #include "catalog/oid_dispatch.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_resgroup.h"
+#include "catalog/pg_resgroupcapability.h"
 #include "cdb/cdbdisp_query.h"
 #include "cdb/cdbdispatchresult.h"
 #include "cdb/cdbvars.h"
@@ -37,10 +38,15 @@
 #include "utils/resource_manager.h"
 #include "utils/resowner.h"
 #include "utils/syscache.h"
+#include "utils/faultinjector.h"
 
 #define RESGROUP_DEFAULT_CONCURRENCY (20)
-#define RESGROUP_DEFAULT_MEM_SHARED_QUOTA (20)
-#define RESGROUP_DEFAULT_MEM_SPILL_RATIO (20)
+#define RESGROUP_DEFAULT_MEM_SHARED_QUOTA (80)
+#define RESGROUP_DEFAULT_MEM_SPILL_RATIO RESGROUP_FALLBACK_MEMORY_SPILL_RATIO
+#define RESGROUP_DEFAULT_MEMORY_LIMIT RESGROUP_UNLIMITED_MEMORY_LIMIT
+
+#define RESGROUP_DEFAULT_MEM_AUDITOR (RESGROUP_MEMORY_AUDITOR_VMTRACKER)
+#define RESGROUP_INVALID_MEM_AUDITOR (-1)
 
 #define RESGROUP_MIN_CONCURRENCY	(0)
 #define RESGROUP_MAX_CONCURRENCY	(MaxConnections)
@@ -48,7 +54,8 @@
 #define RESGROUP_MIN_CPU_RATE_LIMIT	(1)
 #define RESGROUP_MAX_CPU_RATE_LIMIT	(100)
 
-#define RESGROUP_MIN_MEMORY_LIMIT	(1)
+#define RESGROUP_MIN_MEMORY_LIMIT	(0)
+#define RESGROUP_MAX_MEMORY_LIMIT	(100)
 
 #define RESGROUP_MIN_MEMORY_SHARED_QUOTA	(0)
 #define RESGROUP_MAX_MEMORY_SHARED_QUOTA	(100)
@@ -57,103 +64,36 @@
 #define RESGROUP_MAX_MEMORY_SPILL_RATIO		(100)
 
 /*
- * The context to pass to callback in ALTER resource group
+ * The names must be in the same order as ResGroupMemAuditorType.
  */
-typedef struct {
-	Oid		groupid;
-	int		limittype;
-	ResGroupCaps	caps;
-} ResourceGroupAlterCallbackContext;
-
-/*
- * The form of callbacks for resource group
- */
-typedef void (*ResourceGroupCallback) (bool isCommit, void *arg);
-
-/*
- * List of add-on callbacks for resource group related operations
- * The list is maintained as circular doubly linked.
- */
-typedef struct ResourceGroupCallbackItem
+static const char *ResGroupMemAuditorName[] =
 {
-	struct ResourceGroupCallbackItem *next;
-	struct ResourceGroupCallbackItem *prev;
-	ResourceGroupCallback callback;
-	void *arg;
-} ResourceGroupCallbackItem;
-
-static ResourceGroupCallbackItem ResourceGroup_callbacks_head =
-{
-	&ResourceGroup_callbacks_head, &ResourceGroup_callbacks_head, NULL, NULL
+	"vmtracker",	// RESGROUP_MEMORY_AUDITOR_VMTRACKER
+	"cgroup"		// RESGROUP_MEMORY_AUDITOR_CGROUP
 };
-
-static ResourceGroupCallbackItem *ResourceGroup_callbacks = &ResourceGroup_callbacks_head;
 
 static int str2Int(const char *str, const char *prop);
 static ResGroupLimitType getResgroupOptionType(const char* defname);
-static const char * getResgroupOptionName(ResGroupLimitType type);
-static void parseStmtOptions(CreateResourceGroupStmt *stmt, ResGroupOpts *options);
-static void validateCapabilities(Relation rel, Oid groupid, ResGroupOpts *options, bool newGroup);
-static void insertResgroupCapabilityEntry(Relation rel, Oid groupid, uint16 type, char *value);
-static void updateResgroupCapabilities(Oid groupid, const ResGroupCaps *resgroupCaps);
-static void insertResgroupCapabilities(Oid groupid, ResGroupOpts *options);
+static ResGroupCap getResgroupOptionValue(DefElem *defel, int type);
+static const char *getResgroupOptionName(ResGroupLimitType type);
+static void checkResgroupCapLimit(ResGroupLimitType type, ResGroupCap value);
+static void checkResgroupCapConflicts(ResGroupCaps *caps);
+static void parseStmtOptions(CreateResourceGroupStmt *stmt, ResGroupCaps *caps);
+static void validateCapabilities(Relation rel, Oid groupid, ResGroupCaps *caps, bool newGroup);
+static void insertResgroupCapabilityEntry(Relation rel, Oid groupid, uint16 type, const char *value);
+static void updateResgroupCapabilityEntry(Relation rel,
+										  Oid groupId,
+										  ResGroupLimitType limitType,
+										  ResGroupCap value,
+										  const char *strValue);
+static void insertResgroupCapabilities(Relation rel, Oid groupId, ResGroupCaps *caps);
 static void deleteResgroupCapabilities(Oid groupid);
-static void createResGroupAbortCallback(bool isCommit, void *arg);
-static void dropResGroupAbortCallback(bool isCommit, void *arg);
-static void alterResGroupCommitCallback(bool isCommit, void *arg);
-static void registerResourceGroupCallback(ResourceGroupCallback callback, void *arg);
-
-/*
- * Register callback functions for resource group related operations.
- *
- * At transaction end, the callback occurs post-commit or post-abort, so the
- * callback functions can only do non-critical cleanup.
- */
-static void
-registerResourceGroupCallback(ResourceGroupCallback callback, void *arg)
-{
-	ResourceGroupCallbackItem *item;
-
-	item = (ResourceGroupCallbackItem *)
-		MemoryContextAlloc(TopMemoryContext,
-						   sizeof(ResourceGroupCallbackItem));
-	item->callback = callback;
-	item->arg = arg;
-
-	item->prev = ResourceGroup_callbacks->prev;
-	item->next = ResourceGroup_callbacks;
-	item->prev->next = item;
-	item->next->prev = item;
-}
-
-/*
- * Call resource group related callback functions at transaction end.
- *
- * On COMMIT, the callback functions are processed as FIFO.
- * On ABORT,  the callback functions are processed as LIFO.
- *
- * Note the callback functions would be removed as being processed.
- */
-void
-AtEOXact_ResGroup(bool isCommit)
-{
-	ResourceGroupCallbackItem *current =
-		isCommit ? ResourceGroup_callbacks->next : ResourceGroup_callbacks->prev;
-	while (current != ResourceGroup_callbacks)
-	{
-		ResourceGroupCallbackItem *tmp = isCommit? current->next : current->prev;
-
-		ResourceGroupCallback callback = current->callback;
-		void *arg =  current->arg;
-
-		current->prev->next = current->next;
-		current->next->prev = current->prev;
-		pfree(current);
-		current = tmp;
-
-		callback(isCommit, arg);
-	}
-}
+static void checkAuthIdForDrop(Oid groupId);
+static void createResgroupCallback(XactEvent event, void *arg);
+static void dropResgroupCallback(XactEvent event, void *arg);
+static void alterResgroupCallback(XactEvent event, void *arg);
+static int getResGroupMemAuditor(char *name);
+static bool checkCpusetSyntax(const char *cpuset);
 
 /*
  * CREATE RESOURCE GROUP
@@ -162,6 +102,7 @@ void
 CreateResourceGroup(CreateResourceGroupStmt *stmt)
 {
 	Relation	pg_resgroup_rel;
+	Relation	pg_resgroupcapability_rel;
 	TupleDesc	pg_resgroup_dsc;
 	ScanKeyData scankey;
 	SysScanDesc sscan;
@@ -169,7 +110,7 @@ CreateResourceGroup(CreateResourceGroupStmt *stmt)
 	Oid			groupid;
 	Datum		new_record[Natts_pg_resgroup];
 	bool		new_record_nulls[Natts_pg_resgroup];
-	ResGroupOpts options;
+	ResGroupCaps caps;
 	int			nResGroups;
 
 	/* Permission check - only superuser can create groups. */
@@ -187,17 +128,21 @@ CreateResourceGroup(CreateResourceGroupStmt *stmt)
 				(errcode(ERRCODE_RESERVED_NAME),
 				 errmsg("resource group name \"none\" is reserved")));
 
-	MemSet(&options, 0, sizeof(options));
-	parseStmtOptions(stmt, &options);
+	ClearResGroupCaps(&caps);
+	parseStmtOptions(stmt, &caps);
 
 	/*
-	 * Grant ExclusiveLock to serialize concurrent 'CREATE RESOURCE GROUP'
+	 * both CREATE and ALTER resource group need check the sum of cpu_rate_limit
+	 * and memory_limit and make sure the sum don't exceed 100. To make it simple,
+	 * acquire AccessExclusiveLock lock on pg_resgroupcapability at the beginning
+	 * of CREATE and ALTER
 	 */
-	pg_resgroup_rel = heap_open(ResGroupRelationId, ExclusiveLock);
+	pg_resgroupcapability_rel = heap_open(ResGroupCapabilityRelationId, AccessExclusiveLock);
+	pg_resgroup_rel = heap_open(ResGroupRelationId, RowExclusiveLock);
 
-	/* Check if max_resource_group limit is reached */
+	/* Check if MaxResourceGroups limit is reached */
 	sscan = systable_beginscan(pg_resgroup_rel, ResGroupRsgnameIndexId, false,
-							   SnapshotNow, 0, NULL);
+							   NULL, 0, NULL);
 	nResGroups = 0;
 	while (systable_getnext(sscan) != NULL)
 		nResGroups++;
@@ -206,8 +151,7 @@ CreateResourceGroup(CreateResourceGroupStmt *stmt)
 	if (nResGroups >= MaxResourceGroups)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
-				 errmsg("insufficient resource groups available"),
-				 errhint("Increase max_resource_groups")));
+				 errmsg("insufficient resource groups available")));
 
 	/*
 	 * Check the pg_resgroup relation to be certain the group doesn't already
@@ -219,7 +163,7 @@ CreateResourceGroup(CreateResourceGroupStmt *stmt)
 				CStringGetDatum(stmt->name));
 
 	sscan = systable_beginscan(pg_resgroup_rel, ResGroupRsgnameIndexId, true,
-							   SnapshotNow, 1, &scankey);
+							   NULL, 1, &scankey);
 
 	if (HeapTupleIsValid(systable_getnext(sscan)))
 		ereport(ERROR,
@@ -238,7 +182,7 @@ CreateResourceGroup(CreateResourceGroupStmt *stmt)
 	new_record[Anum_pg_resgroup_rsgname - 1] =
 		DirectFunctionCall1(namein, CStringGetDatum(stmt->name));
 
-	new_record[Anum_pg_resgroup_parent - 1] = Int64GetDatum(0);
+	new_record[Anum_pg_resgroup_parent - 1] = ObjectIdGetDatum(0);
 
 	pg_resgroup_dsc = RelationGetDescr(pg_resgroup_rel);
 	tuple = heap_form_tuple(pg_resgroup_dsc, new_record, new_record_nulls);
@@ -250,7 +194,8 @@ CreateResourceGroup(CreateResourceGroupStmt *stmt)
 	CatalogUpdateIndexes(pg_resgroup_rel, tuple);
 
 	/* process the WITH (...) list items */
-	insertResgroupCapabilities(groupid, &options);
+	validateCapabilities(pg_resgroupcapability_rel, groupid, &caps, true);
+	insertResgroupCapabilities(pg_resgroupcapability_rel, groupid, &caps);
 
 	/* Dispatch the statement to segments */
 	if (Gp_role == GP_ROLE_DISPATCH)
@@ -268,28 +213,50 @@ CreateResourceGroup(CreateResourceGroupStmt *stmt)
 	}
 
 	heap_close(pg_resgroup_rel, NoLock);
+	heap_close(pg_resgroupcapability_rel, NoLock);
 
 	/* Add this group into shared memory */
 	if (IsResGroupActivated())
 	{
-		Oid			*callbackArg;
+		ResourceGroupCallbackContext *callbackCtx;
 
-		AllocResGroupEntry(groupid, &options);
-
+		AllocResGroupEntry(groupid, &caps);
 
 		/* Argument of callback function should be allocated in heap region */
-		callbackArg = (Oid *)MemoryContextAlloc(TopMemoryContext, sizeof(Oid));
-		*callbackArg = groupid;
-		registerResourceGroupCallback(createResGroupAbortCallback, (void *)callbackArg);
+		callbackCtx = (ResourceGroupCallbackContext *)
+			MemoryContextAlloc(TopMemoryContext, sizeof(*callbackCtx));
+		callbackCtx->groupid = groupid;
+		callbackCtx->caps = caps;
+		RegisterXactCallbackOnce(createResgroupCallback, callbackCtx);
 
 		/* Create os dependent part for this resource group */
 		ResGroupOps_CreateGroup(groupid);
-		ResGroupOps_SetCpuRateLimit(groupid, options.cpuRateLimit);
+
+		ResGroupOps_SetMemoryLimit(groupid, caps.memLimit);
+
+		if (caps.cpuRateLimit != CPU_RATE_LIMIT_DISABLED)
+		{
+			ResGroupOps_SetCpuRateLimit(groupid, caps.cpuRateLimit);
+		}
+		else if (!CpusetIsEmpty(caps.cpuset))
+		{
+			EnsureCpusetIsAvailable(ERROR);
+
+			ResGroupOps_SetCpuSet(groupid, caps.cpuset);
+			/* reset default group, subtract new group cpu cores */
+			char defaultGroupCpuset[MaxCpuSetLength];
+			ResGroupOps_GetCpuSet(DEFAULT_CPUSET_GROUP_ID,
+								  defaultGroupCpuset,
+								  MaxCpuSetLength);
+			CpusetDifference(defaultGroupCpuset, caps.cpuset, MaxCpuSetLength);
+			ResGroupOps_SetCpuSet(DEFAULT_CPUSET_GROUP_ID, defaultGroupCpuset);
+		}
+		SIMPLE_FAULT_INJECTOR("create_resource_group_fail");
 	}
 	else if (Gp_role == GP_ROLE_DISPATCH)
 		ereport(WARNING,
 				(errmsg("resource group is disabled"),
-				 errhint("To enable set resource_scheduler=on and gp_resource_manager=group")));
+				 errhint("To enable set gp_resource_manager=group")));
 }
 
 /*
@@ -299,14 +266,11 @@ void
 DropResourceGroup(DropResourceGroupStmt *stmt)
 {
 	Relation	 pg_resgroup_rel;
-	Relation	 authIdRel;
 	HeapTuple	 tuple;
 	ScanKeyData	 scankey;
 	SysScanDesc	 sscan;
-	ScanKeyData	 authid_scankey;
-	SysScanDesc	 authid_scan;
 	Oid			 groupid;
-	Oid			*callbackArg;
+	ResourceGroupCallbackContext	*callbackCtx;
 
 	/* Permission check - only superuser can drop resource groups. */
 	if (!superuser())
@@ -326,7 +290,7 @@ DropResourceGroup(DropResourceGroupStmt *stmt)
 				CStringGetDatum(stmt->name));
 
 	sscan = systable_beginscan(pg_resgroup_rel, ResGroupRsgnameIndexId, true,
-							   SnapshotNow, 1, &scankey);
+							   NULL, 1, &scankey);
 
 	tuple = systable_getnext(sscan);
 	if (!HeapTupleIsValid(tuple))
@@ -348,26 +312,14 @@ DropResourceGroup(DropResourceGroupStmt *stmt)
 				 errmsg("cannot drop default resource group \"%s\"",
 						stmt->name)));
 
+	/* check before dispatch to segment */
+	if (IsResGroupActivated())
+		ResGroupCheckForDrop(groupid, stmt->name);
+
 	/*
 	 * Check to see if any roles are in this resource group.
 	 */
-	authIdRel = heap_open(AuthIdRelationId, RowExclusiveLock);
-	ScanKeyInit(&authid_scankey,
-				Anum_pg_authid_rolresgroup,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(groupid));
-
-	authid_scan = systable_beginscan(authIdRel, AuthIdRolResGroupIndexId, true,
-									 SnapshotNow, 1, &authid_scankey);
-
-	if (HeapTupleIsValid(systable_getnext(authid_scan)))
-		ereport(ERROR,
-				(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
-				 errmsg("resource group \"%s\" is used by at least one role",
-						stmt->name)));
-
-	systable_endscan(authid_scan);
-	heap_close(authIdRel, RowExclusiveLock);
+	checkAuthIdForDrop(groupid);
 
 	/*
 	 * Delete the resource group from the catalog.
@@ -384,11 +336,11 @@ DropResourceGroup(DropResourceGroupStmt *stmt)
 	 */
 	DeleteSharedComments(groupid, ResGroupRelationId);
 
-	/* metadata tracking */
-	MetaTrackDropObject(ResGroupRelationId, groupid);
-
 	if (Gp_role == GP_ROLE_DISPATCH)
 	{
+		/* metadata tracking */
+		MetaTrackDropObject(ResGroupRelationId, groupid);
+
 		CdbDispatchUtilityStatement((Node *) stmt,
 									DF_CANCEL_ON_ERROR|
 									DF_WITH_SNAPSHOT|
@@ -399,12 +351,11 @@ DropResourceGroup(DropResourceGroupStmt *stmt)
 
 	if (IsResGroupActivated())
 	{
-		ResGroupCheckForDrop(groupid, stmt->name);
-
 		/* Argument of callback function should be allocated in heap region */
-		callbackArg = (Oid *)MemoryContextAlloc(TopMemoryContext, sizeof(Oid));
-		*callbackArg = groupid;
-		registerResourceGroupCallback(dropResGroupAbortCallback, (void *)callbackArg);
+		callbackCtx = (ResourceGroupCallbackContext *)
+			MemoryContextAlloc(TopMemoryContext, sizeof(*callbackCtx));
+		callbackCtx->groupid = groupid;
+		RegisterXactCallbackOnce(dropResgroupCallback, callbackCtx);
 	}
 }
 
@@ -414,22 +365,15 @@ DropResourceGroup(DropResourceGroupStmt *stmt)
 void
 AlterResourceGroup(AlterResourceGroupStmt *stmt)
 {
-	Relation	pg_resgroup_rel;
 	Relation	pg_resgroupcapability_rel;
-	HeapTuple	tuple;
-	ScanKeyData	scankey;
-	SysScanDesc	sscan;
 	Oid			groupid;
-	ResourceGroupAlterCallbackContext *callbackCtx;
-	int			concurrency = -1;
-	int			cpuRateLimitNew = -1;
-	int			memSharedQuotaNew = -1;
-	int			memSpillRatioNew = -1;
-	int			memLimitNew = -1;
 	DefElem		*defel;
 	ResGroupLimitType	limitType;
 	ResGroupCaps		caps;
-	ResGroupOpts		opts;
+	ResGroupCaps		oldCaps;
+	ResGroupCap			value = 0;
+	const char *cpuset = NULL;
+	ResourceGroupCallbackContext	*callbackCtx;
 
 	/* Permission check - only superuser can alter resource groups. */
 	if (!superuser())
@@ -442,124 +386,44 @@ AlterResourceGroup(AlterResourceGroupStmt *stmt)
 	defel = (DefElem *) lfirst(list_head(stmt->options));
 
 	limitType = getResgroupOptionType(defel->defname);
-
-	switch (limitType)
+	if (limitType == RESGROUP_LIMIT_TYPE_UNKNOWN)
 	{
-		case RESGROUP_LIMIT_TYPE_CONCURRENCY:
-			concurrency = defGetInt64(defel);
-			if (concurrency < RESGROUP_MIN_CONCURRENCY)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_LIMIT_VALUE),
-						 errmsg("concurrency limit cannot be less than %d",
-								RESGROUP_MIN_CONCURRENCY)));
-			if (concurrency > RESGROUP_MAX_CONCURRENCY)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_LIMIT_VALUE),
-						 errmsg("concurrency limit cannot be greater than 'max_connections'")));
-			break;
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("option \"%s\" not recognized", defel->defname)));
+	}
+	else if (limitType == RESGROUP_LIMIT_TYPE_CPUSET)
+	{
+		EnsureCpusetIsAvailable(ERROR);
 
-		case RESGROUP_LIMIT_TYPE_CPU:
-			cpuRateLimitNew = defGetInt64(defel);
-			if (cpuRateLimitNew < RESGROUP_MIN_CPU_RATE_LIMIT)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_LIMIT_VALUE),
-						 errmsg("cpu rate limit cannot be less than %d",
-								RESGROUP_MIN_CPU_RATE_LIMIT)));
-			if (cpuRateLimitNew > RESGROUP_MAX_CPU_RATE_LIMIT)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_LIMIT_VALUE),
-						 errmsg("cpu rate limit cannot be greater than %d",
-								RESGROUP_MAX_CPU_RATE_LIMIT)));
-			/* overall limit will be verified later after groupid is known */
-			break;
-
-		case RESGROUP_LIMIT_TYPE_MEMORY_SHARED_QUOTA:
-			memSharedQuotaNew = defGetInt64(defel);
-			if (memSharedQuotaNew < RESGROUP_MIN_MEMORY_SHARED_QUOTA)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_LIMIT_VALUE),
-						 errmsg("memory shared quota cannot be less than %d",
-								RESGROUP_MIN_MEMORY_SHARED_QUOTA)));
-			if (memSharedQuotaNew > RESGROUP_MAX_MEMORY_SHARED_QUOTA)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_LIMIT_VALUE),
-						 errmsg("memory shared quota cannot be greater than %d",
-								RESGROUP_MAX_MEMORY_SHARED_QUOTA)));
-			break;
-
-		case RESGROUP_LIMIT_TYPE_MEMORY:
-			memLimitNew = defGetInt64(defel);
-			if (memLimitNew < RESGROUP_MIN_MEMORY_LIMIT)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_LIMIT_VALUE),
-						 errmsg("memory limit cannot be less than %d",
-								RESGROUP_MIN_MEMORY_LIMIT)));
-			if (memLimitNew > RESGROUP_MAX_MEMORY_LIMIT)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_LIMIT_VALUE),
-						 errmsg("memory limit cannot be greater than %d",
-								RESGROUP_MAX_MEMORY_LIMIT)));
-			/* overall limit will be verified later after groupid is known */
-			break;
-		case RESGROUP_LIMIT_TYPE_MEMORY_SPILL_RATIO:
-			memSpillRatioNew = defGetInt64(defel);
-			if (memSpillRatioNew < RESGROUP_MIN_MEMORY_SPILL_RATIO)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_LIMIT_VALUE),
-						 errmsg("memory spill ratio cannot be less than %d",
-								RESGROUP_MIN_MEMORY_SPILL_RATIO)));
-			if (memSpillRatioNew > RESGROUP_MAX_MEMORY_SPILL_RATIO)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_LIMIT_VALUE),
-						 errmsg("memory spill ratio cannot be greater than %d",
-								RESGROUP_MAX_MEMORY_SPILL_RATIO)));
-			break;
-
-		default:
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("unsupported resource group limit type '%s'", defel->defname)));
+		cpuset = defGetString(defel);
+		checkCpusetSyntax(cpuset);
+	}
+	else
+	{
+		value = getResgroupOptionValue(defel, limitType);
+		checkResgroupCapLimit(limitType, value);
 	}
 
 	/*
 	 * Check the pg_resgroup relation to be certain the resource group already
 	 * exists.
 	 */
-	pg_resgroup_rel = heap_open(ResGroupRelationId, RowExclusiveLock);
-
-	ScanKeyInit(&scankey,
-				Anum_pg_resgroup_rsgname,
-				BTEqualStrategyNumber, F_NAMEEQ,
-				CStringGetDatum(stmt->name));
-
-	sscan = systable_beginscan(pg_resgroup_rel, ResGroupRsgnameIndexId, true,
-							   SnapshotNow, 1, &scankey);
-
-	tuple = systable_getnext(sscan);
-	if (!HeapTupleIsValid(tuple))
+	groupid = GetResGroupIdForName(stmt->name);
+	if (groupid == InvalidOid)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("resource group \"%s\" does not exist",
 						stmt->name)));
 
-	groupid = HeapTupleGetOid(tuple);
-	systable_endscan(sscan);
-	heap_close(pg_resgroup_rel, NoLock);
-
 	if (limitType == RESGROUP_LIMIT_TYPE_CONCURRENCY &&
-		concurrency == 0 &&
+		value == 0 &&
 		groupid == ADMINRESGROUP_OID)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_LIMIT_VALUE),
 				 errmsg("admin_group must have at least one concurrency")));
 	}
-
-	/* Argument of callback function should be allocated in heap region */
-	callbackCtx = (ResourceGroupAlterCallbackContext *)
-		MemoryContextAlloc(TopMemoryContext, sizeof(*callbackCtx));
-	callbackCtx->groupid = groupid;
-	callbackCtx->limittype = limitType;
 
 	/*
 	 * In validateCapabilities() we scan all the resource groups
@@ -570,64 +434,79 @@ AlterResourceGroup(AlterResourceGroupStmt *stmt)
 	pg_resgroupcapability_rel = heap_open(ResGroupCapabilityRelationId,
 										  AccessExclusiveLock);
 
-	/* Load currency resource group capabilities */
-	GetResGroupCapabilities(groupid, &caps);
-
-	/* Pick up the effective settings from caps */
-	ResGroupCapsToOpts(&caps, &opts);
-
-	/* Attempt to pick previous 'proposed' as 'value' */
-	ResGroupDecideConcurrencyCaps(groupid, &caps, &opts);
-	ResGroupDecideMemoryCaps(groupid, &caps, &opts);
+	/* Load current resource group capabilities */
+	GetResGroupCapabilities(pg_resgroupcapability_rel, groupid, &oldCaps);
+	caps = oldCaps;
 
 	switch (limitType)
 	{
-		case RESGROUP_LIMIT_TYPE_CONCURRENCY:
-			opts.concurrency = concurrency;
-			ResGroupDecideConcurrencyCaps(groupid, &caps, &opts);
-			break;
-
 		case RESGROUP_LIMIT_TYPE_CPU:
-			opts.cpuRateLimit = cpuRateLimitNew;
-			if (caps.cpuRateLimit.proposed < cpuRateLimitNew)
-				validateCapabilities(pg_resgroupcapability_rel,
-									 groupid, &opts, false);
-
-			caps.cpuRateLimit.value = cpuRateLimitNew;
-			caps.cpuRateLimit.proposed = cpuRateLimitNew;
+			caps.cpuRateLimit = value;
+			SetCpusetEmpty(caps.cpuset, sizeof(caps.cpuset));
 			break;
-
-		case RESGROUP_LIMIT_TYPE_MEMORY_SHARED_QUOTA:
-			opts.memSharedQuota = memSharedQuotaNew;
-
-			ResGroupDecideMemoryCaps(groupid, &caps, &opts);
-			break;
-
 		case RESGROUP_LIMIT_TYPE_MEMORY:
-			opts.memLimit = memLimitNew;
-			if (caps.memLimit.proposed < memLimitNew)
-				validateCapabilities(pg_resgroupcapability_rel,
-									 groupid, &opts, false);
-
-			ResGroupDecideMemoryCaps(groupid, &caps, &opts);
+			caps.memLimit = value;
+			break;
+		case RESGROUP_LIMIT_TYPE_CONCURRENCY:
+			caps.concurrency = value;
+			break;
+		case RESGROUP_LIMIT_TYPE_MEMORY_SHARED_QUOTA:
+			caps.memSharedQuota = value;
 			break;
 		case RESGROUP_LIMIT_TYPE_MEMORY_SPILL_RATIO:
-			caps.memSpillRatio.value = memSpillRatioNew;
-			caps.memSpillRatio.proposed = memSpillRatioNew;
+			caps.memSpillRatio = value;
 			break;
-
+		case RESGROUP_LIMIT_TYPE_MEMORY_AUDITOR:
+			caps.memAuditor = value;
+			break;
+		case RESGROUP_LIMIT_TYPE_CPUSET:
+			StrNCpy(caps.cpuset, cpuset, sizeof(caps.cpuset));
+			caps.cpuRateLimit = CPU_RATE_LIMIT_DISABLED;
+			break;
 		default:
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("unsupported resource group limit type '%s'", defel->defname)));
+			break;
 	}
 
-	updateResgroupCapabilities(groupid, &caps);
+	checkResgroupCapConflicts(&caps);
+
+	validateCapabilities(pg_resgroupcapability_rel, groupid, &caps, false);
+
+	/* cpuset & cpu_rate_limit can not coexist 
+	 * if cpuset is active, then cpu_rate_limit must set to CPU_RATE_LIMIT_DISABLED
+	 * if cpu_rate_limit is active, then cpuset must set to "" */
+	if (limitType == RESGROUP_LIMIT_TYPE_CPUSET)
+	{
+		updateResgroupCapabilityEntry(pg_resgroupcapability_rel,
+									  groupid, RESGROUP_LIMIT_TYPE_CPU, 
+									  CPU_RATE_LIMIT_DISABLED, "");
+		updateResgroupCapabilityEntry(pg_resgroupcapability_rel,
+									  groupid, RESGROUP_LIMIT_TYPE_CPUSET, 
+									  0, caps.cpuset);
+	}
+	else if (limitType == RESGROUP_LIMIT_TYPE_CPU)
+	{
+		updateResgroupCapabilityEntry(pg_resgroupcapability_rel,
+									  groupid, RESGROUP_LIMIT_TYPE_CPUSET,
+									  0, DefaultCpuset);
+		updateResgroupCapabilityEntry(pg_resgroupcapability_rel,
+									  groupid, RESGROUP_LIMIT_TYPE_CPU,
+									  value, "");
+	}
+	else
+	{
+		updateResgroupCapabilityEntry(pg_resgroupcapability_rel,
+									  groupid, limitType, value, "");
+	}
 
 	heap_close(pg_resgroupcapability_rel, NoLock);
 
 	if (Gp_role == GP_ROLE_DISPATCH)
 	{
+		MetaTrackUpdObject(ResGroupCapabilityRelationId,
+						   groupid,
+						   GetUserId(),
+						   "ALTER", defel->defname);
+
 		CdbDispatchUtilityStatement((Node *) stmt,
 									DF_CANCEL_ON_ERROR|
 									DF_WITH_SNAPSHOT|
@@ -636,13 +515,16 @@ AlterResourceGroup(AlterResourceGroupStmt *stmt)
 									NULL);
 	}
 
-	/* Bump command counter to make this change visible in the callback function alterResGroupCommitCallback() */
-	CommandCounterIncrement();
-
 	if (IsResGroupActivated())
 	{
+		/* Argument of callback function should be allocated in heap region */
+		callbackCtx = (ResourceGroupCallbackContext *)
+			MemoryContextAlloc(TopMemoryContext, sizeof(*callbackCtx));
+		callbackCtx->groupid = groupid;
+		callbackCtx->limittype = limitType;
 		callbackCtx->caps = caps;
-		registerResourceGroupCallback(alterResGroupCommitCallback, (void *)callbackCtx);
+		callbackCtx->oldCaps = oldCaps;
+		RegisterXactCallbackOnce(alterResgroupCallback, callbackCtx);
 	}
 }
 
@@ -650,20 +532,13 @@ AlterResourceGroup(AlterResourceGroupStmt *stmt)
  * Get all the capabilities of one resource group in pg_resgroupcapability.
  */
 void
-GetResGroupCapabilities(Oid groupId, ResGroupCaps *resgroupCaps)
+GetResGroupCapabilities(Relation rel, Oid groupId, ResGroupCaps *resgroupCaps)
 {
 	SysScanDesc	sscan;
 	ScanKeyData	key;
 	HeapTuple	tuple;
 	bool isNull;
-	Relation	relResGroupCapability;
-	/*
-	 * By converting caps from (ResGroupCaps *) to an array of (ResGroupCap *)
-	 * we can access the individual capability via index, so we don't need
-	 * to use a switch case when setting them.
-	 */
-	ResGroupCap *caps = (ResGroupCap *) resgroupCaps;
-	ResourceOwner owner = NULL;
+
 	/*
 	 * We maintain a bit mask to track which resgroup limit capability types
 	 * have been retrieved, when mask is 0 then no limit capability is found
@@ -671,99 +546,105 @@ GetResGroupCapabilities(Oid groupId, ResGroupCaps *resgroupCaps)
 	 */
 	int			mask = 0;
 
-	MemSet(caps, 0, sizeof(ResGroupCaps));
+	ClearResGroupCaps(resgroupCaps);
 
-	if (CurrentResourceOwner == NULL)
-	{
-		owner = ResourceOwnerCreate(NULL, "getResgroupCapabilityEntry");
-		CurrentResourceOwner = owner;
-	}
-
-	relResGroupCapability = heap_open(ResGroupCapabilityRelationId, AccessShareLock);
+	/* Init cpuset with proper value */
+	strcpy(resgroupCaps->cpuset, DefaultCpuset);
 
 	ScanKeyInit(&key,
 				Anum_pg_resgroupcapability_resgroupid,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(groupId));
 
-	sscan = systable_beginscan(relResGroupCapability,
+	sscan = systable_beginscan(rel,
 							   ResGroupCapabilityResgroupidIndexId,
 							   true,
-							   SnapshotNow, 1, &key);
+							   NULL, 1, &key);
 
 	while (HeapTupleIsValid(tuple = systable_getnext(sscan)))
 	{
 		Datum				typeDatum;
 		ResGroupLimitType	type;
 		Datum				valueDatum;
-		Datum				proposedDatum;
 		char				*value;
-		char				*proposed;
 
 		typeDatum = heap_getattr(tuple, Anum_pg_resgroupcapability_reslimittype,
-								 relResGroupCapability->rd_att, &isNull);
+								 rel->rd_att, &isNull);
 		type = (ResGroupLimitType) DatumGetInt16(typeDatum);
 
 		Assert(type > RESGROUP_LIMIT_TYPE_UNKNOWN);
-		Assert(type < RESGROUP_LIMIT_TYPE_COUNT);
 		Assert(!(mask & (1 << type)));
+
+		if (type >= RESGROUP_LIMIT_TYPE_COUNT)
+			continue;
 
 		mask |= 1 << type;
 
-		valueDatum = heap_getattr(tuple, Anum_pg_resgroupcapability_value, relResGroupCapability->rd_att, &isNull);
-		value = DatumGetCString(DirectFunctionCall1(textout, valueDatum));
-		caps[type].value = str2Int(value, getResgroupOptionName(type));
-
-		proposedDatum = heap_getattr(tuple, Anum_pg_resgroupcapability_proposed, relResGroupCapability->rd_att, &isNull);
-		proposed = DatumGetCString(DirectFunctionCall1(textout, proposedDatum));
-		caps[type].proposed = str2Int(proposed, getResgroupOptionName(type));
+		valueDatum = heap_getattr(tuple, Anum_pg_resgroupcapability_value,
+									 rel->rd_att, &isNull);
+		value = TextDatumGetCString(valueDatum);
+		switch (type)
+		{
+			case RESGROUP_LIMIT_TYPE_CONCURRENCY:
+				resgroupCaps->concurrency = str2Int(value,
+													getResgroupOptionName(type));
+				break;
+			case RESGROUP_LIMIT_TYPE_CPU:
+				resgroupCaps->cpuRateLimit = str2Int(value,
+													 getResgroupOptionName(type));
+				break;
+			case RESGROUP_LIMIT_TYPE_MEMORY:
+				resgroupCaps->memLimit = str2Int(value,
+												 getResgroupOptionName(type));
+				break;
+			case RESGROUP_LIMIT_TYPE_MEMORY_SHARED_QUOTA:
+				resgroupCaps->memSharedQuota = str2Int(value,
+													   getResgroupOptionName(type));
+				break;
+			case RESGROUP_LIMIT_TYPE_MEMORY_SPILL_RATIO:
+				resgroupCaps->memSpillRatio = str2Int(value,
+													  getResgroupOptionName(type));
+				break;
+			case RESGROUP_LIMIT_TYPE_MEMORY_AUDITOR:
+				resgroupCaps->memAuditor = str2Int(value,
+												   getResgroupOptionName(type));
+				break;
+			case RESGROUP_LIMIT_TYPE_CPUSET:
+				StrNCpy(resgroupCaps->cpuset, value, sizeof(resgroupCaps->cpuset));
+				break;
+			default:
+				break;
+		}
 	}
 
 	systable_endscan(sscan);
-
-	/*
-	 * release lock here to guarantee we have no lock held when acquiring
-	 * resource group slot
-	 */
-	heap_close(relResGroupCapability, AccessShareLock);
-
-	if (owner)
-	{
-		CurrentResourceOwner = NULL;
-		ResourceOwnerDelete(owner);
-	}
 
 	if (!mask)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("Cannot find limit capabilities for resource group: %d",
+				 errmsg("cannot find limit capabilities for resource group: %d",
 						groupId)));
 	}
 }
 
 /*
- * Get resource group id for a role in pg_authid
+ * Get resource group id for a role in pg_authid.
+ *
+ * An exception is thrown if the current role is invalid. This can happen if,
+ * for example, a role was logged into psql and that role was dropped by another
+ * psql session. But, normally something like "ERROR:  role 16385 was
+ * concurrently dropped" would happen before the code reaches this function.
  */
 Oid
 GetResGroupIdForRole(Oid roleid)
 {
 	HeapTuple	tuple;
-	ResourceOwner owner = NULL;
 	Oid			groupId;
+	bool		isNull;
 	Relation	rel;
 	ScanKeyData	key;
 	SysScanDesc	 sscan;
-
-	/*
-	 * to cave the code of cache part, we provide a resource owner here if no
-	 * existing
-	 */
-	if (CurrentResourceOwner == NULL)
-	{
-		owner = ResourceOwnerCreate(NULL, "GetResGroupIdForRole");
-		CurrentResourceOwner = owner;
-	}
 
 	rel = heap_open(AuthIdRelationId, AccessShareLock);
 
@@ -772,7 +653,7 @@ GetResGroupIdForRole(Oid roleid)
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(roleid));
 
-	sscan = systable_beginscan(rel, AuthIdOidIndexId, true, SnapshotNow, 1, &key);
+	sscan = systable_beginscan(rel, AuthIdOidIndexId, true, NULL, 1, &key);
 
 	tuple = systable_getnext(sscan);
 	if (!HeapTupleIsValid(tuple))
@@ -786,12 +667,13 @@ GetResGroupIdForRole(Oid roleid)
 		 */
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				errmsg("Role with Oid %d was dropped", roleid),
-				errhint("Cannot execute commands anymore, please terminate this session.")));
+				errmsg("role with Oid %d was dropped", roleid),
+				errdetail("Cannot execute commands anymore, please terminate this session.")));
 	}
 
 	/* must access tuple before systable_endscan */
-	groupId = DatumGetObjectId(heap_getattr(tuple, Anum_pg_authid_rolresgroup, rel->rd_att, NULL));
+	groupId = DatumGetObjectId(heap_getattr(tuple, Anum_pg_authid_rolresgroup,
+							   rel->rd_att, &isNull));
 
 	systable_endscan(sscan);
 
@@ -804,13 +686,93 @@ GetResGroupIdForRole(Oid roleid)
 	if (!OidIsValid(groupId))
 		groupId = InvalidOid;
 
-	if (owner)
-	{
-		CurrentResourceOwner = NULL;
-		ResourceOwnerDelete(owner);
-	}
-
 	return groupId;
+}
+
+/*
+ * GetResGroupIdForName -- Return the Oid for a resource group name
+ *
+ * Notes:
+ *	Used by the various admin commands to convert a user supplied group name
+ *	to Oid.
+ */
+Oid
+GetResGroupIdForName(const char *name)
+{
+	HeapTuple	tuple;
+	Oid			rsgid;
+
+	tuple = SearchSysCache1(RESGROUPNAME,
+							CStringGetDatum(name));
+
+	if (HeapTupleIsValid(tuple))
+	{
+		bool isnull;
+		Datum oidDatum = SysCacheGetAttr(RESGROUPNAME, tuple,
+										  ObjectIdAttributeNumber,
+										  &isnull);
+		Assert (!isnull);
+		rsgid = DatumGetObjectId(oidDatum);
+	}
+	else
+		return InvalidOid;
+
+	ReleaseSysCache(tuple);
+
+	return rsgid;
+}
+
+/*
+ * GetResGroupNameForId -- Return the resource group name for an Oid
+ */
+char *
+GetResGroupNameForId(Oid oid)
+{
+	HeapTuple	tuple;
+	char		*name = NULL;
+
+	tuple = SearchSysCache1(RESGROUPOID,
+							ObjectIdGetDatum(oid));
+
+	if (HeapTupleIsValid(tuple))
+	{
+		bool isnull;
+		Datum nameDatum = SysCacheGetAttr(RESGROUPOID, tuple,
+										  Anum_pg_resgroup_rsgname,
+										  &isnull);
+		Assert (!isnull);
+		Name resGroupName = DatumGetName(nameDatum);
+		name = pstrdup(NameStr(*resGroupName));
+	}
+	else
+		return "unknown";
+
+	ReleaseSysCache(tuple);
+
+	return name;
+}
+
+/*
+ * Check to see if the group can be assigned with role
+ */
+void
+ResGroupCheckForRole(Oid groupId)
+{
+	Relation pg_resgroupcapability_rel;
+	ResGroupCaps caps;
+
+	pg_resgroupcapability_rel = heap_open(ResGroupCapabilityRelationId,
+										  AccessShareLock);
+
+	/* Load current resource group capabilities */
+	GetResGroupCapabilities(pg_resgroupcapability_rel, groupId, &caps);
+	if (caps.memAuditor == RESGROUP_MEMORY_AUDITOR_CGROUP)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("you cannot assign a role to this resource group"),
+				 errdetail("The memory_auditor property for this group is not the default.")));
+
+	heap_close(pg_resgroupcapability_rel, AccessShareLock);
 }
 
 /*
@@ -833,8 +795,37 @@ getResgroupOptionType(const char* defname)
 		return RESGROUP_LIMIT_TYPE_MEMORY_SHARED_QUOTA;
 	else if (strcmp(defname, "memory_spill_ratio") == 0)
 		return RESGROUP_LIMIT_TYPE_MEMORY_SPILL_RATIO;
+	else if (strcmp(defname, "memory_auditor") == 0)
+		return RESGROUP_LIMIT_TYPE_MEMORY_AUDITOR;
+	else if (strcmp(defname, "cpuset") == 0)
+		return RESGROUP_LIMIT_TYPE_CPUSET;
 	else
 		return RESGROUP_LIMIT_TYPE_UNKNOWN;
+}
+
+/*
+ * Get capability value from DefElem, convert from int64 to int
+ */
+static ResGroupCap
+getResgroupOptionValue(DefElem *defel, int type)
+{
+	int64 value;
+
+	if (type == RESGROUP_LIMIT_TYPE_MEMORY_AUDITOR)
+	{
+		char *auditor_name = defGetString(defel);
+		value = getResGroupMemAuditor(auditor_name);
+	}
+	else
+	{
+		value = defGetInt64(defel);
+	}
+
+	if (value < INT_MIN || value > INT_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("capability %s is out of range", defel->defname)));
+	return (ResGroupCap)value;
 }
 
 /*
@@ -859,8 +850,127 @@ getResgroupOptionName(ResGroupLimitType type)
 			return "memory_shared_quota";
 		case RESGROUP_LIMIT_TYPE_MEMORY_SPILL_RATIO:
 			return "memory_spill_ratio";
+		case RESGROUP_LIMIT_TYPE_MEMORY_AUDITOR:
+			return "memory_auditor";
+		case RESGROUP_LIMIT_TYPE_CPUSET:
+			return "cpuset";
 		default:
 			return "unknown";
+	}
+}
+
+/*
+ * Check if capability value exceeds max and min value
+ */
+static void
+checkResgroupCapLimit(ResGroupLimitType type, int value)
+{
+		switch (type)
+		{
+			case RESGROUP_LIMIT_TYPE_CONCURRENCY:
+				if (value < RESGROUP_MIN_CONCURRENCY ||
+					value > RESGROUP_MAX_CONCURRENCY)
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							errmsg("concurrency range is [%d, 'max_connections']",
+								   RESGROUP_MIN_CONCURRENCY)));
+				break;
+
+			case RESGROUP_LIMIT_TYPE_CPU:
+				if (value < RESGROUP_MIN_CPU_RATE_LIMIT ||
+					value > RESGROUP_MAX_CPU_RATE_LIMIT)
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							errmsg("cpu_rate_limit range is [%d, %d]",
+								   RESGROUP_MIN_CPU_RATE_LIMIT,
+								   RESGROUP_MAX_CPU_RATE_LIMIT)));
+				break;
+
+			case RESGROUP_LIMIT_TYPE_MEMORY:
+				if (value < RESGROUP_MIN_MEMORY_LIMIT ||
+					value > RESGROUP_MAX_MEMORY_LIMIT)
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							errmsg("memory_limit range is [%d, %d]",
+								   RESGROUP_MIN_MEMORY_LIMIT,
+								   RESGROUP_MAX_MEMORY_LIMIT)));
+				break;
+
+			case RESGROUP_LIMIT_TYPE_MEMORY_SHARED_QUOTA:
+				if (value < RESGROUP_MIN_MEMORY_SHARED_QUOTA ||
+					value > RESGROUP_MAX_MEMORY_SHARED_QUOTA)
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							errmsg("memory_shared_quota range is [%d, %d]",
+								   RESGROUP_MIN_MEMORY_SHARED_QUOTA,
+								   RESGROUP_MAX_MEMORY_SHARED_QUOTA)));
+				break;
+
+			case RESGROUP_LIMIT_TYPE_MEMORY_SPILL_RATIO:
+				if (value < RESGROUP_MIN_MEMORY_SPILL_RATIO ||
+					value > RESGROUP_MAX_MEMORY_SPILL_RATIO)
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							errmsg("memory_spill_ratio range is [%d, %d]",
+								   RESGROUP_MIN_MEMORY_SPILL_RATIO,
+								   RESGROUP_MAX_MEMORY_SPILL_RATIO)));
+				break;
+
+			case RESGROUP_LIMIT_TYPE_MEMORY_AUDITOR:
+				if (value != RESGROUP_MEMORY_AUDITOR_VMTRACKER &&
+					value != RESGROUP_MEMORY_AUDITOR_CGROUP)
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							errmsg("memory_auditor should be \"%s\" or \"%s\"",
+								   ResGroupMemAuditorName[RESGROUP_MEMORY_AUDITOR_VMTRACKER],
+								   ResGroupMemAuditorName[RESGROUP_MEMORY_AUDITOR_CGROUP])));
+				break;
+
+			default:
+				Assert(!"unexpected options");
+				break;
+		}
+}
+
+/*
+ * Check conflict settings in caps.
+ */
+static void
+checkResgroupCapConflicts(ResGroupCaps *caps)
+{
+	/*
+	 * When memory_limit is unlimited the memory_spill_ratio must be set to
+	 * 'fallback' mode to use the statement_mem.
+	 */
+	if (caps->memLimit == RESGROUP_UNLIMITED_MEMORY_LIMIT &&
+		caps->memSpillRatio != RESGROUP_FALLBACK_MEMORY_SPILL_RATIO)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("when memory_limit is unlimited memory_spill_ratio must be set to %d",
+						RESGROUP_FALLBACK_MEMORY_SPILL_RATIO)));
+
+	/*
+	 * When memory_auditor is cgroup the concurrency must be 0.
+	 */
+	if (caps->memAuditor == RESGROUP_MEMORY_AUDITOR_CGROUP &&
+		caps->concurrency != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				errmsg("resource group concurrency must be 0 when group memory_auditor is %s",
+					ResGroupMemAuditorName[RESGROUP_MEMORY_AUDITOR_CGROUP])));
+
+	/*
+	 * The cgroup memory_auditor should not be used without a properly
+	 * configured cgroup memory directory.
+	 */
+	if (caps->memAuditor == RESGROUP_MEMORY_AUDITOR_CGROUP &&
+		!gp_resource_group_enable_cgroup_memory)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_GP_FEATURE_NOT_CONFIGURED),
+				 errmsg("cgroup is not properly configured for the 'cgroup' memory auditor"),
+				 errhint("Extra cgroup configurations are required to enable this feature, "
+						 "please refer to the Greenplum Documentation for details")));
 	}
 }
 
@@ -868,13 +978,14 @@ getResgroupOptionName(ResGroupLimitType type)
  * Parse a statement and store the settings in options.
  *
  * @param stmt     the statement
- * @param options  used to store the settings
+ * @param caps     used to store the settings
  */
 static void
-parseStmtOptions(CreateResourceGroupStmt *stmt, ResGroupOpts *options)
+parseStmtOptions(CreateResourceGroupStmt *stmt, ResGroupCaps *caps)
 {
 	ListCell *cell;
-	int types = 0;
+	ResGroupCap value;
+	int mask = 0;
 
 	foreach(cell, stmt->options)
 	{
@@ -886,89 +997,84 @@ parseStmtOptions(CreateResourceGroupStmt *stmt, ResGroupOpts *options)
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("option \"%s\" not recognized", defel->defname)));
 
-		if (types & (1 << type))
+		if (mask & (1 << type))
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
-					errmsg("Find duplicate resoure group resource type: %s",
-						   defel->defname)));
+					 errmsg("found duplicate resource group resource type: %s",
+							defel->defname)));
 		else
-			types |= 1 << type;
+			mask |= 1 << type;
 
-		switch (type)
+		if (type == RESGROUP_LIMIT_TYPE_CPUSET) 
 		{
-			case RESGROUP_LIMIT_TYPE_CONCURRENCY:
-				options->concurrency = defGetInt64(defel);
-				if (options->concurrency < RESGROUP_MIN_CONCURRENCY ||
-					options->concurrency > RESGROUP_MAX_CONCURRENCY)
-					ereport(ERROR,
-							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							errmsg("concurrency range is [%d, 'max_connections']",
-								   RESGROUP_MIN_CONCURRENCY)));
-				break;
+			const char *cpuset = defGetString(defel);
+			checkCpusetSyntax(cpuset);
+			StrNCpy(caps->cpuset, cpuset, sizeof(caps->cpuset));
+			caps->cpuRateLimit = CPU_RATE_LIMIT_DISABLED;
+		}
+		else 
+		{
+			value = getResgroupOptionValue(defel, type);
+			checkResgroupCapLimit(type, value);
 
-			case RESGROUP_LIMIT_TYPE_CPU:
-				options->cpuRateLimit = defGetInt64(defel);
-				if (options->cpuRateLimit < RESGROUP_MIN_CPU_RATE_LIMIT ||
-					options->cpuRateLimit > RESGROUP_MAX_CPU_RATE_LIMIT)
-					ereport(ERROR,
-							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							errmsg("cpu_rate_limit range is [%d, %d]",
-								   RESGROUP_MIN_CPU_RATE_LIMIT,
-								   RESGROUP_MAX_CPU_RATE_LIMIT)));
-				break;
-
-			case RESGROUP_LIMIT_TYPE_MEMORY:
-				options->memLimit = defGetInt64(defel);
-				if (options->memLimit < RESGROUP_MIN_MEMORY_LIMIT ||
-					options->memLimit > RESGROUP_MAX_MEMORY_LIMIT)
-					ereport(ERROR,
-							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							errmsg("memory_limit range is [%d, %d]",
-								   RESGROUP_MIN_MEMORY_LIMIT,
-								   RESGROUP_MAX_MEMORY_LIMIT)));
-				break;
-
-			case RESGROUP_LIMIT_TYPE_MEMORY_SHARED_QUOTA:
-				options->memSharedQuota = defGetInt64(defel);
-				if (options->memSharedQuota < RESGROUP_MIN_MEMORY_SHARED_QUOTA ||
-					options->memSharedQuota > RESGROUP_MAX_MEMORY_SHARED_QUOTA)
-					ereport(ERROR,
-							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							errmsg("memory_shared_quota range is [%d, %d]",
-								   RESGROUP_MIN_MEMORY_SHARED_QUOTA,
-								   RESGROUP_MAX_MEMORY_SHARED_QUOTA)));
-				break;
-
-			case RESGROUP_LIMIT_TYPE_MEMORY_SPILL_RATIO:
-				options->memSpillRatio = defGetInt64(defel);
-				if (options->memSpillRatio < RESGROUP_MIN_MEMORY_SPILL_RATIO ||
-					options->memSpillRatio > RESGROUP_MAX_MEMORY_SPILL_RATIO)
-					ereport(ERROR,
-							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							errmsg("memory_spill_ratio range is [%d, %d]",
-								   RESGROUP_MIN_MEMORY_SPILL_RATIO,
-								   RESGROUP_MAX_MEMORY_SPILL_RATIO)));
-				break;
-
-			default:
-				Assert(!"unexpected options");
-				break;
+			switch (type)
+			{
+				case RESGROUP_LIMIT_TYPE_CONCURRENCY:
+					caps->concurrency = value;
+					break;
+				case RESGROUP_LIMIT_TYPE_CPU:
+					caps->cpuRateLimit = value;
+					SetCpusetEmpty(caps->cpuset, sizeof(caps->cpuset));
+					break;
+				case RESGROUP_LIMIT_TYPE_MEMORY:
+					caps->memLimit = value;
+					break;
+				case RESGROUP_LIMIT_TYPE_MEMORY_SHARED_QUOTA:
+					caps->memSharedQuota = value;
+					break;
+				case RESGROUP_LIMIT_TYPE_MEMORY_SPILL_RATIO:
+					caps->memSpillRatio = value;
+					break;
+				case RESGROUP_LIMIT_TYPE_MEMORY_AUDITOR:
+					caps->memAuditor = value;
+					break;
+				default:
+					break;
+			}
 		}
 	}
 
-	if (options->memLimit == 0 || options->cpuRateLimit == 0)
+	if ((mask & (1 << RESGROUP_LIMIT_TYPE_CPUSET)))
+		EnsureCpusetIsAvailable(ERROR);
+
+	if ((mask & (1 << RESGROUP_LIMIT_TYPE_CPU)) &&
+		(mask & (1 << RESGROUP_LIMIT_TYPE_CPUSET)))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				errmsg("must specify both memory_limit and cpu_rate_limit")));
+				errmsg("can't specify both cpu_rate_limit and cpuset")));
 
-	if (!(types & (1 << RESGROUP_LIMIT_TYPE_CONCURRENCY)))
-		options->concurrency = RESGROUP_DEFAULT_CONCURRENCY;
+	if (!(mask & (1 << RESGROUP_LIMIT_TYPE_CPU)) &&
+		!(mask & (1 << RESGROUP_LIMIT_TYPE_CPUSET)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				errmsg("must specify cpu_rate_limit or cpuset")));
 
-	if (!(types & (1 << RESGROUP_LIMIT_TYPE_MEMORY_SHARED_QUOTA)))
-		options->memSharedQuota = RESGROUP_DEFAULT_MEM_SHARED_QUOTA;
+	if (!(mask & (1 << RESGROUP_LIMIT_TYPE_CONCURRENCY)))
+		caps->concurrency = RESGROUP_DEFAULT_CONCURRENCY;
 
-	if (!(types & (1 << RESGROUP_LIMIT_TYPE_MEMORY_SPILL_RATIO)))
-		options->memSpillRatio = RESGROUP_DEFAULT_MEM_SPILL_RATIO;
+	if (!(mask & (1 << RESGROUP_LIMIT_TYPE_MEMORY)))
+		caps->memLimit = RESGROUP_DEFAULT_MEMORY_LIMIT;
+
+	if (!(mask & (1 << RESGROUP_LIMIT_TYPE_MEMORY_SHARED_QUOTA)))
+		caps->memSharedQuota = RESGROUP_DEFAULT_MEM_SHARED_QUOTA;
+
+	if (!(mask & (1 << RESGROUP_LIMIT_TYPE_MEMORY_SPILL_RATIO)))
+		caps->memSpillRatio = RESGROUP_DEFAULT_MEM_SPILL_RATIO;
+
+	if (!(mask & (1 << RESGROUP_LIMIT_TYPE_MEMORY_AUDITOR)))
+		caps->memAuditor = RESGROUP_DEFAULT_MEM_AUDITOR;
+
+	checkResgroupCapConflicts(caps);
 }
 
 /*
@@ -978,71 +1084,30 @@ parseStmtOptions(CreateResourceGroupStmt *stmt, ResGroupOpts *options)
  * creates resource groups
  */
 static void
-createResGroupAbortCallback(bool isCommit, void *arg)
+createResgroupCallback(XactEvent event, void *arg)
 {
-	volatile int savedInterruptHoldoffCount;
-	Oid groupId;
+	ResourceGroupCallbackContext *callbackCtx = arg;
 
-	if (!isCommit)
+	if (event != XACT_EVENT_COMMIT)
 	{
-		groupId = *(Oid *)arg;
-
-		/*
-		 * FreeResGroupEntry would acquire LWLock, since this callback is called
-		 * after LWLockReleaseAll in AbortTransaction, it is safe here
-		 */
-		/* FIXME: don't attempt to lock/unlock */
-		FreeResGroupEntry(groupId);
-
-		/* remove the os dependent part for this resource group */
-		PG_TRY();
-		{
-			savedInterruptHoldoffCount = InterruptHoldoffCount;
-			ResGroupOps_DestroyGroup(groupId);
-		}
-		PG_CATCH();
-		{
-			InterruptHoldoffCount = savedInterruptHoldoffCount;
-			elog(LOG, "Fail to remove cgroup dir for resource group %d", groupId);
-		}
-		PG_END_TRY();
+		ResGroupCreateOnAbort(callbackCtx);
 	}
-
-	pfree(arg);
+	pfree(callbackCtx);
 }
 
 /*
  * Resource group call back function
  *
- * Remove resource group entry in shared memory when commit transaction which
- * drops resource groups
+ * When DROP RESOURCE GROUP transaction ends, need wake up
+ * the queued transactions and cleanup shared menory entry.
  */
 static void
-dropResGroupAbortCallback(bool isCommit, void *arg)
+dropResgroupCallback(XactEvent event, void *arg)
 {
-	volatile int savedInterruptHoldoffCount;
-	Oid groupId;
+	ResourceGroupCallbackContext *callbackCtx = arg;
 
-	groupId = *(Oid *)arg;
-	ResGroupDropCheckForWakeup(groupId, isCommit);
-
-	if (isCommit)
-	{
-		/* remove the os dependent part for this resource group */
-		PG_TRY();
-		{
-			savedInterruptHoldoffCount = InterruptHoldoffCount;
-			ResGroupOps_DestroyGroup(groupId);
-		}
-		PG_CATCH();
-		{
-			InterruptHoldoffCount = savedInterruptHoldoffCount;
-			elog(LOG, "Fail to remove cgroup dir for resource group %d", groupId);
-		}
-		PG_END_TRY();
-	}
-
-	pfree(arg);
+	ResGroupDropFinish(callbackCtx, event == XACT_EVENT_COMMIT);
+	pfree(callbackCtx);
 }
 
 /*
@@ -1050,18 +1115,16 @@ dropResGroupAbortCallback(bool isCommit, void *arg)
  *
  * When ALTER RESOURCE GROUP SET CONCURRENCY commits, some queuing
  * transaction of this resource group may need to be woke up.
- *
  */
 static void
-alterResGroupCommitCallback(bool isCommit, void *arg)
+alterResgroupCallback(XactEvent event, void *arg)
 {
-	ResourceGroupAlterCallbackContext *ctx =
-		(ResourceGroupAlterCallbackContext *) arg;
+	ResourceGroupCallbackContext *callbackCtx = arg;
 
-	if (isCommit)
-		ResGroupAlterOnCommit(ctx->groupid, ctx->limittype, &ctx->caps);
+	if (event == XACT_EVENT_COMMIT)
+		ResGroupAlterOnCommit(callbackCtx);
 
-	pfree(arg);
+	pfree(callbackCtx);
 }
 
 /*
@@ -1076,121 +1139,116 @@ alterResGroupCommitCallback(bool isCommit, void *arg)
  * handle the type conversion etc..
  *
  * @param groupid  oid of the resource group
- * @param options  the capabilities
+ * @param caps     the capabilities
  */
 static void
-insertResgroupCapabilities(Oid groupid,
-						   ResGroupOpts *options)
+insertResgroupCapabilities(Relation rel, Oid groupId, ResGroupCaps *caps)
 {
 	char value[64];
-	Relation resgroup_capability_rel = heap_open(ResGroupCapabilityRelationId, RowExclusiveLock);
 
-	validateCapabilities(resgroup_capability_rel, groupid, options, true);
+	snprintf(value, sizeof(value), "%d", caps->concurrency);
+	insertResgroupCapabilityEntry(rel, groupId,
+								  RESGROUP_LIMIT_TYPE_CONCURRENCY, value);
 
-	sprintf(value, "%d", options->concurrency);
-	insertResgroupCapabilityEntry(resgroup_capability_rel, groupid, RESGROUP_LIMIT_TYPE_CONCURRENCY, value);
+	snprintf(value, sizeof(value), "%d", caps->cpuRateLimit);
+	insertResgroupCapabilityEntry(rel, groupId,
+								  RESGROUP_LIMIT_TYPE_CPU, value);
 
-	sprintf(value, "%d", options->cpuRateLimit);
-	insertResgroupCapabilityEntry(resgroup_capability_rel, groupid, RESGROUP_LIMIT_TYPE_CPU, value);
+	snprintf(value, sizeof(value), "%d", caps->memLimit);
+	insertResgroupCapabilityEntry(rel, groupId,
+								  RESGROUP_LIMIT_TYPE_MEMORY, value);
 
-	sprintf(value, "%d", options->memLimit);
-	insertResgroupCapabilityEntry(resgroup_capability_rel, groupid, RESGROUP_LIMIT_TYPE_MEMORY, value);
+	snprintf(value, sizeof(value), "%d", caps->memSharedQuota);
+	insertResgroupCapabilityEntry(rel, groupId,
+								  RESGROUP_LIMIT_TYPE_MEMORY_SHARED_QUOTA, value);
 
-	sprintf(value, "%d", options->memSharedQuota);
-	insertResgroupCapabilityEntry(resgroup_capability_rel, groupid, RESGROUP_LIMIT_TYPE_MEMORY_SHARED_QUOTA, value);
+	snprintf(value, sizeof(value), "%d", caps->memSpillRatio);
+	insertResgroupCapabilityEntry(rel, groupId,
+								  RESGROUP_LIMIT_TYPE_MEMORY_SPILL_RATIO, value);
 
-	sprintf(value, "%d", options->memSpillRatio);
-	insertResgroupCapabilityEntry(resgroup_capability_rel, groupid, RESGROUP_LIMIT_TYPE_MEMORY_SPILL_RATIO, value);
+	snprintf(value, sizeof(value), "%d", caps->memAuditor);
+	insertResgroupCapabilityEntry(rel, groupId,
+								  RESGROUP_LIMIT_TYPE_MEMORY_AUDITOR, value);
 
-	heap_close(resgroup_capability_rel, NoLock);
+	insertResgroupCapabilityEntry(rel, groupId,
+								  RESGROUP_LIMIT_TYPE_CPUSET, caps->cpuset);
 }
 
 /*
  * Update all the capabilities of one resgroup in pg_resgroupcapability
  *
- * groupid is the update key, resgroupCaps contains all the capabilities.
+ * groupId and limitType are the scan keys.
  */
 static void
-updateResgroupCapabilities(Oid groupid, const ResGroupCaps *resgroupCaps)
+updateResgroupCapabilityEntry(Relation rel,
+							  Oid groupId,
+							  ResGroupLimitType limitType,
+							  ResGroupCap value,
+							  const char *strValue)
 {
 	HeapTuple	oldTuple;
 	HeapTuple	newTuple;
 	SysScanDesc	sscan;
-	ScanKeyData	scankey;
+	ScanKeyData	scankey[2];
 	Datum		values[Natts_pg_resgroupcapability];
 	bool		isnull[Natts_pg_resgroupcapability];
 	bool		repl[Natts_pg_resgroupcapability];
-	/*
-	 * By converting caps from (ResGroupCaps *) to an array of (ResGroupCap *)
-	 * we can access the individual capability via index, so we don't need
-	 * to use a switch case when setting them.
-	 */
-	const ResGroupCap	*caps = (ResGroupCap *) resgroupCaps;
-	/*
-	 * We maintain a bit mask to track which resgroup limit capability types
-	 * have been retrieved, when mask is 0 then no limit capability is found
-	 * for the given groupid.
-	 */
-	int			mask = 0;
+	char		stringBuffer[MaxCpuSetLength];
 
-	Relation resgroupCapabilityRel = heap_open(ResGroupCapabilityRelationId, RowExclusiveLock);
-
-	ScanKeyInit(&scankey,
+	ScanKeyInit(&scankey[0],
 				Anum_pg_resgroupcapability_resgroupid,
 				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(groupid));
+				ObjectIdGetDatum(groupId));
+	ScanKeyInit(&scankey[1],
+				Anum_pg_resgroupcapability_reslimittype,
+				BTEqualStrategyNumber, F_INT2EQ,
+				Int16GetDatum(limitType));
 
-	sscan = systable_beginscan(resgroupCapabilityRel, ResGroupCapabilityResgroupidIndexId, true,
-							   SnapshotNow, 1, &scankey);
+	sscan = systable_beginscan(rel,
+							   ResGroupCapabilityResgroupidResLimittypeIndexId, true,
+							   NULL, 2, scankey);
 
 	MemSet(values, 0, sizeof(values));
 	MemSet(isnull, 0, sizeof(isnull));
 	MemSet(repl, 0, sizeof(repl));
 
-	while (HeapTupleIsValid(oldTuple = systable_getnext(sscan)))
+	oldTuple = systable_getnext(sscan);
+	if (!HeapTupleIsValid(oldTuple))
 	{
-		Datum				typeDatum;
-		ResGroupLimitType	type;
-		char				value[16];
-		char				proposed[16];
+		/*
+		 * It's possible for a cap to be missing, e.g. a resgroup is created
+		 * with v5.0 which does not support cap=7 (cpuset), then we binary
+		 * switch to v5.10 and alter it, then we'll find cap=7 missing here.
+		 * Instead of raising an error we should fallback to insert a new cap.
+		 */
 
-		typeDatum = heap_getattr(oldTuple, Anum_pg_resgroupcapability_reslimittype,
-								 resgroupCapabilityRel->rd_att, isnull);
-		type = (ResGroupLimitType) DatumGetInt16(typeDatum);
+		systable_endscan(sscan);
 
-		Assert(type > RESGROUP_LIMIT_TYPE_UNKNOWN);
-		Assert(type < RESGROUP_LIMIT_TYPE_COUNT);
-		Assert(!(mask & (1 << type)));
+		insertResgroupCapabilityEntry(rel, groupId, limitType, (char *) strValue);
 
-		mask |= 1 << type;
-
-		snprintf(value, sizeof(value), "%d", caps[type].value);
-		snprintf(proposed, sizeof(proposed), "%d", caps[type].proposed);
-
-		values[Anum_pg_resgroupcapability_value - 1] = CStringGetTextDatum(value);
-		isnull[Anum_pg_resgroupcapability_value - 1] = false;
-		repl[Anum_pg_resgroupcapability_value - 1]  = true;
-
-		values[Anum_pg_resgroupcapability_proposed - 1] = CStringGetTextDatum(proposed);
-		isnull[Anum_pg_resgroupcapability_proposed - 1] = false;
-		repl[Anum_pg_resgroupcapability_proposed - 1]  = true;
-
-		newTuple = heap_modify_tuple(oldTuple, RelationGetDescr(resgroupCapabilityRel),
-									 values, isnull, repl);
-
-		simple_heap_update(resgroupCapabilityRel, &oldTuple->t_self, newTuple);
-		CatalogUpdateIndexes(resgroupCapabilityRel, newTuple);
+		return;
 	}
+
+	if (limitType == RESGROUP_LIMIT_TYPE_CPUSET)
+	{
+		StrNCpy(stringBuffer, strValue, sizeof(stringBuffer));
+	}
+	else
+	{
+		snprintf(stringBuffer, sizeof(stringBuffer), "%d", value);
+	}
+
+	values[Anum_pg_resgroupcapability_value - 1] = CStringGetTextDatum(stringBuffer);
+	isnull[Anum_pg_resgroupcapability_value - 1] = false;
+	repl[Anum_pg_resgroupcapability_value - 1]  = true;
+
+	newTuple = heap_modify_tuple(oldTuple, RelationGetDescr(rel),
+								 values, isnull, repl);
+
+	simple_heap_update(rel, &oldTuple->t_self, newTuple);
+	CatalogUpdateIndexes(rel, newTuple);
 
 	systable_endscan(sscan);
-	heap_close(resgroupCapabilityRel, NoLock);
-
-	if (!mask)
-	{
-		ereport(ERROR,
-				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("capabilities missing for resource group: %d", groupid)));
-	}
 }
 
 /*
@@ -1203,30 +1261,74 @@ updateResgroupCapabilities(Oid groupid, const ResGroupCaps *resgroupCaps)
  *
  * @param rel      the relation
  * @param groupid  oid of the resource group
- * @param options  the options for the resource group
+ * @param caps     the capabilities for the resource group
  */
 static void
 validateCapabilities(Relation rel,
 					 Oid groupid,
-					 ResGroupOpts *options,
+					 ResGroupCaps *caps,
 					 bool newGroup)
 {
 	HeapTuple tuple;
 	SysScanDesc sscan;
-	int totalCpu = options->cpuRateLimit;
-	int totalMem = options->memLimit;
+	int totalCpu = caps->cpuRateLimit;
+	int totalMem = caps->memLimit;
+	char cpusetAll[MaxCpuSetLength] = {0};
+	char cpusetMissing[MaxCpuSetLength] = {0};
+	Bitmapset *bmsCurrent = NULL;
+	Bitmapset *bmsCommon = NULL;
 
-	sscan = systable_beginscan(rel, ResGroupCapabilityResgroupidIndexId, true, SnapshotNow, 0, NULL);
+	if (!CpusetIsEmpty(caps->cpuset))
+	{
+		EnsureCpusetIsAvailable(ERROR);
+	}
+
+	/*
+	 * initialize the variables only when resource group is activated
+	 */
+	if (IsResGroupActivated() &&
+		gp_resource_group_enable_cgroup_cpuset)
+	{
+		Bitmapset *bmsAll = NULL;
+
+		/* Get all available cores */
+		ResGroupOps_GetCpuSet(RESGROUP_ROOT_ID,
+							  cpusetAll,
+							  MaxCpuSetLength);
+		bmsAll = CpusetToBitset(cpusetAll, MaxCpuSetLength);
+		/* Check whether the cores in this group are available */
+		if (!CpusetIsEmpty(caps->cpuset))
+		{
+			Bitmapset *bmsMissing = NULL;
+
+			bmsCurrent = CpusetToBitset(caps->cpuset, MaxCpuSetLength);
+			bmsCommon = bms_intersect(bmsCurrent, bmsAll);
+			bmsMissing = bms_difference(bmsCurrent, bmsCommon);
+
+			if (!bms_is_empty(bmsMissing))
+			{
+				BitsetToCpuset(bmsMissing, cpusetMissing, MaxCpuSetLength);
+
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("cpu cores %s are unavailable on the system",
+								cpusetMissing)));
+			}
+		}
+	}
+
+	sscan = systable_beginscan(rel, ResGroupCapabilityResgroupidIndexId,
+							   true, NULL, 0, NULL);
 
 	while (HeapTupleIsValid(tuple = systable_getnext(sscan)))
 	{
 		Datum				groupIdDatum;
 		Datum				typeDatum;
-		Datum				proposedDatum;
+		Datum				valueDatum;
 		ResGroupLimitType	reslimittype;
 		Oid					resgroupid;
-		char				*proposedStr;
-		int					proposed;
+		char				*valueStr;
+		int					value;
 		bool				isNull;
 
 		groupIdDatum = heap_getattr(tuple, Anum_pg_resgroupcapability_resgroupid,
@@ -1240,35 +1342,73 @@ validateCapabilities(Relation rel,
 
 			ereport(ERROR,
 					(errcode(ERRCODE_DUPLICATE_OBJECT),
-					errmsg("Find duplicate resoure group id:%d", groupid)));
+					 errmsg("found duplicate resource group id: %d",
+							groupid)));
 		}
 
 		typeDatum = heap_getattr(tuple, Anum_pg_resgroupcapability_reslimittype,
 								 rel->rd_att, &isNull);
 		reslimittype = (ResGroupLimitType) DatumGetInt16(typeDatum);
 
-		proposedDatum = heap_getattr(tuple, Anum_pg_resgroupcapability_proposed,
+		valueDatum = heap_getattr(tuple, Anum_pg_resgroupcapability_value,
 									 rel->rd_att, &isNull);
-		proposedStr = DatumGetCString(DirectFunctionCall1(textout, proposedDatum));
-		proposed = str2Int(proposedStr, getResgroupOptionName(reslimittype));
 
 		if (reslimittype == RESGROUP_LIMIT_TYPE_CPU)
 		{
-			totalCpu += proposed;
-			if (totalCpu > RESGROUP_MAX_CPU_RATE_LIMIT)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						errmsg("total cpu_rate_limit exceeded the limit of %d",
-							   RESGROUP_MAX_CPU_RATE_LIMIT)));
+			valueStr = TextDatumGetCString(valueDatum);
+			value = str2Int(valueStr, getResgroupOptionName(reslimittype));
+			if (value != CPU_RATE_LIMIT_DISABLED)
+			{
+				totalCpu += value;
+				if (totalCpu > RESGROUP_MAX_CPU_RATE_LIMIT)
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							errmsg("total cpu_rate_limit exceeded the limit of %d",
+								   RESGROUP_MAX_CPU_RATE_LIMIT)));
+			}
 		}
 		else if (reslimittype == RESGROUP_LIMIT_TYPE_MEMORY)
 		{
-			totalMem += proposed;
+			valueStr = TextDatumGetCString(valueDatum);
+			value = str2Int(valueStr, getResgroupOptionName(reslimittype));
+			totalMem += value;
 			if (totalMem > RESGROUP_MAX_MEMORY_LIMIT)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("total memory_limit exceeded the limit of %d",
 							   RESGROUP_MAX_MEMORY_LIMIT)));
+		}
+		else if (reslimittype == RESGROUP_LIMIT_TYPE_CPUSET)
+		{
+			/*
+			 * do the check when resource group is activated
+			 */
+			if (IsResGroupActivated() && !CpusetIsEmpty(caps->cpuset))
+			{
+				valueStr = TextDatumGetCString(valueDatum);
+				if (!CpusetIsEmpty(valueStr))
+				{
+					Bitmapset *bmsOther = NULL;
+
+					EnsureCpusetIsAvailable(ERROR);
+
+					Assert(!bms_is_empty(bmsCurrent));
+
+					bmsOther = CpusetToBitset(valueStr, MaxCpuSetLength);
+					bmsCommon = bms_intersect(bmsCurrent, bmsOther);
+
+					if (!bms_is_empty(bmsCommon))
+					{
+						BitsetToCpuset(bmsCommon, cpusetMissing, MaxCpuSetLength);
+
+						ereport(ERROR,
+								(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+								 errmsg("cpu cores %s are used by resource group %s",
+										cpusetMissing,
+										GetResGroupNameForId(resgroupid))));
+					}
+				}
+			}
 		}
 	}
 
@@ -1277,9 +1417,6 @@ validateCapabilities(Relation rel,
 
 /*
  * Insert one capability to the capability table.
- *
- * 'value' and 'proposed' are both used to describe a resource,
- * in this routine we assume 'proposed' has the same value as 'value'.
  *
  * @param rel      the relation
  * @param groupid  oid of the resource group
@@ -1290,7 +1427,7 @@ static void
 insertResgroupCapabilityEntry(Relation rel,
 							 Oid groupid,
 							 uint16 type,
-							 char *value)
+							 const char *value)
 {
 	Datum new_record[Natts_pg_resgroupcapability];
 	bool new_record_nulls[Natts_pg_resgroupcapability];
@@ -1303,7 +1440,6 @@ insertResgroupCapabilityEntry(Relation rel,
 	new_record[Anum_pg_resgroupcapability_resgroupid - 1] = ObjectIdGetDatum(groupid);
 	new_record[Anum_pg_resgroupcapability_reslimittype - 1] = UInt16GetDatum(type);
 	new_record[Anum_pg_resgroupcapability_value - 1] = CStringGetTextDatum(value);
-	new_record[Anum_pg_resgroupcapability_proposed - 1] = CStringGetTextDatum(value);
 
 	tuple = heap_form_tuple(tupleDesc, new_record, new_record_nulls);
 	simple_heap_insert(rel, tuple);
@@ -1331,7 +1467,7 @@ deleteResgroupCapabilities(Oid groupid)
 
 	sscan = systable_beginscan(resgroup_capability_rel,
 							   ResGroupCapabilityResgroupidIndexId,
-							   true, SnapshotNow, 1, &scankey);
+							   true, NULL, 1, &scankey);
 
 	while ((tuple = systable_getnext(sscan)) != NULL)
 		simple_heap_delete(resgroup_capability_rel, &tuple->t_self);
@@ -1342,81 +1478,32 @@ deleteResgroupCapabilities(Oid groupid)
 }
 
 /*
- * GetResGroupIdForName -- Return the Oid for a resource group name
- *
- * Notes:
- *	Used by the various admin commands to convert a user supplied group name
- *	to Oid.
+ * Check to see if any roles are in this resource group.
  */
-Oid
-GetResGroupIdForName(char *name, LOCKMODE lockmode)
+static void
+checkAuthIdForDrop(Oid groupId)
 {
-	Relation	rel;
-	ScanKeyData scankey;
-	SysScanDesc scan;
-	HeapTuple	tuple;
-	Oid			rsgid;
+	Relation	 authIdRel;
+	ScanKeyData	 authidScankey;
+	SysScanDesc	 authidScan;
 
-	rel = heap_open(ResGroupRelationId, lockmode);
-
-	/* SELECT oid FROM pg_resgroup WHERE rsgname = :1 */
-	ScanKeyInit(&scankey,
-				Anum_pg_resgroup_rsgname,
-				BTEqualStrategyNumber, F_NAMEEQ,
-				CStringGetDatum(name));
-	scan = systable_beginscan(rel, ResGroupRsgnameIndexId, true,
-							  SnapshotNow, 1, &scankey);
-
-	tuple = systable_getnext(scan);
-	if (HeapTupleIsValid(tuple))
-		rsgid = HeapTupleGetOid(tuple);
-	else
-		rsgid = InvalidOid;
-
-	systable_endscan(scan);
-	heap_close(rel, lockmode);
-
-	return rsgid;
-}
-
-/*
- * GetResGroupNameForId -- Return the resource group name for an Oid
- */
-char *
-GetResGroupNameForId(Oid oid, LOCKMODE lockmode)
-{
-	Relation	rel;
-	ScanKeyData scankey;
-	SysScanDesc scan;
-	HeapTuple	tuple;
-	char		*name = NULL;
-
-	rel = heap_open(ResGroupRelationId, lockmode);
-
-	/* SELECT rsgname FROM pg_resgroup WHERE oid = :1 */
-	ScanKeyInit(&scankey,
-				ObjectIdAttributeNumber,
+	authIdRel = heap_open(AuthIdRelationId, RowExclusiveLock);
+	ScanKeyInit(&authidScankey,
+				Anum_pg_authid_rolresgroup,
 				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(oid));
-	scan = systable_beginscan(rel, ResGroupOidIndexId, true,
-							  SnapshotNow, 1, &scankey);
+				ObjectIdGetDatum(groupId));
 
-	tuple = systable_getnext(scan);
-	if (HeapTupleIsValid(tuple))
-	{
-		bool isnull;
-		Datum nameDatum = heap_getattr(tuple, Anum_pg_resgroup_rsgname, rel->rd_att, &isnull);
-		Assert (!isnull);
-		Name resGroupName = DatumGetName(nameDatum);
-		name = pstrdup(NameStr(*resGroupName));
-	}
+	authidScan = systable_beginscan(authIdRel, AuthIdRolResGroupIndexId, true,
+									NULL, 1, &authidScankey);
 
-	systable_endscan(scan);
-	heap_close(rel, lockmode);
+	if (HeapTupleIsValid(systable_getnext(authidScan)))
+		ereport(ERROR,
+				(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
+				 errmsg("resource group is used by at least one role")));
 
-	return name;
+	systable_endscan(authidScan);
+	heap_close(authIdRel, RowExclusiveLock);
 }
-
 /*
  * Convert a C str to a integer value.
  *
@@ -1439,3 +1526,44 @@ str2Int(const char *str, const char *prop)
 	return floor(val);
 }
 
+/*
+ * Get memory auditor from auditor name.
+ */
+static int
+getResGroupMemAuditor(char *name)
+{
+	int index;
+
+	for (index = 0; index < RESGROUP_MEMORY_AUDITOR_COUNT; index ++)
+	{
+		if (strcmp(ResGroupMemAuditorName[index], name) == 0)
+			return index;
+	}
+
+	return RESGROUP_INVALID_MEM_AUDITOR;
+}
+
+/*
+ * check whether the cpuset value is syntactically right
+ */
+static bool
+checkCpusetSyntax(const char *cpuset)
+{
+	if (strlen(cpuset) >= MaxCpuSetLength)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("the length of cpuset reached the upper limit %d",
+						MaxCpuSetLength)));
+		return false;
+	}
+	if (!CpusetToBitset(cpuset,
+						 strlen(cpuset)))
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("cpuset invalid")));
+		return false;
+	}
+	return true;
+}

@@ -1,11 +1,16 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/reset.sgml,v 1.36 2007/09/11 00:06:41 tgl Exp $
+doc/src/sgml/ref/reset.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-RESET">
+ <indexterm zone="sql-reset">
+  <primary>RESET</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="SQL-RESET-TITLE">RESET</refentrytitle>
+  <refentrytitle>RESET</refentrytitle>
+  <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
 
@@ -13,10 +18,6 @@ PostgreSQL documentation
   <refname>RESET</refname>
   <refpurpose>restore the value of a run-time parameter to the default value</refpurpose>
  </refnamediv>
-
- <indexterm zone="sql-reset">
-  <primary>RESET</primary>
- </indexterm>
 
  <refsynopsisdiv>
 <synopsis>
@@ -35,7 +36,7 @@ RESET ALL
 <synopsis>
 SET <replaceable class="parameter">configuration_parameter</replaceable> TO DEFAULT
 </synopsis>
-   Refer to <xref linkend="sql-set" endterm="sql-set-title"> for
+   Refer to <xref linkend="sql-set"> for
    details.
   </para>
 
@@ -67,7 +68,7 @@ SET <replaceable class="parameter">configuration_parameter</replaceable> TO DEFA
      <para>
       Name of a settable run-time parameter.  Available parameters are
       documented in <xref linkend="runtime-config"> and on the
-      <xref linkend="sql-set" endterm="sql-set-title"> reference page.
+      <xref linkend="sql-set"> reference page.
      </para>
     </listitem>
    </varlistentry>
@@ -90,8 +91,7 @@ SET <replaceable class="parameter">configuration_parameter</replaceable> TO DEFA
    Set the <varname>timezone</> configuration variable to its default value:
 <screen>
 RESET timezone;
-</screen>
-  </para>
+</screen></para>
  </refsect1>
 
  <refsect1>
@@ -106,8 +106,8 @@ RESET timezone;
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="SQL-SET" endterm="SQL-SET-title"></member>
-   <member><xref linkend="SQL-SHOW" endterm="SQL-SHOW-title"></member>
+   <member><xref linkend="SQL-SET"></member>
+   <member><xref linkend="SQL-SHOW"></member>
   </simplelist>
  </refsect1>
 </refentry>

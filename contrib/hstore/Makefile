@@ -1,21 +1,24 @@
-# $PostgreSQL: pgsql/contrib/hstore/Makefile,v 1.6 2007/11/10 23:59:51 momjian Exp $
+# contrib/hstore/Makefile
 
+MODULE_big = hstore
+OBJS = hstore_io.o hstore_op.o hstore_gist.o hstore_gin.o hstore_compat.o \
+	$(WIN32RES)
+
+EXTENSION = hstore
+DATA = hstore--1.4.sql hstore--1.3--1.4.sql hstore--1.2--1.3.sql \
+	hstore--1.1--1.2.sql hstore--1.0--1.1.sql \
+	hstore--unpackaged--1.0.sql
+PGFILEDESC = "hstore - key/value pair data type"
+
+REGRESS = hstore
+
+ifdef USE_PGXS
+PG_CONFIG = pg_config
+PGXS := $(shell $(PG_CONFIG) --pgxs)
+include $(PGXS)
+else
 subdir = contrib/hstore
 top_builddir = ../..
 include $(top_builddir)/src/Makefile.global
-
-MODULE_big = hstore
-OBJS = hstore_io.o hstore_op.o hstore_gist.o hstore_gin.o crc32.o
-
-DATA_built = hstore.sql
-DATA = uninstall_hstore.sql
-REGRESS = hstore
-
 include $(top_srcdir)/contrib/contrib-global.mk
-
-installcheck: prepare_hstore_sql
-
-prepare_hstore_sql:
-	cp $(GPHOME)/share/postgresql/contrib/hstore.sql ./hstore.sql
-
-.PHONY: prepare_hstore_sql
+endif

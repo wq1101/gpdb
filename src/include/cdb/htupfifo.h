@@ -26,8 +26,8 @@
 /* An entry in the HeapTuple FIFO.	Entries are formed into queues. */
 typedef struct htf_entry_data
 {
-	/* The HeapTuple itself. */
-	HeapTuple	htup;
+	/* The tuple itself. */
+	GenericTuple tup;
 
 	/* The next entry in the FIFO. */
 	struct htf_entry_data *p_next;
@@ -44,34 +44,13 @@ typedef struct htup_fifo_state
 	htf_entry	p_last;
 
 	htf_entry	freelist;
-	int			freelist_count;
-
-	/* A count of HeapTuples in the FIFO. */
-	int			tup_count;
-
-	/*
-	 * An estimate of the current in-memory size of the FIFO's contents, in
-	 * bytes.
-	 */
-	int			curr_mem_size;
-
-	/*
-	 * The maximum size that the FIFO is allowed to grow to, in bytes, before
-	 * it will cause an error to be reported.
-	 */
-	uint32		max_mem_size;
 
 }	htup_fifo_state, *htup_fifo;
 
-
-#define MIN_HTUPFIFO_KB 8
-
-
-extern htup_fifo htfifo_create(int max_mem_kb);
-extern void htfifo_init(htup_fifo htf, int max_mem_kb);
+extern htup_fifo htfifo_create(void);
 extern void htfifo_destroy(htup_fifo htf);
 
-extern void htfifo_addtuple(htup_fifo htf, HeapTuple htup);
-extern HeapTuple htfifo_gettuple(htup_fifo htf);
+extern void htfifo_addtuple(htup_fifo htf, GenericTuple htup);
+extern GenericTuple htfifo_gettuple(htup_fifo htf);
 
 #endif   /* HTUPFIFO_H */

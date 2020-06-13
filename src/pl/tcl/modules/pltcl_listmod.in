@@ -1,5 +1,5 @@
 #! /bin/sh
-# $PostgreSQL: pgsql/src/pl/tcl/modules/pltcl_listmod.in,v 1.3 2006/03/11 04:38:40 momjian Exp $
+# src/pl/tcl/modules/pltcl_listmod.in
 #
 # Start tclsh \
 exec @TCLSH@ "$0" "$@"
@@ -109,8 +109,8 @@ set conn [eval pg_connect $dbname $options]
 
 if {$i == $argc} {
     pg_select $conn "select distinct modname from pltcl_modules	\
-    		order by modname"	\
-    		MOD {
+		order by modname"	\
+		MOD {
         listmodule $conn $MOD(modname)
     }
 } else {

@@ -21,7 +21,7 @@
 #include "miscadmin.h"
 #include "cdb/cdbdisp_query.h"
 #include "cdb/cdbdispatchresult.h"
-#include "gp-libpq-fe.h"
+#include "libpq-fe.h"
 #include "lib/stringinfo.h"
 #include "utils/int8.h"
 #include "utils/lsyscache.h"
@@ -35,44 +35,43 @@
 int64
 cdbRelMaxSegSize(Relation rel)
 {
-	int64 size = 0;
-	int i;
+	int64		size = 0;
+	int			i;
 	CdbPgResults cdb_pgresults = {NULL, 0};
-	StringInfoData buffer;
+	char	   *sql;
 
 	/*
 	 * Let's ask the QEs for the size of the relation
-	 */
-	initStringInfo(&buffer);
-
-	/*
+	 *
 	 * Relation Oids are assumed to be in sync in all nodes.
 	 */
-	appendStringInfo(&buffer, "select pg_relation_size(%u)",
-					 RelationGetRelid(rel));
+	sql = psprintf("select pg_catalog.pg_relation_size(%u)",
+				   RelationGetRelid(rel));
 
-	CdbDispatchCommand(buffer.data, DF_WITH_SNAPSHOT, &cdb_pgresults);
+	CdbDispatchCommand(sql, DF_WITH_SNAPSHOT, &cdb_pgresults);
 
 	for (i = 0; i < cdb_pgresults.numResults; i++)
 	{
-		struct pg_result * pgresult = cdb_pgresults.pg_results[i];
+		struct pg_result *pgresult = cdb_pgresults.pg_results[i];
+
 		if (PQresultStatus(pgresult) != PGRES_TUPLES_OK)
 		{
 			cdbdisp_clearCdbPgResults(&cdb_pgresults);
-			elog(ERROR,"cdbRelMaxSegSize: resultStatus not tuples_Ok: %s %s",
-				 PQresStatus(PQresultStatus(pgresult)),PQresultErrorMessage(pgresult));
+			elog(ERROR, "cdbRelMaxSegSize: resultStatus not tuples_Ok: %s %s",
+				 PQresStatus(PQresultStatus(pgresult)), PQresultErrorMessage(pgresult));
 		}
 		else
 		{
 			Assert(PQntuples(pgresult) == 1);
-			int64 tempsize = 0;
+			int64		tempsize = 0;
+
 			(void) scanint8(PQgetvalue(pgresult, 0, 0), false, &tempsize);
 			if (tempsize > size)
 				size = tempsize;
 		}
 	}
 
-	pfree(buffer.data);
+	pfree(sql);
 
 	cdbdisp_clearCdbPgResults(&cdb_pgresults);
 

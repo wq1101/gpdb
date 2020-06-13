@@ -15,7 +15,7 @@
  *
  *
  * IDENTIFICATION
- *		$PostgreSQL: pgsql/src/bin/pg_dump/pg_backup.h,v 1.45 2007/01/25 03:30:43 momjian Exp $
+ *		src/bin/pg_dump/pg_backup.h
  *
  *-------------------------------------------------------------------------
  */
@@ -23,34 +23,24 @@
 #ifndef PG_BACKUP_H
 #define PG_BACKUP_H
 
-#include "postgres_fe.h"
-
-#include "pg_dump.h"
-
+#include "fe_utils/simple_list.h"
 #include "libpq-fe.h"
 
 
-#define atooid(x)  ((Oid) strtoul((x), NULL, 10))
-#define oidcmp(x,y) ( ((x) < (y) ? -1 : ((x) > (y)) ?  1 : 0) )
-#define oideq(x,y) ( (x) == (y) )
-#define oidle(x,y) ( (x) <= (y) )
-#define oidge(x,y) ( (x) >= (y) )
-#define oidzero(x) ( (x) == 0 )
-
-enum trivalue
+typedef enum trivalue
 {
 	TRI_DEFAULT,
 	TRI_NO,
 	TRI_YES
-};
+} trivalue;
 
 typedef enum _archiveFormat
 {
 	archUnknown = 0,
 	archCustom = 1,
-	archFiles = 2,
 	archTar = 3,
-	archNull = 4
+	archNull = 4,
+	archDirectory = 5
 } ArchiveFormat;
 
 typedef enum _archiveMode
@@ -60,48 +50,43 @@ typedef enum _archiveMode
 	archModeRead
 } ArchiveMode;
 
-/*
- *	We may want to have some more user-readable data, but in the mean
- *	time this gives us some abstraction and type checking.
- */
-typedef struct _Archive
+typedef enum _teSection
 {
-	int			verbose;
-	char	   *remoteVersionStr;		/* server's version string */
-	int			remoteVersion;	/* same in numeric form */
-
-	int			minRemoteVersion;		/* allowable range */
-	int			maxRemoteVersion;
-
-	/* info needed for string escaping */
-	int			encoding;		/* libpq code for client_encoding */
-	bool		std_strings;	/* standard_conforming_strings */
-
-	/* error handling */
-	bool		exit_on_error;	/* whether to exit on SQL errors... */
-	int			n_errors;		/* number of errors (if no die) */
-
-	/* The rest is private */
-} Archive;
-
-typedef int (*DataDumperPtr) (Archive *AH, void *userArg);
+	SECTION_NONE = 1,			/* COMMENTs, ACLs, etc; can be anywhere */
+	SECTION_PRE_DATA,			/* stuff to be processed before data */
+	SECTION_DATA,				/* TABLE DATA, BLOBS, BLOB COMMENTS */
+	SECTION_POST_DATA			/* stuff to be processed after data */
+} teSection;
 
 typedef struct _restoreOptions
 {
 	int			createDB;		/* Issue commands to create the database */
 	int			noOwner;		/* Don't try to match original object owner */
+	int			noTablespace;	/* Don't issue tablespace-related commands */
 	int			disable_triggers;		/* disable triggers during data-only
 										 * restore */
 	int			use_setsessauth;/* Use SET SESSION AUTHORIZATION commands
 								 * instead of OWNER TO */
 	char	   *superuser;		/* Username to use as superuser */
-	int			dataOnly;
+	char	   *use_role;		/* Issue SET ROLE to this */
 	int			postdataSchemaRestore;
 	int			dropSchema;
-	char	   *filename;
+	int			disable_dollar_quoting;
+	int			dump_inserts;
+	int			column_inserts;
+	int			if_exists;
+	int			no_security_labels;		/* Skip security label entries */
+	int			strict_names;
+
+	const char *filename;
+	int			dataOnly;
 	int			schemaOnly;
+	int			dumpSections;
 	int			verbose;
 	int			aclsSkip;
+	const char *lockWaitTimeout;
+	int			include_everything;
+
 	int			tocSummary;
 	char	   *tocFile;
 	int			format;
@@ -112,19 +97,19 @@ typedef struct _restoreOptions
 	int			selFunction;
 	int			selTrigger;
 	int			selTable;
-	char	   *indexNames;
-	char	   *functionNames;
-	char	   *tableNames;
-	char	   *schemaNames;
-	char	   *triggerNames;
+	SimpleStringList indexNames;
+	SimpleStringList functionNames;
+	SimpleStringList schemaNames;
+	SimpleStringList triggerNames;
+	SimpleStringList tableNames;
 
 	int			useDB;
-	char	   *dbname;
+	char	   *dbname;			/* subject to expand_dbname */
 	char	   *pgport;
 	char	   *pghost;
 	char	   *username;
 	int			noDataForFailedTables;
-	enum trivalue promptPassword;
+	trivalue	promptPassword;
 	int			exit_on_error;
 	int			compression;
 	int			suppressDumpWarnings;	/* Suppress output of WARNING entries
@@ -132,26 +117,131 @@ typedef struct _restoreOptions
 	bool		single_txn;
 
 	bool	   *idWanted;		/* array showing which dump IDs to emit */
+
+	int			binary_upgrade;	/* GPDB: restoring for a binary upgrade */
+	int			enable_row_security;
 } RestoreOptions;
+
+typedef struct _dumpOptions
+{
+	const char *dbname;			/* subject to expand_dbname */
+	const char *pghost;
+	const char *pgport;
+	const char *username;
+	bool		oids;
+
+	int			binary_upgrade;
+
+	/* various user-settable parameters */
+	bool		schemaOnly;
+	bool		dataOnly;
+	int			dumpSections;	/* bitmask of chosen sections */
+	bool		aclsSkip;
+	const char *lockWaitTimeout;
+
+	/* flags for various command-line long options */
+	int			disable_dollar_quoting;
+	int			dump_inserts;
+	int			column_inserts;
+	int			if_exists;
+	int			no_security_labels;
+	int			no_synchronized_snapshots;
+	int			no_unlogged_table_data;
+	int			serializable_deferrable;
+	int			quote_all_identifiers;
+	int			disable_triggers;
+	int			outputNoTablespaces;
+	int			use_setsessauth;
+	int			enable_row_security;
+
+	/* default, if no "inclusion" switches appear, is to dump everything */
+	bool		include_everything;
+
+	int			outputClean;
+	int			outputCreateDB;
+	bool		outputBlobs;
+	int			outputNoOwner;
+	char	   *outputSuperuser;
+} DumpOptions;
+
+/*
+ *	We may want to have some more user-readable data, but in the mean
+ *	time this gives us some abstraction and type checking.
+ */
+typedef struct Archive
+{
+	DumpOptions *dopt;			/* options, if dumping */
+	RestoreOptions *ropt;		/* options, if restoring */
+
+	int			verbose;
+	char	   *remoteVersionStr;		/* server's version string */
+	int			remoteVersion;	/* same in numeric form */
+	bool		isStandby;		/* is server a standby node */
+
+	int			minRemoteVersion;		/* allowable range */
+	int			maxRemoteVersion;
+
+	int			numWorkers;		/* number of parallel processes */
+	char	   *sync_snapshot_id;		/* sync snapshot id for parallel
+										 * operation */
+
+	/* info needed for string escaping */
+	int			encoding;		/* libpq code for client_encoding */
+	bool		std_strings;	/* standard_conforming_strings */
+
+	/* other important stuff */
+	char	   *searchpath;		/* search_path to set during restore */
+	char	   *use_role;		/* Issue SET ROLE to this */
+
+	/* error handling */
+	bool		exit_on_error;	/* whether to exit on SQL errors... */
+	int			n_errors;		/* number of errors (if no die) */
+
+	/* The rest is private */
+} Archive;
+
+
+/*
+ * pg_dump uses two different mechanisms for identifying database objects:
+ *
+ * CatalogId represents an object by the tableoid and oid of its defining
+ * entry in the system catalogs.  We need this to interpret pg_depend entries,
+ * for instance.
+ *
+ * DumpId is a simple sequential integer counter assigned as dumpable objects
+ * are identified during a pg_dump run.  We use DumpId internally in preference
+ * to CatalogId for two reasons: it's more compact, and we can assign DumpIds
+ * to "objects" that don't have a separate CatalogId.  For example, it is
+ * convenient to consider a table, its data, and its ACL as three separate
+ * dumpable "objects" with distinct DumpIds --- this lets us reason about the
+ * order in which to dump these things.
+ */
+
+typedef struct
+{
+	Oid			tableoid;
+	Oid			oid;
+} CatalogId;
+
+typedef int DumpId;
+
+typedef int (*DataDumperPtr) (Archive *AH, void *userArg);
+
+typedef void (*SetupWorkerPtr) (Archive *AH);
 
 /*
  * Main archiver interface.
  */
 
-extern void
-exit_horribly(Archive *AH, const char *modulename, const char *fmt,...)
-__attribute__((format(printf, 3, 4)));
-
-
-/* Lets the archive know we have a DB connection to shutdown if it dies */
-
-PGconn *ConnectDatabase(Archive *AH,
+extern void ConnectDatabase(Archive *AH,
 				const char *dbname,
 				const char *pghost,
 				const char *pgport,
 				const char *username,
-				enum trivalue prompt_password,
-			   	bool binary_upgrade);
+				trivalue prompt_password,
+				bool binary_upgrade);
+extern void DisconnectDatabase(Archive *AHX);
+extern PGconn *GetConnection(Archive *AHX);
 
 /* Called to add a TOC entry */
 extern void ArchiveEntry(Archive *AHX,
@@ -159,46 +249,51 @@ extern void ArchiveEntry(Archive *AHX,
 			 const char *tag,
 			 const char *namespace, const char *tablespace,
 			 const char *owner, bool withOids,
-			 const char *desc, 
-             const char *defn,
+			 const char *desc, teSection section,
+			 const char *defn,
 			 const char *dropStmt, const char *copyStmt,
 			 const DumpId *deps, int nDeps,
 			 DataDumperPtr dumpFn, void *dumpArg);
 
+extern void AmendArchiveEntry(Archive *AHX, DumpId dumpId, const char *defn);
+
 /* Called to write *data* to the archive */
-extern size_t WriteData(Archive *AH, const void *data, size_t dLen);
+extern void WriteData(Archive *AH, const void *data, size_t dLen);
 
 extern int	StartBlob(Archive *AH, Oid oid);
 extern int	EndBlob(Archive *AH, Oid oid);
 
 extern void CloseArchive(Archive *AH);
 
-extern void RestoreArchive(Archive *AH, RestoreOptions *ropt);
+extern void SetArchiveOptions(Archive *AH, DumpOptions *dopt, RestoreOptions *ropt);
+
+extern void ProcessArchiveRestoreOptions(Archive *AH);
+
+extern void RestoreArchive(Archive *AH);
 
 /* Open an existing archive */
 extern Archive *OpenArchive(const char *FileSpec, const ArchiveFormat fmt);
 
 /* Create a new archive */
 extern Archive *CreateArchive(const char *FileSpec, const ArchiveFormat fmt,
-			  const int compression, ArchiveMode mode);
-
-extern int updateArchiveWithDDBoostFile(Archive *AH, const char *ddBoostFile);
+			  const int compression, ArchiveMode mode,
+			  SetupWorkerPtr setupDumpWorker);
 
 /* The --list option */
-extern void PrintTOCSummary(Archive *AH, RestoreOptions *ropt);
+extern void PrintTOCSummary(Archive *AH);
 
 extern RestoreOptions *NewRestoreOptions(void);
 
+extern DumpOptions *NewDumpOptions(void);
+extern void InitDumpOptions(DumpOptions *opts);
+extern DumpOptions *dumpOptionsFromRestoreOptions(RestoreOptions *ropt);
+
 /* Rearrange and filter TOC entries */
-extern void SortTocFromFile(Archive *AHX, RestoreOptions *ropt);
-extern void InitDummyWantedList(Archive *AHX, RestoreOptions *ropt);
+extern void SortTocFromFile(Archive *AHX);
 
 /* Convenience functions used only when writing DATA */
-extern int	archputs(const char *s, Archive *AH);
-extern int
-archprintf(Archive *AH, const char *fmt,...)
-/* This extension allows gcc to check the format string */
-__attribute__((format(printf, 2, 3)));
+extern void archputs(const char *s, Archive *AH);
+extern int	archprintf(Archive *AH, const char *fmt,...) pg_attribute_printf(2, 3);
 
 #define appendStringLiteralAH(buf,str,AH) \
 	appendStringLiteral(buf, str, (AH)->encoding, (AH)->std_strings)

@@ -23,8 +23,6 @@
 #include "executor/executor.h"
 #include "miscadmin.h"
 
-#define SEQUENCE_NSLOTS 1
-
 SequenceState *
 ExecInitSequence(Sequence *node, EState *estate, int eflags)
 {
@@ -72,24 +70,7 @@ ExecInitSequence(Sequence *node, EState *estate, int eflags)
 	ExecInitResultTupleSlot(estate, &sequenceState->ps);
 	ExecAssignResultTypeFromTL(&sequenceState->ps);
 
-	initGpmonPktForSequence((Plan *)node, &sequenceState->ps.gpmon_pkt, estate);
-
 	return sequenceState;
-}
-
-int
-ExecCountSlotsSequence(Sequence *node)
-{
-	Assert(list_length(node->subplans) > 0);
-
-	int numSlots = 0;
-	ListCell *lc = NULL;
-	foreach(lc, node->subplans)
-	{
-		numSlots += ExecCountSlotsNode((Plan *)lfirst(lc));
-	}
-
-	return numSlots + SEQUENCE_NSLOTS;
 }
 
 /*
@@ -126,15 +107,9 @@ ExecSequence(SequenceState *node)
 	}
 
 	Assert(!node->initState);
-	
+
 	PlanState *lastPlan = node->subplans[node->numSubplans - 1];
 	TupleTableSlot *result = ExecProcNode(lastPlan);
-	
-	if (!TupIsNull(result))
-	{
-		Gpmon_Incr_Rows_Out(GpmonPktFromSequenceState(node));
-		CheckSendPlanStateGpmonPkt(&node->ps);
-	}
 
 	/*
 	 * Return the tuple as returned by the subplan as-is. We do
@@ -153,12 +128,10 @@ ExecEndSequence(SequenceState *node)
 		Assert(node->subplans[no] != NULL);
 		ExecEndNode(node->subplans[no]);
 	}
-
-	EndPlanStateGpmonPkt(&node->ps);
 }
 
 void
-ExecReScanSequence(SequenceState *node, ExprContext *exprCtxt)
+ExecReScanSequence(SequenceState *node)
 {
 	for (int i = 0; i < node->numSubplans; i++)
 	{
@@ -177,16 +150,15 @@ ExecReScanSequence(SequenceState *node, ExprContext *exprCtxt)
 		 * Always rescan the inputs immediately, to ensure we can pass down
 		 * any outer tuple that might be used in index quals.
 		 */
-		ExecReScan(subnode, exprCtxt);
+		ExecReScan(subnode);
 	}
 
 	node->initState = true;
 }
 
 void
-initGpmonPktForSequence(Plan *planNode, gpmon_packet_t *gpmon_pkt, EState *estate)
+ExecSquelchSequence(SequenceState *node)
 {
-	Assert(planNode != NULL && gpmon_pkt != NULL && IsA(planNode, Sequence));
-
-	InitPlanNodeGpmonPkt(planNode, gpmon_pkt, estate);
+	for (int i = 0; i < node->numSubplans; i++)
+		ExecSquelchNode(node->subplans[i]);
 }

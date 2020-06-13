@@ -3,17 +3,19 @@
  * tzparser.c
  *	  Functions for parsing timezone offset files
  *
- * Note: we generally should not throw any errors in this file, but instead
- * try to return an error code.  This is not completely bulletproof at
- * present --- in particular out-of-memory will throw an error.  Could
- * probably fix with PG_TRY if necessary.
+ * Note: this code is invoked from the check_hook for the GUC variable
+ * timezone_abbreviations.  Therefore, it should report problems using
+ * GUC_check_errmsg() and related functions, and try to avoid throwing
+ * elog(ERROR).  This is not completely bulletproof at present --- in
+ * particular out-of-memory will throw an error.  Could probably fix with
+ * PG_TRY if necessary.
  *
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/misc/tzparser.c,v 1.8 2009/05/02 22:02:37 tgl Exp $
+ *	  src/backend/utils/misc/tzparser.c
  *
  *-------------------------------------------------------------------------
  */
@@ -24,14 +26,12 @@
 
 #include "miscadmin.h"
 #include "storage/fd.h"
-#include "utils/datetime.h"
+#include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/tzparser.h"
 
 
 #define WHITESPACE " \t\n\r"
-
-static int	tz_elevel;			/* to avoid passing this around a lot */
 
 static bool validateTzEntry(tzEntry *tzentry);
 static bool splitTzLine(const char *filename, int lineno,
@@ -58,20 +58,9 @@ validateTzEntry(tzEntry *tzentry)
 	 */
 	if (strlen(tzentry->abbrev) > TOKMAXLEN)
 	{
-		ereport(tz_elevel,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("time zone abbreviation \"%s\" is too long (maximum %d characters) in time zone file \"%s\", line %d",
-						tzentry->abbrev, TOKMAXLEN,
-						tzentry->filename, tzentry->lineno)));
-		return false;
-	}
-	if (tzentry->offset % 900 != 0)
-	{
-		ereport(tz_elevel,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("time zone offset %d is not a multiple of 900 sec (15 min) in time zone file \"%s\", line %d",
-						tzentry->offset,
-						tzentry->filename, tzentry->lineno)));
+		GUC_check_errmsg("time zone abbreviation \"%s\" is too long (maximum %d characters) in time zone file \"%s\", line %d",
+						 tzentry->abbrev, TOKMAXLEN,
+						 tzentry->filename, tzentry->lineno);
 		return false;
 	}
 
@@ -81,11 +70,9 @@ validateTzEntry(tzEntry *tzentry)
 	if (tzentry->offset > 14 * 60 * 60 ||
 		tzentry->offset < -14 * 60 * 60)
 	{
-		ereport(tz_elevel,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("time zone offset %d is out of range in time zone file \"%s\", line %d",
-						tzentry->offset,
-						tzentry->filename, tzentry->lineno)));
+		GUC_check_errmsg("time zone offset %d is out of range in time zone file \"%s\", line %d",
+						 tzentry->offset,
+						 tzentry->filename, tzentry->lineno);
 		return false;
 	}
 
@@ -99,7 +86,11 @@ validateTzEntry(tzEntry *tzentry)
 }
 
 /*
- * Attempt to parse the line as a timezone abbrev spec (name, offset, dst)
+ * Attempt to parse the line as a timezone abbrev spec
+ *
+ * Valid formats are:
+ *	name  zone
+ *	name  offset  dst
  *
  * Returns TRUE if OK, else false; data is stored in *tzentry
  */
@@ -118,44 +109,56 @@ splitTzLine(const char *filename, int lineno, char *line, tzEntry *tzentry)
 	abbrev = strtok(line, WHITESPACE);
 	if (!abbrev)
 	{
-		ereport(tz_elevel,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("missing time zone abbreviation in time zone file \"%s\", line %d",
-						filename, lineno)));
+		GUC_check_errmsg("missing time zone abbreviation in time zone file \"%s\", line %d",
+						 filename, lineno);
 		return false;
 	}
-	tzentry->abbrev = abbrev;
+	tzentry->abbrev = pstrdup(abbrev);
 
 	offset = strtok(NULL, WHITESPACE);
 	if (!offset)
 	{
-		ereport(tz_elevel,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-		 errmsg("missing time zone offset in time zone file \"%s\", line %d",
-				filename, lineno)));
-		return false;
-	}
-	tzentry->offset = strtol(offset, &offset_endptr, 10);
-	if (offset_endptr == offset || *offset_endptr != '\0')
-	{
-		ereport(tz_elevel,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("invalid number for time zone offset in time zone file \"%s\", line %d",
-						filename, lineno)));
+		GUC_check_errmsg("missing time zone offset in time zone file \"%s\", line %d",
+						 filename, lineno);
 		return false;
 	}
 
-	is_dst = strtok(NULL, WHITESPACE);
-	if (is_dst && pg_strcasecmp(is_dst, "D") == 0)
+	/* We assume zone names don't begin with a digit or sign */
+	if (isdigit((unsigned char) *offset) || *offset == '+' || *offset == '-')
 	{
-		tzentry->is_dst = true;
-		remain = strtok(NULL, WHITESPACE);
+		tzentry->zone = NULL;
+		tzentry->offset = strtol(offset, &offset_endptr, 10);
+		if (offset_endptr == offset || *offset_endptr != '\0')
+		{
+			GUC_check_errmsg("invalid number for time zone offset in time zone file \"%s\", line %d",
+							 filename, lineno);
+			return false;
+		}
+
+		is_dst = strtok(NULL, WHITESPACE);
+		if (is_dst && pg_strcasecmp(is_dst, "D") == 0)
+		{
+			tzentry->is_dst = true;
+			remain = strtok(NULL, WHITESPACE);
+		}
+		else
+		{
+			/* there was no 'D' dst specifier */
+			tzentry->is_dst = false;
+			remain = is_dst;
+		}
 	}
 	else
 	{
-		/* there was no 'D' dst specifier */
+		/*
+		 * Assume entry is a zone name.  We do not try to validate it by
+		 * looking up the zone, because that would force loading of a lot of
+		 * zones that probably will never be used in the current session.
+		 */
+		tzentry->zone = pstrdup(offset);
+		tzentry->offset = 0;
 		tzentry->is_dst = false;
-		remain = is_dst;
+		remain = strtok(NULL, WHITESPACE);
 	}
 
 	if (!remain)				/* no more non-whitespace chars */
@@ -163,10 +166,8 @@ splitTzLine(const char *filename, int lineno, char *line, tzEntry *tzentry)
 
 	if (remain[0] != '#')		/* must be a comment */
 	{
-		ereport(tz_elevel,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("invalid syntax in time zone file \"%s\", line %d",
-						filename, lineno)));
+		GUC_check_errmsg("invalid syntax in time zone file \"%s\", line %d",
+						 filename, lineno);
 		return false;
 	}
 	return true;
@@ -193,7 +194,7 @@ addToArray(tzEntry **base, int *arraysize, int n,
 
 	/*
 	 * Search the array for a duplicate; as a useful side effect, the array is
-	 * maintained in sorted order.	We use strcmp() to ensure we match the
+	 * maintained in sorted order.  We use strcmp() to ensure we match the
 	 * sort order datetime.c expects.
 	 */
 	arrayptr = *base;
@@ -215,8 +216,11 @@ addToArray(tzEntry **base, int *arraysize, int n,
 			/*
 			 * Found a duplicate entry; complain unless it's the same.
 			 */
-			if (midptr->offset == entry->offset &&
-				midptr->is_dst == entry->is_dst)
+			if ((midptr->zone == NULL && entry->zone == NULL &&
+				 midptr->offset == entry->offset &&
+				 midptr->is_dst == entry->is_dst) ||
+				(midptr->zone != NULL && entry->zone != NULL &&
+				 strcmp(midptr->zone, entry->zone) == 0))
 			{
 				/* return unchanged array */
 				return n;
@@ -224,18 +228,17 @@ addToArray(tzEntry **base, int *arraysize, int n,
 			if (override)
 			{
 				/* same abbrev but something is different, override */
+				midptr->zone = entry->zone;
 				midptr->offset = entry->offset;
 				midptr->is_dst = entry->is_dst;
 				return n;
 			}
 			/* same abbrev but something is different, complain */
-			ereport(tz_elevel,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				  errmsg("time zone abbreviation \"%s\" is multiply defined",
-						 entry->abbrev),
-					 errdetail("Entry in time zone file \"%s\", line %d, conflicts with entry in file \"%s\", line %d.",
-							   midptr->filename, midptr->lineno,
-							   entry->filename, entry->lineno)));
+			GUC_check_errmsg("time zone abbreviation \"%s\" is multiply defined",
+							 entry->abbrev);
+			GUC_check_errdetail("Entry in time zone file \"%s\", line %d, conflicts with entry in file \"%s\", line %d.",
+								midptr->filename, midptr->lineno,
+								entry->filename, entry->lineno);
 			return -1;
 		}
 	}
@@ -254,9 +257,6 @@ addToArray(tzEntry **base, int *arraysize, int n,
 	memmove(arrayptr + 1, arrayptr, (n - low) * sizeof(tzEntry));
 
 	memcpy(arrayptr, entry, sizeof(tzEntry));
-
-	/* Must dup the abbrev to ensure it survives */
-	arrayptr->abbrev = pstrdup(entry->abbrev);
 
 	return n + 1;
 }
@@ -296,12 +296,10 @@ ParseTzFile(const char *filename, int depth,
 	{
 		if (!isalpha((unsigned char) *p))
 		{
-			/* at level 0, we need no ereport since guc.c will say enough */
+			/* at level 0, just use guc.c's regular "invalid value" message */
 			if (depth > 0)
-				ereport(tz_elevel,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("invalid time zone file name \"%s\"",
-								filename)));
+				GUC_check_errmsg("invalid time zone file name \"%s\"",
+								 filename);
 			return -1;
 		}
 	}
@@ -313,10 +311,8 @@ ParseTzFile(const char *filename, int depth,
 	 */
 	if (depth > 3)
 	{
-		ereport(tz_elevel,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-			 errmsg("time zone file recursion limit exceeded in file \"%s\"",
-					filename)));
+		GUC_check_errmsg("time zone file recursion limit exceeded in file \"%s\"",
+						 filename);
 		return -1;
 	}
 
@@ -340,12 +336,10 @@ ParseTzFile(const char *filename, int depth,
 		tzdir = AllocateDir(file_path);
 		if (tzdir == NULL)
 		{
-			ereport(tz_elevel,
-					(errcode_for_file_access(),
-					 errmsg("could not open directory \"%s\": %m",
-							file_path),
-					 errhint("This may indicate an incomplete PostgreSQL installation, or that the file \"%s\" has been moved away from its proper location.",
-							 my_exec_path)));
+			GUC_check_errmsg("could not open directory \"%s\": %m",
+							 file_path);
+			GUC_check_errhint("This may indicate an incomplete PostgreSQL installation, or that the file \"%s\" has been moved away from its proper location.",
+							  my_exec_path);
 			return -1;
 		}
 		FreeDir(tzdir);
@@ -356,10 +350,8 @@ ParseTzFile(const char *filename, int depth,
 		 * complaint is enough
 		 */
 		if (errno != ENOENT || depth > 0)
-			ereport(tz_elevel,
-					(errcode_for_file_access(),
-					 errmsg("could not read time zone file \"%s\": %m",
-							filename)));
+			GUC_check_errmsg("could not read time zone file \"%s\": %m",
+							 filename);
 
 		return -1;
 	}
@@ -371,10 +363,8 @@ ParseTzFile(const char *filename, int depth,
 		{
 			if (ferror(tzFile))
 			{
-				ereport(tz_elevel,
-						(errcode_for_file_access(),
-						 errmsg("could not read time zone file \"%s\": %m",
-								filename)));
+				GUC_check_errmsg("could not read time zone file \"%s\": %m",
+								 filename);
 				return -1;
 			}
 			/* else we're at EOF after all */
@@ -383,10 +373,8 @@ ParseTzFile(const char *filename, int depth,
 		if (strlen(tzbuf) == sizeof(tzbuf) - 1)
 		{
 			/* the line is too long for tzbuf */
-			ereport(tz_elevel,
-					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("line is too long in time zone file \"%s\", line %d",
-						filename, lineno)));
+			GUC_check_errmsg("line is too long in time zone file \"%s\", line %d",
+							 filename, lineno);
 			return -1;
 		}
 
@@ -408,10 +396,8 @@ ParseTzFile(const char *filename, int depth,
 			includeFile = strtok(includeFile, WHITESPACE);
 			if (!includeFile || !*includeFile)
 			{
-				ereport(tz_elevel,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("@INCLUDE without file name in time zone file \"%s\", line %d",
-								filename, lineno)));
+				GUC_check_errmsg("@INCLUDE without file name in time zone file \"%s\", line %d",
+								 filename, lineno);
 				return -1;
 			}
 			n = ParseTzFile(includeFile, depth + 1,
@@ -444,22 +430,19 @@ ParseTzFile(const char *filename, int depth,
 /*
  * load_tzoffsets --- read and parse the specified timezone offset file
  *
- * filename: name specified by user
- * doit: whether to actually apply the new values, or just check
- * elevel: elog reporting level (will be less than ERROR)
- *
- * Returns TRUE if OK, FALSE if not; should avoid erroring out
+ * On success, return a filled-in TimeZoneAbbrevTable, which must have been
+ * malloc'd not palloc'd.  On failure, return NULL, using GUC_check_errmsg
+ * and friends to give details of the problem.
  */
-bool
-load_tzoffsets(const char *filename, bool doit, int elevel)
+TimeZoneAbbrevTable *
+load_tzoffsets(const char *filename)
 {
+	TimeZoneAbbrevTable *result = NULL;
 	MemoryContext tmpContext;
 	MemoryContext oldContext;
 	tzEntry    *array;
 	int			arraysize;
 	int			n;
-
-	tz_elevel = elevel;
 
 	/*
 	 * Create a temp memory context to work in.  This makes it easy to clean
@@ -479,13 +462,17 @@ load_tzoffsets(const char *filename, bool doit, int elevel)
 	/* Parse the file(s) */
 	n = ParseTzFile(filename, 0, &array, &arraysize, 0);
 
-	/* If no errors and we should apply the result, pass it to datetime.c */
-	if (n >= 0 && doit)
-		InstallTimeZoneAbbrevs(array, n);
+	/* If no errors so far, let datetime.c allocate memory & convert format */
+	if (n >= 0)
+	{
+		result = ConvertTimeZoneAbbrevs(array, n);
+		if (!result)
+			GUC_check_errmsg("out of memory");
+	}
 
 	/* Clean up */
 	MemoryContextSwitchTo(oldContext);
 	MemoryContextDelete(tmpContext);
 
-	return (n >= 0);
+	return result;
 }

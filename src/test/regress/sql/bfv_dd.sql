@@ -44,27 +44,27 @@ with cte as (select generate_series(1,10) g)  select * from  dd_singlecol_1 t1, 
 
 -- single column distr key
 
-select * from dd_singlecol_1 where a in (1,3,5);
+select * from dd_singlecol_1 where a in (10,11,12);
 
-select * from dd_singlecol_1 where a=1 or a=3 or a=5;
+select * from dd_singlecol_1 where a=10 or a=11 or a=12;
 
 select * from dd_singlecol_1 where a is null or a=1;
 
 -- projections and disjunction
 
-select b from dd_singlecol_1 where a=1 or a=3;
+select b from dd_singlecol_1 where a=1 or a=2;
 
--- negative cases: single column distr key, values don't hash to the same segment
+-- single column distr key, values hash to the same segment
 
-select * from dd_singlecol_1 where a=1 or a=2;
+select * from dd_singlecol_1 where a=10 or a=11;
 
-select * from dd_singlecol_1 where a in (1, 2);
+select * from dd_singlecol_1 where a in (10, 11);
 
 select * from dd_singlecol_1 where a is null or a=2;
 
-select * from dd_singlecol_1 where (a,b) in ((1,2),(3,4)); 
+select * from dd_singlecol_1 where (a,b) in ((10,2),(11,3));
 
-select * from dd_singlecol_1 where a between 1 and 2;
+select * from dd_singlecol_1 where a between 10 and 11;
 
 -- partitioned tables
 
@@ -76,9 +76,9 @@ insert into dd_part_singlecol values (NULL, NULL);
 
 -- disjunction with partitioned tables
 
-select * from dd_part_singlecol where a in (1,3,5);
+select * from dd_part_singlecol where a in (10,11,12);
 
-select * from dd_part_singlecol where a=1 or a=3 or a=5;
+select * from dd_part_singlecol where a=10 or a=11 or a=12;
 
 select * from dd_part_singlecol where a is null or a=1;
 
@@ -127,11 +127,11 @@ analyze dd_singlecol_idx2;
 
 -- disjunction with index scans
 
-select * from dd_singlecol_idx where (a=1 or a=3) and b<3;
+select * from dd_singlecol_idx where (a=1 or a=2) and b<2;
 
-select 'one' from dd_singlecol_idx where (a=1 or a=3) and b=1;
+select 'one' from dd_singlecol_idx where (a=1 or a=2) and b=1;
 
-select a, count(*) from dd_singlecol_idx where (a=1 or a=3) and b=1  group by a;
+select a, count(*) from dd_singlecol_idx where (a=1 or a=2) and b=1  group by a;
 
 select count(*) from dd_singlecol_idx;
 
@@ -146,11 +146,11 @@ insert into dd_singlecol_bitmap_idx values(null, null);
 analyze dd_singlecol_bitmap_idx;
 
 -- disjunction with bitmap index scans
-select * from dd_singlecol_bitmap_idx where (a=1 or a=3) and b<3;
+select * from dd_singlecol_bitmap_idx where (a=1 or a=2) and b<2;
 
-select * from dd_singlecol_bitmap_idx where (a=1 or a=3) and b=3 and c=3;
+select * from dd_singlecol_bitmap_idx where (a=1 or a=2) and b=2 and c=2;
 
-select * from dd_singlecol_bitmap_idx where (a=1 or a=3) and (b=3 or c=3);
+select * from dd_singlecol_bitmap_idx where (a=1 or a=2) and (b=2 or c=2);
 
 select * from dd_singlecol_bitmap_idx where a<5 and b=1;
 
@@ -221,7 +221,7 @@ select a, count(*) from dd_singlecol_idx where a=1 and b=1  group by a;
 -- multicol
 select * from dd_multicol_idx where a=1 and b=1 and c<5;
 
-select * from dd_multicol_idx where (a=1 or a=2) and (b=1 or b=5) and c=1;
+select * from dd_multicol_idx where (a=10 or a=11) and (b=1 or b=5) and c=1;
 
 -- indexes on partitioned tables 
 create table dd_singlecol_part_idx(a int, b int, c int) 

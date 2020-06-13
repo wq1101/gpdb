@@ -1,5 +1,6 @@
-# $PostgreSQL: pgsql/src/interfaces/ecpg/ecpglib/nls.mk,v 1.5.2.1 2009/09/03 21:01:11 petere Exp $
-CATALOG_NAME	 = ecpglib
-AVAIL_LANGUAGES	 = de es fr it ja pt_BR tr
-GETTEXT_FILES	 = connect.c error.c execute.c misc.c
+# src/interfaces/ecpg/ecpglib/nls.mk
+CATALOG_NAME     = ecpglib
+AVAIL_LANGUAGES  = cs de es fr it ja ko pl pt_BR ru tr zh_CN
+GETTEXT_FILES    = connect.c descriptor.c error.c execute.c misc.c
 GETTEXT_TRIGGERS = ecpg_gettext
+GETTEXT_FLAGS    = ecpg_gettext:1:pass-c-format

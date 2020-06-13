@@ -1,11 +1,16 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/create_trigger.sgml,v 1.47 2007/02/01 19:10:24 momjian Exp $
+doc/src/sgml/ref/create_trigger.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-CREATETRIGGER">
+ <indexterm zone="sql-createtrigger">
+  <primary>CREATE TRIGGER</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="SQL-CREATETRIGGER-TITLE">CREATE TRIGGER</refentrytitle>
+  <refentrytitle>CREATE TRIGGER</refentrytitle>
+  <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
 
@@ -14,41 +19,50 @@ PostgreSQL documentation
   <refpurpose>define a new trigger (user-defined triggers are not fully supported in Greenplum Database)</refpurpose>
  </refnamediv>
 
- <indexterm zone="sql-createtrigger">
-  <primary>CREATE TRIGGER</primary>
- </indexterm>
-
  <refsynopsisdiv>
 <synopsis>
-CREATE TRIGGER <replaceable class="PARAMETER">name</replaceable> { BEFORE | AFTER } { <replaceable class="PARAMETER">event</replaceable> [ OR ... ] }
-    ON <replaceable class="PARAMETER">table</replaceable> [ FOR [ EACH ] { ROW | STATEMENT } ]
-    EXECUTE PROCEDURE <replaceable class="PARAMETER">funcname</replaceable> ( <replaceable class="PARAMETER">arguments</replaceable> )
+CREATE [ CONSTRAINT ] TRIGGER <replaceable class="PARAMETER">name</replaceable> { BEFORE | AFTER | INSTEAD OF } { <replaceable class="PARAMETER">event</replaceable> [ OR ... ] }
+    ON <replaceable class="PARAMETER">table_name</replaceable>
+    [ FROM <replaceable class="parameter">referenced_table_name</replaceable> ]
+    [ NOT DEFERRABLE | [ DEFERRABLE ] [ INITIALLY IMMEDIATE | INITIALLY DEFERRED ] ]
+    [ FOR [ EACH ] { ROW | STATEMENT } ]
+    [ WHEN ( <replaceable class="parameter">condition</replaceable> ) ]
+    EXECUTE PROCEDURE <replaceable class="PARAMETER">function_name</replaceable> ( <replaceable class="PARAMETER">arguments</replaceable> )
+
+<phrase>where <replaceable class="parameter">event</replaceable> can be one of:</phrase>
+
+    INSERT
+    UPDATE [ OF <replaceable class="parameter">column_name</replaceable> [, ... ] ]
+    DELETE
+    TRUNCATE
 </synopsis>
  </refsynopsisdiv>
- 
+
  <refsect1>
   <title>Description</title>
 
   <para>
    <command>CREATE TRIGGER</command> creates a new trigger.  The
-   trigger will be associated with the specified table and will
-   execute the specified function <replaceable
-   class="parameter">funcname</replaceable> when certain events occur.
+   trigger will be associated with the specified table, view, or foreign table
+   and will execute the specified
+   function <replaceable class="parameter">function_name</replaceable> when
+   certain events occur.
   </para>
 
   <para>
-   The trigger can be specified to fire either before the
+   The trigger can be specified to fire before the
    operation is attempted on a row (before constraints are checked and
    the <command>INSERT</command>, <command>UPDATE</command>, or
-   <command>DELETE</command> is attempted) or after the operation has
+   <command>DELETE</command> is attempted); or after the operation has
    completed (after constraints are checked and the
    <command>INSERT</command>, <command>UPDATE</command>, or
-   <command>DELETE</command> has completed). If the trigger fires
-   before the event, the trigger can skip the operation for the
-   current row, or change the row being inserted (for
+   <command>DELETE</command> has completed); or instead of the operation
+   (in the case of inserts, updates or deletes on a view).
+   If the trigger fires before or instead of the event, the trigger can skip
+   the operation for the current row, or change the row being inserted (for
    <command>INSERT</command> and <command>UPDATE</command> operations
    only). If the trigger fires after the event, all changes, including
-   the last insertion, update, or deletion, are <quote>visible</quote>
+   the effects of other triggers, are <quote>visible</quote>
    to the trigger.
   </para>
 
@@ -62,12 +76,105 @@ CREATE TRIGGER <replaceable class="PARAMETER">name</replaceable> { BEFORE | AFTE
    executes once for any given operation, regardless of how many rows
    it modifies (in particular, an operation that modifies zero rows
    will still result in the execution of any applicable <literal>FOR
-   EACH STATEMENT</literal> triggers).
+   EACH STATEMENT</literal> triggers).  Note that with an
+   <command>INSERT</command> with an <literal>ON CONFLICT DO UPDATE</>
+   clause, both <command>INSERT</command> and
+   <command>UPDATE</command> statement level trigger will be fired.
+  </para>
+
+  <para>
+   Triggers that are specified to fire <literal>INSTEAD OF</> the trigger
+   event must be marked <literal>FOR EACH ROW</>, and can only be defined
+   on views. <literal>BEFORE</> and <literal>AFTER</> triggers on a view
+   must be marked as <literal>FOR EACH STATEMENT</>.
+  </para>
+
+  <para>
+   In addition, triggers may be defined to fire for
+   <command>TRUNCATE</command>, though only
+   <literal>FOR EACH STATEMENT</literal>.
+  </para>
+
+  <para>
+   The following table summarizes which types of triggers may be used on
+   tables, views, and foreign tables:
+  </para>
+
+  <informaltable id="supported-trigger-types">
+   <tgroup cols="4">
+    <thead>
+     <row>
+      <entry>When</entry>
+      <entry>Event</entry>
+      <entry>Row-level</entry>
+      <entry>Statement-level</entry>
+     </row>
+    </thead>
+    <tbody>
+     <row>
+      <entry align="center" morerows="1"><literal>BEFORE</></entry>
+      <entry align="center"><command>INSERT</>/<command>UPDATE</>/<command>DELETE</></entry>
+      <entry align="center">Tables and foreign tables</entry>
+      <entry align="center">Tables, views, and foreign tables</entry>
+     </row>
+     <row>
+      <entry align="center"><command>TRUNCATE</></entry>
+      <entry align="center">&mdash;</entry>
+      <entry align="center">Tables</entry>
+     </row>
+     <row>
+      <entry align="center" morerows="1"><literal>AFTER</></entry>
+      <entry align="center"><command>INSERT</>/<command>UPDATE</>/<command>DELETE</></entry>
+      <entry align="center">Tables and foreign tables</entry>
+      <entry align="center">Tables, views, and foreign tables</entry>
+     </row>
+     <row>
+      <entry align="center"><command>TRUNCATE</></entry>
+      <entry align="center">&mdash;</entry>
+      <entry align="center">Tables</entry>
+     </row>
+     <row>
+      <entry align="center" morerows="1"><literal>INSTEAD OF</></entry>
+      <entry align="center"><command>INSERT</>/<command>UPDATE</>/<command>DELETE</></entry>
+      <entry align="center">Views</entry>
+      <entry align="center">&mdash;</entry>
+     </row>
+     <row>
+      <entry align="center"><command>TRUNCATE</></entry>
+      <entry align="center">&mdash;</entry>
+      <entry align="center">&mdash;</entry>
+     </row>
+    </tbody>
+   </tgroup>
+  </informaltable>
+
+  <para>
+   Also, a trigger definition can specify a Boolean <literal>WHEN</>
+   condition, which will be tested to see whether the trigger should
+   be fired.  In row-level triggers the <literal>WHEN</> condition can
+   examine the old and/or new values of columns of the row.  Statement-level
+   triggers can also have <literal>WHEN</> conditions, although the feature
+   is not so useful for them since the condition cannot refer to any values
+   in the table.
   </para>
 
   <para>
    If multiple triggers of the same kind are defined for the same event,
    they will be fired in alphabetical order by name.
+  </para>
+
+  <para>
+   When the <literal>CONSTRAINT</> option is specified, this command creates a
+   <firstterm>constraint trigger</>.  This is the same as a regular trigger
+   except that the timing of the trigger firing can be adjusted using
+   <xref linkend="SQL-SET-CONSTRAINTS">.
+   Constraint triggers must be <literal>AFTER ROW</> triggers on tables.  They
+   can be fired either at the end of the statement causing the triggering
+   event, or at the end of the containing transaction; in the latter case they
+   are said to be <firstterm>deferred</>.  A pending deferred-trigger firing
+   can also be forced to happen immediately by using <command>SET
+   CONSTRAINTS</>.  Constraint triggers are expected to raise an exception
+   when the constraints they implement are violated.
   </para>
 
   <para>
@@ -80,7 +187,7 @@ CREATE TRIGGER <replaceable class="PARAMETER">name</replaceable> { BEFORE | AFTE
    Refer to <xref linkend="triggers"> for more information about triggers.
   </para>
  </refsect1>
-  
+
  <refsect1>
   <title>Parameters</title>
 
@@ -91,6 +198,10 @@ CREATE TRIGGER <replaceable class="PARAMETER">name</replaceable> { BEFORE | AFTE
      <para>
       The name to give the new trigger.  This must be distinct from
       the name of any other trigger for the same table.
+      The name cannot be schema-qualified &mdash; the trigger inherits the
+      schema of its table.  For a constraint trigger, this is also the name to
+      use when modifying the trigger's behavior using
+      <command>SET CONSTRAINTS</>.
      </para>
     </listitem>
    </varlistentry>
@@ -98,10 +209,12 @@ CREATE TRIGGER <replaceable class="PARAMETER">name</replaceable> { BEFORE | AFTE
    <varlistentry>
     <term><literal>BEFORE</literal></term>
     <term><literal>AFTER</literal></term>
+    <term><literal>INSTEAD OF</literal></term>
     <listitem>
      <para>
-      Determines whether the function is called before or after the
-      event.
+      Determines whether the function is called before, after, or instead of
+      the event.  A constraint trigger can only be specified as
+      <literal>AFTER</>.
      </para>
     </listitem>
    </varlistentry>
@@ -110,20 +223,60 @@ CREATE TRIGGER <replaceable class="PARAMETER">name</replaceable> { BEFORE | AFTE
     <term><replaceable class="parameter">event</replaceable></term>
     <listitem>
      <para>
-      One of <command>INSERT</command>, <command>UPDATE</command>, or
-      <command>DELETE</command>; this specifies the event that will
-      fire the trigger. Multiple events can be specified using
-      <literal>OR</literal>.
+      One of <literal>INSERT</literal>, <literal>UPDATE</literal>,
+      <literal>DELETE</literal>, or <literal>TRUNCATE</literal>;
+      this specifies the event that will fire the trigger. Multiple
+      events can be specified using <literal>OR</literal>.
+     </para>
+
+     <para>
+      For <literal>UPDATE</literal> events, it is possible to
+      specify a list of columns using this syntax:
+<synopsis>
+UPDATE OF <replaceable>column_name1</replaceable> [, <replaceable>column_name2</replaceable> ... ]
+</synopsis>
+      The trigger will only fire if at least one of the listed columns
+      is mentioned as a target of the <command>UPDATE</> command.
+     </para>
+
+     <para><literal>INSTEAD OF UPDATE</> events do not support lists of columns.
      </para>
     </listitem>
    </varlistentry>
 
    <varlistentry>
-    <term><replaceable class="parameter">table</replaceable></term>
+    <term><replaceable class="parameter">table_name</replaceable></term>
     <listitem>
      <para>
-      The name (optionally schema-qualified) of the table the trigger
-      is for.
+      The name (optionally schema-qualified) of the table, view, or foreign
+      table the trigger is for.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><replaceable class="PARAMETER">referenced_table_name</replaceable></term>
+    <listitem>
+     <para>
+      The (possibly schema-qualified) name of another table referenced by the
+      constraint.  This option is used for foreign-key constraints and is not
+      recommended for general use.  This can only be specified for
+      constraint triggers.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><literal>DEFERRABLE</literal></term>
+    <term><literal>NOT DEFERRABLE</literal></term>
+    <term><literal>INITIALLY IMMEDIATE</literal></term>
+    <term><literal>INITIALLY DEFERRED</literal></term>
+    <listitem>
+     <para>
+      The default timing of the trigger.
+      See the <xref linkend="SQL-CREATETABLE"> documentation for details of
+      these constraint options.  This can only be specified for constraint
+      triggers.
      </para>
     </listitem>
    </varlistentry>
@@ -137,13 +290,50 @@ CREATE TRIGGER <replaceable class="PARAMETER">name</replaceable> { BEFORE | AFTE
       This specifies whether the trigger procedure should be fired
       once for every row affected by the trigger event, or just once
       per SQL statement. If neither is specified, <literal>FOR EACH
-      STATEMENT</literal> is the default.
+      STATEMENT</literal> is the default.  Constraint triggers can only
+      be specified <literal>FOR EACH ROW</>.
      </para>
     </listitem>
    </varlistentry>
 
    <varlistentry>
-    <term><replaceable class="parameter">funcname</replaceable></term>
+    <term><replaceable class="parameter">condition</replaceable></term>
+    <listitem>
+     <para>
+      A Boolean expression that determines whether the trigger function
+      will actually be executed.  If <literal>WHEN</> is specified, the
+      function will only be called if the <replaceable
+      class="parameter">condition</replaceable> returns <literal>true</>.
+      In <literal>FOR EACH ROW</literal> triggers, the <literal>WHEN</>
+      condition can refer to columns of the old and/or new row values
+      by writing <literal>OLD.<replaceable
+      class="parameter">column_name</replaceable></literal> or
+      <literal>NEW.<replaceable
+      class="parameter">column_name</replaceable></literal> respectively.
+      Of course, <literal>INSERT</> triggers cannot refer to <literal>OLD</>
+      and <literal>DELETE</> triggers cannot refer to <literal>NEW</>.
+     </para>
+
+     <para><literal>INSTEAD OF</> triggers do not support <literal>WHEN</>
+      conditions.
+     </para>
+
+     <para>
+      Currently, <literal>WHEN</literal> expressions cannot contain
+      subqueries.
+     </para>
+
+     <para>
+      Note that for constraint triggers, evaluation of the <literal>WHEN</>
+      condition is not deferred, but occurs immediately after the row update
+      operation is performed. If the condition does not evaluate to true then
+      the trigger is not queued for deferred execution.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><replaceable class="parameter">function_name</replaceable></term>
     <listitem>
      <para>
       A user-supplied function that is declared as taking no arguments
@@ -162,8 +352,8 @@ CREATE TRIGGER <replaceable class="PARAMETER">name</replaceable> { BEFORE | AFTE
       literal string constants.  Simple names and numeric constants
       can be written here, too, but they will all be converted to
       strings.  Please check the description of the implementation
-      language of the trigger function about how the trigger arguments
-      are accessible within the function; it might be different from
+      language of the trigger function to find out how these arguments
+      can be accessed within the function; it might be different from
       normal function arguments.
      </para>
     </listitem>
@@ -181,6 +371,58 @@ CREATE TRIGGER <replaceable class="PARAMETER">name</replaceable> { BEFORE | AFTE
   </para>
 
   <para>
+   Use <xref linkend="sql-droptrigger"> to remove a trigger.
+  </para>
+
+  <para>
+   A column-specific trigger (one defined using the <literal>UPDATE OF
+   <replaceable>column_name</replaceable></literal> syntax) will fire when any
+   of its columns are listed as targets in the <command>UPDATE</>
+   command's <literal>SET</> list.  It is possible for a column's value
+   to change even when the trigger is not fired, because changes made to the
+   row's contents by <literal>BEFORE UPDATE</> triggers are not considered.
+   Conversely, a command such as <literal>UPDATE ... SET x = x ...</>
+   will fire a trigger on column <literal>x</>, even though the column's
+   value did not change.
+  </para>
+
+  <para>
+   In a <literal>BEFORE</> trigger, the <literal>WHEN</> condition is
+   evaluated just before the function is or would be executed, so using
+   <literal>WHEN</> is not materially different from testing the same
+   condition at the beginning of the trigger function.  Note in particular
+   that the <literal>NEW</> row seen by the condition is the current value,
+   as possibly modified by earlier triggers.  Also, a <literal>BEFORE</>
+   trigger's <literal>WHEN</> condition is not allowed to examine the
+   system columns of the <literal>NEW</> row (such as <literal>oid</>),
+   because those won't have been set yet.
+  </para>
+
+  <para>
+   In an <literal>AFTER</> trigger, the <literal>WHEN</> condition is
+   evaluated just after the row update occurs, and it determines whether an
+   event is queued to fire the trigger at the end of statement.  So when an
+   <literal>AFTER</> trigger's <literal>WHEN</> condition does not return
+   true, it is not necessary to queue an event nor to re-fetch the row at end
+   of statement.  This can result in significant speedups in statements that
+   modify many rows, if the trigger only needs to be fired for a few of the
+   rows.
+  </para>
+
+  <para>
+   Statement-level triggers on a view are fired only if the action on the
+   view is handled by a row-level <literal>INSTEAD OF</literal> trigger.
+   If the action is handled by an <literal>INSTEAD</literal> rule, then
+   whatever statements are emitted by the rule are executed in place of the
+   original statement naming the view, so that the triggers that will be
+   fired are those on tables named in the replacement statements.
+   Similarly, if the view is automatically updatable, then the action is
+   handled by automatically rewriting the statement into an action on the
+   view's base table, so that the base table's statement-level triggers are
+   the ones that are fired.
+  </para>
+
+  <para>
    In <productname>PostgreSQL</productname> versions before 7.3, it was
    necessary to declare trigger functions as returning the placeholder
    type <type>opaque</>, rather than <type>trigger</>.  To support loading
@@ -188,37 +430,89 @@ CREATE TRIGGER <replaceable class="PARAMETER">name</replaceable> { BEFORE | AFTE
    declared as returning <type>opaque</>, but it will issue a notice and
    change the function's declared return type to <type>trigger</>.
   </para>
-
-  <para>
-   Use <xref linkend="sql-droptrigger"
-   endterm="sql-droptrigger-title"> to remove a trigger.
-  </para>
  </refsect1>
 
- <refsect1 id="R1-SQL-CREATETRIGGER-2">
+ <refsect1 id="SQL-CREATETRIGGER-examples">
   <title>Examples</title>
 
   <para>
-   <xref linkend="trigger-example"> contains a complete example.
+   Execute the function <function>check_account_update</> whenever
+   a row of the table <literal>accounts</> is about to be updated:
+
+<programlisting>
+CREATE TRIGGER check_update
+    BEFORE UPDATE ON accounts
+    FOR EACH ROW
+    EXECUTE PROCEDURE check_account_update();
+</programlisting>
+
+   The same, but only execute the function if column <literal>balance</>
+   is specified as a target in the <command>UPDATE</> command:
+
+<programlisting>
+CREATE TRIGGER check_update
+    BEFORE UPDATE OF balance ON accounts
+    FOR EACH ROW
+    EXECUTE PROCEDURE check_account_update();
+</programlisting>
+
+   This form only executes the function if column <literal>balance</>
+   has in fact changed value:
+
+<programlisting>
+CREATE TRIGGER check_update
+    BEFORE UPDATE ON accounts
+    FOR EACH ROW
+    WHEN (OLD.balance IS DISTINCT FROM NEW.balance)
+    EXECUTE PROCEDURE check_account_update();
+</programlisting>
+
+   Call a function to log updates of <literal>accounts</>, but only if
+   something changed:
+
+<programlisting>
+CREATE TRIGGER log_update
+    AFTER UPDATE ON accounts
+    FOR EACH ROW
+    WHEN (OLD.* IS DISTINCT FROM NEW.*)
+    EXECUTE PROCEDURE log_account_update();
+</programlisting>
+
+   Execute the function <function>view_insert_row</> for each row to insert
+   rows into the tables underlying a view:
+
+<programlisting>
+CREATE TRIGGER view_insert
+    INSTEAD OF INSERT ON my_view
+    FOR EACH ROW
+    EXECUTE PROCEDURE view_insert_row();
+</programlisting>
+  </para>
+
+  <para>
+   <xref linkend="trigger-example"> contains a complete example of a trigger
+   function written in C.
   </para>
  </refsect1>
 
  <refsect1 id="SQL-CREATETRIGGER-compatibility">
   <title>Compatibility</title>
-  
+
+  <!--
+   It's not clear whether SQL/MED contemplates triggers on foreign tables.
+   Its <drop basic column definition> General Rules do mention the possibility
+   of a reference from a trigger column list.  On the other hand, nothing
+   overrides the fact that CREATE TRIGGER only targets base tables.  For now,
+   do not document the compatibility status of triggers on foreign tables.
+  -->
+
   <para>
    The <command>CREATE TRIGGER</command> statement in
    <productname>PostgreSQL</productname> implements a subset of the
-   <acronym>SQL</> standard. The following functionality is currently missing:
+   <acronym>SQL</> standard. The following functionalities are currently
+   missing:
 
    <itemizedlist>
-    <listitem>
-     <para>
-      SQL allows triggers to fire on updates to specific columns
-      (e.g., <literal>AFTER UPDATE OF col1, col2</literal>).
-     </para>
-    </listitem>
-
     <listitem>
      <para>
       SQL allows you to define aliases for the <quote>old</quote>
@@ -234,10 +528,19 @@ CREATE TRIGGER <replaceable class="PARAMETER">name</replaceable> { BEFORE | AFTE
 
     <listitem>
      <para>
-      <productname>PostgreSQL</productname> only allows the execution
+      <productname>PostgreSQL</productname> does not allow the old and new
+      tables to be referenced in statement-level triggers, i.e., the tables
+      that contain all the old and/or new rows, which are referred to by the
+      <literal>OLD TABLE</literal> and <literal>NEW TABLE</literal> clauses in
+      the <acronym>SQL</> standard.
+     </para>
+    </listitem>
+
+    <listitem>
+     <para><productname>PostgreSQL</productname> only allows the execution
       of a user-defined function for the triggered action.  The standard
       allows the execution of a number of other SQL commands, such as
-      <command>CREATE TABLE</command> as the triggered action.  This
+      <command>CREATE TABLE</command>, as the triggered action.  This
       limitation is not hard to work around by creating a user-defined
       function that executes the desired commands.
      </para>
@@ -257,10 +560,11 @@ CREATE TRIGGER <replaceable class="PARAMETER">name</replaceable> { BEFORE | AFTE
    deletes fire <emphasis>after</> the cascaded <literal>DELETE</> completes.
    The <productname>PostgreSQL</productname> behavior is for <literal>BEFORE
    DELETE</literal> to always fire before the delete action, even a cascading
-   one.  This is considered more consistent.  There is also unpredictable
-   behavior when <literal>BEFORE</literal> triggers modify rows that are later
-   to be modified by referential actions.  This can lead to constraint violations
-   or stored data that does not honor the referential constraint.
+   one.  This is considered more consistent.  There is also nonstandard
+   behavior if <literal>BEFORE</literal> triggers modify rows or prevent
+   updates during an update that is caused by a referential action.  This can
+   lead to constraint violations or stored data that does not honor the
+   referential constraint.
   </para>
 
   <para>
@@ -268,15 +572,29 @@ CREATE TRIGGER <replaceable class="PARAMETER">name</replaceable> { BEFORE | AFTE
    <literal>OR</literal> is a <productname>PostgreSQL</> extension of
    the SQL standard.
   </para>
+
+  <para>
+   The ability to fire triggers for <command>TRUNCATE</command> is a
+   <productname>PostgreSQL</> extension of the SQL standard, as is the
+   ability to define statement-level triggers on views.
+  </para>
+
+  <para>
+   <command>CREATE CONSTRAINT TRIGGER</command> is a
+   <productname>PostgreSQL</productname> extension of the <acronym>SQL</>
+   standard.
+  </para>
+
  </refsect1>
 
  <refsect1>
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-createfunction" endterm="sql-createfunction-title"></member>
-   <member><xref linkend="sql-altertrigger" endterm="sql-altertrigger-title"></member>
-   <member><xref linkend="sql-droptrigger" endterm="sql-droptrigger-title"></member>
+   <member><xref linkend="sql-altertrigger"></member>
+   <member><xref linkend="sql-droptrigger"></member>
+   <member><xref linkend="sql-createfunction"></member>
+   <member><xref linkend="sql-set-constraints"></member>
   </simplelist>
  </refsect1>
 </refentry>

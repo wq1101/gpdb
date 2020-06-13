@@ -1,4 +1,4 @@
-/* $PostgreSQL: pgsql/src/interfaces/ecpg/pgtypeslib/interval.c,v 1.43 2010/08/02 01:24:54 tgl Exp $ */
+/* src/interfaces/ecpg/pgtypeslib/interval.c */
 
 #include "postgres_fe.h"
 #include <time.h>
@@ -16,7 +16,7 @@
 
 /* copy&pasted from .../src/backend/utils/adt/datetime.c */
 static int
-strtoi(const char *nptr, char **endptr, int base)
+strtoint(const char *nptr, char **endptr, int base)
 {
 	long		val;
 
@@ -160,7 +160,7 @@ DecodeISO8601Interval(char *str,
 			return dterr;
 
 		/*
-		 * Note: we could step off the end of the string here.	Code below
+		 * Note: we could step off the end of the string here.  Code below
 		 * *must* exit the loop if unit == '\0'.
 		 */
 		unit = *str++;
@@ -200,6 +200,7 @@ DecodeISO8601Interval(char *str,
 						continue;
 					}
 					/* Else fall through to extended alternative format */
+					/* FALL THROUGH */
 				case '-':		/* ISO 8601 4.4.3.3 Alternative Format,
 								 * Extended */
 					if (havefield)
@@ -278,6 +279,7 @@ DecodeISO8601Interval(char *str,
 						return 0;
 					}
 					/* Else fall through to extended alternative format */
+					/* FALL THROUGH */
 				case ':':		/* ISO 8601 4.4.3.3 Alternative Format,
 								 * Extended */
 					if (havefield)
@@ -448,7 +450,7 @@ DecodeInterval(char **field, int *ftype, int nf,		/* int range, */
 				}
 
 				errno = 0;
-				val = strtoi(field[i], &cp, 10);
+				val = strtoint(field[i], &cp, 10);
 				if (errno == ERANGE)
 					return DTERR_FIELD_OVERFLOW;
 
@@ -457,7 +459,7 @@ DecodeInterval(char **field, int *ftype, int nf,		/* int range, */
 					/* SQL "years-months" syntax */
 					int			val2;
 
-					val2 = strtoi(cp + 1, &cp, 10);
+					val2 = strtoint(cp + 1, &cp, 10);
 					if (errno == ERANGE || val2 < 0 || val2 >= MONTHS_PER_YEAR)
 						return DTERR_FIELD_OVERFLOW;
 					if (*cp != '\0')
@@ -801,7 +803,6 @@ AppendSeconds(char *cp, int sec, fsec_t fsec, int precision, bool fillzeros)
 int
 EncodeInterval(struct /* pg_ */ tm * tm, fsec_t fsec, int style, char *str)
 {
-
 	char	   *cp = str;
 	int			year = tm->tm_year;
 	int			mon = tm->tm_mon;
@@ -918,7 +919,7 @@ EncodeInterval(struct /* pg_ */ tm * tm, fsec_t fsec, int style, char *str)
 				AppendSeconds(cp, sec, fsec, MAX_INTERVAL_PRECISION, false);
 				cp += strlen(cp);
 				*cp++ = 'S';
-				*cp++ = '\0';
+				*cp = '\0';
 			}
 			break;
 
@@ -981,7 +982,7 @@ EncodeInterval(struct /* pg_ */ tm * tm, fsec_t fsec, int style, char *str)
 
 
 /* interval2tm()
- * Convert a interval data type to a tm structure.
+ * Convert an interval data type to a tm structure.
  */
 static int
 interval2tm(interval span, struct tm * tm, fsec_t *fsec)
@@ -1037,6 +1038,9 @@ recalc:
 static int
 tm2interval(struct tm * tm, fsec_t fsec, interval * span)
 {
+	if ((double) tm->tm_year * MONTHS_PER_YEAR + tm->tm_mon > INT_MAX ||
+		(double) tm->tm_year * MONTHS_PER_YEAR + tm->tm_mon < INT_MIN)
+		return -1;
 	span->month = tm->tm_year * MONTHS_PER_YEAR + tm->tm_mon;
 #ifdef HAVE_INT64_TIMESTAMP
 	span->time = (((((((tm->tm_mday * INT64CONST(24)) +

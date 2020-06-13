@@ -1,11 +1,16 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/alter_schema.sgml,v 1.9 2006/09/16 00:30:16 momjian Exp $
+doc/src/sgml/ref/alter_schema.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-ALTERSCHEMA">
+ <indexterm zone="sql-alterschema">
+  <primary>ALTER SCHEMA</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="SQL-ALTERSCHEMA-title">ALTER SCHEMA</refentrytitle>
+  <refentrytitle>ALTER SCHEMA</refentrytitle>
+  <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
 
@@ -14,14 +19,10 @@ PostgreSQL documentation
   <refpurpose>change the definition of a schema</refpurpose>
  </refnamediv>
 
- <indexterm zone="sql-alterschema">
-  <primary>ALTER SCHEMA</primary>
- </indexterm>
-
  <refsynopsisdiv>
 <synopsis>
-ALTER SCHEMA <replaceable>name</replaceable> RENAME TO <replaceable>newname</replaceable>
-ALTER SCHEMA <replaceable>name</replaceable> OWNER TO <replaceable>newowner</replaceable>
+ALTER SCHEMA <replaceable>name</replaceable> RENAME TO <replaceable>new_name</replaceable>
+ALTER SCHEMA <replaceable>name</replaceable> OWNER TO { <replaceable>new_owner</replaceable> | CURRENT_USER | SESSION_USER }
 </synopsis>
  </refsynopsisdiv>
 
@@ -57,7 +58,7 @@ ALTER SCHEMA <replaceable>name</replaceable> OWNER TO <replaceable>newowner</rep
    </varlistentry>
 
    <varlistentry>
-    <term><replaceable>newname</replaceable></term>
+    <term><replaceable>new_name</replaceable></term>
     <listitem>
      <para>
       The new name of the schema.  The new name cannot
@@ -68,7 +69,7 @@ ALTER SCHEMA <replaceable>name</replaceable> OWNER TO <replaceable>newowner</rep
    </varlistentry>
 
    <varlistentry>
-    <term><replaceable class="parameter">newowner</replaceable></term>
+    <term><replaceable class="parameter">new_owner</replaceable></term>
     <listitem>
      <para>
       The new owner of the schema.
@@ -80,7 +81,7 @@ ALTER SCHEMA <replaceable>name</replaceable> OWNER TO <replaceable>newowner</rep
 
  <refsect1>
   <title>Compatibility</title>
-    
+
   <para>
    There is no <command>ALTER SCHEMA</command> statement in the SQL
    standard.
@@ -91,8 +92,8 @@ ALTER SCHEMA <replaceable>name</replaceable> OWNER TO <replaceable>newowner</rep
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-createschema" endterm="sql-createschema-title"></member>
-   <member><xref linkend="sql-dropschema" endterm="sql-dropschema-title"></member>
+   <member><xref linkend="sql-createschema"></member>
+   <member><xref linkend="sql-dropschema"></member>
   </simplelist>
  </refsect1>
 

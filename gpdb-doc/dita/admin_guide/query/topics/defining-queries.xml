@@ -2,8 +2,7 @@
 <!DOCTYPE topic PUBLIC "-//OASIS//DTD DITA Composite//EN" "ditabase.dtd">
 <topic id="defining-queries">
     <title id="in140509">Defining Queries</title>
-    <shortdesc>Greenplum Database is based on the PostgreSQL implementation of the SQL
-        standard. </shortdesc>
+    <shortdesc>Greenplum Database is based on the PostgreSQL implementation of the SQL standard. </shortdesc>
     <body>
         <p>This topic describes how to construct SQL queries in Greenplum Database.</p>
         <ul>
@@ -20,14 +19,17 @@
         <body>
             <p>SQL is a standard language for accessing databases. The language consists of elements
                 that enable data storage, retrieval, analysis, viewing, manipulation, and so on. You
-                use SQL commands to construct queries and commands that the Greenplum Database engine understands. SQL queries consist of a sequence of
-                commands. Commands consist of a sequence of valid tokens in correct syntax order,
-                terminated by a semicolon (<codeph>;</codeph>). </p>
-            <p>For more information about SQL commands, see the <cite>Greenplum
-                    Database Reference Guide</cite>.</p>
-            <p>Greenplum Database uses PostgreSQL's structure and syntax, with some
-                exceptions. For more information about SQL rules and concepts in PostgreSQL, see
-                "SQL Syntax" in the PostgreSQL documentation.</p>
+                use SQL commands to construct queries and commands that the Greenplum Database
+                engine understands. SQL queries consist of a sequence of commands. Commands consist
+                of a sequence of valid tokens in correct syntax order, terminated by a semicolon
+                    (<codeph>;</codeph>). </p>
+            <p>For more information about SQL commands, see <xref
+                    href="../../../ref_guide/sql_commands/sql_ref.xml">SQL Command
+                    Reference</xref><ph otherprops="op-print"> in the <cite>Greenplum Database
+                        Reference Guide</cite></ph>.</p>
+            <p>Greenplum Database uses PostgreSQL's structure and syntax, with some exceptions. For
+                more information about SQL rules and concepts in PostgreSQL, see "SQL Syntax" in the
+                PostgreSQL documentation.</p>
         </body>
     </topic>
     <topic id="topic4" xml:lang="en">
@@ -46,8 +48,8 @@
                 <li id="in143969">A correlated subquery</li>
                 <li id="in199893">A field selection expression</li>
                 <li id="in199900">A function call</li>
-                <li id="in205284">A new column value in an <codeph>INSERT</codeph><ph
-                       > or <codeph>UPDATE</codeph></ph></li>
+                <li id="in205284">A new column value in an <codeph>INSERT</codeph><ph> or
+                            <codeph>UPDATE</codeph></ph></li>
                 <li id="in205286">An operator invocation column reference</li>
                 <li id="in144037">A positional parameter reference, in the body of a function
                     definition or prepared statement</li>
@@ -186,9 +188,10 @@
                 <p>
                     <codeblock>sqrt(2)</codeblock>
                 </p>
-                <p>See the <cite>Greenplum Database Reference Guide</cite> for
-                    lists of the built-in functions by category. You can add custom functions,
-                    too.</p>
+                <p>See <xref href="../../../ref_guide/function-summary.xml#topic1">Summary of
+                        Built-in Functions</xref><ph otherprops="op-print"> in the <cite>Greenplum
+                            Database Reference Guide</cite></ph> for lists of the built-in functions
+                    by category. You can add custom functions, too.</p>
             </body>
         </topic>
         <topic id="topic11" xml:lang="en">
@@ -199,18 +202,21 @@
                     and returns a single value, such as the sum or average of the set of values. The
                     syntax of an aggregate expression is one of the following:</p>
                 <ul>
-                    <li id="in144858"><codeph><i>aggregate_name</i>(<i>expression</i> [ , ... ]
-                            )</codeph> — operates across all input rows for which the expected
-                        result value is non-null. <codeph>ALL</codeph> is the default.</li>
-                    <li id="in144859"><codeph><i>aggregate_name</i>(ALL <i>expression</i> [ , ... ]
-                            )</codeph> — operates identically to the first form because
+                    <li id="in144858"><codeph><i>aggregate_name</i>(<i>expression</i> [ , ... ] ) [
+                            FILTER ( WHERE <varname>filter_clause</varname> ) ]</codeph> — operates
+                        across all input rows for which the expected result value is non-null.
                             <codeph>ALL</codeph> is the default.</li>
+                    <li id="in144859"><codeph><i>aggregate_name</i>(ALL <i>expression</i> [ , ... ]
+                            ) [ FILTER ( WHERE <varname>filter_clause</varname> ) ]</codeph> —
+                        operates identically to the first form because <codeph>ALL</codeph> is the
+                        default.</li>
                     <li id="in144860"><codeph><i>aggregate_name</i>(DISTINCT <i>expression</i> [ ,
-                            ... ] )</codeph> — operates across all distinct non-null values of input
-                        rows.</li>
-                    <li id="in144861"><codeph><i>aggregate_name</i>(*)</codeph> — operates on all
-                        rows with values both null and non-null. Generally, this form is most useful
-                        for the <codeph>count(*)</codeph> aggregate function.</li>
+                            ... ] ) [ FILTER ( WHERE <varname>filter_clause</varname> ) ]</codeph> —
+                        operates across all distinct non-null values of input rows.</li>
+                    <li id="in144861"><codeph><i>aggregate_name</i>(*) [ FILTER ( WHERE
+                                <varname>filter_clause</varname> ) ]</codeph> — operates on all rows
+                        with values both null and non-null. Generally, this form is most useful for
+                        the <codeph>count(*)</codeph> aggregate function.</li>
                 </ul>
                 <p>Where <i>aggregate_name</i> is a previously defined aggregate (possibly
                     schema-qualified) and <i>expression</i> is any value expression that does not
@@ -220,13 +226,24 @@
                         <codeph>f1</codeph> is <ph>non-null, and </ph><codeph>count(distinct
                         f1)</codeph> yields the number of distinct non-null values of
                         <codeph>f1</codeph>.</p>
+                <p>If <codeph>FILTER</codeph> is specified, then only the input rows for which the
+                        <varname>filter_clause</varname> evaluates to true are fed to the aggregate
+                    function; other rows are discarded. For example:</p>
+                <codeblock>SELECT
+    count(*) AS unfiltered,
+    count(*) FILTER (WHERE i &lt; 5) AS filtered
+FROM generate_series(1,10) AS s(i);
+ unfiltered | filtered
+------------+----------
+         10 |        4
+(1 row)</codeblock>
                 <p>For predefined aggregate functions, see <xref
                         href="../topics/functions-operators.xml#topic29"/>. You can also add custom
                     aggregate functions.</p>
-                <p>Greenplum Database provides the <codeph>MEDIAN</codeph> aggregate
-                    function, which returns the fiftieth percentile of the
-                        <codeph>PERCENTILE_CONT</codeph> result and special aggregate expressions
-                    for inverse distribution functions as follows:</p>
+                <p>Greenplum Database provides the <codeph>MEDIAN</codeph> aggregate function, which
+                    returns the fiftieth percentile of the <codeph>PERCENTILE_CONT</codeph> result
+                    and special aggregate expressions for inverse distribution functions as
+                    follows:</p>
                 <p>
                     <codeblock>PERCENTILE_CONT(_percentage_) WITHIN GROUP (ORDER BY _expression_)
 </codeblock>
@@ -241,26 +258,34 @@
                 <body>
                     <p>The following are current limitations of the aggregate expressions:</p>
                     <ul>
-                        <li id="in199103">Greenplum Database does not support the
-                            following keywords: ALL, DISTINCT, FILTER and OVER. See <xref
+                        <li id="in199103">Greenplum Database does not support the following
+                            keywords: <codeph>ALL</codeph>, <codeph>DISTINCT</codeph>, and
+                                <codeph>OVER</codeph>. See <xref
                                 href="../topics/functions-operators.xml#topic31/in2073121"/> for
                             more details. </li>
                         <li id="in199105">An aggregate expression can appear only in the result list
-                            or HAVING clause of a SELECT command. It is forbidden in other clauses,
-                            such as WHERE, because those clauses are logically evaluated before the
-                            results of aggregates form. This restriction applies to the query level
-                            to which the aggregate belongs.</li>
+                            or <codeph>HAVING</codeph> clause of a <codeph>SELECT</codeph> command.
+                            It is forbidden in other clauses, such as <codeph>WHERE</codeph>,
+                            because those clauses are logically evaluated before the results of
+                            aggregates form. This restriction applies to the query level to which
+                            the aggregate belongs.</li>
                         <li id="in200910">When an aggregate expression appears in a subquery, the
                             aggregate is normally evaluated over the rows of the subquery. If the
-                            aggregate's arguments contain only outer-level variables, the aggregate
-                            belongs to the nearest such outer level and evaluates over the rows of
-                            that query. The aggregate expression as a whole is then an outer
-                            reference for the subquery in which it appears, and the aggregate
-                            expression acts as a constant over any one evaluation of that subquery.
-                            See <xref format="dita" href="#topic15" type="topic"/> and <xref
+                            aggregate's arguments (and <varname>filter_clause</varname> if any)
+                            contain only outer-level variables, the aggregate belongs to the nearest
+                            such outer level and evaluates over the rows of that query. The
+                            aggregate expression as a whole is then an outer reference for the
+                            subquery in which it appears, and the aggregate expression acts as a
+                            constant over any one evaluation of that subquery. The restriction about
+                            appearing only in the result list or
+                                <codeph><codeph>HAVING</codeph></codeph> clause applies with respect
+                            to the query level at which the aggregate appears. See <xref
+                                format="dita" href="#topic15" type="topic"/> and <xref
                                 href="../topics/functions-operators.xml#topic29/in204913"/>.</li>
-                        <li id="in200915">Greenplum Database does not support DISTINCT
-                            with multiple input expressions.</li>
+                        <li id="in2009151">Greenplum Database does not support specifying an
+                            aggregate function as an argument to another aggregate function.</li>
+                        <li id="in2009152">Greenplum Database does not support specifying a window
+                            function as an argument to an aggregate function.</li>
                     </ul>
                 </body>
             </topic>
@@ -273,23 +298,28 @@
                     example, with window expressions, users can calculate moving averages or sums
                     over various intervals, reset aggregations and ranks as selected column values
                     change, and express complex ratios in simple terms.</p>
-                <p>A window expression represents the application of a <i>window function</i>
-                    applied to a <i>window frame</i>, which is defined in a special
-                        <codeph>OVER()</codeph> clause. A window partition is a set of rows that are
-                    grouped together to apply a window function. Unlike aggregate functions, which
-                    return a result value for each group of rows, window functions return a result
-                    value for every row, but that value is calculated with respect to the rows in a
-                    particular window partition. If no partition is specified, the window function
-                    is computed over the complete intermediate result set.</p>
+                <p>A window expression represents the application of a <i>window function</i> to a
+                        <i>window frame</i>, which is defined with an <codeph>OVER()</codeph>
+                    clause. This is comparable to the type of calculation that can be done with an
+                    aggregate function and a <codeph>GROUP BY</codeph> clause. Unlike aggregate
+                    functions, which return a single result value for each group of rows, window
+                    functions return a result value for every row, but that value is calculated with
+                    respect to the set of rows in the window frame to which the row belongs. The
+                        <codeph>OVER()</codeph> clause allows dividing the rows into
+                        <i>partitions</i> and then further restricting the window frame by
+                    specifying which rows preceding or following the current row within its
+                    partition to include in the calculation.</p>
+                <p>Greenplum Database does not support specifying a window function as an argument
+                    to another window function.</p>
                 <p>The syntax of a window expression is:</p>
                 <p>
-                    <codeblock><i>window_function</i> ( [<i>expression</i> [, ...]] ) OVER ( <i>window_specification</i> )</codeblock>
+                    <codeblock><i>window_function</i> ( [<i>expression</i> [, ...]] ) [ FILTER ( WHERE <varname>filter_clause</varname> ) ] OVER ( <i>window_specification</i> )</codeblock>
                 </p>
                 <p>Where <i><codeph>window_function</codeph></i> is one of the functions listed in
-                        <xref href="../topics/functions-operators.xml#topic30/in164369"/>,
-                            <i><codeph>expression</codeph></i> is any value expression that does not
-                    contain a window expression, and <i><codeph>window_specification</codeph></i>
-                    is:</p>
+                        <xref href="../topics/functions-operators.xml#topic30/in164369"/> or a
+                    user-defined window function, <i><codeph>expression</codeph></i> is any value
+                    expression that does not contain a window expression, and
+                            <i><codeph>window_specification</codeph></i> is:</p>
                 <p><codeblock>[<i>window_name</i>]
 [PARTITION BY <i>expression </i>[, ...]]
 [[ORDER BY <i>expression</i> [ASC | DESC | USING <i>operator</i>] [NULLS {FIRST | LAST}] [, ...]
@@ -310,11 +340,19 @@
                     <codeblock>SELECT count(*) OVER(PARTITION BY customer_id), * FROM sales;
 </codeblock>
                 </p>
-                <p>The <codeph>OVER</codeph> clause differentiates window functions from other
-                    aggregate or reporting functions. The <codeph>OVER</codeph> clause defines the
-                            <i><codeph>window_specification</codeph></i> to which the window
-                    function is applied. A window specification has the following
-                    characteristics:</p>
+                <p>If <codeph>FILTER</codeph> is specified, then only the input rows for which the
+                        <varname>filter_clause</varname> evaluates to true are fed to the window
+                    function; other rows are discarded. In a window expression, a
+                        <codeph>FILTER</codeph> clause can be used only with a
+                        <varname>window_function</varname> that is an aggregate function.</p>
+                <p>In a window expression, the expression must contain an <codeph>OVER</codeph>
+                    clause. The <codeph>OVER</codeph> clause specifies the window frame—the rows to
+                    be processed by the window function. This syntactically distinguishes the
+                    function from a regular or aggregate function.</p>
+                <p>In a window aggregate function that is used in a window expression, Greenplum
+                    Database does not support a <codeph>DISTINCT</codeph> clause with multiple input
+                    expressions.</p>
+                <p>A window specification has the following characteristics:</p>
                 <ul>
                     <li id="in166168">The <codeph>PARTITION BY</codeph> clause defines the window
                         partitions to which the window function is applied. If omitted, the entire
@@ -326,7 +364,7 @@
                             <codeph>ORDER BY</codeph> clause is required for the window functions
                         that calculate rankings, as it identifies the measure(s) for the ranking
                         values. For OLAP aggregations, the <codeph>ORDER BY</codeph> clause is
-                        required to use window frames (the <codeph>ROWS</codeph> |
+                        required to use window frames (the <codeph>ROWS</codeph> or
                             <codeph>RANGE</codeph> clause).</li>
                 </ul>
                 <note type="note">Columns of data types without a coherent ordering, such as
@@ -336,40 +374,199 @@
                     subtraction do not have the expected effects. For example, the following is not
                     generally true: <codeph>x::time &lt; x::time + '2
                     hour'::interval</codeph></note>
-                <ul>
-                    <li id="in167503">The <codeph>ROWS/RANGE</codeph> clause defines a window frame
-                        for aggregate (non-ranking) window functions. A window frame defines a set
-                        of rows within a window partition. When a window frame is defined, the
-                        window function computes on the contents of this moving frame rather than
-                        the fixed contents of the entire window partition. Window frames are
-                        row-based (<codeph>ROWS</codeph>) or value-based
-                        (<codeph>RANGE</codeph>).</li>
+                <ul id="ul_im5_14q_2gb">
+                    <li id="in167503">The <codeph>ROWS</codeph> or <codeph>RANGE</codeph> clause
+                        defines a window frame for aggregate (non-ranking) window functions. A
+                        window frame defines a set of rows within a window partition. When a window
+                        frame is defined, the window function computes on the contents of this
+                        moving frame rather than the fixed contents of the entire window partition.
+                        Window frames are row-based (<codeph>ROWS</codeph>) or value-based
+                            (<codeph>RANGE</codeph>).</li>
                 </ul>
             </body>
+            <topic id="topic_qck_12r_2gb">
+                <title>Window Examples</title>
+                <body>
+                    <p>The following examples demonstrate using window functions with partitions and
+                        window frames.</p>
+                    <section>
+                        <title>Example 1 – Aggregate Window Function Over a Partition</title>
+                        <p>The <codeph>PARTITION BY</codeph> list in the <codeph>OVER</codeph>
+                            clause divides the rows into groups, or partitions, that have the same
+                            values as the specified expressions.</p>
+                        <p>This example compares employees' salaries with the average salaries for
+                            their
+                            departments:<codeblock>SELECT depname, empno, salary, avg(salary) OVER(PARTITION BY depname)
+FROM empsalary;
+  depname  | empno | salary |          avg          
+-----------+-------+--------+-----------------------
+ develop   |     9 |   4500 | 5020.0000000000000000
+ develop   |    10 |   5200 | 5020.0000000000000000
+ develop   |    11 |   5200 | 5020.0000000000000000
+ develop   |     7 |   4200 | 5020.0000000000000000
+ develop   |     8 |   6000 | 5020.0000000000000000
+ personnel |     5 |   3500 | 3700.0000000000000000
+ personnel |     2 |   3900 | 3700.0000000000000000
+ sales     |     1 |   5000 | 4866.6666666666666667
+ sales     |     3 |   4800 | 4866.6666666666666667
+ sales     |     4 |   4800 | 4866.6666666666666667
+(10 rows)
+</codeblock></p>
+                        <p>The first three output columns come from the table
+                                <codeph>empsalary</codeph>, and there is one output row for each row
+                            in the table. The fourth column is the average calculated on all rows
+                            that have the same <codeph>depname</codeph> value as the current row.
+                            Rows that share the same <codeph>depname</codeph> value constitute a
+                            partition, and there are three partitions in this example. The
+                                <codeph>avg</codeph> function is the same as the regular
+                                <codeph>avg</codeph> aggregate function, but the
+                                <codeph>OVER</codeph> clause causes it to be applied as a window
+                            function.</p>
+                        <p>You can also put the window specification in a <codeph>WINDOW</codeph>
+                            clause and reference it in the select list. This example is equivalent
+                            to the previous
+                            query:<codeblock>SELECT depname, empno, salary, avg(salary) OVER(mywindow)
+FROM empsalary
+WINDOW mywindow AS (PARTITION BY depname);</codeblock></p>
+                        <p>Defining a named window is useful when the select list has multiple
+                            window functions using the same window specification.</p>
+                    </section>
+                    <section>
+                        <title>Example 2 – Ranking Window Function With an ORDER BY Clause</title>
+                        <p>An <codeph>ORDER BY</codeph> clause within the <codeph>OVER</codeph>
+                            clause controls the order in which rows are processed by window
+                            functions. The <codeph>ORDER BY</codeph> list for the window function
+                            does not have to match the output order of the query. This example uses
+                            the <codeph>rank()</codeph> window function to rank employees' salaries
+                            within their departments:</p>
+                        <codeblock>SELECT depname, empno, salary,
+    rank() OVER (PARTITION BY depname ORDER BY salary DESC)
+FROM empsalary;
+  depname  | empno | salary | rank 
+-----------+-------+--------+------
+ develop   |     8 |   6000 |    1
+ develop   |    11 |   5200 |    2
+ develop   |    10 |   5200 |    2
+ develop   |     9 |   4500 |    4
+ develop   |     7 |   4200 |    5
+ personnel |     2 |   3900 |    1
+ personnel |     5 |   3500 |    2
+ sales     |     1 |   5000 |    1
+ sales     |     4 |   4800 |    2
+ sales     |     3 |   4800 |    2
+(10 rows)</codeblock>
+                    </section>
+                    <section>
+                        <title>Example 3 – Aggregate Function over a Row Window Frame</title>
+                        <p>A <codeph>RANGE</codeph> or <codeph>ROWS</codeph> clause defines the
+                            window frame—a set of rows within a partition—that the window function
+                            includes in the calculation. <codeph>ROWS</codeph> specifies a physical
+                            set of rows to process, for example all rows from the beginning of the
+                            partition to the current row.</p>
+                        <p>This example calculates a running total of employee's salaries by department 
+                            using the <codeph>sum()</codeph> function to total rows from the start of 
+                            the partition to the current row:</p>
+                        <codeblock>SELECT depname, empno, salary,
+    sum(salary) OVER (PARTITION BY depname ORDER BY salary
+        ROWS between UNBOUNDED PRECEDING AND CURRENT ROW)
+FROM empsalary ORDER BY depname, sum;
+  depname  | empno | salary |  sum  
+-----------+-------+--------+-------
+ develop   |     7 |   4200 |  4200
+ develop   |     9 |   4500 |  8700
+ develop   |    11 |   5200 | 13900
+ develop   |    10 |   5200 | 19100
+ develop   |     8 |   6000 | 25100
+ personnel |     5 |   3500 |  3500
+ personnel |     2 |   3900 |  7400
+ sales     |     4 |   4800 |  4800
+ sales     |     3 |   4800 |  9600
+ sales     |     1 |   5000 | 14600
+(10 rows)</codeblock>
+                    </section>
+                    <section>
+                        <title>Example 4 – Aggregate Function for a Range Window Frame</title>
+                        <p><codeph>RANGE</codeph> specifies logical values based on values of the
+                                <codeph>ORDER BY</codeph> expression in the <codeph>OVER</codeph>
+                            clause. This example demonstrates the difference between
+                                <codeph>ROWS</codeph> and <codeph>RANGE</codeph>. The frame contains
+                            all rows with salary values less than or equal to the current row. Unlike
+                            the previous example, for employees with the same salary, the sum is the 
+                            same and includes the salaries of all of those employees. </p>
+                        <codeblock>SELECT depname, empno, salary,
+    sum(salary) OVER (PARTITION BY depname ORDER BY salary
+        RANGE between UNBOUNDED PRECEDING AND CURRENT ROW)
+FROM empsalary ORDER BY depname, sum;
+  depname  | empno | salary |  sum  
+-----------+-------+--------+-------
+ develop   |     7 |   4200 |  4200
+ develop   |     9 |   4500 |  8700
+ develop   |    11 |   5200 | 19100
+ develop   |    10 |   5200 | 19100
+ develop   |     8 |   6000 | 25100
+ personnel |     5 |   3500 |  3500
+ personnel |     2 |   3900 |  7400
+ sales     |     4 |   4800 |  9600
+ sales     |     3 |   4800 |  9600
+ sales     |     1 |   5000 | 14600
+(10 rows)</codeblock>
+                    </section>
+                </body>
+            </topic>
         </topic>
         <topic id="topic14" xml:lang="en">
             <title>Type Casts</title>
             <body>
-                <p>A type cast specifies a conversion from one data type to another. Greenplum Database accepts two equivalent syntaxes for type casts:</p>
-                <p>
-                    <codeblock>CAST ( expression AS type )
-expression::type
-</codeblock>
-                </p>
-                <p>The <codeph>CAST</codeph> syntax conforms to SQL; the syntax with
-                        <codeph>::</codeph> is historical PostgreSQL usage.</p>
-                <p>A cast applied to a value expression of a known type is a run-time type
-                    conversion. The cast succeeds only if a suitable type conversion function is
-                    defined. This differs from the use of casts with constants. A cast applied to a
-                    string literal represents the initial assignment of a type to a literal constant
-                    value, so it succeeds for any type if the contents of the string literal are
-                    acceptable input syntax for the data type.</p>
+                <p>A type cast specifies a conversion from one data type to another. A cast applied
+                    to a value expression of a known type is a run-time type conversion. The cast
+                    succeeds only if a suitable type conversion is defined. This differs
+                    from the use of casts with constants. A cast applied to a string literal
+                    represents the initial assignment of a type to a literal constant value, so it
+                    succeeds for any type if the contents of the string literal are acceptable input
+                    syntax for the data type.</p>
+                <p>Greenplum Database supports three types of casts applied to a value expression:
+                        <ul id="ul_f4w_svt_rdb">
+                        <li><i>Explicit cast</i> - Greenplum Database applies a cast when you
+                            explicitly specify a cast between two data types. Greenplum Database
+                            accepts two equivalent syntaxes for explicit type casts:<p>
+                                <codeblock>CAST ( expression AS type )
+expression::type</codeblock>
+                            </p><p>The <codeph>CAST</codeph> syntax conforms to SQL; the syntax using
+                                    <codeph>::</codeph> is historical PostgreSQL usage.</p></li>
+                        <li><i>Assignment cast</i> - Greenplum Database implicitly invokes a cast in
+                            assignment contexts, when assigning a value to a column of the target
+                            data type. For example, a <codeph><xref
+                                    href="../../../ref_guide/sql_commands/CREATE_CAST.xml">CREATE
+                                    CAST</xref></codeph> command with the <codeph>AS
+                                ASSIGNMENT</codeph> clause creates a cast that is applied implicitly
+                            in the assignment context. This example assignment cast assumes that
+                                <codeph>tbl1.f1</codeph> is a column of type <codeph>text</codeph>.
+                            The <codeph>INSERT</codeph> command is allowed because the value is
+                            implicitly cast from the <codeph>integer</codeph> to
+                                <codeph>text</codeph> type.
+                            <codeblock>INSERT INTO tbl1 (f1) VALUES (42);</codeblock></li>
+                        <li><i>Implicit cast</i> - Greenplum Database implicitly invokes a cast in
+                            assignment or expression contexts. For example, a <codeph>CREATE
+                                CAST</codeph> command with the <codeph>AS IMPLICIT</codeph> clause
+                            creates an implicit cast, a cast that is applied implicitly in both the
+                            assignment and expression context. This example implicit cast assumes
+                            that <codeph>tbl1.c1</codeph> is a column of type <codeph>int</codeph>.
+                            For the calculation in the predicate, the value of <codeph>c1</codeph>
+                            is implicitly cast from <codeph>int</codeph> to a
+                                <codeph>decimal</codeph>
+                            type.<codeblock>SELECT * FROM tbl1 WHERE tbl1.c2 = (4.3 + tbl1.c1) ;</codeblock></li>
+                    </ul></p>
                 <p>You can usually omit an explicit type cast if there is no ambiguity about the
-                    type a value expression must produce; for example, when it is assigned to a
-                    table column, the system automatically applies a type cast. The system applies
-                    automatic casting only to casts marked "OK to apply implicitly" in system
-                    catalogs. Other casts must be invoked with explicit casting syntax to prevent
-                    unexpected conversions from being applied without the user's knowledge.</p>
+                    type a value expression must produce (for example, when it is assigned to a
+                    table column); the system automatically applies a type cast. Greenplum Database
+                    implicitly applies casts only to casts defined with a cast context of
+                    assignment or explicit in the system catalogs. Other casts must be
+                    invoked with explicit casting syntax to prevent unexpected conversions from
+                    being applied without the user's knowledge. </p>
+                <p>You can display cast information with the <codeph>psql</codeph> meta-command
+                        <codeph>\dC</codeph>. Cast information is stored in the catalog table
+                        <codeph>pg_cast</codeph>, and type information is stored in the catalog
+                    table <codeph>pg_type</codeph>. </p>
             </body>
         </topic>
         <topic id="topic15" xml:lang="en">
@@ -388,10 +585,11 @@ expression::type
                 <p>A correlated subquery (CSQ) is a <codeph>SELECT</codeph> query with a
                         <codeph>WHERE</codeph> clause or target list that contains references to the
                     parent outer clause. CSQs efficiently express results in terms of results of
-                    another query. Greenplum Database supports correlated subqueries
-                    that provide compatibility with many existing applications. A CSQ is a scalar or
-                    table subquery, depending on whether it returns one or multiple rows. Greenplum Database does not support correlated subqueries with
-                    skip-level correlations.</p>
+                    another query. Greenplum Database supports correlated subqueries that provide
+                    compatibility with many existing applications. A CSQ is a scalar or table
+                    subquery, depending on whether it returns one or multiple rows. Greenplum
+                    Database does not support correlated subqueries with skip-level
+                    correlations.</p>
             </body>
         </topic>
         <topic id="topic17" xml:lang="en">
@@ -410,16 +608,15 @@ expression::type
                     <codeblock>SELECT * FROM t1 WHERE 
 EXISTS (SELECT 1 FROM t2 WHERE t2.x = t1.x);
 </codeblock>
-                    <p>Greenplum Database uses one of the following methods to run
-                        CSQs:</p>
+                    <p>Greenplum Database uses one of the following methods to run CSQs:</p>
                     <ul>
                         <li id="in197793">Unnest the CSQ into join operations &#8211; This method is
-                            most efficient, and it is how Greenplum Database runs most
-                            CSQs, including queries from the TPC-H benchmark.</li>
+                            most efficient, and it is how Greenplum Database runs most CSQs,
+                            including queries from the TPC-H benchmark.</li>
                         <li id="in197800">Run the CSQ on every row of the outer query &#8211; This
-                            method is relatively inefficient, and it is how Greenplum Database runs queries that contain CSQs in the
-                                <codeph>SELECT</codeph> list or are connected by <codeph>OR</codeph>
-                            conditions.</li>
+                            method is relatively inefficient, and it is how Greenplum Database runs
+                            queries that contain CSQs in the <codeph>SELECT</codeph> list or are
+                            connected by <codeph>OR</codeph> conditions.</li>
                     </ul>
                     <p>The following examples illustrate how to rewrite some of these types of
                         queries to improve performance.</p>
@@ -477,31 +674,6 @@ WHERE x &lt; (SELECT count(*) FROM t3 WHERE t1.y = t3.y)
                     query will run on every row of the outer query, and the query is a candidate for
                     rewriting. For more information about these statements, see <xref
                         href="query-profiling.xml#topic39"/>.</p>
-            </body>
-        </topic>
-        <topic id="topic22" xml:lang="en">
-            <title>Advanced Table Functions</title>
-            <body>
-                <p>Greenplum Database supports table functions with
-                        <codeph>TABLE</codeph> value expressions. You can sort input rows for
-                    advanced table functions with an <codeph>ORDER BY</codeph> clause. You can
-                    redistribute them with a <codeph>SCATTER BY</codeph> clause to specify one or
-                    more columns or an expression for which rows with the specified characteristics
-                    are available to the same process. This usage is similar to using a
-                        <codeph>DISTRIBUTED BY</codeph> clause when creating a table, but the
-                    redistribution occurs when the query runs.</p>
-                <note type="note">Based on the distribution of data, Greenplum Database
-                    automatically parallelizes table functions with <codeph>TABLE</codeph> value
-                    parameters over the nodes of the cluster.</note>
-                <p otherprops="pivotal">The following command uses the <codeph>TABLE</codeph>
-                    function with the <codeph>SCATTER BY</codeph> clause in the the GPText function
-                        <codeph>gptext.index()</codeph> to populate the index
-                        <codeph>mytest.articles</codeph> with data from the messages
-                    table:<codeblock>SELECT * FROM gptext.index(TABLE(SELECT * FROM messages 
-SCATTER BY distrib_id), 'mytest.articles');
-</codeblock></p>
-                <p otherprops="pivotal">For information about the function
-                        <codeph>gptext.index()</codeph>, see the Pivotal GPText documentation.</p>
             </body>
         </topic>
         <topic id="topic23" xml:lang="en">

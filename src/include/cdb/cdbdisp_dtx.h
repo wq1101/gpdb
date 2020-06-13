@@ -15,10 +15,9 @@
 #ifndef CDBDISP_DTX_H
 #define CDBDISP_DTX_H
 
-#include "lib/stringinfo.h"         /* StringInfo */
 #include "cdb/cdbtm.h"
 
-struct pg_result;                   /* #include "gp-libpq-fe.h" */
+struct pg_result;                   /* #include "libpq-fe.h" */
 struct CdbPgResults;
 /*
  * CdbDispatchDtxProtocolCommand:
@@ -28,21 +27,18 @@ struct CdbPgResults;
  * produced; the caller must PQclear() them and free() the array.
  * A NULL entry follows the last used entry in the array.
  *
- * Any error messages - whether or not they are associated with
- * PGresult objects - are appended to a StringInfo buffer provided
- * by the caller.
+ * Any error message - whether or not it is associated with an
+ * PGresult object - is returned in *qeError.
  */
 struct pg_result **
 CdbDispatchDtxProtocolCommand(DtxProtocolCommand dtxProtocolCommand,
-								   int flags,
-								   char	*dtxProtocolCommandLoggingStr,
-								   char	*gid,
-								   DistributedTransactionId	gxid,
-								   StringInfo errmsgbuf,
-								   int *resultCount,
-								   bool* badGangs,
-								   CdbDispatchDirectDesc *direct,
-								   char *argument, int argumentLength );
+							  char	*dtxProtocolCommandLoggingStr,
+							  char	*gid,
+							  ErrorData **qeError,
+							  int *resultCount,
+							  List *dtxSegments,
+							  char *serializedDtxContextInfo,
+							  int serializedDtxContextInfoLen);
 
 
 /*

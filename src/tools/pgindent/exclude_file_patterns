@@ -1,7 +1,6 @@
-#list of file patterns to exclude from pg_indent runs
+#list of file patterns to exclude from pgindent runs, see notes in README
 /s_lock\.h$
+/atomics/
 /ecpg/test/expected/
 /snowball/libstemmer/
-/ecpg/include/(sqlda|sqltypes)\.h$
-/ecpg/include/preproc/struct\.h$
 /pl/plperl/ppport\.h$

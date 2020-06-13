@@ -1,4 +1,6 @@
-static pg_utf_to_local ULmapBIG5[ 13711 ] = {
+/* src/backend/utils/mb/Unicode/utf8_to_big5.map */
+
+static const pg_utf_to_local ULmapBIG5[ 13711 ] = {
   {0xc2a2, 0xa246},
   {0xc2a3, 0xa247},
   {0xc2a5, 0xa244},

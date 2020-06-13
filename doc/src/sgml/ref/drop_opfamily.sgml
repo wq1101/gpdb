@@ -1,11 +1,16 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/drop_opfamily.sgml,v 1.1 2007/01/23 05:07:17 tgl Exp $
+doc/src/sgml/ref/drop_opfamily.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-DROPOPFAMILY">
+ <indexterm zone="sql-dropopfamily">
+  <primary>DROP OPERATOR FAMILY</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="SQL-DROPOPFAMILY-TITLE">DROP OPERATOR FAMILY</refentrytitle>
+  <refentrytitle>DROP OPERATOR FAMILY</refentrytitle>
+  <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
 
@@ -13,10 +18,6 @@ PostgreSQL documentation
   <refname>DROP OPERATOR FAMILY</refname>
   <refpurpose>remove an operator family</refpurpose>
  </refnamediv>
-  
- <indexterm zone="sql-dropopfamily">
-  <primary>DROP OPERATOR FAMILY</primary>
- </indexterm>
 
  <refsynopsisdiv>
 <synopsis>
@@ -40,7 +41,7 @@ DROP OPERATOR FAMILY [ IF EXISTS ] <replaceable class="PARAMETER">name</replacea
    <literal>CASCADE</> for the drop to complete.
   </para>
  </refsect1>
-  
+
  <refsect1>
   <title>Parameters</title>
 
@@ -78,7 +79,9 @@ DROP OPERATOR FAMILY [ IF EXISTS ] <replaceable class="PARAMETER">name</replacea
     <term><literal>CASCADE</literal></term>
     <listitem>
      <para>
-      Automatically drop objects that depend on the operator family.
+      Automatically drop objects that depend on the operator family,
+      and in turn all objects that depend on those objects
+      (see <xref linkend="ddl-depend">).
      </para>
     </listitem>
    </varlistentry>
@@ -110,7 +113,7 @@ DROP OPERATOR FAMILY float_ops USING btree;
    drop such indexes along with the operator family.
   </para>
  </refsect1>
- 
+
  <refsect1>
   <title>Compatibility</title>
 
@@ -124,11 +127,11 @@ DROP OPERATOR FAMILY float_ops USING btree;
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-alteropfamily" endterm="sql-alteropfamily-title"></member>
-   <member><xref linkend="sql-createopfamily" endterm="sql-createopfamily-title"></member>
-   <member><xref linkend="sql-alteropclass" endterm="sql-alteropclass-title"></member>
-   <member><xref linkend="sql-createopclass" endterm="sql-createopclass-title"></member>
-   <member><xref linkend="sql-dropopclass" endterm="sql-dropopclass-title"></member>
+   <member><xref linkend="sql-alteropfamily"></member>
+   <member><xref linkend="sql-createopfamily"></member>
+   <member><xref linkend="sql-alteropclass"></member>
+   <member><xref linkend="sql-createopclass"></member>
+   <member><xref linkend="sql-dropopclass"></member>
   </simplelist>
  </refsect1>
 

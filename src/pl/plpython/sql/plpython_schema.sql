@@ -5,7 +5,7 @@ CREATE TABLE users (
 	lname text not null,
 	username text,
 	userid serial
-	-- , PRIMARY KEY(lname, fname) 
+	-- , PRIMARY KEY(lname, fname)
 	) DISTRIBUTED BY (userid);
 
 CREATE INDEX users_username_idx ON users(username);
@@ -39,20 +39,6 @@ CREATE TABLE xsequences (
 	sequence text not null
 	) DISTRIBUTED BY (pid);
 CREATE INDEX xsequences_pid_idx ON xsequences(pid) ;
-
-CREATE TABLE unicode_test (
-	testvalue  text NOT NULL
-) DISTRIBUTED BY (testvalue);
-
-CREATE TABLE table_record (
-	first text,
-	second int4
-	) DISTRIBUTED BY (first);
-
-CREATE TYPE type_record AS (
-	first text,
-	second int4
-	);
 
 CREATE TYPE ab_tuple as (
 	a int8, 

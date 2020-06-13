@@ -26,7 +26,7 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $PostgreSQL: pgsql/contrib/pgcrypto/pgp-encrypt.c,v 1.4 2009/06/11 14:48:52 momjian Exp $
+ * contrib/pgcrypto/pgp-encrypt.c
  */
 
 #include "postgres.h"
@@ -567,7 +567,7 @@ init_s2k_key(PGP_Context *ctx)
 	if (ctx->s2k_cipher_algo < 0)
 		ctx->s2k_cipher_algo = ctx->cipher_algo;
 
-	res = pgp_s2k_fill(&ctx->s2k, ctx->s2k_mode, ctx->s2k_digest_algo);
+	res = pgp_s2k_fill(&ctx->s2k, ctx->s2k_mode, ctx->s2k_digest_algo, ctx->s2k_count);
 	if (res < 0)
 		return res;
 

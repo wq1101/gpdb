@@ -1,4 +1,4 @@
-# $PostgreSQL: pgsql/config/docbook.m4,v 1.8 2007/08/09 02:33:58 tgl Exp $
+# config/docbook.m4
 
 # PGAC_PROG_JADE
 # --------------
@@ -55,7 +55,7 @@ AC_CACHE_VAL([pgac_cv_path_stylesheets],
 [if test -n "$DOCBOOKSTYLE"; then
   pgac_cv_path_stylesheets=$DOCBOOKSTYLE
 else
-  for pgac_prefix in /usr /usr/local /opt; do
+  for pgac_prefix in /usr /usr/local /opt /sw; do
     for pgac_infix in share lib; do
       for pgac_postfix in \
         sgml/stylesheets/nwalsh-modular \
@@ -64,7 +64,8 @@ else
         sgml/docbook-dsssl \
         sgml/docbook/dsssl/modular \
         sgml/docbook/stylesheet/dsssl/modular \
-        sgml/docbook/dsssl-stylesheets
+        sgml/docbook/dsssl-stylesheets \
+        sgml/dsssl/docbook-dsssl-nwalsh
       do
         pgac_candidate=$pgac_prefix/$pgac_infix/$pgac_postfix
         if test -r "$pgac_candidate/html/docbook.dsl" \
@@ -88,11 +89,14 @@ fi])# PGAC_PATH_DOCBOOK_STYLESHEETS
 
 # PGAC_PATH_COLLATEINDEX
 # ----------------------
+# Some DocBook installations provide collateindex.pl in $DOCBOOKSTYLE/bin,
+# but it's not necessarily marked executable, so we can't use AC_PATH_PROG
+# to check for it there.  Other installations just put it in the PATH.
 AC_DEFUN([PGAC_PATH_COLLATEINDEX],
 [AC_REQUIRE([PGAC_PATH_DOCBOOK_STYLESHEETS])dnl
-if test -n "$DOCBOOKSTYLE"; then
-  AC_PATH_PROGS(COLLATEINDEX, collateindex.pl, [],
-                [$DOCBOOKSTYLE/bin $PATH])
+if test -n "$DOCBOOKSTYLE" -a -r "$DOCBOOKSTYLE/bin/collateindex.pl"; then
+  COLLATEINDEX="$DOCBOOKSTYLE/bin/collateindex.pl"
+  AC_SUBST([COLLATEINDEX])
 else
-  AC_PATH_PROGS(COLLATEINDEX, collateindex.pl)
+  AC_PATH_PROG(COLLATEINDEX, collateindex.pl)
 fi])# PGAC_PATH_COLLATEINDEX

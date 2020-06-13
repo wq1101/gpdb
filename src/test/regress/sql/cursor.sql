@@ -1,5 +1,3 @@
-CREATE EXTENSION IF NOT EXISTS gp_inject_fault;
-
 DROP TABLE if exists lu_customer;
 CREATE TABLE lu_customer (
     customer_id numeric(28,0),
@@ -53,11 +51,11 @@ abort;
 CREATE TABLE cursor_writer_reader (a int, b int) DISTRIBUTED BY (a);
 BEGIN;
 INSERT INTO cursor_writer_reader VALUES(1, 666);
-select gp_inject_fault('qe_got_snapshot_and_interconnect', 'suspend', 2);
+select gp_inject_fault_infinite('qe_got_snapshot_and_interconnect', 'suspend', 2);
 DECLARE cursor_c2 CURSOR FOR SELECT * FROM cursor_writer_reader WHERE b=666 ORDER BY 1;
 SAVEPOINT x;
 UPDATE cursor_writer_reader SET b=333 WHERE b=666;
-select gp_inject_fault('qe_got_snapshot_and_interconnect', 'status', 2);
+select gp_wait_until_triggered_fault('qe_got_snapshot_and_interconnect', 1, 2);
 select gp_inject_fault('qe_got_snapshot_and_interconnect', 'resume', 2);
 FETCH cursor_c2;
 SELECT * FROM cursor_writer_reader WHERE b=666 ORDER BY 1;
@@ -386,8 +384,50 @@ SET gp_interconnect_queue_depth to 20;
 FETCH ABSOLUTE 1 IN CUR;
 
 COMMIT;
+
+
+--
+-- Shared snapshot files for cursor should be gone after transaction commits.
+--
+BEGIN;
+DECLARE c CURSOR FOR SELECT * FROM ctest ORDER BY id;
+FETCH 1 FROM c;
+
+-- holdable cursor should be ok
+DECLARE c_hold CURSOR WITH HOLD FOR SELECT * FROM ctest ORDER BY id;
+COMMIT;
+
+FETCH 1 FROM c_hold;
+
 --start_ignore
 DROP INDEX if exists ctest_id_idx;
 DROP TABLE if exists ctest;
 --end_ignore
 
+
+--
+-- Simple test for the combination of cursor, initplans and function
+--
+SET optimizer=off;
+CREATE TABLE cursor_initplan(a int, b int);
+INSERT INTO cursor_initplan SELECT i, i FROM generate_series(1,10) i;
+CREATE OR REPLACE FUNCTION func_test_cursor() RETURNS void AS
+$BODY$
+DECLARE cur CURSOR FOR SELECT * FROM cursor_initplan WHERE a = 2 or a = 3 FOR UPDATE;
+var1 record;
+var2 record;
+BEGIN
+	OPEN cur;
+
+	FETCH  cur INTO var1;
+	UPDATE cursor_initplan SET b = var1.b + 1 WHERE CURRENT OF cur;
+
+	FETCH  cur INTO var2;
+	UPDATE cursor_initplan SET b = var2.b + 1 WHERE CURRENT OF cur;
+END;
+$BODY$
+LANGUAGE 'plpgsql';
+
+SELECT func_test_cursor();
+SELECT * FROM cursor_initplan ORDER BY a;
+DROP TABLE cursor_initplan;

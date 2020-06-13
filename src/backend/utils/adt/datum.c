@@ -3,17 +3,18 @@
  * datum.c
  *	  POSTGRES Datum (abstract data type) manipulation routines.
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/adt/datum.c,v 1.37 2009/01/01 17:23:49 momjian Exp $
+ *	  src/backend/utils/adt/datum.c
  *
  *-------------------------------------------------------------------------
  */
+
 /*
- * In the implementation of the next routines we assume the following:
+ * In the implementation of these routines we assume the following:
  *
  * A) if a type is "byVal" then all the information is stored in the
  * Datum itself (i.e. no pointers involved!). In this case the
@@ -34,11 +35,15 @@
  *
  * Note that we do not treat "toasted" datums specially; therefore what
  * will be copied or compared is the compressed data or toast reference.
+ * An exception is made for datumCopy() of an expanded object, however,
+ * because most callers expect to get a simple contiguous (and pfree'able)
+ * result from datumCopy().  See also datumTransfer().
  */
 
 #include "postgres.h"
 
 #include "utils/datum.h"
+#include "utils/expandeddatum.h"
 
 
 /*-------------------------------------------------------------------------
@@ -46,6 +51,7 @@
  *
  * Find the "real" size of a datum, given the datum value,
  * whether it is a "by value", and the declared type length.
+ * (For TOAST pointer datums, this is the size of the pointer datum.)
  *
  * This is essentially an out-of-line version of the att_addlength_datum()
  * macro in access/tupmacs.h.  We do a tad more error checking though.
@@ -106,9 +112,19 @@ datumGetSize(Datum value, bool typByVal, int typLen)
 /*-------------------------------------------------------------------------
  * datumCopy
  *
- * make a copy of a datum
+ * Make a copy of a non-NULL datum.
  *
  * If the datatype is pass-by-reference, memory is obtained with palloc().
+ *
+ * If the value is a reference to an expanded object, we flatten into memory
+ * obtained with palloc().  We need to copy because one of the main uses of
+ * this function is to copy a datum out of a transient memory context that's
+ * about to be destroyed, and the expanded object is probably in a child
+ * context that will also go away.  Moreover, many callers assume that the
+ * result is a single pfree-able chunk.
+ *
+ * NOTICE: GPDB had a similar function datumCopyWithMemManager to acceleration
+ * aggreation, please keep datumCopyWithMemManager in sync with datumCopy.
  *-------------------------------------------------------------------------
  */
 Datum
@@ -118,44 +134,71 @@ datumCopy(Datum value, bool typByVal, int typLen)
 
 	if (typByVal)
 		res = value;
+	else if (typLen == -1)
+	{
+		/* It is a varlena datatype */
+		struct varlena *vl = (struct varlena *) DatumGetPointer(value);
+
+		if (VARATT_IS_EXTERNAL_EXPANDED(vl))
+		{
+			/* Flatten into the caller's memory context */
+			ExpandedObjectHeader *eoh = DatumGetEOHP(value);
+			Size		resultsize;
+			char	   *resultptr;
+
+			resultsize = EOH_get_flat_size(eoh);
+			resultptr = (char *) palloc(resultsize);
+			EOH_flatten_into(eoh, (void *) resultptr, resultsize);
+			res = PointerGetDatum(resultptr);
+		}
+		else
+		{
+			/* Otherwise, just copy the varlena datum verbatim */
+			Size		realSize;
+			char	   *resultptr;
+
+			realSize = (Size) VARSIZE_ANY(vl);
+			resultptr = (char *) palloc(realSize);
+			memcpy(resultptr, vl, realSize);
+			res = PointerGetDatum(resultptr);
+		}
+	}
 	else
 	{
+		/* Pass by reference, but not varlena, so not toasted */
 		Size		realSize;
-		char	   *s;
-
-		if (DatumGetPointer(value) == NULL)
-			return PointerGetDatum(NULL);
+		char	   *resultptr;
 
 		realSize = datumGetSize(value, typByVal, typLen);
 
-		s = (char *) palloc(realSize);
-		memcpy(s, DatumGetPointer(value), realSize);
-		res = PointerGetDatum(s);
+		resultptr = (char *) palloc(realSize);
+		memcpy(resultptr, DatumGetPointer(value), realSize);
+		res = PointerGetDatum(resultptr);
 	}
 	return res;
 }
 
 /*-------------------------------------------------------------------------
- * datumFree
+ * datumTransfer
  *
- * Free the space occupied by a datum CREATED BY "datumCopy"
+ * Transfer a non-NULL datum into the current memory context.
  *
- * NOTE: DO NOT USE THIS ROUTINE with datums returned by heap_getattr() etc.
- * ONLY datums created by "datumCopy" can be freed!
+ * This is equivalent to datumCopy() except when the datum is a read-write
+ * pointer to an expanded object.  In that case we merely reparent the object
+ * into the current context, and return its standard R/W pointer (in case the
+ * given one is a transient pointer of shorter lifespan).
  *-------------------------------------------------------------------------
  */
-#ifdef NOT_USED
-void
-datumFree(Datum value, bool typByVal, int typLen)
+Datum
+datumTransfer(Datum value, bool typByVal, int typLen)
 {
-	if (!typByVal)
-	{
-		Pointer		s = DatumGetPointer(value);
-
-		pfree(s);
-	}
+	if (!typByVal && typLen == -1 &&
+		VARATT_IS_EXTERNAL_EXPANDED_RW(DatumGetPointer(value)))
+		value = TransferExpandedObject(value, CurrentMemoryContext);
+	else
+		value = datumCopy(value, typByVal, typLen);
+	return value;
 }
-#endif
 
 /*-------------------------------------------------------------------------
  * datumIsEqual
@@ -181,7 +224,7 @@ datumIsEqual(Datum value1, Datum value2, bool typByVal, int typLen)
 		/*
 		 * just compare the two datums. NOTE: just comparing "len" bytes will
 		 * not do the work, because we do not know how these bytes are aligned
-		 * inside the "Datum".	We assume instead that any given datatype is
+		 * inside the "Datum".  We assume instead that any given datatype is
 		 * consistent about how it fills extraneous bits in the Datum.
 		 */
 		res = (value1 == value2);
@@ -205,4 +248,139 @@ datumIsEqual(Datum value1, Datum value2, bool typByVal, int typLen)
 		res = (memcmp(s1, s2, size1) == 0);
 	}
 	return res;
+}
+
+/*-------------------------------------------------------------------------
+ * datumEstimateSpace
+ *
+ * Compute the amount of space that datumSerialize will require for a
+ * particular Datum.
+ *-------------------------------------------------------------------------
+ */
+Size
+datumEstimateSpace(Datum value, bool isnull, bool typByVal, int typLen)
+{
+	Size		sz = sizeof(int);
+
+	if (!isnull)
+	{
+		/* no need to use add_size, can't overflow */
+		if (typByVal)
+			sz += sizeof(Datum);
+		else if (VARATT_IS_EXTERNAL_EXPANDED(value))
+		{
+			ExpandedObjectHeader *eoh = DatumGetEOHP(value);
+
+			sz += EOH_get_flat_size(eoh);
+		}
+		else
+			sz += datumGetSize(value, typByVal, typLen);
+	}
+
+	return sz;
+}
+
+/*-------------------------------------------------------------------------
+ * datumSerialize
+ *
+ * Serialize a possibly-NULL datum into caller-provided storage.
+ *
+ * The format is as follows: first, we write a 4-byte header word, which
+ * is either the length of a pass-by-reference datum, -1 for a
+ * pass-by-value datum, or -2 for a NULL.  If the value is NULL, nothing
+ * further is written.  If it is pass-by-value, sizeof(Datum) bytes
+ * follow.  Otherwise, the number of bytes indicated by the header word
+ * follow.  The caller is responsible for ensuring that there is enough
+ * storage to store the number of bytes that will be written; use
+ * datumEstimateSpace() to find out how many will be needed.
+ * *start_address is updated to point to the byte immediately following
+ * those written.
+ *-------------------------------------------------------------------------
+ */
+void
+datumSerialize(Datum value, bool isnull, bool typByVal, int typLen,
+			   char **start_address)
+{
+	ExpandedObjectHeader *eoh = NULL;
+	int			header;
+
+	/* Write header word. */
+	if (isnull)
+		header = -2;
+	else if (typByVal)
+		header = -1;
+	else if (VARATT_IS_EXTERNAL_EXPANDED(value))
+	{
+		eoh = DatumGetEOHP(value);
+		header = EOH_get_flat_size(eoh);
+	}
+	else
+		header = datumGetSize(value, typByVal, typLen);
+	memcpy(*start_address, &header, sizeof(int));
+	*start_address += sizeof(int);
+
+	/* If not null, write payload bytes. */
+	if (!isnull)
+	{
+		if (typByVal)
+		{
+			memcpy(*start_address, &value, sizeof(Datum));
+			*start_address += sizeof(Datum);
+		}
+		else if (eoh)
+		{
+			EOH_flatten_into(eoh, (void *) *start_address, header);
+			*start_address += header;
+		}
+		else
+		{
+			memcpy(*start_address, DatumGetPointer(value), header);
+			*start_address += header;
+		}
+	}
+}
+
+/*-------------------------------------------------------------------------
+ * datumRestore
+ *
+ * Restore a possibly-NULL datum previously serialized by datumSerialize.
+ * *start_address is updated according to the number of bytes consumed.
+ *-------------------------------------------------------------------------
+ */
+Datum
+datumRestore(char **start_address, bool *isnull)
+{
+	int			header;
+	void	   *d;
+
+	/* Read header word. */
+	memcpy(&header, *start_address, sizeof(int));
+	*start_address += sizeof(int);
+
+	/* If this datum is NULL, we can stop here. */
+	if (header == -2)
+	{
+		*isnull = true;
+		return (Datum) 0;
+	}
+
+	/* OK, datum is not null. */
+	*isnull = false;
+
+	/* If this datum is pass-by-value, sizeof(Datum) bytes follow. */
+	if (header == -1)
+	{
+		Datum		val;
+
+		memcpy(&val, *start_address, sizeof(Datum));
+		*start_address += sizeof(Datum);
+		return val;
+	}
+
+	/* Pass-by-reference case; copy indicated number of bytes. */
+	Assert(header > 0);
+	d = palloc(header);
+	memcpy(d, *start_address, header);
+	*start_address += header;
+	return PointerGetDatum(d);
 }

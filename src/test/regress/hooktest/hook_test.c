@@ -5,17 +5,18 @@
 
 PG_MODULE_MAGIC;
 
-static planner_hook_type	prev_planner_hook = NULL;
+static planner_hook_type prev_planner_hook = NULL;
 
-static PlannedStmt * test_hook(Query *parse, int cursorOptions, ParamListInfo boundParams);
-void _PG_init(void);
-void _PG_fini(void);
+static PlannedStmt *test_planner_hook(Query *parse, int cursorOptions, ParamListInfo boundParams);
+
+void		_PG_init(void);
+void		_PG_fini(void);
 
 void
 _PG_init(void)
 {
 	prev_planner_hook = planner_hook;
-	planner_hook = test_hook;
+	planner_hook = test_planner_hook;
 }
 
 void
@@ -25,14 +26,14 @@ _PG_fini(void)
 }
 
 static PlannedStmt *
-test_hook(Query *parse, int cursorOptions, ParamListInfo boundParams)
+test_planner_hook(Query *parse, int cursorOptions, ParamListInfo boundParams)
 {
 	PlannedStmt *stmt;
 
-	elog(LOG, "In test_hook");
+	elog(LOG, "In test_planner_hook");
 
 	if (prev_planner_hook)
-		stmt = (* prev_planner_hook)(parse, cursorOptions, boundParams);
+		stmt = (*prev_planner_hook) (parse, cursorOptions, boundParams);
 	else
 		stmt = standard_planner(parse, cursorOptions, boundParams);
 

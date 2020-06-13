@@ -1,5 +1,9 @@
 #!/bin/bash
 
+echo "Caching password..."
+sudo -K
+sudo true;
+
 if hash brew 2>/dev/null; then
 	  echo "Homebrew is already installed!"
 else
@@ -13,25 +17,20 @@ brew install cmake # gporca
 brew install xerces-c #gporca
 brew install libyaml   # enables `--enable-mapreduce`
 brew install libevent # gpfdist
-brew install apr # gpperfmon
-brew install apr-util # gpperfmon
+brew install apr # gpfdist
+brew install apr-util # gpfdist
 brew link --force apr
 brew link --force apr-util
 
 # Installing Golang
 mkdir -p ~/go/src
 brew install go # Or get the latest from https://golang.org/dl/
+brew install dep
 
 # Installing python libraries
-brew install python
-export PATH="/usr/local/opt/python/libexec/bin:$PATH"
-cat >> ~/.bash_profile << EOF
-export PATH="/usr/local/opt/python/libexec/bin:$PATH"
-EOF
-pip install lockfile psi paramiko pysql psutil setuptools
-pip install unittest2 parse pexpect mock pyyaml
-pip install git+https://github.com/behave/behave@v1.2.4
-pip install pylint
+brew install python2
+pip install --user -r python-dependencies.txt
+pip install --user -r python-developer-dependencies.txt
 
 #echo -e "127.0.0.1\t$HOSTNAME" | sudo tee -a /etc/hosts
 echo 127.0.0.1$'\t'$HOSTNAME | sudo tee -a /etc/hosts
@@ -82,17 +81,9 @@ EOF
 
 # Step: GOPATH for Golang
 cat >> ~/.bash_profile << EOF
-export GOPATH=\$HOME/go:\$HOME/workspace/gpdb/gpMgmt/go-utils
-export PATH=\$GOPATH/bin:\$PATH
-EOF
-
-# Step: speed up compile time (optional)
-cat >> ~/.bashrc << EOF
-
-# This assumes that the macOS machine has 8 threads
-export MAKEFLAGS='-j8'
+export GOPATH=\$HOME/go
+export PATH=\$HOME/go/bin:\$PATH
 EOF
 
 # Step: install any optional tools
 brew install gdb
-

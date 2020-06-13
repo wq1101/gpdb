@@ -9,16 +9,16 @@
 CREATE TABLE pxtest1 (foobar VARCHAR(10));
 INSERT INTO pxtest1 VALUES ('aaa');
 -- Test PREPARE TRANSACTION
-BEGIN;
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
 UPDATE pxtest1 SET foobar = 'bbb' WHERE foobar = 'aaa';
-SELECT * from pxtest1 ORDER BY 1;
+SELECT * FROM pxtest1;
  foobar 
 --------
  bbb
 (1 row)
 
 PREPARE TRANSACTION 'foo1';
-SELECT * from pxtest1 ORDER BY 1;
+SELECT * FROM pxtest1;
  foobar 
 --------
  aaa
@@ -33,7 +33,7 @@ SELECT gid FROM pg_prepared_xacts;
 
 -- Test ROLLBACK PREPARED
 ROLLBACK PREPARED 'foo1';
-SELECT * from pxtest1 ORDER BY 1;
+SELECT * FROM pxtest1;
  foobar 
 --------
  aaa
@@ -45,9 +45,9 @@ SELECT gid FROM pg_prepared_xacts;
 (0 rows)
 
 -- Test COMMIT PREPARED
-BEGIN;
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
 INSERT INTO pxtest1 VALUES ('ddd');
-SELECT * from pxtest1 ORDER BY 1;
+SELECT * FROM pxtest1;
  foobar 
 --------
  aaa
@@ -55,14 +55,14 @@ SELECT * from pxtest1 ORDER BY 1;
 (2 rows)
 
 PREPARE TRANSACTION 'foo2';
-SELECT * from pxtest1 ORDER BY 1;
+SELECT * FROM pxtest1;
  foobar 
 --------
  aaa
 (1 row)
 
 COMMIT PREPARED 'foo2';
-SELECT * from pxtest1 ORDER BY 1;
+SELECT * FROM pxtest1;
  foobar 
 --------
  aaa
@@ -70,9 +70,9 @@ SELECT * from pxtest1 ORDER BY 1;
 (2 rows)
 
 -- Test duplicate gids
-BEGIN;
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
 UPDATE pxtest1 SET foobar = 'eee' WHERE foobar = 'ddd';
-SELECT * from pxtest1 ORDER BY 1;
+SELECT * FROM pxtest1;
  foobar 
 --------
  aaa
@@ -86,20 +86,12 @@ SELECT gid FROM pg_prepared_xacts;
  foo3
 (1 row)
 
-BEGIN;
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
 INSERT INTO pxtest1 VALUES ('fff');
-SELECT * from pxtest1 ORDER BY 1;
- foobar 
---------
- aaa
- ddd
- fff
-(3 rows)
-
 -- This should fail, because the gid foo3 is already in use
 PREPARE TRANSACTION 'foo3';
 ERROR:  transaction identifier "foo3" is already in use
-SELECT * from pxtest1 ORDER BY 1;
+SELECT * FROM pxtest1;
  foobar 
 --------
  aaa
@@ -107,17 +99,60 @@ SELECT * from pxtest1 ORDER BY 1;
 (2 rows)
 
 ROLLBACK PREPARED 'foo3';
-SELECT * from pxtest1 ORDER BY 1;
+SELECT * FROM pxtest1;
  foobar 
 --------
  aaa
  ddd
 (2 rows)
 
+-- Test serialization failure (SSI)
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+UPDATE pxtest1 SET foobar = 'eee' WHERE foobar = 'ddd';
+SELECT * FROM pxtest1;
+ foobar 
+--------
+ aaa
+ eee
+(2 rows)
+
+PREPARE TRANSACTION 'foo4';
+SELECT gid FROM pg_prepared_xacts;
+ gid  
+------
+ foo4
+(1 row)
+
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+SELECT * FROM pxtest1;
+ foobar 
+--------
+ aaa
+ ddd
+(2 rows)
+
+-- This should fail, because the two transactions have a write-skew anomaly
+INSERT INTO pxtest1 VALUES ('fff');
+ERROR:  could not serialize access due to read/write dependencies among transactions
+DETAIL:  Reason code: Canceled on identification as a pivot, during write.
+HINT:  The transaction might succeed if retried.
+PREPARE TRANSACTION 'foo5';
+SELECT gid FROM pg_prepared_xacts;
+ gid  
+------
+ foo4
+(1 row)
+
+ROLLBACK PREPARED 'foo4';
+SELECT gid FROM pg_prepared_xacts;
+ gid 
+-----
+(0 rows)
+
 -- Clean up
 DROP TABLE pxtest1;
 -- Test subtransactions
-BEGIN;
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
   CREATE TABLE pxtest2 (a int);
   INSERT INTO pxtest2 VALUES (1);
   SAVEPOINT a;
@@ -128,7 +163,7 @@ BEGIN;
 PREPARE TRANSACTION 'regress-one';
 CREATE TABLE pxtest3(fff int);
 -- Test shared invalidation
-BEGIN;
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
   DROP TABLE pxtest3;
   CREATE TABLE pxtest4 (a int);
   INSERT INTO pxtest4 VALUES (1);
@@ -148,6 +183,8 @@ ERROR:  cursor "foo" does not exist
 -- Table doesn't exist, the creation hasn't been committed yet
 SELECT * FROM pxtest2;
 ERROR:  relation "pxtest2" does not exist
+LINE 1: SELECT * FROM pxtest2;
+                      ^
 -- There should be two prepared transactions
 SELECT gid FROM pg_prepared_xacts;
      gid     
@@ -157,10 +194,10 @@ SELECT gid FROM pg_prepared_xacts;
 (2 rows)
 
 -- pxtest3 should be locked because of the pending DROP
-set statement_timeout to 1000;
-SELECT * FROM pxtest3;
-ERROR:  canceling statement due to statement timeout
-reset statement_timeout;
+begin;
+lock table pxtest3 in access share mode nowait;
+ERROR:  could not obtain lock on relation "pxtest3"
+rollback;
 -- Disconnect, we will continue testing in a different backend
 \c -
 -- There should still be two prepared transactions
@@ -172,10 +209,10 @@ SELECT gid FROM pg_prepared_xacts;
 (2 rows)
 
 -- pxtest3 should still be locked because of the pending DROP
-set statement_timeout to 1000;
-SELECT * FROM pxtest3;
-ERROR:  canceling statement due to statement timeout
-reset statement_timeout;
+begin;
+lock table pxtest3 in access share mode nowait;
+ERROR:  could not obtain lock on relation "pxtest3"
+rollback;
 -- Commit table creation
 COMMIT PREPARED 'regress-one';
 \d pxtest2
@@ -200,8 +237,10 @@ SELECT gid FROM pg_prepared_xacts;
 
 -- Commit table drop
 COMMIT PREPARED 'regress-two';
-SELECT * FROM pxtest3 ORDER BY 1;
+SELECT * FROM pxtest3;
 ERROR:  relation "pxtest3" does not exist
+LINE 1: SELECT * FROM pxtest3;
+                      ^
 -- There should be no prepared transactions
 SELECT gid FROM pg_prepared_xacts;
  gid 
@@ -210,4 +249,6 @@ SELECT gid FROM pg_prepared_xacts;
 
 -- Clean up
 DROP TABLE pxtest2;
+DROP TABLE pxtest3;  -- will still be there if prepared xacts are disabled
+ERROR:  table "pxtest3" does not exist
 DROP TABLE pxtest4;

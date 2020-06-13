@@ -54,7 +54,7 @@ main(void)
 #line 30 "num_test.pgc"
 
 
-	{ ECPGconnect(__LINE__, 0, "regress1" , NULL, NULL , NULL, 0); 
+	{ ECPGconnect(__LINE__, 0, "ecpg1_regression" , NULL, NULL , NULL, 0); 
 #line 32 "num_test.pgc"
 
 if (sqlca.sqlcode < 0) sqlprint ( );}
@@ -78,7 +78,7 @@ if (sqlca.sqlcode < 0) sqlprint ( );}
 	PGTYPESnumeric_from_int(1407, value1);
 	text = PGTYPESnumeric_to_asc(value1, -1);
 	printf("from int = %s\n", text);
-	free(text);
+	PGTYPESchar_free(text);
 	PGTYPESnumeric_free(value1);
 
 	value1 = PGTYPESnumeric_from_asc("2369.7", NULL);
@@ -87,12 +87,12 @@ if (sqlca.sqlcode < 0) sqlprint ( );}
 	PGTYPESnumeric_add(value1, value2, res);
 	text = PGTYPESnumeric_to_asc(res, -1);
 	printf("add = %s\n", text);
-	free(text);
+	PGTYPESchar_free(text);
 
 	PGTYPESnumeric_sub(res, value2, res);
 	text = PGTYPESnumeric_to_asc(res, -1);
 	printf("sub = %s\n", text);
-	free(text);
+	PGTYPESchar_free(text);
 	PGTYPESnumeric_free(value2);
 
 	des = PGTYPESnumeric_new();
@@ -122,7 +122,7 @@ if (sqlca.sqlcode < 0) sqlprint ( );}
 	PGTYPESnumeric_mul(res, des, res);
 	text = PGTYPESnumeric_to_asc(res, -1);
 	printf("mul = %s\n", text);
-	free(text);
+	PGTYPESchar_free(text);
 	PGTYPESnumeric_free(des);
 
 	value2 = PGTYPESnumeric_from_asc("10000", NULL);
@@ -131,29 +131,31 @@ if (sqlca.sqlcode < 0) sqlprint ( );}
 	PGTYPESnumeric_to_double(res, &d);
 	printf("div = %s %e\n", text, d);
 
+	PGTYPESnumeric_free(value1);
+	PGTYPESnumeric_free(value2);
+
 	value1 = PGTYPESnumeric_from_asc("2E7", NULL);
 	value2 = PGTYPESnumeric_from_asc("14", NULL);
 	i = PGTYPESnumeric_to_long(value1, &l1) | PGTYPESnumeric_to_long(value2, &l2);
 	printf("to long(%d) = %ld %ld\n", i, l1, l2);
 
-	free(text);
+	PGTYPESchar_free(text);
 	PGTYPESnumeric_free(value1);
 	PGTYPESnumeric_free(value2);
 	PGTYPESnumeric_free(res);
 
 	{ ECPGtrans(__LINE__, NULL, "rollback");
-#line 90 "num_test.pgc"
+#line 93 "num_test.pgc"
 
 if (sqlca.sqlcode < 0) sqlprint ( );}
-#line 90 "num_test.pgc"
+#line 93 "num_test.pgc"
 
 	{ ECPGdisconnect(__LINE__, "CURRENT");
-#line 91 "num_test.pgc"
+#line 94 "num_test.pgc"
 
 if (sqlca.sqlcode < 0) sqlprint ( );}
-#line 91 "num_test.pgc"
+#line 94 "num_test.pgc"
 
 
 	return (0);
 }
-

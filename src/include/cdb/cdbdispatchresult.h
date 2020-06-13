@@ -19,7 +19,7 @@
 #include "commands/tablecmds.h"
 #include "utils/hsearch.h"
 
-struct pg_result;                   /* PGresult ... #include "gp-libpq-fe.h" */
+struct pg_result;                   /* PGresult ... #include "libpq-fe.h" */
 struct SegmentDatabaseDescriptor;   /* #include "cdb/cdbconn.h" */
 struct StringInfoData;              /* #include "lib/stringinfo.h" */
 struct PQExpBufferData;             /* #include "libpq-int.h" */
@@ -70,13 +70,6 @@ typedef struct CdbDispatchResult
 	 * an int) of first error, or 0.
 	 */
 	int errcode;
-
-	/*
-	 * index of first entry in resultbuf
-	 * that represents an error; or -1.
-	 * Pass to cdbconn_getResult().
-	 */
-	int errindex;
 
 	/*
 	 * index of last entry in resultbuf
@@ -162,11 +155,6 @@ typedef struct CdbDispatchResults
 	
 	/* num of slots in sliceMap */
 	int sliceCapacity;
-	
-	/*during dispatch, it is important to check to see that
-	 * the writer gang isn't already doing something -- this is an
-	 * important, missing sanity check */
-	struct Gang *writer_gang;
 } CdbDispatchResults;
 
 
@@ -211,28 +199,11 @@ cdbdisp_seterrcode(int errcode, /* ERRCODE_xxx or 0 */
  * palloc/pfree or elog/ereport because they are not thread safe.
  */
 void
-cdbdisp_appendMessage(CdbDispatchResult *dispatchResult,
-                      int errcode,
-                      const char *fmt,
-                      ...)
-/* This extension allows gcc to check the format string */
-__attribute__((format(printf, 3, 4)));
-
-/*
- * Format a message, printf-style, and append to the error_message buffer.
- * Also write it to stderr if logging is enabled for messages of the
- * given severity level 'elevel' (for example, DEBUG1; or 0 to suppress).
- * 'errcode' is the ERRCODE_xxx value for setting the client's SQLSTATE.
- * NB: This can be called from a dispatcher thread, so it must not use
- * palloc/pfree or elog/ereport because they are not thread safe.
- */
-void
 cdbdisp_appendMessageNonThread(CdbDispatchResult *dispatchResult,
 							   int errcode,
 							   const char *fmt,
 							   ...)
-/* This extension allows gcc to check the format string */
-__attribute__((format(printf, 3, 4)));
+pg_attribute_printf(3, 4);
 
 
 /*
@@ -265,12 +236,10 @@ void
 cdbdisp_debugDispatchResult(CdbDispatchResult  *dispatchResult);
 
 /*
- * Format a CdbDispatchResult into a StringInfo buffer provided by caller.
- * It reports at most one error.
+ * Construct an ErrorData from the dispatch results.
  */
-void
-cdbdisp_dumpDispatchResult(CdbDispatchResult *dispatchResult,
-                           struct StringInfoData *buf);
+ErrorData *
+cdbdisp_dumpDispatchResult(CdbDispatchResult *dispatchResult);
 
 /*
  * Format a CdbDispatchResults object.
@@ -278,9 +247,11 @@ cdbdisp_dumpDispatchResult(CdbDispatchResult *dispatchResult,
  * Returns ERRCODE_xxx if some error was found, or 0 if no errors.
  * Before calling this function, you must call CdbCheckDispatchResult().
  */
-int
+void
 cdbdisp_dumpDispatchResults(struct CdbDispatchResults *gangResults,
-                            struct StringInfoData *buffer);
+							ErrorData **qeError);
+
+extern ErrorData *cdbdisp_get_PQerror(struct pg_result *pgresult);
 
 /*
  * Return sum of the cmdTuples values from CdbDispatchResult
@@ -298,9 +269,6 @@ cdbdisp_sumCmdTuples(CdbDispatchResults *results, int sliceIndex);
  */
 void
 cdbdisp_sumRejectedRows(CdbDispatchResults *results);
-
-HTAB *
-cdbdisp_sumAoPartTupCount(PartitionNode *parts, CdbDispatchResults *results);
 
 /*
  * max of the lastOid values returned from the QEs
@@ -331,12 +299,12 @@ cdbdisp_checkResultsErrcode(struct CdbDispatchResults *meeleResults);
 
 /*
  * cdbdisp_makeDispatchResults:
- * Allocates a CdbDispatchResults object in the current memory context.
  * Will be freed in function cdbdisp_destroyDispatcherState by deleting the
  * memory context.
  */
-CdbDispatchResults *
-cdbdisp_makeDispatchResults(int sliceCapacity,
+void
+cdbdisp_makeDispatchResults(struct CdbDispatcherState *ds,
+							int sliceCapacity,
 							bool cancelOnError);
 
 void

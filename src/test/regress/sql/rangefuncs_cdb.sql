@@ -1,4 +1,8 @@
 SELECT name, setting FROM pg_settings WHERE name LIKE 'enable%';
+-- start_ignore
+create schema rangefuncs_cdb;
+set search_path to rangefuncs_cdb, public;
+-- end_ignore
 
 DROP TABLE IF EXISTS foo;
 
@@ -54,7 +58,8 @@ select foost(fooid), * from foo2;
 -- Joining with a table
 select * from foo2, foost(3) z where foo2.f2 = z.f2;
 
--- supposed to fail with ERROR - requires LATERAL
+-- Lateral function. (If it was a subquery, this would require the LATERAL
+-- keyword, but for a function, we're more lenient.)
 select * from foo2, foost(foo2.fooid) z where foo2.f2 = z.f2;
 
 -- function in subselect, without correlation
@@ -120,7 +125,8 @@ select foor(fooid), * from foor(3) as (fooid int, f2 int);
 -- Joining with a table
 select * from foo2, foor(3) z(fooid int, f2 int) where foo2.f2 = z.f2;
 
--- supposed to fail with ERROR - requires LATERAL
+-- Lateral function. (If it was a subquery, this would require the LATERAL
+-- keyword, but for a function, we're more lenient.)
 select * from foo2, foor(foo2.fooid) z(fooid int, f2 int) 
 where foo2.f2 = z.f2;
 
@@ -184,7 +190,8 @@ select fooro(fooid), * from fooro(3);
 -- Joining with a table
 select * from foo2, fooro(3) z where foo2.f2 = z.f2;
 
--- supposed to fail with ERROR - requires LATERAL
+-- Lateral function. (If it was a subquery, this would require the LATERAL
+-- keyword, but for a function, we're more lenient.)
 select * from foo2, fooro(foo2.fooid) z where foo2.f2 = z.f2;
 
 -- function in subselect, without correlation
@@ -210,7 +217,7 @@ ORDER BY 1,2;
 -- nested functions
 select z.fooid, z.f2 from fooro(sin(pi()/2)::int) z ORDER BY 1,2;
 
-DROP FUNCTION fooro;
+DROP FUNCTION fooro(int);
 
 --
 -- RETURNS TABLE
@@ -241,7 +248,8 @@ select foot(fooid), * from foot(3);
 -- Joining with a table
 select * from foo2, foot(3) z where foo2.f2 = z.f2;
 
--- supposed to fail with ERROR - requires LATERAL
+-- Lateral function. (If it was a subquery, this would require the LATERAL
+-- keyword, but for a function, we're more lenient.)
 select * from foo2, foot(foo2.fooid) z where foo2.f2 = z.f2;
 
 -- function in subselect, without correlation
@@ -267,7 +275,7 @@ ORDER BY 1,2;
 -- nested functions
 select z.fooid, z.f2 from foot(sin(pi()/2)::int) z ORDER BY 1,2;
 
-DROP FUNCTION foot;
+DROP FUNCTION foot(int);
 
 -- sql, proretset = f, prorettype = b
 CREATE FUNCTION getfoo(int) RETURNS int AS 'SELECT $1;' LANGUAGE SQL CONTAINS SQL;
@@ -468,5 +476,37 @@ DROP FUNCTION dup(anyelement);
 -- fails, no way to deduce outputs
 CREATE FUNCTION bad (f1 int, out f2 anyelement, out f3 anyarray)
 AS 'select $1, array[$1,$1]' LANGUAGE sql;
+
+--
+-- Test that a set-returning function is not called unnecessarily.
+--
+-- The planner could legitimately call an immutable function as many times it
+-- wishes, but there's no need to call it more than once. (ORCA used to create
+-- plans where the FunctionScan was executed on every segment, but a Result
+-- on top of it filtered all the rows, except on one segment.
+--
+CREATE FUNCTION notice_srf() RETURNS SETOF text AS $$
+begin
+   RAISE NOTICE 'notice_srf called in segment %', gp_execution_segment();
+
+   RETURN NEXT 'foo';
+   RETURN NEXT 'bar';
+end;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+-- gpdiff suppresses identical NOTICEs coming from multiple segments. But we
+-- specifically want to check that we get the NOTICE only from one segment.
+-- To defeat gpdiff's duplicate-elimination, the NOTICE includes the segment
+-- number in the message, so that the message is different on every segment.
+-- But we don't actually don't care which segment it executes on, so filter
+-- out the segment number for comparison.
+--
+-- start_matchsubs
+-- m/NOTICE:  notice_srf called in segment (\d+)/
+-- s/in segment (\d+)/in segment ###/
+-- end_matchsubs
+
+CREATE TEMPORARY TABLE srfdest (t text) DISTRIBUTED RANDOMLY;
+INSERT INTO srfdest select * FROM notice_srf();
 
 reset optimizer_segments;

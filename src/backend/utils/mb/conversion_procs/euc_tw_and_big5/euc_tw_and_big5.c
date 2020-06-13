@@ -2,11 +2,11 @@
  *
  *	  EUC_TW, BIG5 and MULE_INTERNAL
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/mb/conversion_procs/euc_tw_and_big5/euc_tw_and_big5.c,v 1.21 2009/02/28 18:49:42 tgl Exp $
+ *	  src/backend/utils/mb/conversion_procs/euc_tw_and_big5/euc_tw_and_big5.c
  *
  *-------------------------------------------------------------------------
  */
@@ -25,13 +25,6 @@ PG_FUNCTION_INFO_V1(euc_tw_to_mic);
 PG_FUNCTION_INFO_V1(mic_to_euc_tw);
 PG_FUNCTION_INFO_V1(big5_to_mic);
 PG_FUNCTION_INFO_V1(mic_to_big5);
-
-extern Datum euc_tw_to_big5(PG_FUNCTION_ARGS);
-extern Datum big5_to_euc_tw(PG_FUNCTION_ARGS);
-extern Datum euc_tw_to_mic(PG_FUNCTION_ARGS);
-extern Datum mic_to_euc_tw(PG_FUNCTION_ARGS);
-extern Datum big5_to_mic(PG_FUNCTION_ARGS);
-extern Datum mic_to_big5(PG_FUNCTION_ARGS);
 
 /* ----------
  * conv_proc(
@@ -168,7 +161,8 @@ euc_tw2mic(const unsigned char *euc, unsigned char *p, int len)
 					*p++ = LC_CNS11643_2;
 				else
 				{
-					*p++ = 0x9d;	/* LCPRV2 */
+					/* other planes are MULE private charsets */
+					*p++ = LCPRV2_B;
 					*p++ = c1 - 0xa3 + LC_CNS11643_3;
 				}
 				*p++ = euc[2];
@@ -235,9 +229,9 @@ mic2euc_tw(const unsigned char *mic, unsigned char *p, int len)
 			*p++ = mic[1];
 			*p++ = mic[2];
 		}
-		else if (c1 == 0x9d &&
+		else if (c1 == LCPRV2_B &&
 				 mic[1] >= LC_CNS11643_3 && mic[1] <= LC_CNS11643_7)
-		{						/* LCPRV2? */
+		{
 			*p++ = SS2;
 			*p++ = mic[1] - LC_CNS11643_3 + 0xa3;
 			*p++ = mic[2];
@@ -286,10 +280,9 @@ big52mic(const unsigned char *big5, unsigned char *p, int len)
 		cnsBuf = BIG5toCNS(big5buf, &lc);
 		if (lc != 0)
 		{
+			/* Planes 3 and 4 are MULE private charsets */
 			if (lc == LC_CNS11643_3 || lc == LC_CNS11643_4)
-			{
-				*p++ = 0x9d;	/* LCPRV2 */
-			}
+				*p++ = LCPRV2_B;
 			*p++ = lc;			/* Plane No. */
 			*p++ = (cnsBuf >> 8) & 0x00ff;
 			*p++ = cnsBuf & 0x00ff;
@@ -332,10 +325,9 @@ mic2big5(const unsigned char *mic, unsigned char *p, int len)
 		if (l < 0)
 			report_invalid_encoding(PG_MULE_INTERNAL,
 									(const char *) mic, len);
-		/* 0x9d means LCPRV2 */
-		if (c1 == LC_CNS11643_1 || c1 == LC_CNS11643_2 || c1 == 0x9d)
+		if (c1 == LC_CNS11643_1 || c1 == LC_CNS11643_2 || c1 == LCPRV2_B)
 		{
-			if (c1 == 0x9d)
+			if (c1 == LCPRV2_B)
 			{
 				c1 = mic[1];	/* get plane no. */
 				cnsBuf = (mic[2] << 8) | mic[3];

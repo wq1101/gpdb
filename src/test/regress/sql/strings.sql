@@ -1,3 +1,8 @@
+-- GPDB_10_MERGE_FIXME: this shouldn't be needed after merge of upstream commit 1e7c4bb004. Remove when we get there.
+-- start_matchsubs
+-- m/^(ERROR:  .*)\(parse_coerce\.c:\d+\)$/
+-- s/\(parse_coerce\.c:\d+\)$/(parse_coerce.c:XXX)/
+-- end_matchsubs
 --
 -- STRINGS
 -- Test various data entry syntaxes.
@@ -20,7 +25,7 @@ CREATE TABLE TEXT_STRINGS_TBL (f1 text);
 INSERT INTO TEXT_STRINGS_TBL VALUES ('doh!'),
 ('hi de ho neighbor');
 
--- SQL92 string continuation syntax
+-- SQL string continuation syntax
 -- E021-03 character string literals
 SELECT 'first line'
 ' - next line'
@@ -54,35 +59,83 @@ SELECT E'DeAdBeEf'::bytea;
 SELECT E'De\\000dBeEf'::bytea;
 SELECT E'De\\123dBeEf'::bytea;
 
+-- Unicode escapes
+SET standard_conforming_strings TO on;
+
+SELECT U&'d\0061t\+000061' AS U&"d\0061t\+000061";
+SELECT U&'d!0061t\+000061' UESCAPE '!' AS U&"d*0061t\+000061" UESCAPE '*';
+
+SELECT U&' \' UESCAPE '!' AS "tricky";
+SELECT 'tricky' AS U&"\" UESCAPE '!';
+
+SELECT U&'wrong: \061';
+SELECT U&'wrong: \+0061';
+SELECT U&'wrong: +0061' UESCAPE '+';
+
+SET standard_conforming_strings TO off;
+
+SELECT U&'d\0061t\+000061' AS U&"d\0061t\+000061";
+SELECT U&'d!0061t\+000061' UESCAPE '!' AS U&"d*0061t\+000061" UESCAPE '*';
+
+SELECT U&' \' UESCAPE '!' AS "tricky";
+SELECT 'tricky' AS U&"\" UESCAPE '!';
+
+SELECT U&'wrong: \061';
+SELECT U&'wrong: \+0061';
+SELECT U&'wrong: +0061' UESCAPE '+';
+
+RESET standard_conforming_strings;
+
+-- bytea
+SET bytea_output TO hex;
+SELECT E'\\xDeAdBeEf'::bytea;
+SELECT E'\\x De Ad Be Ef '::bytea;
+SELECT E'\\xDeAdBeE'::bytea;
+SELECT E'\\xDeAdBeEx'::bytea;
+SELECT E'\\xDe00BeEf'::bytea;
+SELECT E'DeAdBeEf'::bytea;
+SELECT E'De\\000dBeEf'::bytea;
+SELECT E'De\123dBeEf'::bytea;
+SELECT E'De\\123dBeEf'::bytea;
+SELECT E'De\\678dBeEf'::bytea;
+
+SET bytea_output TO escape;
+SELECT E'\\xDeAdBeEf'::bytea;
+SELECT E'\\x De Ad Be Ef '::bytea;
+SELECT E'\\xDe00BeEf'::bytea;
+SELECT E'DeAdBeEf'::bytea;
+SELECT E'De\\000dBeEf'::bytea;
+SELECT E'De\\123dBeEf'::bytea;
+
 --
 -- test conversions between various string types
 -- E021-10 implicit casting among the character data types
 --
 
-SELECT CAST(f1 AS text) AS "text(char)" FROM CHAR_STRINGS_TBL ORDER BY 1;
+SELECT CAST(f1 AS text) AS "text(char)" FROM CHAR_STRINGS_TBL;
 
-SELECT CAST(f1 AS text) AS "text(varchar)" FROM VARCHAR_STRINGS_TBL ORDER BY 1;
+SELECT CAST(f1 AS text) AS "text(varchar)" FROM VARCHAR_STRINGS_TBL;
 
 SELECT CAST(name 'namefield' AS text) AS "text(name)";
 
 -- since this is an explicit cast, it should truncate w/o error:
-SELECT CAST(f1 AS char(10)) AS "char(text)" FROM TEXT_STRINGS_TBL ORDER BY 1;
+SELECT CAST(f1 AS char(10)) AS "char(text)" FROM TEXT_STRINGS_TBL;
 -- note: implicit-cast case is tested in char.sql
 
-SELECT CAST(f1 AS char(20)) AS "char(text)" FROM TEXT_STRINGS_TBL ORDER BY 1;
+SELECT CAST(f1 AS char(20)) AS "char(text)" FROM TEXT_STRINGS_TBL;
 
-SELECT CAST(f1 AS char(10)) AS "char(varchar)" FROM VARCHAR_STRINGS_TBL ORDER BY 1;
+SELECT CAST(f1 AS char(10)) AS "char(varchar)" FROM VARCHAR_STRINGS_TBL;
 
 SELECT CAST(name 'namefield' AS char(10)) AS "char(name)";
 
-SELECT CAST(f1 AS varchar) AS "varchar(text)" FROM TEXT_STRINGS_TBL ORDER BY 1;
+SELECT CAST(f1 AS varchar) AS "varchar(text)" FROM TEXT_STRINGS_TBL;
 
-SELECT CAST(f1 AS varchar) AS "varchar(char)" FROM CHAR_STRINGS_TBL ORDER BY 1;
+SELECT CAST(f1 AS varchar) AS "varchar(char)" FROM CHAR_STRINGS_TBL;
 
 SELECT CAST(name 'namefield' AS varchar) AS "varchar(name)";
 
 --
--- test SQL92 string functions
+-- test SQL string functions
 -- E### and T### are feature reference numbers from SQL99
 --
 
@@ -148,35 +201,45 @@ SELECT regexp_matches('foobarbequebaz', $re$(bar)(.+)?(beque)$re$);
 -- no capture groups
 SELECT regexp_matches('foobarbequebaz', $re$barbeque$re$);
 
+-- start/end-of-line matches are of zero length
+SELECT regexp_matches('foo' || chr(10) || 'bar' || chr(10) || 'bequq' || chr(10) || 'baz', '^', 'mg');
+SELECT regexp_matches('foo' || chr(10) || 'bar' || chr(10) || 'bequq' || chr(10) || 'baz', '$', 'mg');
+SELECT regexp_matches('1' || chr(10) || '2' || chr(10) || '3' || chr(10) || '4' || chr(10), '^.?', 'mg');
+SELECT regexp_matches(chr(10) || '1' || chr(10) || '2' || chr(10) || '3' || chr(10) || '4' || chr(10), '.?$', 'mg');
+SELECT regexp_matches(chr(10) || '1' || chr(10) || '2' || chr(10) || '3' || chr(10) || '4', '.?$', 'mg');
+
 -- give me errors
 SELECT regexp_matches('foobarbequebaz', $re$(bar)(beque)$re$, 'gz');
 SELECT regexp_matches('foobarbequebaz', $re$(barbeque$re$);
 SELECT regexp_matches('foobarbequebaz', $re$(bar)(beque){2,1}$re$);
 
 -- split string on regexp
-SELECT foo, length(foo) FROM regexp_split_to_table('the quick brown fox jumped over the lazy dog', $re$\s+$re$) AS foo;
-SELECT regexp_split_to_array('the quick brown fox jumped over the lazy dog', $re$\s+$re$);
+SELECT foo, length(foo) FROM regexp_split_to_table('the quick brown fox jumps over the lazy dog', $re$\s+$re$) AS foo;
+SELECT regexp_split_to_array('the quick brown fox jumps over the lazy dog', $re$\s+$re$);
 
-SELECT foo, length(foo) FROM regexp_split_to_table('the quick brown fox jumped over the lazy dog', $re$\s*$re$) AS foo;
-SELECT regexp_split_to_array('the quick brown fox jumped over the lazy dog', $re$\s*$re$);
-SELECT foo, length(foo) FROM regexp_split_to_table('the quick brown fox jumped over the lazy dog', '') AS foo;
-SELECT regexp_split_to_array('the quick brown fox jumped over the lazy dog', '');
+SELECT foo, length(foo) FROM regexp_split_to_table('the quick brown fox jumps over the lazy dog', $re$\s*$re$) AS foo;
+SELECT regexp_split_to_array('the quick brown fox jumps over the lazy dog', $re$\s*$re$);
+SELECT foo, length(foo) FROM regexp_split_to_table('the quick brown fox jumps over the lazy dog', '') AS foo;
+SELECT regexp_split_to_array('the quick brown fox jumps over the lazy dog', '');
 -- case insensitive
-SELECT foo, length(foo) FROM regexp_split_to_table('thE QUick bROWn FOx jUMPed ovEr THE lazy dOG', 'e', 'i') AS foo;
-SELECT regexp_split_to_array('thE QUick bROWn FOx jUMPed ovEr THE lazy dOG', 'e', 'i');
+SELECT foo, length(foo) FROM regexp_split_to_table('thE QUick bROWn FOx jUMPs ovEr The lazy dOG', 'e', 'i') AS foo;
+SELECT regexp_split_to_array('thE QUick bROWn FOx jUMPs ovEr The lazy dOG', 'e', 'i');
 -- no match of pattern
-SELECT foo, length(foo) FROM regexp_split_to_table('the quick brown fox jumped over the lazy dog', 'nomatch') AS foo;
-SELECT regexp_split_to_array('the quick brown fox jumped over the lazy dog', 'nomatch');
+SELECT foo, length(foo) FROM regexp_split_to_table('the quick brown fox jumps over the lazy dog', 'nomatch') AS foo;
+SELECT regexp_split_to_array('the quick brown fox jumps over the lazy dog', 'nomatch');
 -- some corner cases
 SELECT regexp_split_to_array('123456','1');
 SELECT regexp_split_to_array('123456','6');
 SELECT regexp_split_to_array('123456','.');
+SELECT regexp_split_to_array('123456','');
+SELECT regexp_split_to_array('123456','(?:)');
+SELECT regexp_split_to_array('1','');
 -- errors
-SELECT foo, length(foo) FROM regexp_split_to_table('thE QUick bROWn FOx jUMPed ovEr THE lazy dOG', 'e', 'zippy') AS foo;
-SELECT regexp_split_to_array('thE QUick bROWn FOx jUMPed ovEr THE lazy dOG', 'e', 'iz');
+SELECT foo, length(foo) FROM regexp_split_to_table('thE QUick bROWn FOx jUMPs ovEr The lazy dOG', 'e', 'zippy') AS foo;
+SELECT regexp_split_to_array('thE QUick bROWn FOx jUMPs ovEr The lazy dOG', 'e', 'iz');
 -- global option meaningless for regexp_split
-SELECT foo, length(foo) FROM regexp_split_to_table('thE QUick bROWn FOx jUMPed ovEr THE lazy dOG', 'e', 'g') AS foo;
-SELECT regexp_split_to_array('thE QUick bROWn FOx jUMPed ovEr THE lazy dOG', 'e', 'g');
+SELECT foo, length(foo) FROM regexp_split_to_table('thE QUick bROWn FOx jUMPs ovEr The lazy dOG', 'e', 'g') AS foo;
+SELECT regexp_split_to_array('thE QUick bROWn FOx jUMPs ovEr The lazy dOG', 'e', 'g');
 
 -- change NULL-display back
 \pset null ''
@@ -369,7 +432,7 @@ insert into toasttest values(repeat('1234567890',10000));
 insert into toasttest values(repeat('1234567890',10000));
 
 -- If the starting position is zero or less, then return from the start of the string
--- adjusting the length to be consistent with the "negative start" per SQL92.
+-- adjusting the length to be consistent with the "negative start" per SQL.
 SELECT substr(f1, -1, 5) from toasttest;
 
 -- If the length is less than zero, an ERROR is thrown.
@@ -402,7 +465,7 @@ insert into toasttest values("decode"(repeat('1234567890',10000),'escape'));
 insert into toasttest values(pg_catalog.decode(repeat('1234567890',10000),'escape'));
 
 -- If the starting position is zero or less, then return from the start of the string
--- adjusting the length to be consistent with the "negative start" per SQL92.
+-- adjusting the length to be consistent with the "negative start" per SQL.
 SELECT substr(f1, -1, 5) from toasttest;
 
 -- If the length is less than zero, an ERROR is thrown.
@@ -582,6 +645,9 @@ SELECT trim(E'\\000'::bytea from E'\\000Tom\\000'::bytea);
 SELECT btrim(E'\\000trim\\000'::bytea, E'\\000'::bytea);
 SELECT btrim(''::bytea, E'\\000'::bytea);
 SELECT btrim(E'\\000trim\\000'::bytea, ''::bytea);
+SELECT encode(overlay(E'Th\\000omas'::bytea placing E'Th\\001omas'::bytea from 2),'escape');
+SELECT encode(overlay(E'Th\\000omas'::bytea placing E'\\002\\003'::bytea from 8),'escape');
+SELECT encode(overlay(E'Th\\000omas'::bytea placing E'\\002\\003'::bytea from 5 for 3),'escape');
 
 
 -- Clean up GPDB-added tables

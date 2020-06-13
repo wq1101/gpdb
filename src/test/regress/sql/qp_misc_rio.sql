@@ -40,11 +40,13 @@ select sum((select count(*) from t11_t group by b having b = s.b)) as sum_col fr
 -- Test: 15
 -- ----------------------------------------------------------------------
 -- aggregate over partition by
+-- GPDB_10_MERGE_FIXME: Here we cast the unknown typed literal to text. After
+-- we move past postgres 10 we can drop the cast.
 select state,
        sum(revenue) over (partition by state)
 from
-   (select 'A' as enc_email, 1 as revenue) b
-   join (select 'A' as enc_email, 'B' as state ) c using(enc_email)
+   (select 'A'::text as enc_email, 1 as revenue) b
+   join (select 'A'::text as enc_email, 'B'::text as state ) c using(enc_email)
 group by 1,b.revenue;
 
 -- ----------------------------------------------------------------------
@@ -374,7 +376,7 @@ select * from ccdd1;
 -- Test: 34
 -- ----------------------------------------------------------------------
 -- This is expected to fail, with an error along the lines of:
--- function cannot execute on segment because it accesses relation "qp_misc_rio.testdata_in"
+-- function cannot execute on a QE slice because it accesses relation "qp_misc_rio.testdata_in"
 
 set search_path to qp_misc_rio;
 
@@ -524,3 +526,16 @@ from
 ) sub1
 group by a
 order by a;
+
+
+-- ----------------------------------------------------------------------
+-- Test: to_date() boundaries.
+--
+-- to_date() used to not check the input like the date input function
+-- does. The fix was submitted to upstream PostgreSQL and fixed there in
+-- version 8.4.16 (commit 5c4eb9166e.)
+-- ----------------------------------------------------------------------
+select to_date('-4713-11-23', 'yyyy-mm-dd');
+select to_date('-4713-11-24', 'yyyy-mm-dd');
+select to_date('5874897-12-31', 'yyyy-mm-dd');
+select to_date('5874898-01-01', 'yyyy-mm-dd');

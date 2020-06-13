@@ -19,6 +19,7 @@ import signal
 import glob
 import time
 import shutil
+import tempfile
 from datetime import datetime, timedelta
 
 # import GPDB modules
@@ -27,11 +28,9 @@ try:
     from gppylib.commands import unix, gp, pg
     from gppylib.db import dbconn
     from gppylib.gpparseopts import OptParser, OptChecker, OptionGroup, SUPPRESS_HELP
-    from gppylib.gplog import get_default_logger, setup_tool_logging, enable_verbose_logging, get_logger_if_verbose
+    from gppylib.gplog import get_default_logger, setup_tool_logging, enable_verbose_logging
     from gppylib import gparray
     from gppylib.userinput import ask_yesno
-    from gppylib.gp_dbid import GpDbidFile, writeGpDbidFile
-    from gppylib.operations.filespace import GP_TRANSACTION_FILES_FILESPACE, GP_TEMPORARY_FILES_FILESPACE
 except ImportError, e_:
     sys.exit('ERROR: Cannot import modules.  Please check that you '
              'have sourced greenplum_path.sh.  Detail: ' + str(e_))
@@ -210,12 +209,12 @@ def check_original_master_status(options):
     original_master_hostname = ""
     original_master_port = 0
 
-    recocver_conf_file_location = os.path.join(options.master_data_dir, GP_RECOVERY_CONF_FILE) 
-    if not os.path.exists(recocver_conf_file_location):
+    recovery_conf_file_location = os.path.join(options.master_data_dir, GP_RECOVERY_CONF_FILE) 
+    if not os.path.exists(recovery_conf_file_location):
         logger.warn('Please make sure the command gpactivatestandby is executed on current Standby host')
-        raise GpActivateStandbyException('Critical required file on standby \"%s\" is not present.' % recocver_conf_file_location)
+        raise GpActivateStandbyException('Critical required file on standby \"%s\" is not present.' % recovery_conf_file_location)
 
-    with open(recocver_conf_file_location) as read_file:
+    with open(recovery_conf_file_location) as read_file:
         for line in read_file:
             tokens = line.split()
             if tokens[0] == "primary_conninfo":
@@ -245,56 +244,6 @@ def get_config():
     array = gparray.GpArray.initFromCatalog(dburl, utility=True)
     
     return array
-
-#-------------------------------------------------------------------------
-def update_flat_file(datadir, flat_file, old_dbid, new_dbid):
-    """
-        If the transaction/temporary filespaces have
-        ever been moved, we need to update the flat file.
-        The filespace directories are copied by the 
-        copy_master_filespaces method.
-    """
-
-    flat_file_location = os.path.join(datadir, flat_file)
-    if not os.path.exists(flat_file_location):
-        return
-
-    logger.debug('flat file location for filespace files = %s' % flat_file_location)
-    # The flat file looks like this:
-    # <BOF>
-    # {filespace_oid}
-    # {dbid} {path to filespace}
-    # {dbid} {path to filespace}
-    # <EOF>
-    with open(flat_file_location) as read_file:
-        lines_to_write = ''
-        for line in read_file:
-            tokens = line.split()
-            if len(tokens) != 2:
-                lines_to_write += line
-            elif tokens[0] == str(old_dbid):
-                lines_to_write += str(new_dbid) + ' ' + tokens[1] + '\n'
-
-    temp_flat_file = os.path.join(flat_file_location + '.tmp')
-    
-    try:
-        with open(temp_flat_file, 'w') as write_file:
-            write_file.write(lines_to_write)
-     
-        #Rewrite the master flat file to include the standby information 
-        shutil.move(temp_flat_file, flat_file_location)
-    except Exception, e:
-        raise Exception('Failed to update flat file')
-
-
-#-------------------------------------------------------------------------
-def update_gpdbid_file(options, new_dbid):
-    """Updates to gp_dbid file in the data directory to reflect the standby masters dbid."""
-
-    datadir = options.master_data_dir
-
-    # MPP-13245, use single mechanism to manage gp_dbid file instead of ad-hoc replace
-    writeGpDbidFile(datadir, new_dbid, get_logger_if_verbose())
 
 #-------------------------------------------------------------------------
 def check_standby_running(options):
@@ -330,20 +279,30 @@ def check_or_start_standby(options):
         # it anyway.  We'll restart with the full options after
         # promoting the standby.  This is nothing but a bailout and
         # this could lose some of the latest changes from the primary.
-        promote_file = os.path.join(options.master_data_dir, "promote")
-        with open(promote_file, 'w') as f:
-            f.write('')
+        recovery_conf_file_location = os.path.join(options.master_data_dir, GP_RECOVERY_CONF_FILE)
+        fd, trigger_file = tempfile.mkstemp(dir=options.master_data_dir)
+        trigger_entry = "trigger_file = '" + trigger_file + "'"
 
-        start_master()
+        with open(recovery_conf_file_location, 'w') as f:
+            f.write("standby_mode = 'on'\n")
+            f.write("primary_conninfo = 'dummy'\n")
+            f.write(trigger_entry)
+        f.close()
+
+        with open(trigger_file, 'w') as f:
+            f.write('');
+        f.close();
+
+        start_master(options)
 
         return False
 
 #-------------------------------------------------------------------------
-def start_master():
+def start_master(options):
     """Starts the master."""
 
     logger.info('Starting standby master database in utility mode...')
-    gp.GpStart.local('Start GPDB', masterOnly=True)
+    gp.NewGpStart.local('Start GPDB', masterOnly=True, masterDirectory=options.master_data_dir)
 
 #-------------------------------------------------------------------------
 def stop_master():
@@ -353,12 +312,12 @@ def stop_master():
     gp.GpStop.local('Stop GPDB', masterOnly=True, fast=True)
  
 #-------------------------------------------------------------------------
-def promote_standby():
+def promote_standby(master_data_dir):
     """Promote standby"""
 
     logger.info('Promoting standby...')
     cmd = gp.Command('pg_ctl promote',
-                     'pg_ctl promote -D $MASTER_DATA_DIRECTORY')
+                     'pg_ctl promote -D %s' % master_data_dir)
     cmd.run(validateAfter=True)
 
     logger.debug('Waiting for connection...')
@@ -366,7 +325,10 @@ def promote_standby():
         try:
             dburl = dbconn.DbURL()
             with dbconn.connect(dburl, utility=True, logConn=False) as conn:
-                pass
+                # When the new master is available for connections, we should
+                # run a CHECKPOINT to force the new TimeLineID to be written to
+                # the pg_control file.
+                dbconn.execSQL(conn, 'CHECKPOINT')
             logger.info('Standby master is promoted')
             return True
         except pygresql.InternalError, e:
@@ -402,25 +364,11 @@ try:
     # backwards.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-    dbidfile = GpDbidFile(options_.master_data_dir, do_read=True)
-    old_dbid = dbidfile.dbid
     requires_restart = not check_or_start_standby(options_)
-
-    # We update flat files before promote because postmaster reads
-    # the new value on the promote procedure.  Unfortunately at this
-    # point we don't know what is the new dbid as it is only in catalog,
-    # but for now we assume it's 1.
-    logger.info('Updating transaction files filespace flat files...')
-    update_flat_file(options_.master_data_dir, GP_TRANSACTION_FILES_FILESPACE,
-                     old_dbid, 1)
-
-    logger.info('Updating temporary files filespace flat files...')
-    update_flat_file(options_.master_data_dir, GP_TEMPORARY_FILES_FILESPACE,
-                     old_dbid, 1)
 
     # promote standby, only if the standby is running in recovery
     if not requires_restart:
-        res = promote_standby()
+        res = promote_standby(options_.master_data_dir)
         if not res:
             raise GpActivateStandbyException('Either the set port is incorrect or '
                                              'the postmaster could not come up.')
@@ -428,12 +376,11 @@ try:
     # now we can access the catalog.  promote action has already updated
     # catalog, so array.master is the old (promoted) standby at this point.
     array_ = get_config()
-    update_gpdbid_file(options_, 1)
 
     # If we forced to start utility master, this is the time to restart
     # cluster so that the new master becomes dispatch mode.
     if requires_restart:
-        cmd = gp.GpStop.local('GPDB restart', restart=True)
+        cmd = gp.GpStop.local('GPDB restart', restart=True, datadir=options_.master_data_dir)
 
     # At this point, cancel isn't all that bad so re-enable 
     # keyboard interrupt.

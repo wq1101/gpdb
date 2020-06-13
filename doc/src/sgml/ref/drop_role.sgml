@@ -1,11 +1,15 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/drop_role.sgml,v 1.6 2008/11/14 10:22:46 petere Exp $
+doc/src/sgml/ref/drop_role.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-DROPROLE">
+ <indexterm zone="sql-droprole">
+  <primary>DROP ROLE</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="SQL-DROPROLE-TITLE">DROP ROLE</refentrytitle>
+  <refentrytitle>DROP ROLE</refentrytitle>
   <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
@@ -14,10 +18,6 @@ PostgreSQL documentation
   <refname>DROP ROLE</refname>
   <refpurpose>remove a database role</refpurpose>
  </refnamediv>
-
- <indexterm zone="sql-droprole">
-  <primary>DROP ROLE</primary>
- </indexterm>
 
  <refsynopsisdiv>
 <synopsis>
@@ -39,10 +39,10 @@ DROP ROLE [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> [, ...
    A role cannot be removed if it is still referenced in any database
    of the cluster; an error will be raised if so.  Before dropping the role,
    you must drop all the objects it owns (or reassign their ownership)
-   and revoke any privileges the role has been granted. The <xref
-   linkend="sql-reassign-owned" endterm="sql-reassign-owned-title">
-   and <xref linkend="sql-drop-owned" endterm="sql-drop-owned-title">
-   commands can be useful for this purpose.
+   and revoke any privileges the role has been granted on other objects.
+   The <xref linkend="sql-reassign-owned"> and <xref linkend="sql-drop-owned">
+   commands can be useful for this purpose; see <xref linkend="role-removal">
+   for more discussion.
   </para>
 
   <para>
@@ -61,7 +61,7 @@ DROP ROLE [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> [, ...
     <term><literal>IF EXISTS</literal></term>
     <listitem>
      <para>
-      Do not throw an error if the role does not exist. A notice is issued 
+      Do not throw an error if the role does not exist. A notice is issued
       in this case.
      </para>
     </listitem>
@@ -83,7 +83,7 @@ DROP ROLE [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> [, ...
 
   <para>
    <productname>PostgreSQL</productname> includes a program <xref
-   linkend="APP-DROPUSER" endterm="APP-DROPUSER-title"> that has the
+   linkend="APP-DROPUSER"> that has the
    same functionality as this command (in fact, it calls this command)
    but can be run from the command shell.
   </para>
@@ -96,13 +96,12 @@ DROP ROLE [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> [, ...
    To drop a role:
 <programlisting>
 DROP ROLE jonathan;
-</programlisting>
-  </para>
+</programlisting></para>
  </refsect1>
- 
+
  <refsect1>
   <title>Compatibility</title>
-  
+
   <para>
    The SQL standard defines <command>DROP ROLE</command>, but it allows
    only one role to be dropped at a time, and it specifies different
@@ -114,9 +113,9 @@ DROP ROLE jonathan;
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-createrole" endterm="sql-createrole-title"></member>
-   <member><xref linkend="sql-alterrole" endterm="sql-alterrole-title"></member>
-   <member><xref linkend="sql-set-role" endterm="sql-set-role-title"></member>
+   <member><xref linkend="sql-createrole"></member>
+   <member><xref linkend="sql-alterrole"></member>
+   <member><xref linkend="sql-set-role"></member>
   </simplelist>
  </refsect1>
 

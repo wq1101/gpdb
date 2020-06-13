@@ -3,7 +3,6 @@
 default: all
 
 BLD_TOP=..
-include $(BLD_TOP)/Makefile.windows
 
 ext_dir=../ext
 
@@ -15,95 +14,16 @@ ifneq (${ENV_JAVA_HOME},)
 	JAVA_HOME=${ENV_JAVA_HOME}
 endif
 
-.PHONY: all install clean distclean installcheck mapreduce pxf gpcloud mkgphdfs mkorafce
-
-#
-# targets built via top_builddir/GNUmakefile
-#
-
-all: mapreduce gpcloud pxf
-
-mapreduce:
-	@if [ "$(enable_mapreduce)" = "yes" ]; then \
-		echo "gpmapreduce enabled"; \
-		$(MAKE) -C gpmapreduce; \
-	fi
-
-gpcloud:
-	@if [ "$(enable_gpcloud)" = "yes" ]; then \
-		echo "gpcloud enabled"; \
-		$(MAKE) -C gpcloud && \
-		$(MAKE) -C gpcloud/bin/gpcheckcloud; \
-	fi
-
-pxf:
-	@if [ "$(enable_pxf)" = "yes" ]; then \
-		echo "pxf enabled"; \
-		$(MAKE) -C pxf; \
-	fi
-
-install:
-	@if [ "$(enable_mapreduce)" = "yes" ]; then \
-		$(MAKE) -C gpmapreduce install; \
-	fi
-	@if [ "$(enable_gpcloud)" = "yes" ]; then \
-		$(MAKE) -C gpcloud install && \
-		$(MAKE) -C gpcloud/bin/gpcheckcloud install; \
-	fi
-	@if [ "$(enable_pxf)" = "yes" ]; then \
-		$(MAKE) -C pxf install; \
-	fi
-
-clean:
-	if [ "$(enable_mapreduce)" = "yes" ]; then $(MAKE) -C gpmapreduce clean; fi
-	if [ "$(enable_gpcloud)" = "yes" ]; then $(MAKE) -C gpcloud clean; fi
-	if [ "$(enable_pxf)" = "yes" ]; then $(MAKE) -C pxf clean; fi
-
-distclean:
-	if [ "$(enable_mapreduce)" = "yes" ]; then $(MAKE) -C gpmapreduce distclean; fi
-	if [ "$(enable_gpcloud)" = "yes" ]; then $(MAKE) -C gpcloud distclean; fi
-	if [ "$(enable_pxf)" = "yes" ]; then $(MAKE) -C pxf distclean; fi
-
-installcheck:
-	if [ -d "$(ext_dir)" ]; then \
-		PATH=$(INSTLOC)/bin:$(PATH) $(MAKE) -C orafce installcheck USE_PGXS=1 && \
-		PATH=$(INSTLOC)/bin:$(PATH) $(MAKE) -C gphdfs installcheck USE_PGXS=1 ; \
-	fi; \
-	if [ "$(enable_mapreduce)" = "yes" ]; then \
-		$(MAKE) -C gpmapreduce installcheck; \
-	fi
-
-unittest-check:
-	@if [ "$(enable_pxf)" = "yes" ]; then \
-		echo "pxf enabled"; \
-		$(MAKE) -C pxf unittest-check; \
-	fi
-
 #
 # below targets will be built via top_builddir/gpAux/Makefile
 #
 
-mkgphdfs:
-	PATH=$(INSTLOC)/bin:$(PATH) $(MAKE) -C gphdfs USE_PGXS=1 docdir=$(INSTLOC)/docs install \
-		ANT=/opt/releng/apache-ant/bin/ant \
-		JAVA_HOME=${JAVA_HOME}
-
-# Only include these files when running enterprise build
-ENTERPRISE_TARGETS="mkgphdfs mkorafce"
-ifneq ($(findstring $(MAKECMDGOALS), $(ENTERPRISE_TARGETS)),)
-include $(BLD_TOP)/Makefile.global
-include $(BLD_TOP)/Makefile.thirdparty
-endif
-
 # Use $JAVA_HOME if specified, otherwise look for java in the likely places.
-# Note that Darwin's JVM layout is pretty weird.  JDK 1.6 apears to be the
-# default for Snow Leopard, but JDK 1.5 is for Leopard.
-# See http://developer.apple.com/qa/qa2001/qa1170.html
 ifeq ($(wildcard "${JAVA_HOME}/bin/java"),)
   JDK="${JAVA_HOME}"
 else
-  ifeq ($(wildcard "/System/Library/Frameworks/JavaVM.framework/Versions/1.6/Home/bin/java"),)
-    JDK="/System/Library/Frameworks/JavaVM.framework/Versions/1.6/Home"
+  ifeq ($(wildcard "/System/Library/Frameworks/JavaVM.framework/Versions/1.7/Home/bin/java"),)
+    JDK="/System/Library/Frameworks/JavaVM.framework/Versions/1.7/Home"
   else
     ifeq ($(wildcard "/usr/java/bin/java"),)
       JDK="/usr/java"
@@ -117,6 +37,3 @@ JAVAC=${JAVA_HOME}/bin/javac
 JAVAH=${JAVA_HOME}/bin/javah
 JAR=${JAVA_HOME}/bin/jar
 JAVADOC=${JAVA_HOME}/bin/javadoc
-
-mkorafce:
-	PATH=$(INSTLOC)/bin:$(PATH) $(MAKE) -C orafce install USE_PGXS=1

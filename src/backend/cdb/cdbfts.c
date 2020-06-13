@@ -16,8 +16,8 @@
 #include "postgres.h"
 
 #include "miscadmin.h"
-#include "gp-libpq-fe.h"
-#include "gp-libpq-int.h"
+#include "libpq-fe.h"
+#include "libpq-int.h"
 #include "utils/memutils.h"
 #include "cdb/cdbvars.h"
 #include "cdb/cdbconn.h"
@@ -28,13 +28,12 @@
 #include "cdb/cdbtm.h"
 #include "libpq/libpq-be.h"
 #include "commands/dbcommands.h"
+#include "storage/pmsignal.h"
 #include "storage/proc.h"
 
 #include "executor/spi.h"
 
 #include "postmaster/fts.h"
-#include "postmaster/primary_mirror_mode.h"
-#include "utils/faultinjection.h"
 
 #include "utils/fmgroids.h"
 #include "catalog/pg_authid.h"
@@ -42,16 +41,10 @@
 /* segment id for the master */
 #define MASTER_SEGMENT_ID -1
 
-FtsProbeInfo *ftsProbeInfo = NULL; /* Probe process updates this structure */
-volatile bool	*ftsEnabled;
-volatile bool	*ftsShutdownMaster;
-static LWLockId	ftsControlLock;
+volatile FtsProbeInfo *ftsProbeInfo = NULL;	/* Probe process updates this structure */
+static LWLockId ftsControlLock;
 
-static volatile bool	*ftsReadOnlyFlag;
-static volatile bool	*ftsAdminRequestedRO;
-
-static bool		local_fts_status_initialized=false;
-static uint64	local_fts_statusVersion;
+extern volatile pid_t *shmFtsProbePID;
 
 /*
  * get fts share memory size
@@ -59,12 +52,7 @@ static uint64	local_fts_statusVersion;
 int
 FtsShmemSize(void)
 {
-	/*
-	 * this shared memory block doesn't even need to *exist* on the
-	 * QEs!
-	 */
-	if ((Gp_role != GP_ROLE_DISPATCH) && (Gp_role != GP_ROLE_UTILITY))
-		return 0;
+	RequestNamedLWLockTranche("ftsControlLock", 1);
 
 	return MAXALIGN(sizeof(FtsControlBlock));
 }
@@ -75,38 +63,22 @@ FtsShmemInit(void)
 	bool		found;
 	FtsControlBlock *shared;
 
-	shared = (FtsControlBlock *)ShmemInitStruct("Fault Tolerance manager", FtsShmemSize(), &found);
+	shared = (FtsControlBlock *) ShmemInitStruct("Fault Tolerance manager", sizeof(FtsControlBlock), &found);
 	if (!shared)
 		elog(FATAL, "FTS: could not initialize fault tolerance manager share memory");
 
 	/* Initialize locks and shared memory area */
-
-	ftsEnabled = &shared->ftsEnabled;
-	ftsShutdownMaster = &shared->ftsShutdownMaster;
 	ftsControlLock = shared->ControlLock;
-
-	ftsReadOnlyFlag = &shared->ftsReadOnlyFlag; /* global RO state */
-
-	ftsAdminRequestedRO = &shared->ftsAdminRequestedRO; /* Admin request -- guc-controlled RO state */
-
 	ftsProbeInfo = &shared->fts_probe_info;
+	shmFtsProbePID = &shared->fts_probe_pid;
+	*shmFtsProbePID = 0;
 
 	if (!IsUnderPostmaster)
 	{
-		shared->ControlLock = LWLockAssign();
+		shared->ControlLock = &(GetNamedLWLockTranche("ftsControlLock"))->lock;
 		ftsControlLock = shared->ControlLock;
 
-		/* initialize */
-		shared->ftsReadOnlyFlag = gp_set_read_only;
-		shared->ftsAdminRequestedRO = gp_set_read_only;
-
-		shared->fts_probe_info.fts_probePid = 0;
-		shared->fts_probe_info.fts_pauseProbes = false;
-		shared->fts_probe_info.fts_discardResults = false;
-		shared->fts_probe_info.fts_statusVersion = 0;
-
-		shared->ftsEnabled = true; /* ??? */
-		shared->ftsShutdownMaster = false;
+		shared->fts_probe_info.status_version = 0;
 	}
 }
 
@@ -122,117 +94,65 @@ ftsUnlock(void)
 	LWLockRelease(ftsControlLock);
 }
 
+/* see src/backend/fts/README */
 void
 FtsNotifyProber(void)
 {
 	Assert(Gp_role == GP_ROLE_DISPATCH);
+	int32			initial_started;
+	int32			started;
+	int32			done;
 
-	if (ftsProbeInfo->fts_probePid == 0)
-		return;
-	/*
-	 * This is a full-scan request. We set the request-flag == to the bitmap version flag.
-	 * When the version has been bumped, we know that the request has been filled.
-	 */
-	ftsProbeInfo->fts_probeScanRequested = ftsProbeInfo->fts_statusVersion;
+	SpinLockAcquire(&ftsProbeInfo->lock);
+	initial_started = ftsProbeInfo->start_count;
+	SpinLockRelease(&ftsProbeInfo->lock);
 
-	/* signal fts-probe */
-	kill(ftsProbeInfo->fts_probePid, SIGINT);
+	SendPostmasterSignal(PMSIGNAL_WAKEN_FTS);
 
-	/* sit and spin */
-	while (ftsProbeInfo->fts_probeScanRequested == ftsProbeInfo->fts_statusVersion)
+	SIMPLE_FAULT_INJECTOR("ftsNotify_before");
+
+	/* Wait for a new fts probe to start. */
+	for (;;)
 	{
-		struct timeval tv;
+		SpinLockAcquire(&ftsProbeInfo->lock);
+		started = ftsProbeInfo->start_count;
+		SpinLockRelease(&ftsProbeInfo->lock);
 
-		tv.tv_usec = 50000;
-		tv.tv_sec = 0;
-		select(0, NULL, NULL, NULL, &tv); /* don't care about return value. */
+		if (started != initial_started)
+			break;
 
 		CHECK_FOR_INTERRUPTS();
+		pg_usleep(50000);
 	}
+
+	/* Wait until current probe in progress is completed */
+	for (;;)
+	{
+		SpinLockAcquire(&ftsProbeInfo->lock);
+		done = ftsProbeInfo->done_count;
+		SpinLockRelease(&ftsProbeInfo->lock);
+
+		if (done - started >= 0)
+			break;
+
+		CHECK_FOR_INTERRUPTS();
+		pg_usleep(50000);
+	}
+
 }
-
-
-/*
- * Check if master needs to shut down
- */
-bool FtsMasterShutdownRequested()
-{
-	return *ftsShutdownMaster;
-}
-
-
-/*
- * Set flag indicating that master needs to shut down
- */
-void FtsRequestMasterShutdown()
-{
-#ifdef USE_ASSERT_CHECKING
-	Assert(!*ftsShutdownMaster);
-
-	PrimaryMirrorMode pm_mode;
-	getPrimaryMirrorStatusCodes(&pm_mode, NULL, NULL, NULL);
-	Assert(pm_mode == PMModeMaster);
-#endif /*USE_ASSERT_CHECKING*/
-
-	*ftsShutdownMaster = true;
-}
-
 
 /*
  * Test-Connection: This is called from the threaded context inside the
  * dispatcher: ONLY CALL THREADSAFE FUNCTIONS -- elog() is NOT threadsafe.
  */
 bool
-FtsTestConnection(CdbComponentDatabaseInfo *failedDBInfo, bool fullScan)
+FtsIsSegmentDown(CdbComponentDatabaseInfo *dBInfo)
 {
 	/* master is always reported as alive */
-	if (failedDBInfo->segindex == MASTER_SEGMENT_ID)
-	{
-		return true;
-	}
+	if (dBInfo->config->segindex == MASTER_SEGMENT_ID)
+		return false;
 
-	if (!fullScan)
-	{
-		return FTS_STATUS_ISALIVE(failedDBInfo->dbid, ftsProbeInfo->fts_status);
-	}
-
-	FtsNotifyProber();
-
-	return FTS_STATUS_ISALIVE(failedDBInfo->dbid, ftsProbeInfo->fts_status);
-}
-
-/*
- * Re-Configure the system: if someone has noticed that the status
- * version has been updated, they call this to verify that they've got
- * the right configuration.
- *
- * NOTE: This *always* destroys gangs. And also attempts to inform the
- * fault-prober to do a full scan.
- */
-void
-FtsReConfigureMPP(bool create_new_gangs)
-{
-	/* need to scan to pick up the latest view */
-	FtsNotifyProber();
-	local_fts_statusVersion = ftsProbeInfo->fts_statusVersion;
-
-	ereport(LOG, (errmsg_internal("FTS: reconfiguration is in progress"),
-			errSendAlert(true)));
-	DisconnectAndDestroyAllGangs(true);
-
-	/* Caller should throw an error. */
-	return;
-}
-
-void
-FtsHandleNetFailure(SegmentDatabaseDescriptor ** segDB, int numOfFailed)
-{
-	elog(LOG, "FtsHandleNetFailure: numOfFailed %d", numOfFailed);
-
-	FtsReConfigureMPP(true);
-
-	ereport(ERROR, (errmsg_internal("MPP detected %d segment failures, system is reconnected", numOfFailed),
-			errSendAlert(true)));
+	return FTS_STATUS_IS_DOWN(ftsProbeInfo->status[dBInfo->config->dbid]);
 }
 
 /*
@@ -241,68 +161,29 @@ FtsHandleNetFailure(SegmentDatabaseDescriptor ** segDB, int numOfFailed)
  * returns true if any segment DB is down.
  */
 bool
-FtsTestSegmentDBIsDown(SegmentDatabaseDescriptor * segdbDesc, int size)
+FtsTestSegmentDBIsDown(SegmentDatabaseDescriptor **segdbDesc, int size)
 {
-	int i = 0;
-	bool forceRescan = true;
-
-	Assert(isFTSEnabled());
+	int			i = 0;
 
 	for (i = 0; i < size; i++)
 	{
-		CdbComponentDatabaseInfo *segInfo = segdbDesc[i].segment_database_info;
+		CdbComponentDatabaseInfo *segInfo = segdbDesc[i]->segment_database_info;
 
-		elog(DEBUG2, "FtsTestSegmentDBIsDown: looking for real fault on segment dbid %d", segInfo->dbid);
+		elog(DEBUG2, "FtsTestSegmentDBIsDown: looking for real fault on segment dbid %d", (int) segInfo->config->dbid);
 
-		if (!FtsTestConnection(segInfo, forceRescan))
+		if (FtsIsSegmentDown(segInfo))
 		{
 			ereport(LOG, (errmsg_internal("FTS: found fault with segment dbid %d. "
-					"Reconfiguration is in progress", segInfo->dbid)));
+										  "Reconfiguration is in progress", (int) segInfo->config->dbid)));
 			return true;
 		}
-
-		/* only force the rescan on the first call. */
-		forceRescan = false;
 	}
 
 	return false;
 }
 
-
-void
-FtsCondSetTxnReadOnly(bool *XactFlag)
+uint8
+getFtsVersion(void)
 {
-	if (!isFTSEnabled())
-		return;
-
-	if (*ftsReadOnlyFlag && Gp_role != GP_ROLE_UTILITY)
-		*XactFlag = true;
-}
-
-bool
-verifyFtsSyncCount(void)
-{
-	if (ftsProbeInfo->fts_probePid == 0)
-		return true;
-
-	if (!local_fts_status_initialized)
-	{
-		local_fts_status_initialized = true;
-		local_fts_statusVersion = ftsProbeInfo->fts_statusVersion;
-
-		return true;
-	}
-
-	return (local_fts_statusVersion == ftsProbeInfo->fts_statusVersion);
-}
-
-bool
-isFtsReadOnlySet(void)
-{
-	return *ftsReadOnlyFlag;
-}
-
-uint64 getFtsVersion(void)
-{
-	return ftsProbeInfo->fts_statusVersion;
+	return ftsProbeInfo->status_version;
 }

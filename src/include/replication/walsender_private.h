@@ -3,7 +3,7 @@
  * walsender_private.h
  *	  Private definitions from replication/walsender.c.
  *
- * Portions Copyright (c) 2010-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2016, PostgreSQL Global Development Group
  *
  * src/include/replication/walsender_private.h
  *
@@ -24,7 +24,8 @@ typedef enum WalSndState
 	WALSNDSTATE_STARTUP = 0,
 	WALSNDSTATE_BACKUP,
 	WALSNDSTATE_CATCHUP,
-	WALSNDSTATE_STREAMING
+	WALSNDSTATE_STREAMING,
+	WALSNDSTATE_STOPPING
 } WalSndState;
 
 /*
@@ -35,9 +36,9 @@ typedef struct WalSnd
 	pid_t		pid;			/* this walsender's process id, or 0 */
 	WalSndState state;			/* this walsender's state */
 	XLogRecPtr	sentPtr;		/* WAL has been sent up to this point */
+	bool		sendKeepalive;	/* do we send keepalives on this connection? */
 	bool		needreload;		/* does currently-open file need to be
 								 * reloaded? */
-	bool		sendKeepalive;	/* do we send keepalives on this connection? */
 
 	/*
 	 * The xlog locations that have been written, flushed, and applied by
@@ -67,14 +68,20 @@ typedef struct WalSnd
 	 */
 	XLogRecPtr	xlogCleanUpTo;
 
+	/*
+	 * Records time, either during initialization or due to disconnection.
+	 * This helps to detect time passed since mirror didn't connect.
+	 */
+	pg_time_t   replica_disconnected_at;
+
 	/* Protects shared variables shown above. */
 	slock_t		mutex;
 
 	/*
-	 * Latch used by backends to wake up this walsender when it has work to
-	 * do.
+	 * Pointer to the walsender's latch. Used by backends to wake up this
+	 * walsender when it has work to do. NULL if the walsender isn't active.
 	 */
-	Latch		latch;
+	Latch	   *latch;
 
 	/*
 	 * The priority order of the standby managed by this WALSender, as listed
@@ -83,10 +90,20 @@ typedef struct WalSnd
 	 */
 	int			sync_standby_priority;
 
-	bool		synchronous;
+	/*
+	 * Indicates whether the WalSnd represents a connection with a Greenplum
+	 * mirror in streaming mode
+	 */
+	bool 		is_for_gp_walreceiver;
 } WalSnd;
 
 extern WalSnd *MyWalSnd;
+
+typedef enum
+{
+	WALSNDERROR_NONE = 0,
+	WALSNDERROR_WALREAD
+} WalSndError;
 
 /* There is one WalSndCtl struct for the whole database cluster */
 typedef struct
@@ -124,14 +141,26 @@ typedef struct
 	 */
 	XLogRecPtr	walsnd_xlogCleanUpTo;
 
-	WalSnd		walsnds[1];		/* VARIABLE LENGTH ARRAY */
+	/*
+	 * Indicate error state of WalSender, for example, missing XLOG for mirror
+	 * to stream.
+	 *
+	 * Note: If we want to support multiple mirrors, this data structure
+	 * need to be redesigned (e.g. using WalSndError[]). We cannot store this
+	 * field in the walsnds[] array below, because the walsnds[] only
+	 * tracks the live wal senders. Hence, if the wal sender goes away
+	 * with certain error, the error state will go away with it.
+	 *
+	 */
+	WalSndError error;
+
+	WalSnd		walsnds[FLEXIBLE_ARRAY_MEMBER];
 } WalSndCtlData;
 
 extern WalSndCtlData *WalSndCtl;
 
 
 extern void WalSndSetState(WalSndState state);
-extern void XLogRead(char *buf, XLogRecPtr startptr, Size count);
 
 /*
  * Internal functions for parsing the replication grammar, in repl_gram.y and
@@ -139,10 +168,12 @@ extern void XLogRead(char *buf, XLogRecPtr startptr, Size count);
  */
 extern int	replication_yyparse(void);
 extern int	replication_yylex(void);
-extern void replication_yyerror(const char *str);
+extern void replication_yyerror(const char *str) pg_attribute_noreturn();
 extern void replication_scanner_init(const char *query_string);
 extern void replication_scanner_finish(void);
 
 extern Node *replication_parse_result;
+
+#define GP_WALRECEIVER_APPNAME "gp_walreceiver"
 
 #endif   /* _WALSENDER_PRIVATE_H */

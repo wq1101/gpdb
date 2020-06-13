@@ -1,11 +1,16 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/drop_tablespace.sgml,v 1.7 2007/06/03 17:06:13 tgl Exp $
+doc/src/sgml/ref/drop_tablespace.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-DROPTABLESPACE">
+ <indexterm zone="sql-droptablespace">
+  <primary>DROP TABLESPACE</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="SQL-DROPTABLESPACE-TITLE">DROP TABLESPACE</refentrytitle>
+  <refentrytitle>DROP TABLESPACE</refentrytitle>
+  <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
 
@@ -14,13 +19,9 @@ PostgreSQL documentation
   <refpurpose>remove a tablespace</refpurpose>
  </refnamediv>
 
- <indexterm zone="sql-droptablespace">
-  <primary>DROP TABLESPACE</primary>
- </indexterm>
-
  <refsynopsisdiv>
 <synopsis>
-DROP TABLESPACE [ IF EXISTS ] <replaceable class="PARAMETER">tablespacename</replaceable>
+DROP TABLESPACE [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable>
 </synopsis>
  </refsynopsisdiv>
 
@@ -52,14 +53,14 @@ DROP TABLESPACE [ IF EXISTS ] <replaceable class="PARAMETER">tablespacename</rep
     <term><literal>IF EXISTS</literal></term>
     <listitem>
      <para>
-      Do not throw an error if the tablespace does not exist. A notice is issued 
+      Do not throw an error if the tablespace does not exist. A notice is issued
       in this case.
      </para>
     </listitem>
    </varlistentry>
 
    <varlistentry>
-    <term><replaceable class="PARAMETER">tablespacename</replaceable></term>
+    <term><replaceable class="PARAMETER">name</replaceable></term>
     <listitem>
      <para>
       The name of a tablespace.
@@ -85,8 +86,7 @@ DROP TABLESPACE [ IF EXISTS ] <replaceable class="PARAMETER">tablespacename</rep
    To remove tablespace <literal>mystuff</literal> from the system:
 <programlisting>
 DROP TABLESPACE mystuff;
-</programlisting>
-  </para>
+</programlisting></para>
  </refsect1>
 
  <refsect1>
@@ -102,8 +102,8 @@ DROP TABLESPACE mystuff;
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-createtablespace" endterm="sql-createtablespace-title"></member>
-   <member><xref linkend="sql-altertablespace" endterm="sql-altertablespace-title"></member>
+   <member><xref linkend="sql-createtablespace"></member>
+   <member><xref linkend="sql-altertablespace"></member>
   </simplelist>
  </refsect1>
 

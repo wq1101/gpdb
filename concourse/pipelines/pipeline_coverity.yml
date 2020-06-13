@@ -1,3 +1,9 @@
+resource_types:
+- name: gcs
+  type: docker-image
+  source:
+    repository: frodenas/gcs-resource
+
 resources:
 - name: gpdb_src
   type: git
@@ -20,6 +26,20 @@ resources:
     start: 4:00 AM
     stop: 5:00 AM
 
+- name: libquicklz-centos7
+  type: gcs
+  source:
+    bucket: ((gcs-bucket))
+    json_key: ((concourse-gcs-resources-service-account-key)))
+    regexp: gp-internal-artifacts/centos7/libquicklz-(1\.5\.0-.*)-1.el7.x86_64.rpm
+
+- name: libquicklz-devel-centos7
+  type: gcs
+  source:
+    bucket: ((gcs-bucket))
+    json_key: ((concourse-gcs-resources-service-account-key))
+    regexp: gp-internal-artifacts/centos7/libquicklz-devel-(1\.5\.0-.*)-1.el7.x86_64.rpm
+
 jobs:
 
 - name: coverity_scan
@@ -29,13 +49,13 @@ jobs:
   - aggregate:
     - get: gpdb_src
     - get: centos-coverity
+    - get: libquicklz-installer
+      resource: libquicklz-centos7
+    - get: libquicklz-devel-installer
+      resource: libquicklz-devel-centos7
   - task: scan_with_coverity
     file: gpdb_src/concourse/tasks/scan_with_coverity.yml
     image: centos-coverity
     params:
-      IVYREPO_HOST: {{ivyrepo_host}}
-      IVYREPO_REALM: {{ivyrepo_realm}}
-      IVYREPO_USER: {{ivyrepo_user}}
-      IVYREPO_PASSWD: {{ivyrepo_passwd}}
       COVERITY_TOKEN: {{coverity_token}}
       COVERITY_EMAIL: {{coverity_email}}

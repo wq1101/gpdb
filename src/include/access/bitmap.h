@@ -6,7 +6,7 @@
  * Copyright (c) 2006-2008, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
- *	$PostgreSQL$
+ *	src/include/access/bitmap.h
  *
  *-------------------------------------------------------------------------
  */
@@ -14,13 +14,11 @@
 #ifndef BITMAP_H
 #define BITMAP_H
 
+#include "access/genam.h"
 #include "access/htup.h"
-#include "access/itup.h"
-#include "access/relscan.h"
-#include "access/sdir.h"
+#include "access/xlog.h"
 #include "access/xlogutils.h"
-#include "storage/lock.h"
-#include "miscadmin.h"
+#include "utils/hsearch.h"
 
 #define BM_READ		BUFFER_LOCK_SHARE
 #define BM_WRITE	BUFFER_LOCK_EXCLUSIVE
@@ -40,6 +38,9 @@ typedef uint64			BM_HRL_WORD;
 
 #define BITMAP_VERSION 2
 #define BITMAP_MAGIC 0x4249544D
+
+/* This file can not and should not depend on execnodes.h */
+struct IndexInfo;
 
 /*
  * Metapage, always the first page (page 0) in the index.
@@ -320,19 +321,6 @@ typedef struct BMTidBuildBuf
 #define WORDNO_GET_HEADER_BIT(cw_no) \
 	((BM_HRL_WORD)1 << (BM_HRL_WORD_SIZE - 1 - ((cw_no) % BM_HRL_WORD_SIZE)))
 
-/*
- * To see if the content word at n is a compressed word or not we must look
- * look in the header words h_words. Each bit in the header words corresponds
- * to a word amongst the content words. If the bit is 1, the word is compressed
- * (i.e., it is a fill word) otherwise it is uncompressed.
- *
- * See src/backend/access/bitmap/README for more details
- */
-
-#define IS_FILL_WORD(h, n) \
-	(bool) ((((h)[(n)/BM_HRL_WORD_SIZE]) & (WORDNO_GET_HEADER_BIT(n))) > 0 ? \
-			true : false)
-
 /* A simplified interface to IS_FILL_WORD */
 
 #define CUR_WORD_IS_FILL(b) \
@@ -378,9 +366,6 @@ typedef struct BMTIDBuffer
 	uint64			last_tid;	/* most recent tid added */
 	int16			curword; /* index into content */
 	int16			num_cwords;	/* number of allocated words in content */
-
-	/* the starting array index that contains useful content words */
-	int16           start_wordno;
 
 	/* the last tids, one for each actual data words */
 	uint64         *last_tids;
@@ -554,21 +539,42 @@ typedef struct BMScanOpaqueData
 typedef BMScanOpaqueData *BMScanOpaque;
 
 /*
+ * To see if the content word at wordno is a compressed word or not we must look
+ * in the header words. Each bit in the header words corresponds to a word
+ * amongst the content words. If the bit is 1, the word is compressed (i.e., it
+ * is a fill word) otherwise it is uncompressed.
+ *
+ * See src/backend/access/bitmap/README for more details
+ */
+static inline bool
+IS_FILL_WORD(const BM_HRL_WORD *words, int16 wordno)
+{
+	return (words[wordno / BM_HRL_WORD_SIZE] & WORDNO_GET_HEADER_BIT(wordno)) > 0;
+}
+
+/*
  * XLOG records for bitmap index operations
  *
  * Some information in high 4 bits of log record xl_info field.
  */
-#define XLOG_BITMAP_INSERT_NEWLOV	0x10 /* add a new LOV page */
+/* 0x10 is unused */
 #define XLOG_BITMAP_INSERT_LOVITEM	0x20 /* add a new entry into a LOV page */
 #define XLOG_BITMAP_INSERT_META		0x30 /* update the metapage */
 #define XLOG_BITMAP_INSERT_BITMAP_LASTWORDS	0x40 /* update the last 2 words
 													in a bitmap */
 /* insert bitmap words into a bitmap page which is not the last one. */
 #define XLOG_BITMAP_INSERT_WORDS		0x50
-/* insert bitmap words to the last bitmap page and the lov buffer */
-#define XLOG_BITMAP_INSERT_LASTWORDS	0x60
+/* 0x60 is unused */
 #define XLOG_BITMAP_UPDATEWORD			0x70
 #define XLOG_BITMAP_UPDATEWORDS			0x80
+
+/*
+ * Maximum number of inserts that can be done in one WAL-logged operation.
+ * This is a conservative estimate, I think the code actually flushes the
+ * insert buffer whenever it has more than 1 page's worth of data, so
+ * we could get away with 2 here. But better safe than sorry.
+ */
+#define MAX_BITMAP_PAGES_PER_INSERT	10
 
 /*
  * The information about writing bitmap words to last bitmap page
@@ -577,15 +583,15 @@ typedef BMScanOpaqueData *BMScanOpaque;
 typedef struct xl_bm_bitmapwords
 {
 	RelFileNode 	bm_node;
-	ItemPointerData bm_persistentTid;
-	int64 			bm_persistentSerialNum;
+	int32			bm_num_pages;
 
-	/* The block number for the bitmap page */
-	BlockNumber		bm_blkno;
-	/* The next block number for this bitmap page */
-	BlockNumber		bm_next_blkno;
-	/* The last tid location for this bitmap page */
-	uint64			bm_last_tid;
+	/*
+	 * If true, the first page is initialized from scratch. Otherwise it is
+	 * an existing page, stored as backup block #1. (All subsequent pages
+	 * are implicitly initialized.)
+	 */
+	bool			bm_init_first_page;
+
 	/*
 	 * The block number and offset for the lov page that is associated
 	 * with this bitmap page.
@@ -599,44 +605,37 @@ typedef struct xl_bm_bitmapwords
 	uint8			lov_words_header;
 	uint64			bm_last_setbit;
 
-	/*
-	 * Indicate if these bitmap words are stored in the last bitmap
-	 * page and the lov buffer.
-	 */
-	bool			bm_is_last;
+	/*  bm_num_pages xl_bm_bitmapwords_perpage structs follow */
 
-	/*
-	 * Indicate if this is the first time to insert into a bitmap
-	 * page.
-	 */
-	bool			bm_is_first;
+} xl_bm_bitmapwords;
+
+typedef struct xl_bm_bitmapwords_perpage
+{
+	/* The block number for the bitmap page */
+	BlockNumber		bmp_blkno;
+
+	/* The last tid location for this bitmap page */
+	uint64			bmp_last_tid;
 
 	/*
 	 * The words stored in the following array to be written to this
 	 * bitmap page.
 	 */
-	uint64			bm_start_wordno;
-	uint64			bm_words_written;
+	uint16			bmp_start_hword_no;
+	uint16			bmp_num_hwords;
+	uint16			bmp_start_cword_no;
+	uint16			bmp_num_cwords;
 
 	/*
-	 * Total number of new bitmap words. We need to log all new words
-	 * to be able to do recovery.
+	 * The following are arrays of content words and header
+	 * words, at next MAXALIGN boundary. They are located one after the other.
+	 * They are omitted, if a full-page-image of the page is created.
 	 */
-	uint64			bm_num_cwords;
-
-	/*
-	 * The following are arrays of last tids, content words, and header
-	 * words. They are located one after the other. There are bm_num_cwords
-	 * of last tids and content words, and BM_CALC_H_WORDS(bm_num_cwords)
-	 * header words.
-	 */
-} xl_bm_bitmapwords;
+} xl_bm_bitmapwords_perpage;
 
 typedef struct xl_bm_updatewords
 {
 	RelFileNode		bm_node;
-	ItemPointerData bm_persistentTid;
-	int64 			bm_persistentSerialNum;
 
 	BlockNumber		bm_lov_blkno;
 	OffsetNumber	bm_lov_offset;
@@ -666,8 +665,6 @@ typedef struct xl_bm_updatewords
 typedef struct xl_bm_updateword
 {
 	RelFileNode		bm_node;
-	ItemPointerData bm_persistentTid;
-	int64 			bm_persistentSerialNum;
 
 	BlockNumber		bm_blkno;
 	int				bm_word_no;
@@ -679,8 +676,7 @@ typedef struct xl_bm_updateword
 typedef struct xl_bm_lovitem
 {
 	RelFileNode 	bm_node;
-	ItemPointerData bm_persistentTid;
-	int64 			bm_persistentSerialNum;
+	ForkNumber		bm_fork;
 
 	BlockNumber		bm_lov_blkno;
 	OffsetNumber	bm_lov_offset;
@@ -692,9 +688,6 @@ typedef struct xl_bm_lovitem
 typedef struct xl_bm_newpage
 {
 	RelFileNode 	bm_node;
-	ItemPointerData bm_persistentTid;
-	int64 			bm_persistentSerialNum;
-
 	BlockNumber		bm_new_blkno;
 } xl_bm_newpage;
 
@@ -705,8 +698,6 @@ typedef struct xl_bm_newpage
 typedef struct xl_bm_bitmappage
 {
 	RelFileNode 	bm_node;
-	ItemPointerData bm_persistentTid;
-	int64 			bm_persistentSerialNum;
 
 	BlockNumber		bm_bitmap_blkno;
 
@@ -725,8 +716,6 @@ typedef struct xl_bm_bitmappage
 typedef struct xl_bm_bitmap_lastwords
 {
 	RelFileNode 	bm_node;
-	ItemPointerData bm_persistentTid;
-	int64 			bm_persistentSerialNum;
 
 	BM_HRL_WORD		bm_last_compword;
 	BM_HRL_WORD		bm_last_word;
@@ -742,9 +731,7 @@ typedef struct xl_bm_bitmap_lastwords
 typedef struct xl_bm_metapage
 {
 	RelFileNode 	bm_node;
-	ItemPointerData bm_persistentTid;
-	int64 			bm_persistentSerialNum;
-
+	ForkNumber		bm_fork;
 	Oid				bm_lov_heapId;		/* the relation id for the heap */
 	Oid				bm_lov_indexId;		/* the relation id for the index */
 	/* the block number for the last LOV pages. */
@@ -752,18 +739,30 @@ typedef struct xl_bm_metapage
 } xl_bm_metapage;
 
 /* public routines */
-extern Datum bmbuild(PG_FUNCTION_ARGS);
-extern Datum bminsert(PG_FUNCTION_ARGS);
-extern Datum bmbeginscan(PG_FUNCTION_ARGS);
-extern Datum bmgettuple(PG_FUNCTION_ARGS);
-extern Datum bmgetmulti(PG_FUNCTION_ARGS);
-extern Datum bmrescan(PG_FUNCTION_ARGS);
-extern Datum bmendscan(PG_FUNCTION_ARGS);
-extern Datum bmmarkpos(PG_FUNCTION_ARGS);
-extern Datum bmrestrpos(PG_FUNCTION_ARGS);
-extern Datum bmbulkdelete(PG_FUNCTION_ARGS);
-extern Datum bmvacuumcleanup(PG_FUNCTION_ARGS);
-extern Datum bmoptions(PG_FUNCTION_ARGS);
+extern Datum bmhandler(PG_FUNCTION_ARGS);
+extern IndexBuildResult *bmbuild(Relation heap, Relation index,
+		struct IndexInfo *indexInfo);
+extern void bmbuildempty(Relation index);
+extern bool bminsert(Relation rel, Datum *values, bool *isnull,
+		 ItemPointer ht_ctid, Relation heapRel,
+		 IndexUniqueCheck checkUnique);
+extern IndexScanDesc bmbeginscan(Relation rel, int nkeys, int norderbys);
+extern bool bmgettuple(IndexScanDesc scan, ScanDirection dir);
+extern Node *bmgetbitmap(IndexScanDesc scan, Node *tbm);
+extern void bmrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
+		 ScanKey orderbys, int norderbys);
+extern void bmendscan(IndexScanDesc scan);
+extern void bmmarkpos(IndexScanDesc scan);
+extern void bmrestrpos(IndexScanDesc scan);
+extern IndexBulkDeleteResult *bmbulkdelete(IndexVacuumInfo *info,
+			 IndexBulkDeleteResult *stats,
+			 IndexBulkDeleteCallback callback,
+			 void *callback_state);
+extern IndexBulkDeleteResult *bmvacuumcleanup(IndexVacuumInfo *info,
+				IndexBulkDeleteResult *stats);
+extern bool bmcanreturn(Relation index, int attno);
+extern bytea *bmoptions(Datum reloptions, bool validate);
+extern bool bmvalidate(Oid opclassoid);
 
 extern void GetBitmapIndexAuxOids(Relation index, Oid *heapId, Oid *indexId);
 
@@ -772,10 +771,10 @@ extern Buffer _bitmap_getbuf(Relation rel, BlockNumber blkno, int access);
 extern void _bitmap_wrtbuf(Buffer buf);
 extern void _bitmap_relbuf(Buffer buf);
 extern void _bitmap_init_lovpage(Relation rel, Buffer buf);
-extern void _bitmap_init_bitmappage(Relation rel, Buffer buf);
+extern void _bitmap_init_bitmappage(Page page);
 extern void _bitmap_init_buildstate(Relation index, BMBuildState* bmstate);
 extern void _bitmap_cleanup_buildstate(Relation index, BMBuildState* bmstate);
-extern void _bitmap_init(Relation indexrel, bool use_wal);
+extern void _bitmap_init(Relation indexrel, bool use_wal, bool for_empty);
 
 /* bitmapinsert.c */
 extern void _bitmap_buildinsert(Relation rel, ItemPointerData ht_ctid, 
@@ -785,13 +784,6 @@ extern void _bitmap_doinsert(Relation rel, ItemPointerData ht_ctid,
 							 Datum *attdata, bool *nulls);
 extern void _bitmap_write_alltids(Relation rel, BMTidBuildBuf *tids,
 						  		  bool use_wal);
-extern uint64 _bitmap_write_bitmapwords(Buffer bitmapBuffer,
-								BMTIDBuffer* buf);
-extern void _bitmap_write_new_bitmapwords(
-	Relation rel,
-	Buffer lovBuffer, OffsetNumber lovOffset,
-	BMTIDBuffer* buf, bool use_wal);
-extern uint16 _bitmap_free_tidbuf(BMTIDBuffer* buf);
 
 /* bitmaputil.c */
 extern BMLOVItem _bitmap_formitem(uint64 currTidNumber);
@@ -815,22 +807,24 @@ extern void _bitmap_intersect(BMBatchWords **batches, uint32 numBatches,
 extern void _bitmap_union(BMBatchWords **batches, uint32 numBatches,
 					   BMBatchWords *result);
 extern void _bitmap_begin_iterate(BMBatchWords *words, BMIterateResult *result);
-extern void _bitmap_log_newpage(Relation rel, uint8 info, Buffer buf);
-extern void _bitmap_log_metapage(Relation rel, Page page);
+extern void _bitmap_log_metapage(Relation rel, ForkNumber fork, Page page);
 extern void _bitmap_log_bitmap_lastwords(Relation rel, Buffer lovBuffer,
 									 OffsetNumber lovOffset, BMLOVItem lovItem);
-extern void _bitmap_log_lovitem	(Relation rel, Buffer lovBuffer,
+extern void _bitmap_log_lovitem	(Relation rel, ForkNumber fork, Buffer lovBuffer,
 								 OffsetNumber offset, BMLOVItem lovItem,
 								 Buffer metabuf,  bool is_new_lov_blkno);
-extern void _bitmap_log_bitmapwords(Relation rel, Buffer bitmapBuffer, Buffer lovBuffer,
-						OffsetNumber lovOffset, BMTIDBuffer* buf,
-						uint64 words_written, uint64 tidnum, BlockNumber nextBlkno,
-						bool isLast, bool isFirst);
+extern void _bitmap_log_bitmapwords(Relation rel, BMTIDBuffer *buf,
+						bool init_first_page, List *xl_bm_bitmapwords, List *bitmapBuffers,
+						Buffer lovBuffer, OffsetNumber lovOffset, uint64 tidnum);
 extern void _bitmap_log_updatewords(Relation rel,
 						Buffer lovBuffer, OffsetNumber lovOffset,
 						Buffer firstBuffer, Buffer secondBuffer,
 						bool new_lastpage);
 extern void _bitmap_log_updateword(Relation rel, Buffer bitmapBuffer, int word_no);
+
+#ifdef DUMP_BITMAPAM_INSERT_RECORDS
+extern void _dump_page(char *file, XLogRecPtr recptr, RelFileNode *relfilenode, Buffer buf);
+#endif
 
 /* bitmapsearch.c */
 extern bool _bitmap_first(IndexScanDesc scan, ScanDirection dir);
@@ -860,10 +854,12 @@ extern bool _bitmap_findvalue(Relation lovHeap, Relation lovIndex,
 /*
  * prototypes for functions in bitmapxlog.c
  */
-extern void bitmap_redo(XLogRecPtr beginLoc, XLogRecPtr lsn, XLogRecord *record);
-extern void bitmap_desc(StringInfo buf, XLogRecPtr beginLoc, XLogRecord *record);
-extern void bitmap_xlog_startup(void);
-extern void bitmap_xlog_cleanup(void);
-extern bool bitmap_safe_restartpoint(void);
+extern void bitmap_redo(XLogReaderState *record);
+extern void bitmap_desc(StringInfo buf, XLogReaderState *record);
+extern const char *bitmap_identify(uint8 info);
+
+/* reloptions.c */
+#define BITMAP_MIN_FILLFACTOR		10
+#define BITMAP_DEFAULT_FILLFACTOR	100
 
 #endif

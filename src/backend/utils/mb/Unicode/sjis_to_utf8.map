@@ -1,4 +1,6 @@
-static pg_local_to_utf LUmapSJIS[ 7787 ] = {
+/* src/backend/utils/mb/Unicode/sjis_to_utf8.map */
+
+static const pg_local_to_utf LUmapSJIS[ 7787 ] = {
   {0x00a1, 0xefbda1},
   {0x00a2, 0xefbda2},
   {0x00a3, 0xefbda3},

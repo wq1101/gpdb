@@ -1,11 +1,16 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/create_tsparser.sgml,v 1.1 2007/08/21 21:08:47 tgl Exp $
+doc/src/sgml/ref/create_tsparser.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-CREATETSPARSER">
+ <indexterm zone="sql-createtsparser">
+  <primary>CREATE TEXT SEARCH PARSER</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="sql-createtsparser-title">CREATE TEXT SEARCH PARSER</refentrytitle>
+  <refentrytitle>CREATE TEXT SEARCH PARSER</refentrytitle>
+  <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
 
@@ -13,10 +18,6 @@ PostgreSQL documentation
   <refname>CREATE TEXT SEARCH PARSER</refname>
   <refpurpose>define a new text search parser</refpurpose>
  </refnamediv>
-
- <indexterm zone="sql-createtsparser">
-  <primary>CREATE TEXT SEARCH PARSER</primary>
- </indexterm>
 
  <refsynopsisdiv>
 <synopsis>
@@ -57,7 +58,7 @@ CREATE TEXT SEARCH PARSER <replaceable class="parameter">name</replaceable> (
    Refer to <xref linkend="textsearch"> for further information.
   </para>
  </refsect1>
-  
+
  <refsect1>
   <title>Parameters</title>
 
@@ -130,7 +131,7 @@ CREATE TEXT SEARCH PARSER <replaceable class="parameter">name</replaceable> (
    The arguments can appear in any order, not only the one shown above.
   </para>
  </refsect1>
- 
+
  <refsect1>
   <title>Compatibility</title>
 
@@ -145,8 +146,8 @@ CREATE TEXT SEARCH PARSER <replaceable class="parameter">name</replaceable> (
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-altertsparser" endterm="sql-altertsparser-title"></member>
-   <member><xref linkend="sql-droptsparser" endterm="sql-droptsparser-title"></member>
+   <member><xref linkend="sql-altertsparser"></member>
+   <member><xref linkend="sql-droptsparser"></member>
   </simplelist>
  </refsect1>
 </refentry>

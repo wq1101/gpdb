@@ -42,7 +42,6 @@ class StartSegmentsResult:
     def __init__(self):
         self.__successfulSegments = []
         self.__failedSegments = []
-        pass
 
     def getSuccessfulSegments(self):
         return self.__successfulSegments[:]
@@ -58,7 +57,7 @@ class StartSegmentsResult:
 
     def addFailure(self, segment, reason, reasonCode):
         self.__failedSegments.append(FailedSegmentResult(segment, reason, reasonCode))
-        
+
     def clearSuccessfulSegments(self):
         self.__successfulSegments = []
 
@@ -67,18 +66,17 @@ class StartSegmentsOperation:
        This operation, to be run from the master, will start the segments up
             and, if necessary, convert them to the proper mode
 
-       Note that this can be used to start only a subset of the segments 
+       Note that this can be used to start only a subset of the segments
 
     """
 
-    def __init__(self, workerPool, quiet, localeData, gpVersion, 
-                 gpHome, masterDataDirectory, timeout=SEGMENT_TIMEOUT_DEFAULT,
-                 specialMode=None, wrapper=None, wrapper_args=None,
+    def __init__(self, workerPool, quiet, gpVersion,
+                 gpHome, masterDataDirectory, master_checksum_value=None, timeout=SEGMENT_TIMEOUT_DEFAULT,
+                 specialMode=None, wrapper=None, wrapper_args=None, parallel=gp.DEFAULT_GPSTART_NUM_WORKERS,
                  logfileDirectory=False):
         checkNotNone("workerPool", workerPool)
         self.__workerPool = workerPool
         self.__quiet = quiet
-        self.__localeData = localeData
         self.__gpVersion = gpVersion
         self.__gpHome = gpHome
         self.__masterDataDirectory = masterDataDirectory
@@ -87,6 +85,8 @@ class StartSegmentsOperation:
         self.__specialMode = specialMode
         self.__wrapper = wrapper
         self.__wrapper_args = wrapper_args
+        self.__parallel = parallel
+        self.master_checksum_value = master_checksum_value
         self.logfileDirectory = logfileDirectory
 
     def startSegments(self, gpArray, segments, startMethod, era):
@@ -150,21 +150,6 @@ class StartSegmentsOperation:
         assert totalToAttempt == len(result.getFailedSegmentObjs()) + len(result.getSuccessfulSegments())
         return result
 
-    def transitionSegments(self, gpArray, segments, convertUsingFullResync, mirrorMode):
-        """
-        gpArray: the system to which the segments to start belong
-        segments: the list of segments to be transitioned
-        convertUsingFullResync: in parallel with segments, gives true/false for whether fullResync flag should be passed
-        mirrorMode: should be one of the MIRROR_MODE_* constant values
-
-        """
-
-        result = StartSegmentsResult()
-        self.__sendPrimaryMirrorTransition(mirrorMode, segments, convertUsingFullResync, gpArray, result)
-        
-        assert len(segments) == len(result.getFailedSegmentObjs()) + len(result.getSuccessfulSegments())
-        return result
-
     def __runStartCommand(self, segments, startMethod, numContentsInCluster, resultOut, gpArray, era):
         """
         Putt results into the resultOut object
@@ -177,7 +162,6 @@ class StartSegmentsOperation:
             logger.info("Commencing parallel primary and mirror segment instance startup, please wait...")
         else:
             logger.info("Commencing parallel segment instance startup, please wait...")
-        dispatchCount=0
 
         dbIdToPeerMap = gpArray.getDbIdToPeerMap()
 
@@ -200,11 +184,12 @@ class StartSegmentsOperation:
             # This will call sbin/gpsegstart.py
             #
             cmd = gp.GpSegStartCmd("remote segment starts on host '%s'" % hostName,
-                                   self.__gpHome, segments, self.__localeData,
+                                   self.__gpHome, segments,
                                    self.__gpVersion,
                                    mirroringModePreTransition,
                                    numContentsInCluster,
                                    era,
+                                   self.master_checksum_value,
                                    self.__timeout,
                                    verbose=logging_is_verbose(),
                                    ctxt=base.REMOTE,
@@ -213,11 +198,14 @@ class StartSegmentsOperation:
                                    specialMode=self.__specialMode,
                                    wrapper=self.__wrapper,
                                    wrapper_args=self.__wrapper_args,
+                                   parallel=self.__parallel,
                                    logfileDirectory=self.logfileDirectory)
             self.__workerPool.addCommand(cmd)
-            dispatchCount+=1
 
-        self.__workerPool.wait_and_printdots(dispatchCount, self.__quiet)
+        if self.__quiet:
+            self.__workerPool.join()
+        else:
+            base.join_and_indicate_progress(self.__workerPool)
 
         # process results
         self.__processStartOrConvertCommands(resultOut)
@@ -230,7 +218,6 @@ class StartSegmentsOperation:
             # error code 0 mean all good, 1 means it ran but at least one thing failed
                 cmdout = cmd.get_results().stdout
                 lines=cmdout.split('\n')
-
                 for line in lines:
                     if line.startswith("STATUS"):
                         fields=line.split('--')
@@ -283,9 +270,7 @@ class StartSegmentsOperation:
             dbData["dbid"] = db.getSegmentDbId()
             dbData["mode"] = db.getSegmentMode()
             dbData["hostName"] = db.getSegmentAddress()
-            dbData["hostPort"] = db.getSegmentReplicationPort()
             dbData["peerName"] = peer.getSegmentAddress()
-            dbData["peerPort"] = peer.getSegmentReplicationPort()
             dbData["peerPMPort"] = peer.getSegmentPort()
             dbData["fullResyncFlag"] = db.getSegmentDbId() in dbIdToFullResync
             dbData["targetMode"] = targetModePerSegment[i]
@@ -293,49 +278,4 @@ class StartSegmentsOperation:
             hostData["dbsByPort"][db.getSegmentPort()] = dbData
 
         return base64.urlsafe_b64encode(pickle.dumps(hostData))
-
-    def __sendPrimaryMirrorTransition(self, targetMode, segments, convertUsingFullResync, gpArray, resultOut):
-        """
-            @param segments the segments to convert
-            @param convertUsingFullResync in parallel with segments, may be None, gives true/false for whether fullResync
-                                          flag should be passed to the transition
-        """
-
-        if len(segments) == 0:
-            logger.debug("%s conversion of zero segments...skipping" % targetMode)
-            return
-
-        logger.info("Commencing parallel %s conversion of %s segments, please wait..." % (targetMode, len(segments)))
-
-        ###############################################
-        # for each host, create + transfer the transition arguments file
-        dispatchCount=0
-
-        dbIdToPeerMap = gpArray.getDbIdToPeerMap()
-        segmentsByHostName = GpArray.getSegmentsByHostName(segments)
-        for hostName, segments in segmentsByHostName.iteritems():
-            assert len(segments) > 0
-
-            logger.debug("Dispatching command to convert segments on host: %s " % (hostName))
-
-            targetModePerSegment = [targetMode for seg in segments]
-            pickledParams = self.__createPickledTransitionParameters(segments, targetModePerSegment,
-                                        convertUsingFullResync, dbIdToPeerMap)
-
-            address = segments[0].getSegmentAddress()
-            cmd=gp.GpSegChangeMirrorModeCmd(
-                    "remote segment mirror mode conversion on host '%s' using address '%s'" % (hostName, address),
-                    self.__gpHome, self.__localeData, self.__gpVersion,
-                    segments, targetMode, pickledParams, verbose=logging_is_verbose(),
-                    ctxt=base.REMOTE,
-                    remoteHost=address)
-            self.__workerPool.addCommand(cmd)
-            dispatchCount+=1
-        self.__workerPool.wait_and_printdots(dispatchCount,self.__quiet)
-
-        # process results
-        self.__processStartOrConvertCommands(resultOut)
-        self.__workerPool.empty_completed_items()
-
-
 

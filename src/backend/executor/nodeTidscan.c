@@ -3,12 +3,12 @@
  * nodeTidscan.c
  *	  Routines to support direct tid scans of relations
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/executor/nodeTidscan.c,v 1.58.2.1 2008/04/30 23:28:37 tgl Exp $
+ *	  src/backend/executor/nodeTidscan.c
  *
  *-------------------------------------------------------------------------
  */
@@ -17,21 +17,20 @@
  *
  *		ExecTidScan			scans a relation using tids
  *		ExecInitTidScan		creates and initializes state info.
- *		ExecTidReScan		rescans the tid relation.
+ *		ExecReScanTidScan	rescans the tid relation.
  *		ExecEndTidScan		releases all storage.
- *		ExecTidMarkPos		marks scan position.
- *		ExecTidRestrPos		restores scan position.
  */
 #include "postgres.h"
 
-#include "access/heapam.h"
+#include "access/sysattr.h"
 #include "catalog/pg_type.h"
 #include "cdb/cdbvars.h"
 #include "executor/execdebug.h"
 #include "executor/nodeTidscan.h"
 #include "optimizer/clauses.h"
+#include "storage/bufmgr.h"
 #include "utils/array.h"
-#include "parser/parsetree.h"
+#include "utils/rel.h"
 
 
 #define IsCTIDVar(node)  \
@@ -63,10 +62,10 @@ TidListCreate(TidScanState *tidstate)
 	ListCell   *l;
 
 	/*
-	 * We silently discard any TIDs that are out of range at the time of
-	 * scan start.  (Since we hold at least AccessShareLock on the table,
-	 * it won't be possible for someone to truncate away the blocks we
-	 * intend to visit.)
+	 * We silently discard any TIDs that are out of range at the time of scan
+	 * start.  (Since we hold at least AccessShareLock on the table, it won't
+	 * be possible for someone to truncate away the blocks we intend to
+	 * visit.)
 	 */
 	nblocks = RelationGetNumberOfBlocks(tidstate->ss.ss_currentRelation);
 
@@ -259,7 +258,6 @@ TidNext(TidScanState *node)
 	Relation	heapRelation;
 	HeapTuple	tuple;
 	TupleTableSlot *slot;
-	Index		scanrelid;
 	Buffer		buffer = InvalidBuffer;
 	ItemPointerData *tidList;
 	int			numTids;
@@ -273,37 +271,6 @@ TidNext(TidScanState *node)
 	snapshot = estate->es_snapshot;
 	heapRelation = node->ss.ss_currentRelation;
 	slot = node->ss.ss_ScanTupleSlot;
-	scanrelid = ((TidScan *) node->ss.ps.plan)->scan.scanrelid;
-
-	/*
-	 * Check if we are evaluating PlanQual for tuple of this relation.
-	 * Additional checking is not good, but no other way for now. We could
-	 * introduce new nodes for this case and handle TidScan --> NewNode
-	 * switching in Init/ReScan plan...
-	 */
-	if (estate->es_evTuple != NULL &&
-		estate->es_evTuple[scanrelid - 1] != NULL)
-	{
-		if (estate->es_evTupleNull[scanrelid - 1])
-			return ExecClearTuple(slot);
-
-		/*
-		 * XXX shouldn't we check here to make sure tuple matches TID list? In
-		 * runtime-key case this is not certain, is it?  However, in the WHERE
-		 * CURRENT OF case it might not match anyway ...
-		 */
-
-		ExecStoreGenericTuple(estate->es_evTuple[scanrelid - 1], slot, false);
-
-		/* Flag for the next call that no more tuples */
-		estate->es_evTupleNull[scanrelid - 1] = true;
-          	if (!TupIsNull(slot))
-                {
-          		Gpmon_Incr_Rows_Out(GpmonPktFromTidScanState(node));
-                        CheckSendPlanStateGpmonPkt(&node->ss.ps);
-                }
-		return slot;
-	}
 
 	/*
 	 * First time through, compute the list of TIDs to be visited
@@ -389,13 +356,28 @@ TidNext(TidScanState *node)
 	return ExecClearTuple(slot);
 }
 
+/*
+ * TidRecheck -- access method routine to recheck a tuple in EvalPlanQual
+ */
+static bool
+TidRecheck(TidScanState *node, TupleTableSlot *slot)
+{
+	/*
+	 * XXX shouldn't we check here to make sure tuple matches TID list? In
+	 * runtime-key case this is not certain, is it?  However, in the WHERE
+	 * CURRENT OF case it might not match anyway ...
+	 */
+	return true;
+}
+
+
 /* ----------------------------------------------------------------
  *		ExecTidScan(node)
  *
  *		Scans the relation using tids and returns
  *		   the next qualifying tuple in the direction specified.
- *		It calls ExecScan() and passes it the access methods which returns
- *		the next tuple using the tids.
+ *		We call the ExecScan() routine and pass it the appropriate
+ *		access method functions.
  *
  *		Conditions:
  *		  -- the "cursor" maintained by the AMI is positioned at the tuple
@@ -410,45 +392,25 @@ TidNext(TidScanState *node)
 TupleTableSlot *
 ExecTidScan(TidScanState *node)
 {
-	/*
-	 * use TidNext as access method
-	 */
-	return ExecScan(&node->ss, (ExecScanAccessMtd) TidNext);
+	return ExecScan(&node->ss,
+					(ExecScanAccessMtd) TidNext,
+					(ExecScanRecheckMtd) TidRecheck);
 }
 
 /* ----------------------------------------------------------------
- *		ExecTidReScan(node)
+ *		ExecReScanTidScan(node)
  * ----------------------------------------------------------------
  */
 void
-ExecTidReScan(TidScanState *node, ExprContext *exprCtxt)
+ExecReScanTidScan(TidScanState *node)
 {
-	EState	   *estate;
-	Index		scanrelid;
-
-	estate = node->ss.ps.state;
-	scanrelid = ((TidScan *) node->ss.ps.plan)->scan.scanrelid;
-
-	/*node->ss.ps.ps_TupFromTlist = false;*/
-
-	/* If we are being passed an outer tuple, save it for runtime key calc */
-	if (exprCtxt != NULL)
-		node->ss.ps.ps_ExprContext->ecxt_outertuple =
-			exprCtxt->ecxt_outertuple;
-
-	/* If this is re-scanning of PlanQual ... */
-	if (estate->es_evTuple != NULL &&
-		estate->es_evTuple[scanrelid - 1] != NULL)
-	{
-		estate->es_evTupleNull[scanrelid - 1] = false;
-		return;
-	}
-
 	if (node->tss_TidList)
 		pfree(node->tss_TidList);
 	node->tss_TidList = NULL;
 	node->tss_NumTids = 0;
 	node->tss_TidPtr = -1;
+
+	ExecScanReScan(&node->ss);
 }
 
 /* ----------------------------------------------------------------
@@ -476,36 +438,6 @@ ExecEndTidScan(TidScanState *node)
 	 * close the heap relation.
 	 */
 	ExecCloseScanRelation(node->ss.ss_currentRelation);
-
-	EndPlanStateGpmonPkt(&node->ss.ps);
-}
-
-/* ----------------------------------------------------------------
- *		ExecTidMarkPos
- *
- *		Marks scan position by marking the current tid.
- *		Returns nothing.
- * ----------------------------------------------------------------
- */
-void
-ExecTidMarkPos(TidScanState *node)
-{
-	node->tss_MarkTidPtr = node->tss_TidPtr;
-}
-
-/* ----------------------------------------------------------------
- *		ExecTidRestrPos
- *
- *		Restores scan position by restoring the current tid.
- *		Returns nothing.
- *
- *		XXX Assumes previously marked scan position belongs to current tid
- * ----------------------------------------------------------------
- */
-void
-ExecTidRestrPos(TidScanState *node)
-{
-	node->tss_TidPtr = node->tss_MarkTidPtr;
 }
 
 /* ----------------------------------------------------------------
@@ -555,8 +487,6 @@ ExecInitTidScan(TidScan *node, EState *estate, int eflags)
 		ExecInitExpr((Expr *) node->tidquals,
 					 (PlanState *) tidstate);
 
-#define TIDSCAN_NSLOTS 2
-
 	/*
 	 * tuple table initialization
 	 */
@@ -573,7 +503,7 @@ ExecInitTidScan(TidScan *node, EState *estate, int eflags)
 	/*
 	 * open the base relation and acquire appropriate lock on it.
 	 */
-	currentRelation = ExecOpenScanRelation(estate, node->scan.scanrelid);
+	currentRelation = ExecOpenScanRelation(estate, node->scan.scanrelid, eflags);
 
 	tidstate->ss.ss_currentRelation = currentRelation;
 
@@ -588,25 +518,8 @@ ExecInitTidScan(TidScan *node, EState *estate, int eflags)
 	ExecAssignResultTypeFromTL(&tidstate->ss.ps);
 	ExecAssignScanProjectionInfo(&tidstate->ss);
 
-	initGpmonPktForTidScan((Plan *)node, &tidstate->ss.ps.gpmon_pkt, estate);
-
 	/*
 	 * all done.
 	 */
 	return tidstate;
-}
-
-int
-ExecCountSlotsTidScan(TidScan *node)
-{
-	return ExecCountSlotsNode(outerPlan((Plan *) node)) +
-		ExecCountSlotsNode(innerPlan((Plan *) node)) + TIDSCAN_NSLOTS;
-}
-
-void
-initGpmonPktForTidScan(Plan *planNode, gpmon_packet_t *gpmon_pkt, EState *estate)
-{
-	Assert(planNode != NULL && gpmon_pkt != NULL && IsA(planNode, TidScan));
-	
-	InitPlanNodeGpmonPkt(planNode, gpmon_pkt, estate);
 }

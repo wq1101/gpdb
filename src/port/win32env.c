@@ -1,16 +1,15 @@
 /*-------------------------------------------------------------------------
  *
  * win32env.c
- *	  putenv() and unsetenv() for win32, that updates both process
- *	  environment and the cached versions in (potentially multiple)
- *	  MSVCRT.
+ *	  putenv() and unsetenv() for win32, which update both process environment
+ *	  and caches in (potentially multiple) C run-time library (CRT) versions.
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/port/win32env.c,v 1.3 2009/06/11 14:49:15 momjian Exp $
+ *	  src/port/win32env.c
  *
  *-------------------------------------------------------------------------
  */
@@ -24,44 +23,127 @@ pgwin32_putenv(const char *envval)
 	char	   *cp;
 
 	/*
-	 * Each version of MSVCRT has its own _putenv() call in the runtime
-	 * library.
-	 *
-	 * If we're in VC 7.0 or later (means != mingw), update in the 6.0
-	 * MSVCRT.DLL environment as well, to work with third party libraries
-	 * linked against it (such as gnuwin32 libraries).
+	 * Each CRT has its own _putenv() symbol and copy of the environment.
+	 * Update the environment in each CRT module currently loaded, so every
+	 * third-party library sees this change regardless of the CRT it links
+	 * against.
 	 */
-#if defined(_MSC_VER) && (_MSC_VER >= 1300)
+#ifdef _MSC_VER
 	typedef int (_cdecl * PUTENVPROC) (const char *);
-	HMODULE		hmodule;
-	static PUTENVPROC putenvFunc = NULL;
-	int			ret;
-
-	if (putenvFunc == NULL)
+	static struct
 	{
-		hmodule = GetModuleHandle("msvcrt");
-		if (hmodule == NULL)
-			return 1;
-		putenvFunc = (PUTENVPROC) GetProcAddress(hmodule, "_putenv");
-		if (putenvFunc == NULL)
-			return 1;
-	}
-	ret = putenvFunc(envval);
-	if (ret != 0)
-		return ret;
-#endif   /* _MSC_VER >= 1300 */
+		char	   *modulename;
+		HMODULE		hmodule;
+		PUTENVPROC	putenvFunc;
+	}			rtmodules[] =
+	{
+		{
+			"msvcrt", NULL, NULL
+		},						/* Visual Studio 6.0 / MinGW */
+		{
+			"msvcrtd", NULL, NULL
+		},
+		{
+			"msvcr70", NULL, NULL
+		},						/* Visual Studio 2002 */
+		{
+			"msvcr70d", NULL, NULL
+		},
+		{
+			"msvcr71", NULL, NULL
+		},						/* Visual Studio 2003 */
+		{
+			"msvcr71d", NULL, NULL
+		},
+		{
+			"msvcr80", NULL, NULL
+		},						/* Visual Studio 2005 */
+		{
+			"msvcr80d", NULL, NULL
+		},
+		{
+			"msvcr90", NULL, NULL
+		},						/* Visual Studio 2008 */
+		{
+			"msvcr90d", NULL, NULL
+		},
+		{
+			"msvcr100", NULL, NULL
+		},						/* Visual Studio 2010 */
+		{
+			"msvcr100d", NULL, NULL
+		},
+		{
+			"msvcr110", NULL, NULL
+		},						/* Visual Studio 2012 */
+		{
+			"msvcr120", 0, NULL
+		},						/* Visual Studio 2013 */
+		{
+			"ucrtbase", 0, NULL
+		},						/* Visual Studio 2015 and later */
+		{
+			NULL, 0, NULL
+		}
+	};
+	int			i;
 
+	for (i = 0; rtmodules[i].modulename; i++)
+	{
+		if (rtmodules[i].putenvFunc == NULL)
+		{
+			if (rtmodules[i].hmodule == NULL)
+			{
+				/* Not attempted before, so try to find this DLL */
+				rtmodules[i].hmodule = GetModuleHandle(rtmodules[i].modulename);
+				if (rtmodules[i].hmodule == NULL)
+				{
+					/*
+					 * Set to INVALID_HANDLE_VALUE so we know we have tried
+					 * this one before, and won't try again.
+					 */
+					rtmodules[i].hmodule = INVALID_HANDLE_VALUE;
+					continue;
+				}
+				else
+				{
+					rtmodules[i].putenvFunc = (PUTENVPROC) GetProcAddress(rtmodules[i].hmodule, "_putenv");
+					if (rtmodules[i].putenvFunc == NULL)
+					{
+						rtmodules[i].hmodule = INVALID_HANDLE_VALUE;
+						continue;
+					}
+				}
+			}
+			else
+			{
+				/*
+				 * Module loaded, but we did not find the function last time.
+				 * We're not going to find it this time either...
+				 */
+				continue;
+			}
+		}
+		/* At this point, putenvFunc is set or we have exited the loop */
+		rtmodules[i].putenvFunc(envval);
+	}
+#endif   /* _MSC_VER */
 
 	/*
-	 * Update the process environment - to make modifications visible to child
-	 * processes.
+	 * Update process environment, making this change visible to child
+	 * processes and to CRTs initializing in the future.
 	 *
 	 * Need a copy of the string so we can modify it.
 	 */
 	envcpy = strdup(envval);
+	if (!envcpy)
+		return -1;
 	cp = strchr(envcpy, '=');
 	if (cp == NULL)
+	{
+		free(envcpy);
 		return -1;
+	}
 	*cp = '\0';
 	cp++;
 	if (strlen(cp))
@@ -69,7 +151,7 @@ pgwin32_putenv(const char *envval)
 		/*
 		 * Only call SetEnvironmentVariable() when we are adding a variable,
 		 * not when removing it. Calling it on both crashes on at least
-		 * certain versions of MingW.
+		 * certain versions of MinGW.
 		 */
 		if (!SetEnvironmentVariable(envcpy, cp))
 		{

@@ -66,13 +66,10 @@ COPY country (code, name, continent, region, surfacearea, indepyear, population,
 COPY countrylanguage (countrycode, "language", isofficial, percentage) FROM stdin;
 ALTER TABLE ONLY city
     ADD CONSTRAINT city_pkey PRIMARY KEY (id);
-NOTICE:  ALTER TABLE / ADD PRIMARY KEY will create implicit index "city_pkey" for table "city"
 ALTER TABLE ONLY country
     ADD CONSTRAINT country_pkey PRIMARY KEY (code);
-NOTICE:  ALTER TABLE / ADD PRIMARY KEY will create implicit index "country_pkey" for table "country"
 ALTER TABLE ONLY countrylanguage
     ADD CONSTRAINT countrylanguage_pkey PRIMARY KEY (countrycode, "language");
-NOTICE:  ALTER TABLE / ADD PRIMARY KEY will create implicit index "countrylanguage_pkey" for table "countrylanguage"
 COMMIT;
 ANALYZE city;
 ANALYZE country;
@@ -142,9 +139,8 @@ end $$ language plpgsql volatile;
 --ctas with sirv in the select list
 --ctas with sirv in select list
 create table sirv_test1_result1 as select sirv_test1() as res distributed by (res);
---workaround
+--workaround, should return the same result
 create table sirv_test1_result2 as select (select sirv_test1()) as res distributed by (res);
---start_equiv
 select * from sirv_test1_result1;
  res  
 ------
@@ -157,7 +153,6 @@ select * from sirv_test1_result2;
  PASS
 (1 row)
 
---end_equiv
 -- ----------------------------------------------------------------------
 -- Test: test2_ctas_from_clause.sql
 -- ----------------------------------------------------------------------
@@ -205,9 +200,8 @@ $$
     LANGUAGE plpgsql volatile;
 --ctas with sirv in the from clause
 create table sirv_test2_result1 as select * from sirv_test2(2,1000,1000) as res distributed by(res);
---workaround
+--workaround, should return the same result
 create table sirv_test2_result2 as select * from (select (select sirv_test2(2,1000,1000)) as res) as foo distributed by(res);
---start_equiv
 select * from sirv_test2_result1;
         res        
 -------------------
@@ -220,7 +214,6 @@ select * from sirv_test2_result2;
  10170744008509700
 (1 row)
 
---end_equiv
 -- ----------------------------------------------------------------------
 -- Test: test3_insert_select_list.sql
 -- ----------------------------------------------------------------------
@@ -268,9 +261,8 @@ create table sirv_test3_result1(id int,country_index text) distributed by(id);
 create table sirv_test3_result2(id int, country_index text) distributed by(id);
 --insert with sirv in the select list
 insert into sirv_test3_result1 select 1,sirv_test3(2,1000,1000);
---workaround
+--workaround, should return the same result
 insert into sirv_test3_result2 select 1,(select sirv_test3(2,1000,1000));
---start_equiv
 select * from sirv_test3_result1;
  id |   country_index   
 ----+-------------------
@@ -283,7 +275,6 @@ select * from sirv_test3_result2;
   1 | 10170744008509700
 (1 row)
 
---end_equiv
 -- ----------------------------------------------------------------------
 -- Test: test4_insert_from_clause.sql
 -- ----------------------------------------------------------------------
@@ -345,12 +336,11 @@ insert into sirv_test4_result1 select * from sirv_test4(20000,0);
 insert into sirv_test4_result1 select * from sirv_test4(25000,1);
 insert into sirv_test4_result1 select * from sirv_test4(30000,0);
 insert into sirv_test4_result1 select * from sirv_test4(35000,1);
---workaround
+--workaround, should return the same result
 insert into sirv_test4_result2 select * from (select (select sirv_test4(20000,0))) AS FOO;
 insert into sirv_test4_result2 select * from (select (select sirv_test4(25000,1))) AS FOO;
 insert into sirv_test4_result2 select * from (select (select sirv_test4(30000,0))) AS FOO;
 insert into sirv_test4_result2 select * from (select (select sirv_test4(35000,1))) AS FOO;
---start_equiv
 select * from sirv_test4_result1 order by res;
                                                                                                                                                                                                                                                                                                                                                                                                               res                                                                                                                                                                                                                                                                                                                                                                                                              
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -369,7 +359,6 @@ select * from sirv_test4_result2 order by res;
  {8510700,3787042,2133367,1424285,1378330,1161755,982268,776739,598862,553233,447114,414972,371362,351182,340238,320749,276608,264478,256254,249704,226492,211860,210721,195746,180375,174099,166448,151697,145895,137635,121914,120724,116729,116416,105954,102896,97477,95023,86503,84982,82710,75921,72949,69213,65984,65707,65107,64140,61289,55017}
 (4 rows)
 
---end_equiv
 -- ----------------------------------------------------------------------
 -- Test: test5_ctas_multiple_sirv.sql
 -- ----------------------------------------------------------------------
@@ -922,10 +911,9 @@ $$
     LANGUAGE plpgsql volatile;
 --ctas with nested calls in the from clause
 create table sirv_test7_result2 as select * from sirv_test7_fun3(sirv_test7_fun2(2,1000,1000),3,2000,2000) as field1 distributed by (field1);
-ERROR:  function cannot execute on segment because it issues a non-SELECT statement  (entry db pbld2:12010 pid=29278)
-DETAIL:  
-SQL statement "CREATE  TABLE countries_results (country_code text, country_name text, lang_count int, area float, gnp float) distributed by (country_code)"
-PL/pgSQL function "sirv_test7_fun3" line 7 at EXECUTE statement
+ERROR:  function cannot execute on a QE slice because it issues a non-SELECT statement  (entry db pbld2:12010 pid=29278)
+CONTEXT:  SQL statement "CREATE  TABLE countries_results (country_code text, country_name text, lang_count int, area float, gnp float) distributed by (country_code)"
+PL/pgSQL function sirv_test7_fun3(text,integer,double precision,double precision) line 8 at EXECUTE
 select * from sirv_test7_result2;
 ERROR:  relation "sirv_test7_result2" does not exist
 LINE 1: select * from sirv_test7_result2;
@@ -1094,10 +1082,9 @@ $$
 --insert select with nested calls in the from clause
 create table sirv_test8_result2 (field1 text, field2 int) distributed by (field2);
 insert into sirv_test8_result2 select * from sirv_test8_fun3(sirv_test8_fun2(2,1000,1000),3,2000,2000),(select 1) FOO;
-ERROR:  function cannot execute on segment because it issues a non-SELECT statement  (entry db pbld2:12010 pid=29278)
-DETAIL:  
-SQL statement "CREATE  TABLE countries_results (country_code text, country_name text, lang_count int, area float, gnp float) distributed by (country_code)"
-PL/pgSQL function "sirv_test8_fun3" line 7 at EXECUTE statement
+ERROR:  function cannot execute on a QE slice because it issues a non-SELECT statement  (entry db pbld2:12010 pid=29278)
+CONTEXT:  SQL statement "CREATE  TABLE countries_results (country_code text, country_name text, lang_count int, area float, gnp float) distributed by (country_code)"
+PL/pgSQL function sirv_test8_fun3(text,integer,double precision,double precision) line 8 at EXECUTE
 select * from sirv_test8_result2 order by field2;
  field1 | field2 
 --------+--------
@@ -1244,14 +1231,12 @@ create table sirv_test10_result1(field1 countries,country_code text,country_name
 --ignore error messages
 --start_ignore 
 insert into sirv_test10_result1 select sirv_test10_srf1(2,1000,1000);
-ERROR:  function cannot execute on segment because it accesses relation "sirv_functions.country"  (seg0 slice1 pbld2:12011 pid=29727)
-DETAIL:  
-SQL statement " ( with lang_total as ( select count(*) as lang_count,country.code,countrylanguage.countrycode from country join countrylanguage on (country.code=countrylanguage.countrycode) group by country.code,countrylanguage.countrycode order by country.code ) select country.code,country.name, lang_count, country.surfacearea, country.gnp from country left outer join lang_total on (lang_total.code = country.code) where lang_count >  $1  and country.surfacearea >  $2  and country.gnp >  $3  order by lang_total.lang_count desc )"
+ERROR:  function cannot execute on a QE slice because it accesses relation "sirv_functions.country"  (seg0 slice1 pbld2:12011 pid=29727)
+CONTEXT:  SQL statement " ( with lang_total as ( select count(*) as lang_count,country.code,countrylanguage.countrycode from country join countrylanguage on (country.code=countrylanguage.countrycode) group by country.code,countrylanguage.countrycode order by country.code ) select country.code,country.name, lang_count, country.surfacearea, country.gnp from country left outer join lang_total on (lang_total.code = country.code) where lang_count >  $1  and country.surfacearea >  $2  and country.gnp >  $3  order by lang_total.lang_count desc )"
 PL/pgSQL function "sirv_test10_srf1" line 8 at for over select rows
 insert into sirv_test10_result1 select sirv_test10_srf1 from sirv_test10_srf1(2,1000,1000);
-ERROR:  function cannot execute on segment because it accesses relation "sirv_functions.country"  (entry db pbld2:12010 pid=29278)
-DETAIL:  
-SQL statement " ( with lang_total as ( select count(*) as lang_count,country.code,countrylanguage.countrycode from country join countrylanguage on (country.code=countrylanguage.countrycode) group by country.code,countrylanguage.countrycode order by country.code ) select country.code,country.name, lang_count, country.surfacearea, country.gnp from country left outer join lang_total on (lang_total.code = country.code) where lang_count >  $1  and country.surfacearea >  $2  and country.gnp >  $3  order by lang_total.lang_count desc )"
+ERROR:  function cannot execute on a QE slice because it accesses relation "sirv_functions.country"  (entry db pbld2:12010 pid=29278)
+CONTEXT:  SQL statement " ( with lang_total as ( select count(*) as lang_count,country.code,countrylanguage.countrycode from country join countrylanguage on (country.code=countrylanguage.countrycode) group by country.code,countrylanguage.countrycode order by country.code ) select country.code,country.name, lang_count, country.surfacearea, country.gnp from country left outer join lang_total on (lang_total.code = country.code) where lang_count >  $1  and country.surfacearea >  $2  and country.gnp >  $3  order by lang_total.lang_count desc )"
 PL/pgSQL function "sirv_test10_srf1" line 8 at for over select rows
 --end_ignore
 select * from sirv_test10_result1; --should return 0 rows
@@ -1305,14 +1290,12 @@ create table sirv_test10_result2(res text) distributed by (res);
 --ignore error messages
 --start_ignore
 insert into sirv_test10_result2 select sirv_test10_srf2('result',2,1000,1000);
-ERROR:  function cannot execute on segment because it issues a non-SELECT statement  (seg0 slice1 pbld2:12011 pid=29759)
-DETAIL:  
-SQL statement "CREATE  TABLE countries_results (country_code text, country_name text, lang_count int, area float, gnp float) distributed by (country_code)"
+ERROR:  function cannot execute on a QE slice because it issues a non-SELECT statement  (seg0 slice1 pbld2:12011 pid=29759)
+CONTEXT:  SQL statement "CREATE  TABLE countries_results (country_code text, country_name text, lang_count int, area float, gnp float) distributed by (country_code)"
 PL/pgSQL function "sirv_test10_srf2" line 8 at EXECUTE statement
 insert into sirv_test10_result2 select * from sirv_test10_srf2('result',2,1000,1000);
-ERROR:  function cannot execute on segment because it issues a non-SELECT statement  (entry db pbld2:12010 pid=29278)
-DETAIL:  
-SQL statement "CREATE  TABLE countries_results (country_code text, country_name text, lang_count int, area float, gnp float) distributed by (country_code)"
+ERROR:  function cannot execute on a QE slice because it issues a non-SELECT statement  (entry db pbld2:12010 pid=29278)
+CONTEXT:  SQL statement "CREATE  TABLE countries_results (country_code text, country_name text, lang_count int, area float, gnp float) distributed by (country_code)"
 PL/pgSQL function "sirv_test10_srf2" line 8 at EXECUTE statement
 --end_ignore
 select * from sirv_test10_result2; --should return 0 rows
@@ -1413,14 +1396,12 @@ create table sirv_test12_result1 (res text) distributed by (res);
 --ignore error messages
 --start_ignore
 insert into sirv_test12_result1 select sirv_test12(lang_count::int,surfacearea::float,gnp::float) from sirv_test12_input;
-ERROR:  function cannot execute on segment because it issues a non-SELECT statement  (seg1 slice1 pbld2:12012 pid=27128)
-DETAIL:  
-SQL statement "CREATE  TABLE countries_results (country_code text, country_name text, lang_count int, area float, gnp float) distributed by(country_code)"
+ERROR:  function cannot execute on a QE slice because it issues a non-SELECT statement  (seg1 slice1 pbld2:12012 pid=27128)
+CONTEXT:  SQL statement "CREATE  TABLE countries_results (country_code text, country_name text, lang_count int, area float, gnp float) distributed by(country_code)"
 PL/pgSQL function "sirv_test12" line 7 at EXECUTE statement
 insert into sirv_test12_result1 select * from (select sirv_test12(lang_count::int,surfacearea::float,gnp::float) from sirv_test12_input) FOO;
-ERROR:  function cannot execute on segment because it issues a non-SELECT statement  (seg1 slice1 pbld2:12012 pid=27159)
-DETAIL:  
-SQL statement "CREATE  TABLE countries_results (country_code text, country_name text, lang_count int, area float, gnp float) distributed by(country_code)"
+ERROR:  function cannot execute on a QE slice because it issues a non-SELECT statement  (seg1 slice1 pbld2:12012 pid=27159)
+CONTEXT:  SQL statement "CREATE  TABLE countries_results (country_code text, country_name text, lang_count int, area float, gnp float) distributed by(country_code)"
 PL/pgSQL function "sirv_test12" line 7 at EXECUTE statement
 --end_ignore
 select * from sirv_test12_result1;
@@ -1438,8 +1419,8 @@ drop table if exists sirv_test13_result1;
 NOTICE:  table "sirv_test13_result1" does not exist, skipping
 drop table if exists sirv_test13_result2;
 NOTICE:  table "sirv_test13_result2" does not exist, skipping
---end_ignore
 CREATE LANGUAGE plpythonu;
+--end_ignore
 CREATE or replace FUNCTION sirv_test13_fun1 ()
   RETURNS text
 AS $$
@@ -1519,8 +1500,8 @@ NOTICE:  drop cascades to function sirv_test13_fun2(double precision,integer)
 NOTICE:  drop cascades to function sirv_test13_fun1()
 drop table if exists sirv_test14_result1;
 NOTICE:  table "sirv_test14_result1" does not exist, skipping
---end_ignore
 CREATE LANGUAGE plpythonu;
+--end_ignore
 CREATE or replace FUNCTION sirv_test14_fun1 ()
   RETURNS text
 AS $$
@@ -1894,6 +1875,40 @@ $$
     LANGUAGE plpgsql volatile;
 --ctas with a function returning record
 DROP TABLE countries_results;
+--
+-- SIRV that returns a composite type. Test referencing the individual
+-- fields in WHERE clause.
+--
+CREATE TYPE address AS (street text, name text);
+CREATE TABLE inserted_addresses OF address;
+CREATE TABLE testfunc_seen_streets (street text);
+CREATE OR REPLACE FUNCTION testfunc(street text) RETURNS address AS
+$$
+declare
+  r address;
+begin
+  INSERT INTO testfunc_seen_streets VALUES (street);
+
+  r.street = street;
+  r.name = NULL;
+  return r;
+end;
+$$ LANGUAGE plpgsql VOLATILE;
+INSERT INTO inserted_addresses SELECT street, name FROM testfunc('Wall Street') WHERE name IS NOT NULL;
+INSERT INTO inserted_addresses SELECT street, name FROM testfunc('Abbey Road') WHERE street IS NOT NULL;
+SELECT * FROM inserted_addresses;
+   street   | name 
+------------+------
+ Abbey Road | 
+(1 row)
+
+SELECT * FROM testfunc_seen_streets;
+   street    
+-------------
+ Abbey Road
+ Wall Street
+(2 rows)
+
 -- ----------------------------------------------------------------------
 -- Test: teardown.sql
 -- ----------------------------------------------------------------------

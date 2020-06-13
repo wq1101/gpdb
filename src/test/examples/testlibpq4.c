@@ -1,5 +1,5 @@
 /*
- * $PostgreSQL: pgsql/src/test/examples/testlibpq4.c,v 1.14 2009/06/11 14:49:15 momjian Exp $
+ * src/test/examples/testlibpq4.c
  *
  *
  * testlibpq4.c
@@ -22,8 +22,10 @@ exit_nicely(PGconn *conn1, PGconn *conn2)
 }
 
 static void
-check_conn(PGconn *conn, const char *dbName)
+check_prepare_conn(PGconn *conn, const char *dbName)
 {
+	PGresult   *res;
+
 	/* check to see that the backend connection was successfully made */
 	if (PQstatus(conn) != CONNECTION_OK)
 	{
@@ -31,6 +33,17 @@ check_conn(PGconn *conn, const char *dbName)
 				dbName, PQerrorMessage(conn));
 		exit(1);
 	}
+
+	/* Set always-secure search path, so malicous users can't take control. */
+	res = PQexec(conn,
+				 "SELECT pg_catalog.set_config('search_path', '', false)");
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		fprintf(stderr, "SET failed: %s", PQerrorMessage(conn));
+		PQclear(res);
+		exit(1);
+	}
+	PQclear(res);
 }
 
 int
@@ -72,18 +85,18 @@ main(int argc, char **argv)
 	 * defaults by looking up environment variables or, failing that, using
 	 * hardwired constants
 	 */
-	pghost = NULL;				/* host name of the backend server */
-	pgport = NULL;				/* port of the backend server */
+	pghost = NULL;				/* host name of the backend */
+	pgport = NULL;				/* port of the backend */
 	pgoptions = NULL;			/* special options to start up the backend
 								 * server */
-	pgtty = NULL;				/* debugging tty for the backend server */
+	pgtty = NULL;				/* debugging tty for the backend */
 
 	/* make a connection to the database */
 	conn1 = PQsetdb(pghost, pgport, pgoptions, pgtty, dbName1);
-	check_conn(conn1, dbName1);
+	check_prepare_conn(conn1, dbName1);
 
 	conn2 = PQsetdb(pghost, pgport, pgoptions, pgtty, dbName2);
-	check_conn(conn2, dbName2);
+	check_prepare_conn(conn2, dbName2);
 
 	/* start a transaction block */
 	res1 = PQexec(conn1, "BEGIN");

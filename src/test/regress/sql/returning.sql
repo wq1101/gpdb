@@ -6,6 +6,10 @@
 
 CREATE TEMP TABLE foo (f1 serial, f2 text, f3 int default 42);
 
+-- GPDB: otherwise the UPDATE tests fail with:
+-- ERROR:  Cannot parallelize an UPDATE statement that updates the distribution columns
+ALTER TABLE foo SET DISTRIBUTED RANDOMLY;
+
 INSERT INTO foo (f2,f3)
   VALUES ('test', DEFAULT), ('More', 11), (upper('more'), 7+9)
   RETURNING *, f1+f3 AS sum;
@@ -154,3 +158,9 @@ UPDATE joinview SET f1 = f1 + 1 WHERE f3 = 57 RETURNING *, other + 1;
 SELECT * FROM joinview;
 SELECT * FROM foo;
 SELECT * FROM voo;
+
+-- Check aliased target relation
+INSERT INTO foo AS bar DEFAULT VALUES RETURNING *; -- ok
+INSERT INTO foo AS bar DEFAULT VALUES RETURNING foo.*; -- fails, wrong name
+INSERT INTO foo AS bar DEFAULT VALUES RETURNING bar.*; -- ok
+INSERT INTO foo AS bar DEFAULT VALUES RETURNING bar.f3; -- ok

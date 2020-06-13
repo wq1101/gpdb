@@ -24,10 +24,8 @@ SET search_path TO 'exttableext';
     FORMAT 'text'
     OPTIONS (database 'greenplum', foo 'bar');
 
-    -- Checking pg_exttable for new created RET and WET
-    select urilocation,fmttype,fmtopts,encoding,writable from pg_exttable 
-    where reloid='exttabtest_r'::regclass 
-       or reloid='exttabtest_w'::regclass;
+    \d exttabtest_r
+    \d exttabtest_w
 
     -- write to WET
     SELECT * FROM clean_exttabtest_files;
@@ -674,7 +672,7 @@ DROP FUNCTION formatter_import_todrop();
 -- Note: Only STABLE is supported for formatter, this is enforced
 -- When it is not STABLE (VOLATILE, or IMMUTABLE),
 -- the expected error like:
--- ERROR: formatter function formatter_export_i is not declared STABLE. (seg1 rh55-qavm55:7533 pid=14816)
+-- ERROR: formatter function formatter_export_i is not declared STABLE (seg1 rh55-qavm55:7533 pid=14816)
 
     -- Create RET and WET using IMMUTABLE functions will succeed
     -- However query such RET or WET should fail
@@ -689,7 +687,7 @@ DROP FUNCTION formatter_import_todrop();
     FORMAT 'CUSTOM' (FORMATTER='formatter_import_i');
 
     INSERT INTO format_w (SELECT * FROM formatsource);
-    -- ERROR:  formatter function formatter_export_i is not declared STABLE.  (seg1 rh55-qavm55:7533 pid=14816)
+    -- ERROR:  formatter function formatter_export_i is not declared STABLE  (seg1 rh55-qavm55:7533 pid=14816)
 
     -- Create RET and WET using STABLE functions 
     DROP EXTERNAL TABLE IF EXISTS format_w;
@@ -705,19 +703,6 @@ DROP FUNCTION formatter_import_todrop();
     -- Displaying table info
     \d format_w
     \d format_r
-
-    -- Checking pg_exttable 
-    select pg_class.relname, fmttype,
-       fmtopts, encoding, writable
-    from pg_class, pg_exttable
-    where pg_class.oid = pg_exttable.reloid
-    and (pg_class.relname='format_w'
-    or
-    pg_class.relname='format_r'
-    or
-    pg_class.relname='format_text'
-    or
-    pg_class.relname='format_csv');
 
     -- Write to WET
     SELECT * FROM clean_exttabtest_files;
@@ -751,14 +736,8 @@ select max(cnt) - min(cnt)  > 20 from t;
     WHERE proname='formatter_import_s' or proname='formatter_export_s' 
     ORDER BY proname;
 
-    -- Checking pg_exttable, should return 0
-    select pg_class.relname, fmttype,
-       fmtopts, encoding, writable
-    from pg_class, pg_exttable
-    where pg_class.oid = pg_exttable.reloid
-    and (pg_class.relname='format_w'
-    or
-    pg_class.relname='format_r');
+    \d format_w
+    \d format_r
 
     -- Write to WET, should fail
     SELECT * FROM clean_exttabtest_files;
@@ -825,14 +804,10 @@ select max(cnt) - min(cnt)  > 20 from t;
     LOCATION ('demoprot://exttabtest_test67_s2') 
     FORMAT 'CUSTOM' (FORMATTER='formatter_import_s');
 
-    -- Checking pg_exttable
-    select pg_class.relname, fmttype,
-       fmtopts, encoding, writable
-    from pg_class, pg_exttable
-    where pg_class.oid = pg_exttable.reloid
-    and (pg_class.relname like 'format_w_s%'
-        or
-        pg_class.relname like 'format_r_s%');
+    \d format_w_s1
+    \d format_w_s2
+    \d format_r_s1
+    \d format_r_s2
 
     -- Write to WET    
     INSERT INTO format_w_s1 (SELECT * FROM formatsource);
@@ -1078,10 +1053,10 @@ select max(cnt) - min(cnt)  > 20 from t;
     LOCATION ('demoprot://format_long_test13') 
     FORMAT 'CUSTOM' (FORMATTER='formatter_import_s');
 
-    -- Drop colum value1 from source table formatsource
+    -- Drop column value1 from source table formatsource
     ALTER TABLE formatsource DROP COLUMN value1;
 
-    -- Drop colum value1 from RET and WET
+    -- Drop column value1 from RET and WET
     ALTER EXTERNAL TABLE format_r DROP COLUMN value1;
     ALTER EXTERNAL TABLE format_w DROP COLUMN value1;
 
@@ -1276,14 +1251,6 @@ validatorfunc = url_validator
     -- Create a non-privileged user demoprot_nopriv
     drop role if exists demoprot_nopriv;
     create role demoprot_nopriv with login ;
-
-    -- Create a gphdfs_user with CREATEEXTTABLE privilege using gphdfs protocol
-    drop role if exists gphdfs_user;
-    create role gphdfs_user with login CREATEEXTTABLE (protocol='gphdfs');
-    -- WARNING:  GRANT/REVOKE on gphdfs is deprecated
-    -- HINT:  Issue the GRANT or REVOKE on the protocol itself
-    -- NOTICE:  resource queue required -- using default resource queue "pg_default"
-    -- CREATE ROLE
 
 
 -- Test 92: Rename existing protocol

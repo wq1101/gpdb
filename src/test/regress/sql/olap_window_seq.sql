@@ -3,9 +3,12 @@
 --
 -- Changes here should also be made to olap_window_seq.sql
 
-set gp_enable_sequential_window_plans to true;
+-- start_ignore
+create schema olap_window_seq;
+set search_path to olap_window_seq, public;
+-- end_ignore
 
----- 1 -- Null window specification -- OVER () ----
+-- 1 -- Null window specification -- OVER () --
 
 select row_number() over (), cn,pn,vn 
 from sale; -- mvd 1->1
@@ -17,7 +20,7 @@ select dense_rank() over (), *
 from sale; --error - order by order by req'd
 
 
--- 2 -- Plan trivial windows over various input plan types ----
+-- 2 -- Plan trivial windows over various input plan types --
 
 select row_number() over (), pn, cn, vn, dt, qty, prc
 from sale; -- mvd 1->1
@@ -39,7 +42,7 @@ select row_number() over (), u, v
 from ( values (1,2),(3,4),(5,6) ) r(u,v); -- mvd 1->1
 
 
----- 3 -- Exercise WINDOW Clause ----
+-- 3 -- Exercise WINDOW Clause --
 
 select row_number() over (w), * from sale window w as () -- mvd 1->1
 order by 1 desc; -- order 1
@@ -96,7 +99,7 @@ select cn,
   sum(cn) over (order by cn range '1'::float8 preceding)
   from customer; -- this, however, should work
 
----- 4 -- Partitioned, non-ordered window specifications -- OVER (PARTITION BY ...) ----
+-- 4 -- Partitioned, non-ordered window specifications -- OVER (PARTITION BY ...) --
 
 -- !
 select row_number() over (partition by cn), cn, pn 
@@ -125,7 +128,7 @@ group by vn; -- mvd 3->1
 
 
 
----- 5 -- Ordered, non-partitioned window specifications -- OVER (ORDER BY ...) ----
+-- 5 -- Ordered, non-partitioned window specifications -- OVER (ORDER BY ...) --
 
 select row_number() over (order by cn), cn, pn 
 from sale; -- mvd 2->1
@@ -212,7 +215,7 @@ window w1 as (order by a nulls first, t),
 order by t;
 
 
----- X -- Miscellaneous (e.g. old bugs, etc.) ----
+-- X -- Miscellaneous (e.g. old bugs, etc.) --
 
 -- Why was this here? We can't guarantee all correct answers will pass!
 --select 
@@ -638,7 +641,6 @@ SELECT sale.pn,sale.cn,sale.prc,
 
 -- Check LEAD()
 -- sanity tests
-select p.proname, p.proargtypes from pg_window w, pg_proc p, pg_proc p2 where w.winfunc = p.oid and w.winfnoid = p2.oid and p2.proname = 'lead' order by 1,2;
 
 select lead(cn) from sale;
 
@@ -659,8 +661,6 @@ select cn, vn, pn, qty * prc,
 order by 1, 2, 3;
 
 -- Check LAG()
--- sanity tests
-select p.proname, p.proargtypes from pg_window w, pg_proc p, pg_proc p2 where w.winfunc = p.oid and w.winfnoid = p2.oid and p2.proname = 'lag' order by 1,2;
 
 -- actual LAG tests
 select cn, cname, lag(cname, 2, 'undefined') over (order by cn) from customer;
@@ -823,9 +823,9 @@ FROM sale;
 select cn,pn,vn, count(*) over (order by cn) as c1, 
 count(*) over (order by cn,vn) as c2,
 count(*) over (order by cn,vn,pn) as c3 from sale;
-select cn,pn,vn, count(*) over (order by cn range between 2 preceding and 2 following) as c1,
-count(*) over (order by cn,vn rows between 2 preceding and 2 following) as c2,
-count(*) over (order by cn,vn,pn) as c3 from sale;
+select cn,pn,vn, count(*) over (order by ord range between 2 preceding and 2 following) as c1,
+count(*) over (order by ord,cn,vn rows between 2 preceding and 2 following) as c2,
+count(*) over (order by ord,cn,vn,pn) as c3 from sale_ord;
 
 -- MPP-1897
 SELECT sale.cn,sale.qty,
@@ -1294,8 +1294,8 @@ FROM (SELECT * FROM sale) sale; --mvd 3,4,5->6; 3,4->7
 create view v1 as
 select dt, sum(cn) over(order by grouping(cn) range grouping(cn) preceding) 
 from sale group by rollup(cn,dt);
-\d v1
-drop view v1;
+--\d+ v1
+--drop view v1;
 
 -- MPP-2194, MPP-2236
 drop table if exists win_test_for_window_seq;
@@ -1347,11 +1347,11 @@ select cn,vn, sum, 1+rank() over (partition by cn order by vn) as rank
 from (select cn,vn,sum(qty) as sum from sale group by cn, vn) sale order by rank; --mvd 1->3
 -- end equivalent
 
-select cn, first_value(NULL) over (partition by cn order by case when 1=1 then pn || ' ' else 'test' end)
-	from sale order by first_value(NULL) over (
+select cn, first_value(NULL::text) over (partition by cn order by case when 1=1 then pn || ' ' else 'test' end)
+	from sale order by first_value(NULL::text) over (
 	partition by cn order by case when 1=1 then (pn || ' ') else 'test'::character varying(15) end); --mvd 1->2
-select cn, first_value(NULL) over (partition by cn order by case when 1=1 then pn || ' ' else 'test' end)
-	from sale order by first_value(NULL) over (
+select cn, first_value(NULL::text) over (partition by cn order by case when 1=1 then pn || ' ' else 'test' end)
+	from sale order by first_value(NULL::text) over (
 	partition by cn order by case when 1=1 then (pn || ' ') else 'test' end); --mvd 1->2
 
 -- MPP-4836
@@ -1394,7 +1394,7 @@ from product
 window w as (partition by pcolor order by pname)
 order by 1,2,3;
 
--- Once upon a time, there was a bug in deparsing a Window node with EXPLAIN
+-- Once upon a time, there was a bug in deparsing a WindowAgg node with EXPLAIN
 -- that this query triggered (MPP-4840)
 explain select n from ( select row_number() over () from (values (0)) as t(x) ) as r(n) group by n;
 
@@ -1444,9 +1444,9 @@ select
     f, 
     sum(g) over (partition by f)
 from
-    (select 'A', 1) b(j, g)
+    (select 'A'::text, 1) b(j, g)
     join 
-    (select 'A', 'B') c(j, f)
+    (select 'A'::text, 'B'::text) c(j, f)
     using(j)
 group by 
     1,
@@ -1457,9 +1457,9 @@ select
     f, 
     sum(b.g) over (partition by f)
 from
-    (select 'A', 1) b(j, g)
+    (select 'A'::text, 1) b(j, g)
     join 
-    (select 'A', 'B') c(j, f)
+    (select 'A'::text, 'B'::text) c(j, f)
     using(j)
 group by 
     1,
@@ -1470,9 +1470,9 @@ select
     lower(c.f),
     sum(2*b.g) over (partition by lower(c.f))
 from
-    (select 'A', 1) b(j, g)
+    (select 'A'::text, 1) b(j, g)
     join 
-    (select 'A', 'B') c(j, f)
+    (select 'A'::text, 'B'::text) c(j, f)
     using(j)
 group by 
     2*b.g,
@@ -1483,9 +1483,9 @@ select
     lower(c.f),
     sum(2*g) over (partition by lower(c.f))
 from
-    (select 'A', 1) b(j, g)
+    (select 'A'::text, 1) b(j, g)
     join 
-    (select 'A', 'B') c(j, f)
+    (select 'A'::text, 'B'::text) c(j, f)
     using(j)
 group by 
     2*b.g,
@@ -1529,8 +1529,8 @@ select stddev(n) over(order by d range between current row and interval '1 day' 
        sum(n) over(order by d range between current row and interval '1 day' following),
        avg(n) over(order by d range between current row and interval '1 day' following), n from olap_window_seq_test;
 
--- This test examines the case that a statement invokes multiple lead functions, 
--- which are not sorted regarding the rows that they use and projected attributes are varlen. 
+-- This test examines the case that a statement invokes multiple lead functions,
+-- which are not sorted regarding the rows that they use and projected attributes are varlen.
 DROP TABLE IF EXISTS empsalary;
 CREATE TABLE empsalary(
   depname varchar,
@@ -1543,15 +1543,15 @@ INSERT INTO empsalary VALUES('develop', 8, '6000', '2006/10/01');
 INSERT INTO empsalary VALUES('develop', 11, '5200', '2007/08/15');
 INSERT INTO empsalary VALUES('develop', 9, '4500', '2008/01/01');
 
--- First lead retrieves data from one tuple ahead, second lead function retrieves data from two tuples ahead, while third one 
--- gets data from one tuple ahead again.  
+-- First lead retrieves data from one tuple ahead, second lead function retrieves data from two tuples ahead, while third one
+-- gets data from one tuple ahead again.
 select * ,
 lead(salary,1) over (partition by depname order by salary desc) qianzhi1,
 lead(salary,2) over (partition by depname order by salary desc) qianzhi2,
 lead(empno,1) over (partition by depname order by salary desc) qianzhi11
 from empsalary;
 
--- Lead functions are in order. 
+-- Lead functions are in order.
 select * ,
 lead(salary,1) over (partition by depname order by salary desc) qianzhi1,
 lead(empno,1) over (partition by depname order by salary desc) qianzhi11,
@@ -1589,42 +1589,13 @@ INSERT INTO empsalary VALUES('develop', 8, 6000, '2006/10/01');
 INSERT INTO empsalary VALUES('develop', 11, 5200, '2007/08/15');
 INSERT INTO empsalary VALUES('develop', 9, 4500, '2008/01/01');
 
--- Similar to the first statement using int. 
+-- Similar to the first statement using int.
 select * ,
 lead(salary,1) over (partition by depname order by salary desc) qianzhi1,
 lead(salary,2) over (partition by depname order by salary desc) qianzhi2,
 lead(empno,1) over (partition by depname order by salary desc) qianzhi11
 from empsalary;
 
--- There was a bug at one point where the planner would not recognize that the
--- distribution key of a subplan matched the distribution key needed for the
--- PARTITION BY clause, and generated an unnecessary Motion node. The
--- sub-optimal plan looked like this:
---
---                                                       QUERY PLAN                                
---                       
--- ----------------------------------------------------------------------------------------------------------------------
---  Gather Motion 2:1  (slice3; segments: 2)  (cost=3.56..3.60 rows=5 width=12)
---    ->  Window  (cost=3.56..3.60 rows=3 width=12)
---          Partition By: bar.a
---          Order By: bar.b
---          ->  Sort  (cost=3.56..3.57 rows=3 width=12)
---                Sort Key: bar.a, bar.b
---                ->  Redistribute Motion 2:2  (slice2; segments: 2)  (cost=1.21..3.50 rows=3 width=12)
---                      Hash Key: bar.a
---                      ->  Hash Join  (cost=1.21..3.40 rows=3 width=12)
---                            Hash Cond: foo.a = bar.a
---                            ->  Seq Scan on foo  (cost=0.00..2.10 rows=5 width=4)
---                            ->  Hash  (cost=1.15..1.15 rows=3 width=8)
---                                  ->  Redistribute Motion 2:2  (slice1; segments: 2)  (cost=0.00..1.15 rows=3 width=8)
---                                        Hash Key: bar.a
---                                        ->  Seq Scan on bar  (cost=0.00..1.05 rows=3 width=8)
--- (15 rows)
---
--- The Redistribute Motion node in the middle is not needed, because the
--- subplan is already distributed by bar.a, but the planner failed to
--- recognize that. The point of this test case is to test that that unneeded
--- Motion node isn't there.
 create table foo (a int4) distributed by (a);
 create table bar (a int4, b int4) distributed by (a, b);
 insert into foo select g from generate_series(1, 10) g;
@@ -1642,8 +1613,112 @@ create table foo (a int, b int) distributed by (a);
 create table bar (c int, d int) distributed by (c);
 insert into foo select i,i from generate_series(1,10) i;
 insert into bar select i,i from generate_series(1,10) i;
-set optimizer_segments to 1; 
+set optimizer_segments to 1;
 SELECT bar.*, count(*) OVER() AS e FROM foo, bar where foo.b = bar.d;
 
 reset optimizer_segments;
 drop table foo, bar;
+
+
+CREATE TABLE foo (a int, b int, c int, d int);
+insert into foo select i,i,i,i from generate_series(1, 10) i;
+
+EXPLAIN SELECT count(*) over (PARTITION BY a ORDER BY b, c, d) as count1,
+       count(*) over (PARTITION BY a ORDER BY b, c) as count2,
+       count(*) over (PARTITION BY a ORDER BY b) as count3,
+       count(*) over (PARTITION BY a ORDER BY c) as count1,
+       count(*) over (PARTITION BY a ORDER BY c, b) as count2,
+       count(*) over (PARTITION BY a ORDER BY c, b, d) as count3
+FROM foo;
+drop table foo;
+
+-- test predicate push down in subqueries for quals containing windowref nodes
+-- start_ignore
+drop table if exists window_preds;
+create table window_preds(i int, j int, k int);
+insert into window_preds values(1,2,3);
+insert into window_preds values(2,3,4);
+insert into window_preds values(3,4,5);
+insert into window_preds values(4,5,6);
+insert into window_preds values(5,6,7);
+insert into window_preds values(6,7,8);
+-- end_ignore
+
+-- for planner qual k = 1 should not be pushed down in the subquery as it has window refs at top level of subquery. orca is able to push down the predicate to appropriate node
+explain select k from ( select row_number() over()+2 as k from window_preds union all select row_number() over()+2 as k from window_preds) as t where k = 3;
+select k from ( select row_number() over()+2 as k from window_preds union all select row_number() over()+2 as k from window_preds) as t where k = 3;
+explain insert into window_preds select k from ( select row_number() over()+2 as k from window_preds union all select row_number() over()+2 as k from window_preds) as t where k = 3;
+insert into window_preds select k from ( select row_number() over()+2 as k from window_preds union all select row_number() over()+2 as k from window_preds) as t where k = 3;
+explain SELECT t.k FROM window_preds p1, window_preds p2, (SELECT ROW_NUMBER() OVER() AS k FROM window_preds union all SELECT ROW_NUMBER() OVER() AS k FROM window_preds) AS t WHERE t.k = 1 limit 1;
+SELECT t.k FROM window_preds p1, window_preds p2, (SELECT ROW_NUMBER() OVER() AS k FROM window_preds union all SELECT ROW_NUMBER() OVER() AS k FROM window_preds) AS t WHERE t.k = 1 limit 1;
+explain with CTE as (select i, row_number() over (partition by j) j from window_preds union all select i, row_number() over (partition by j) from window_preds) select * from cte where j = 1;
+insert into window_preds with CTE as (select i, row_number() over (partition by j) j from window_preds union all select i, row_number() over (partition by j) from window_preds) select * from cte where j = 1;
+
+-- qual k = 1 should be pushed down
+explain select k from ( select k from (select row_number() over() as k from window_preds) f union all select 1::bigint as k from window_preds) as t where k = 1;
+select k from ( select k from (select row_number() over() as k from window_preds) f union all select 1::bigint as k from window_preds) as t where k = 1;
+explain insert into window_preds select k from ( select k from (select row_number() over() as k from window_preds) f union all select 1::bigint as k from window_preds) as t where k = 1;
+insert into window_preds select k from ( select k from (select row_number() over() as k from window_preds) f union all select 1::bigint as k from window_preds) as t where k = 1;
+explain with CTE as (select i, row_number() over (partition by j) j from window_preds union all select i, row_number() over (partition by j) from window_preds) select * from cte where i = 1;
+insert into window_preds with CTE as (select i, row_number() over (partition by j) j from window_preds union all select i, row_number() over (partition by j) from window_preds) select * from cte where i = 1;
+
+
+--
+-- Tests for DISTINCT-qualified window aggregates
+--
+-- This is a GPDB extension, not implemented in PostgreSQL.
+--
+select dt, pn, count(distinct pn) over (partition by dt) from sale;
+select dt, pn, count(distinct pn) over (partition by dt), sum(distinct pn) over (partition by dt) from sale;
+select dt, pn, sum(distinct pn) over (partition by dt), sum(pn) over (partition by dt) from sale;
+
+-- Also test with a pass-by-ref type, to make sure we don't get confused with memory contexts.
+
+select pcolor, pname, count(distinct pname) over (partition by pcolor) from product;
+
+
+-- Disallowed or not-implemented cases
+select dt, pn, count(distinct pn) over (partition by pn order by dt) from sale;
+
+select dt, pn, count(distinct pn) over (partition by pn rows unbounded preceding ) from sale;
+select dt, pn, count(distinct pn) over (partition by pn rows between unbounded preceding and unbounded following ) from sale;
+
+-- not supported with true window functions.
+select dt, pn, lead(distinct pn) over (partition by pn) from sale;
+
+-- not supported with aggregates with multiple arguments.
+select dt, pn, corr(distinct pn, pn) over (partition by dt), sum(pn) over (partition by dt) from sale;
+
+-- Test deparsing (for \d+ and pg_dump)
+create view distinct_windowagg_view as select sum(distinct g/2) OVER (partition by g/4) from generate_series (1, 5) g;
+\d+ distinct_windowagg_view
+
+-- These are tests for pushing down filter predicates in window functions.
+CREATE TABLE window_part_sales (trans_id int, date date, region text)
+DISTRIBUTED BY (trans_id)
+PARTITION BY RANGE (date)
+SUBPARTITION BY LIST (region)
+SUBPARTITION TEMPLATE
+( SUBPARTITION usa VALUES ('usa'),
+DEFAULT SUBPARTITION other_regions)
+(START (date '2011-01-01') INCLUSIVE
+END (date '2011-06-01') EXCLUSIVE
+EVERY (INTERVAL '1 month'),
+DEFAULT PARTITION outlying_dates );
+
+-- When there is no PARTITION BY in the window function, we do not want to push down any of the filter predicates.
+EXPLAIN WITH cte as (SELECT *, row_number() over () FROM window_part_sales) SELECT * FROM cte WHERE date > '2011-03-01' AND region = 'usa';
+
+-- If there is a PARTITION BY in the window function, we can push down ONLY the predicates that match the PARTITION BY column.
+EXPLAIN WITH cte as (SELECT *, row_number() over (PARTITION BY region) FROM window_part_sales) SELECT * FROM cte WHERE date > '2011-03-01' AND region = 'usa';
+
+-- When both columns in the filter predicates are in the window function, it is possible to push both down.
+EXPLAIN WITH cte as (SELECT *, row_number() over (PARTITION BY date,region) FROM window_part_sales) SELECT * FROM cte WHERE date > '2011-03-01' AND region = 'usa';
+
+-- When the column in the filter predicates is also present in the window function, it is possible to push it down.
+EXPLAIN WITH cte as (SELECT *, row_number() over (PARTITION BY date,region) FROM window_part_sales) SELECT * FROM cte WHERE region = 'usa';
+
+-- When there is a disjunct in the filter predicates, it is not possible to push down either into the window function.
+EXPLAIN WITH cte as (SELECT *, row_number() over (PARTITION BY date,region) FROM window_part_sales) SELECT * FROM cte WHERE date > '2011-03-01' OR region = 'usa';
+
+-- End of Test

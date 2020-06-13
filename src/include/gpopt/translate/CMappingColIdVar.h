@@ -47,20 +47,20 @@ namespace gpdxl
 	{
 		protected:
 			// memory pool
-			IMemoryPool *m_pmp;
+			CMemoryPool *m_mp;
 
 		public:
 
 			// ctor/dtor
 			explicit
-			CMappingColIdVar(IMemoryPool *);
+			CMappingColIdVar(CMemoryPool *);
 
 			virtual
 			~CMappingColIdVar(){}
 
 			// translate DXL ScalarIdent node into GPDB Var node
 			virtual
-			Var *PvarFromDXLNodeScId(const CDXLScalarIdent *) = 0;
+			Var *VarFromDXLNodeScId(const CDXLScalarIdent *) = 0;
 	};
 }
 

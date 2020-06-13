@@ -300,10 +300,6 @@ default partition other
 NOTICE:  CREATE TABLE will create partition "employees_1_prt_women" for table "employees"
 NOTICE:  CREATE TABLE will create partition "employees_1_prt_men" for table "employees"
 NOTICE:  CREATE TABLE will create partition "employees_1_prt_other" for table "employees"
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "employees_pkey" for table "employees"
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "employees_1_prt_women_pkey" for table "employees_1_prt_women"
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "employees_1_prt_men_pkey" for table "employees_1_prt_men"
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "employees_1_prt_other_pkey" for table "employees_1_prt_other"
 CREATE TABLE emp_start_dates
 (
    empid integer,
@@ -421,10 +417,6 @@ default partition other
 NOTICE:  CREATE TABLE will create partition "employees_1_prt_women" for table "employees"
 NOTICE:  CREATE TABLE will create partition "employees_1_prt_men" for table "employees"
 NOTICE:  CREATE TABLE will create partition "employees_1_prt_other" for table "employees"
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "employees_pkey" for table "employees"
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "employees_1_prt_women_pkey" for table "employees_1_prt_women"
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "employees_1_prt_men_pkey" for table "employees_1_prt_men"
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "employees_1_prt_other_pkey" for table "employees_1_prt_other"
 CREATE TABLE emp_start_dates
 (
    empid integer,
@@ -492,10 +484,6 @@ default partition other
 NOTICE:  CREATE TABLE will create partition "employees_1_prt_women" for table "employees"
 NOTICE:  CREATE TABLE will create partition "employees_1_prt_men" for table "employees"
 NOTICE:  CREATE TABLE will create partition "employees_1_prt_other" for table "employees"
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "employees_pkey" for table "employees"
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "employees_1_prt_women_pkey" for table "employees_1_prt_women"
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "employees_1_prt_men_pkey" for table "employees_1_prt_men"
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "employees_1_prt_other_pkey" for table "employees_1_prt_other"
 CREATE TABLE emp_start_dates
 (
    empid integer,
@@ -542,10 +530,6 @@ default partition other
 NOTICE:  CREATE TABLE will create partition "employees_1_prt_women" for table "employees"
 NOTICE:  CREATE TABLE will create partition "employees_1_prt_men" for table "employees"
 NOTICE:  CREATE TABLE will create partition "employees_1_prt_other" for table "employees"
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "employees_pkey" for table "employees"
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "employees_1_prt_women_pkey" for table "employees_1_prt_women"
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "employees_1_prt_men_pkey" for table "employees_1_prt_men"
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "employees_1_prt_other_pkey" for table "employees_1_prt_other"
 CREATE TABLE emp_start_dates
 (
    empid integer,
@@ -694,10 +678,6 @@ default partition other
 NOTICE:  CREATE TABLE will create partition "employees_1_prt_women" for table "employees"
 NOTICE:  CREATE TABLE will create partition "employees_1_prt_men" for table "employees"
 NOTICE:  CREATE TABLE will create partition "employees_1_prt_other" for table "employees"
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "employees_pkey" for table "employees"
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "employees_1_prt_women_pkey" for table "employees_1_prt_women"
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "employees_1_prt_men_pkey" for table "employees_1_prt_men"
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "employees_1_prt_other_pkey" for table "employees_1_prt_other"
 CREATE TABLE emp_start_dates
 (
    empid integer,
@@ -774,10 +754,6 @@ default partition other
 NOTICE:  CREATE TABLE will create partition "employees_1_prt_women" for table "employees"
 NOTICE:  CREATE TABLE will create partition "employees_1_prt_men" for table "employees"
 NOTICE:  CREATE TABLE will create partition "employees_1_prt_other" for table "employees"
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "employees_pkey" for table "employees"
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "employees_1_prt_women_pkey" for table "employees_1_prt_women"
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "employees_1_prt_men_pkey" for table "employees_1_prt_men"
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "employees_1_prt_other_pkey" for table "employees_1_prt_other"
 CREATE TABLE emp_start_dates
 (
    empid integer,
@@ -978,6 +954,8 @@ LINE 1: ...-01'::date, '2010-12-30'::date, '2010-01-01'::date, '2012');
                                                                ^
 select decode('2011-01-05'::date, '2011-01-01'::date, '2011-01-01'::date, '2010-12-30'::date, '2010-01-01'::date, 2012);
 ERROR:  CASE types integer and date cannot be matched
+LINE 1: ...ct decode('2011-01-05'::date, '2011-01-01'::date, '2011-01-0...
+                                                             ^
 -- Test using DECODE as table, database, column, constraint, index, partition name.
 -- These all fail because DECODE is a reserved keyword.
 create table decode (a int, b int) distributed by (b);
@@ -1099,7 +1077,8 @@ order by locid, country_code;
  country_code | character(2) |           | extended | 
  region       | text         |           | extended | 
 View definition:
- SELECT locations.bus_name, locations.country_code, 
+ SELECT locations.bus_name,
+    locations.country_code,
         CASE locations.country_code
             WHEN IS NOT DISTINCT FROM 'US'::bpchar THEN 'Americas'::text
             WHEN IS NOT DISTINCT FROM 'CA'::bpchar THEN 'Americas'::text
@@ -1145,15 +1124,15 @@ order by locid, country_code;
 -- Test that "decode", when quoted, is interpreted as the PostgreSQL built-in
 -- function decode, rather than as a decode expression.
 select "decode"('MTIzAAE=', 'base64');
-   decode    
--------------
- 123\000\001
+    decode    
+--------------
+ \x3132330001
 (1 row)
 
 select "decode"(md5('password'),'hex');
-                     decode                     
-------------------------------------------------
- _M\314;Z\247e\326\035\203'\336\270\202\317\231
+               decode               
+------------------------------------
+ \x5f4dcc3b5aa765d61d8327deb882cf99
 (1 row)
 
 --

@@ -29,9 +29,9 @@ main (void)
   struct TBempl empl;
   string str;
   c ptr = NULL;
-  struct varchar_vc
+  struct varchar
   {
-  	int len;
+	int len;
 	char text[10];
   } vc;
   EXEC SQL END DECLARE SECTION;

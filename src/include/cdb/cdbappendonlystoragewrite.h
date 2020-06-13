@@ -43,8 +43,10 @@ typedef struct AppendOnlyStorageWrite
 
 	/*
 	 * The large write length given to the BufferedAppend module.
+	 * The buffer in BufferedAppend will be flushed to disk when
+	 * maxLargeWriteLen is reached.
 	 */
-	int32		largeWriteLen;
+	int32		maxLargeWriteLen;
 
 	/*
 	 * Version number indicating the AO table format version to write in.
@@ -95,14 +97,8 @@ typedef struct AppendOnlyStorageWrite
 	 */
 	int64		startEof;
 
-	RelFileNode relFileNode;
+	RelFileNodeBackend relFileNode;
 	int32		segmentFileNum;
-
-	/*
-	 * Persistence information for current write open.
-	 */
-	ItemPointerData persistentTid;
-	int64		persistentSerialNum;
 
 	/*
 	 * The number of blocks written since the beginning of the segment file.
@@ -178,39 +174,32 @@ typedef struct AppendOnlyStorageWrite
 	PGFunction *compression_functions;	/* For AO or CO compression.                   */
 	/* The array index corresponds to COMP_FUNC_*  */
 
+	bool needsWAL;
+
 } AppendOnlyStorageWrite;
 
 extern void AppendOnlyStorageWrite_Init(AppendOnlyStorageWrite *storageWrite,
-							MemoryContext memoryContext,
-							int32 maxBufferLen,
-							char *relationName,
-							char *title,
-							AppendOnlyStorageAttributes *storageAttributes);
+										MemoryContext memoryContext,
+										int32 maxBufferLen,
+										char *relationName,
+										char *title,
+										AppendOnlyStorageAttributes *storageAttributes,
+										bool needsWAL);
 extern void AppendOnlyStorageWrite_FinishSession(AppendOnlyStorageWrite *storageWrite);
 
 extern void AppendOnlyStorageWrite_TransactionCreateFile(AppendOnlyStorageWrite *storageWrite,
-											 char *filePathName,
-											 int64 logicalEof,
-											 RelFileNode *relFileNode,
-											 int32 segmentFileNum,
-											 ItemPointer persistentTid,
-											 int64 *persistentSerialNum);
+											 RelFileNodeBackend *relFileNode,
+											 int32 segmentFileNum);
 extern void AppendOnlyStorageWrite_OpenFile(AppendOnlyStorageWrite *storageWrite,
 								char *filePathName,
 								int version,
 								int64 logicalEof,
 								int64 fileLen_uncompressed,
-								RelFileNode *relFileNode,
-								int32 segmentFileNum,
-								ItemPointer persistentTid,
-								int64 persistentSerialNum);
+								RelFileNodeBackend *relFileNode,
+								int32 segmentFileNum);
 extern void AppendOnlyStorageWrite_FlushAndCloseFile(AppendOnlyStorageWrite *storageWrite,
 											 int64 *newLogicalEof,
-											 int64 *fileLen_uncompressed,
-											 bool *mirrorDataLossOccurred,
-											 bool *mirrorCatchupRequired,
-			MirrorDataLossTrackingState *originalMirrorDataLossTrackingState,
-							int64 *originalMirrorDataLossTrackingSessionNum);
+											 int64 *fileLen_uncompressed);
 extern void AppendOnlyStorageWrite_TransactionFlushAndCloseFile(AppendOnlyStorageWrite *storageWrite,
 													int64 *newLogicalEof,
 												int64 *fileLen_uncompressed);

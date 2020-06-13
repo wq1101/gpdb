@@ -3,10 +3,10 @@
  * win32_sema.c
  *	  Microsoft Windows Win32 Semaphores Emulation
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/port/win32_sema.c,v 1.9 2009/06/11 14:49:00 momjian Exp $
+ *	  src/backend/port/win32_sema.c
  *
  *-------------------------------------------------------------------------
  */
@@ -91,7 +91,7 @@ PGSemaphoreCreate(PGSemaphore sema)
 	}
 	else
 		ereport(PANIC,
-				(errmsg("could not create semaphore: error code %d", (int) GetLastError())));
+				(errmsg("could not create semaphore: error code %lu", GetLastError())));
 }
 
 /*
@@ -116,10 +116,10 @@ PGSemaphoreReset(PGSemaphore sema)
  * Serve the interrupt if interruptOK is true.
  */
 void
-PGSemaphoreLock(PGSemaphore sema, bool interruptOK)
+PGSemaphoreLock(PGSemaphore sema)
 {
-	DWORD		ret;
 	HANDLE		wh[2];
+	bool		done = false;
 
 	/*
 	 * Note: pgwin32_signal_event should be first to ensure that it will be
@@ -130,39 +130,48 @@ PGSemaphoreLock(PGSemaphore sema, bool interruptOK)
 	wh[1] = *sema;
 
 	/*
-	 * As in other implementations of PGSemaphoreLock, we need to check
-	 * for cancel/die interrupts each time through the loop.  But here,
-	 * there is no hidden magic about whether the syscall will internally
-	 * service a signal --- we do that ourselves.
+	 * As in other implementations of PGSemaphoreLock, we need to check for
+	 * cancel/die interrupts each time through the loop.  But here, there is
+	 * no hidden magic about whether the syscall will internally service a
+	 * signal --- we do that ourselves.
 	 */
-	do
+	while (!done)
 	{
-		ImmediateInterruptOK = interruptOK;
+		DWORD		rc;
+
 		CHECK_FOR_INTERRUPTS();
 
-		ret = WaitForMultipleObjectsEx(2, wh, FALSE, INFINITE, TRUE);
-
-		if (ret == WAIT_OBJECT_0)
+		rc = WaitForMultipleObjectsEx(2, wh, FALSE, INFINITE, TRUE);
+		switch (rc)
 		{
-			/* Signal event is set - we have a signal to deliver */
-			pgwin32_dispatch_queued_signals();
-			errno = EINTR;
-		}
-		else if (ret == WAIT_OBJECT_0 + 1)
-		{
-			/* We got it! */
-			errno = 0;
-		}
-		else
-			/* Otherwise we are in trouble */
-			errno = EIDRM;
+			case WAIT_OBJECT_0:
+				/* Signal event is set - we have a signal to deliver */
+				pgwin32_dispatch_queued_signals();
+				break;
+			case WAIT_OBJECT_0 + 1:
+				/* We got it! */
+				done = true;
+				break;
+			case WAIT_IO_COMPLETION:
 
-		ImmediateInterruptOK = false;
-	} while (errno == EINTR);
-
-	if (errno != 0)
-		ereport(FATAL,
-				(errmsg("could not lock semaphore: error code %d", (int) GetLastError())));
+				/*
+				 * The system interrupted the wait to execute an I/O
+				 * completion routine or asynchronous procedure call in this
+				 * thread.  PostgreSQL does not provoke either of these, but
+				 * atypical loaded DLLs or even other processes might do so.
+				 * Now, resume waiting.
+				 */
+				break;
+			case WAIT_FAILED:
+				ereport(FATAL,
+						(errmsg("could not lock semaphore: error code %lu",
+								GetLastError())));
+				break;
+			default:
+				elog(FATAL, "unexpected return code from WaitForMultipleObjectsEx(): %lu", rc);
+				break;
+		}
+	}
 }
 
 /*
@@ -175,7 +184,7 @@ PGSemaphoreUnlock(PGSemaphore sema)
 {
 	if (!ReleaseSemaphore(*sema, 1, NULL))
 		ereport(FATAL,
-				(errmsg("could not unlock semaphore: error code %d", (int) GetLastError())));
+				(errmsg("could not unlock semaphore: error code %lu", GetLastError())));
 }
 
 /*
@@ -204,7 +213,7 @@ PGSemaphoreTryLock(PGSemaphore sema)
 
 	/* Otherwise we are in trouble */
 	ereport(FATAL,
-			(errmsg("could not try-lock semaphore: error code %d", (int) GetLastError())));
+	(errmsg("could not try-lock semaphore: error code %lu", GetLastError())));
 
 	/* keep compiler quiet */
 	return false;

@@ -4,10 +4,10 @@
  *	  prototypes for AIX-specific routines
  *
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/backend/port/dynloader/aix.h,v 1.14 2009/04/21 21:15:50 tgl Exp $
+ * src/backend/port/dynloader/aix.h
  *
  *-------------------------------------------------------------------------
  */
@@ -16,7 +16,7 @@
 #define PORT_PROTOS_H
 
 #include <dlfcn.h>
-#include "utils/dynamic_loader.h"
+#include "utils/dynamic_loader.h"		/* pgrminclude ignore */
 
 /*
  * In some older systems, the RTLD_NOW flag isn't defined and the mode

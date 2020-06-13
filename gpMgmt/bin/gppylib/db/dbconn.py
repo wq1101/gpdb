@@ -114,7 +114,10 @@ class DbURL:
             self.pgdb = dbname
 
         if username is None:
-            self.pguser = os.environ.get('PGUSER', os.environ.get('USER', UserId.local('Get uid')))
+            self.pguser = os.environ.get('PGUSER', os.environ.get('USER', None))
+            if self.pguser is None:
+                # fall back to /usr/bin/id
+                self.pguser = UserId.local('Get uid')
             if self.pguser is None or self.pguser == '':
                 raise Exception('Both $PGUSER and $USER env variables are not set!')
         else:
@@ -152,18 +155,16 @@ class DbURL:
 
 
 def connect(dburl, utility=False, verbose=False,
-            encoding=None, allowSystemTableMods=None, logConn=True):
+            encoding=None, allowSystemTableMods=False, logConn=True, unsetSearchPath=True):
 
     if utility:
-        options = '-c gp_session_role=utility'
+        options = '-c gp_role=utility'
     else:
         options = ''
 
     # MPP-13779, et al
-    if allowSystemTableMods in ['dml']:
-        options += ' -c allow_system_table_mods=' + allowSystemTableMods
-    elif allowSystemTableMods is not None:
-        raise Exception('allowSystemTableMods invalid: %s' % allowSystemTableMods)
+    if allowSystemTableMods:
+        options += ' -c allow_system_table_mods=true'
 
     # bypass pgdb.connect() and instead call pgdb._connect_
     # to avoid silly issues with : in ipv6 address names and the url string
@@ -195,6 +196,21 @@ def connect(dburl, utility=False, verbose=False,
         cstr    = "dbname='%s'" % dbbase
         retries = 1
 
+    options = []
+
+    # unset search path due to CVE-2018-1058
+    if unsetSearchPath:
+        options.append("-c search_path=")
+
+    #by default, libpq will print WARNINGS to stdout
+    if not verbose:
+        options.append("-c CLIENT_MIN_MESSAGES=ERROR")
+
+    # set client encoding if needed
+    if encoding:
+        options.append("-c CLIENT_ENCODING=%s" % encoding)
+    cstr += " options='%s'" % " ".join(options)
+
     # This flag helps to avoid logging the connection string in some special
     # situations as requested
     if (logConn == True):
@@ -214,21 +230,8 @@ def connect(dburl, utility=False, verbose=False,
     if cnx is None:
         raise ConnectionError('Failed to connect to %s' % dbbase)
 
+    # NOTE: the code to set ALWAYS_SECURE_SEARCH_PATH_SQL below assumes it is not part of an existing transaction
     conn = pgdb.pgdbCnx(cnx)
-
-    #by default, libpq will print WARNINGS to stdout
-    if not verbose:
-        cursor=conn.cursor()
-        cursor.execute("SET CLIENT_MIN_MESSAGES='ERROR'")
-        conn.commit()
-        cursor.close()
-
-    # set client encoding if needed
-    if encoding:
-        cursor=conn.cursor()
-        cursor.execute("SET CLIENT_ENCODING='%s'" % encoding)
-        conn.commit()
-        cursor.close()
 
     def __enter__(self):
         return self

@@ -3,19 +3,18 @@
  * fmgr.c
  *	  The Postgres function manager.
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/fmgr/fmgr.c,v 1.113.2.2 2009/12/09 21:58:17 tgl Exp $
+ *	  src/backend/utils/fmgr/fmgr.c
  *
  *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
 
-#include "access/heapam.h"
 #include "access/tuptoaster.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_proc.h"
@@ -23,7 +22,7 @@
 #include "executor/spi.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
-#include "parser/parse_expr.h"
+#include "nodes/nodeFuncs.h"
 #include "pgstat.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -33,6 +32,12 @@
 #include "utils/syscache.h"
 
 #include "cdb/cdbvars.h"
+
+/*
+ * Hooks for function calls
+ */
+PGDLLIMPORT needs_fmgr_hook_type needs_fmgr_hook = NULL;
+PGDLLIMPORT fmgr_hook_type fmgr_hook = NULL;
 
 /*
  * Declaration for old-style function pointer type.  This is now used only
@@ -93,7 +98,7 @@ static Datum fmgr_security_definer(PG_FUNCTION_ARGS);
 
 
 /*
- * Lookup routines for builtin-function table.	We can search by either Oid
+ * Lookup routines for builtin-function table.  We can search by either Oid
  * or name, but search by Oid is much faster.
  */
 
@@ -209,9 +214,7 @@ fmgr_info_cxt_security(Oid functionId, FmgrInfo *finfo, MemoryContext mcxt,
 	}
 
 	/* Otherwise we need the pg_proc entry */
-	procedureTuple = SearchSysCache(PROCOID,
-									ObjectIdGetDatum(functionId),
-									0, 0, 0);
+	procedureTuple = SearchSysCache1(PROCOID, ObjectIdGetDatum(functionId));
 	if (!HeapTupleIsValid(procedureTuple))
 		elog(ERROR, "cache lookup failed for function %u", functionId);
 	procedureStruct = (Form_pg_proc) GETSTRUCT(procedureTuple);
@@ -221,13 +224,23 @@ fmgr_info_cxt_security(Oid functionId, FmgrInfo *finfo, MemoryContext mcxt,
 	finfo->fn_retset = procedureStruct->proretset;
 
 	/*
-	 * If it has prosecdef set, or non-null proconfig, use
-	 * fmgr_security_definer call handler --- unless we are being called again
-	 * by fmgr_security_definer or fmgr_info_other_lang.
+	 * If it has prosecdef set, non-null proconfig, or if a plugin wants to
+	 * hook function entry/exit, use fmgr_security_definer call handler ---
+	 * unless we are being called again by fmgr_security_definer or
+	 * fmgr_info_other_lang.
+	 *
+	 * When using fmgr_security_definer, function stats tracking is always
+	 * disabled at the outer level, and instead we set the flag properly in
+	 * fmgr_security_definer's private flinfo and implement the tracking
+	 * inside fmgr_security_definer.  This loses the ability to charge the
+	 * overhead of fmgr_security_definer to the function, but gains the
+	 * ability to set the track_functions GUC as a local GUC parameter of an
+	 * interesting function and have the right things happen.
 	 */
 	if (!ignore_security &&
 		(procedureStruct->prosecdef ||
-		 !heap_attisnull(procedureTuple, Anum_pg_proc_proconfig)))
+		 !heap_attisnull(procedureTuple, Anum_pg_proc_proconfig) ||
+		 FmgrHookIsNeeded(functionId)))
 	{
 		finfo->fn_addr = fmgr_security_definer;
 		finfo->fn_stats = TRACK_FUNC_ALL;		/* ie, never track */
@@ -391,17 +404,15 @@ fmgr_info_other_lang(Oid functionId, FmgrInfo *finfo, HeapTuple procedureTuple)
 	Form_pg_language languageStruct;
 	FmgrInfo	plfinfo;
 
-	languageTuple = SearchSysCache(LANGOID,
-								   ObjectIdGetDatum(language),
-								   0, 0, 0);
+	languageTuple = SearchSysCache1(LANGOID, ObjectIdGetDatum(language));
 	if (!HeapTupleIsValid(languageTuple))
 		elog(ERROR, "cache lookup failed for language %u", language);
 	languageStruct = (Form_pg_language) GETSTRUCT(languageTuple);
 
 	/*
 	 * Look up the language's call handler function, ignoring any attributes
-	 * that would normally cause insertion of fmgr_security_definer.  We
-	 * need to get back a bare pointer to the actual C-language function.
+	 * that would normally cause insertion of fmgr_security_definer.  We need
+	 * to get back a bare pointer to the actual C-language function.
 	 */
 	fmgr_info_cxt_security(languageStruct->lanplcallfoid, &plfinfo,
 						   CurrentMemoryContext, true);
@@ -440,10 +451,7 @@ fetch_finfo_record(void *filehandle, char *funcname)
 	const Pg_finfo_record *inforec;
 	static Pg_finfo_record default_inforec = {0};
 
-	/* Compute name of info func */
-	infofuncname = (char *) palloc(strlen(funcname) + 10);
-	strcpy(infofuncname, "pg_finfo_");
-	strcat(infofuncname, funcname);
+	infofuncname = psprintf("pg_finfo_%s", funcname);
 
 	/* Try to look up the info function */
 	infofunc = (PGFInfoFunction) lookup_external_function(filehandle,
@@ -463,11 +471,6 @@ fetch_finfo_record(void *filehandle, char *funcname)
 		elog(ERROR, "null result from info function \"%s\"", infofuncname);
 	switch (inforec->api_version)
 	{
-		case 0:
-			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					errmsg("Old style C function (API version 0) are no longer supported by Greenplum")
-				       ));
-			break;
 		case 1:
 			/* OK, no additional fields to validate */
 			break;
@@ -513,7 +516,7 @@ lookup_C_func(HeapTuple procedureTuple)
 					NULL);
 	if (entry == NULL)
 		return NULL;			/* no such entry */
-	if (entry->fn_xmin == HeapTupleHeaderGetXmin(procedureTuple->t_data) &&
+	if (entry->fn_xmin == HeapTupleHeaderGetRawXmin(procedureTuple->t_data) &&
 		ItemPointerEquals(&entry->fn_tid, &procedureTuple->t_self))
 		return entry;			/* OK */
 	return NULL;				/* entry is out of date */
@@ -538,11 +541,10 @@ record_C_func(HeapTuple procedureTuple,
 		MemSet(&hash_ctl, 0, sizeof(hash_ctl));
 		hash_ctl.keysize = sizeof(Oid);
 		hash_ctl.entrysize = sizeof(CFuncHashTabEntry);
-		hash_ctl.hash = oid_hash;
 		CFuncHash = hash_create("CFuncHash",
 								100,
 								&hash_ctl,
-								HASH_ELEM | HASH_FUNCTION);
+								HASH_ELEM | HASH_BLOBS);
 	}
 
 	entry = (CFuncHashTabEntry *)
@@ -551,7 +553,7 @@ record_C_func(HeapTuple procedureTuple,
 					HASH_ENTER,
 					&found);
 	/* OID is already filled in */
-	entry->fn_xmin = HeapTupleHeaderGetXmin(procedureTuple->t_data);
+	entry->fn_xmin = HeapTupleHeaderGetRawXmin(procedureTuple->t_data);
 	entry->fn_tid = procedureTuple->t_self;
 	entry->user_fn = user_fn;
 	entry->inforec = inforec;
@@ -576,7 +578,7 @@ clear_external_function_hash(void *filehandle)
  * Copy an FmgrInfo struct
  *
  * This is inherently somewhat bogus since we can't reliably duplicate
- * language-dependent subsidiary info.	We cheat by zeroing fn_extra,
+ * language-dependent subsidiary info.  We cheat by zeroing fn_extra,
  * instead, meaning that subsidiary info will have to be recomputed.
  */
 void
@@ -871,7 +873,7 @@ fmgr_oldstyle(PG_FUNCTION_ARGS)
 
 
 /*
- * Support for security-definer and proconfig-using functions.	We support
+ * Support for security-definer and proconfig-using functions.  We support
  * both of these features using the same call handler, because they are
  * often used together and it would be inefficient (as well as notationally
  * messy) to have two levels of call handler involved.
@@ -881,17 +883,18 @@ struct fmgr_security_definer_cache
 	FmgrInfo	flinfo;			/* lookup info for target function */
 	Oid			userid;			/* userid to set, or InvalidOid */
 	ArrayType  *proconfig;		/* GUC values to set, or NULL */
+	Datum		arg;			/* passthrough argument for plugin modules */
 };
 
 /*
- * Function handler for security-definer/proconfig functions.  We extract the
- * OID of the actual function and do a fmgr lookup again.  Then we fetch the
- * pg_proc row and copy the owner ID and proconfig fields.	(All this info
- * is cached for the duration of the current query.)  To execute a call,
- * we temporarily replace the flinfo with the cached/looked-up one, while
- * keeping the outer fcinfo (which contains all the actual arguments, etc.)
- * intact.	This is not re-entrant, but then the fcinfo itself can't be used
- * re-entrantly anyway.
+ * Function handler for security-definer/proconfig/plugin-hooked functions.
+ * We extract the OID of the actual function and do a fmgr lookup again.
+ * Then we fetch the pg_proc row and copy the owner ID and proconfig fields.
+ * (All this info is cached for the duration of the current query.)
+ * To execute a call, we temporarily replace the flinfo with the cached
+ * and looked-up one, while keeping the outer fcinfo (which contains all
+ * the actual arguments, etc.) intact.  This is not re-entrant, but then
+ * the fcinfo itself can't be used re-entrantly anyway.
  */
 static Datum
 fmgr_security_definer(PG_FUNCTION_ARGS)
@@ -954,7 +957,7 @@ fmgr_security_definer(PG_FUNCTION_ARGS)
 
 	if (OidIsValid(fcache->userid))
 		SetUserIdAndSecContext(fcache->userid,
-							   save_sec_context | SECURITY_LOCAL_USERID_CHANGE);
+							save_sec_context | SECURITY_LOCAL_USERID_CHANGE);
 
 	if (fcache->proconfig)
 	{
@@ -963,6 +966,10 @@ fmgr_security_definer(PG_FUNCTION_ARGS)
 						PGC_S_SESSION,
 						GUC_ACTION_SAVE);
 	}
+
+	/* function manager hook */
+	if (fmgr_hook)
+		(*fmgr_hook) (FHET_START, &fcache->flinfo, &fcache->arg);
 
 	/*
 	 * We don't need to restore GUC or userid settings on error, because the
@@ -992,6 +999,8 @@ fmgr_security_definer(PG_FUNCTION_ARGS)
 	PG_CATCH();
 	{
 		fcinfo->flinfo = save_flinfo;
+		if (fmgr_hook)
+			(*fmgr_hook) (FHET_ABORT, &fcache->flinfo, &fcache->arg);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -1002,6 +1011,8 @@ fmgr_security_definer(PG_FUNCTION_ARGS)
 		AtEOXact_GUC(true, save_nestlevel);
 	if (OidIsValid(fcache->userid))
 		SetUserIdAndSecContext(save_userid, save_sec_context);
+	if (fmgr_hook)
+		(*fmgr_hook) (FHET_END, &fcache->flinfo, &fcache->arg);
 
 	return result;
 }
@@ -1015,16 +1026,16 @@ fmgr_security_definer(PG_FUNCTION_ARGS)
 /*
  * These are for invocation of a specifically named function with a
  * directly-computed parameter list.  Note that neither arguments nor result
- * are allowed to be NULL.	Also, the function cannot be one that needs to
+ * are allowed to be NULL.  Also, the function cannot be one that needs to
  * look at FmgrInfo, since there won't be any.
  */
 Datum
-DirectFunctionCall1(PGFunction func, Datum arg1)
+DirectFunctionCall1Coll(PGFunction func, Oid collation, Datum arg1)
 {
 	FunctionCallInfoData fcinfo;
 	Datum		result;
 
-	InitFunctionCallInfoData(fcinfo, NULL, 1, NULL, NULL);
+	InitFunctionCallInfoData(fcinfo, NULL, 1, collation, NULL, NULL);
 
 	fcinfo.arg[0] = arg1;
 	fcinfo.argnull[0] = false;
@@ -1039,12 +1050,12 @@ DirectFunctionCall1(PGFunction func, Datum arg1)
 }
 
 Datum
-DirectFunctionCall2(PGFunction func, Datum arg1, Datum arg2)
+DirectFunctionCall2Coll(PGFunction func, Oid collation, Datum arg1, Datum arg2)
 {
 	FunctionCallInfoData fcinfo;
 	Datum		result;
 
-	InitFunctionCallInfoData(fcinfo, NULL, 2, NULL, NULL);
+	InitFunctionCallInfoData(fcinfo, NULL, 2, collation, NULL, NULL);
 
 	fcinfo.arg[0] = arg1;
 	fcinfo.arg[1] = arg2;
@@ -1061,13 +1072,13 @@ DirectFunctionCall2(PGFunction func, Datum arg1, Datum arg2)
 }
 
 Datum
-DirectFunctionCall3(PGFunction func, Datum arg1, Datum arg2,
-					Datum arg3)
+DirectFunctionCall3Coll(PGFunction func, Oid collation, Datum arg1, Datum arg2,
+						Datum arg3)
 {
 	FunctionCallInfoData fcinfo;
 	Datum		result;
 
-	InitFunctionCallInfoData(fcinfo, NULL, 3, NULL, NULL);
+	InitFunctionCallInfoData(fcinfo, NULL, 3, collation, NULL, NULL);
 
 	fcinfo.arg[0] = arg1;
 	fcinfo.arg[1] = arg2;
@@ -1086,13 +1097,13 @@ DirectFunctionCall3(PGFunction func, Datum arg1, Datum arg2,
 }
 
 Datum
-DirectFunctionCall4(PGFunction func, Datum arg1, Datum arg2,
-					Datum arg3, Datum arg4)
+DirectFunctionCall4Coll(PGFunction func, Oid collation, Datum arg1, Datum arg2,
+						Datum arg3, Datum arg4)
 {
 	FunctionCallInfoData fcinfo;
 	Datum		result;
 
-	InitFunctionCallInfoData(fcinfo, NULL, 4, NULL, NULL);
+	InitFunctionCallInfoData(fcinfo, NULL, 4, collation, NULL, NULL);
 
 	fcinfo.arg[0] = arg1;
 	fcinfo.arg[1] = arg2;
@@ -1113,13 +1124,13 @@ DirectFunctionCall4(PGFunction func, Datum arg1, Datum arg2,
 }
 
 Datum
-DirectFunctionCall5(PGFunction func, Datum arg1, Datum arg2,
-					Datum arg3, Datum arg4, Datum arg5)
+DirectFunctionCall5Coll(PGFunction func, Oid collation, Datum arg1, Datum arg2,
+						Datum arg3, Datum arg4, Datum arg5)
 {
 	FunctionCallInfoData fcinfo;
 	Datum		result;
 
-	InitFunctionCallInfoData(fcinfo, NULL, 5, NULL, NULL);
+	InitFunctionCallInfoData(fcinfo, NULL, 5, collation, NULL, NULL);
 
 	fcinfo.arg[0] = arg1;
 	fcinfo.arg[1] = arg2;
@@ -1142,14 +1153,14 @@ DirectFunctionCall5(PGFunction func, Datum arg1, Datum arg2,
 }
 
 Datum
-DirectFunctionCall6(PGFunction func, Datum arg1, Datum arg2,
-					Datum arg3, Datum arg4, Datum arg5,
-					Datum arg6)
+DirectFunctionCall6Coll(PGFunction func, Oid collation, Datum arg1, Datum arg2,
+						Datum arg3, Datum arg4, Datum arg5,
+						Datum arg6)
 {
 	FunctionCallInfoData fcinfo;
 	Datum		result;
 
-	InitFunctionCallInfoData(fcinfo, NULL, 6, NULL, NULL);
+	InitFunctionCallInfoData(fcinfo, NULL, 6, collation, NULL, NULL);
 
 	fcinfo.arg[0] = arg1;
 	fcinfo.arg[1] = arg2;
@@ -1174,14 +1185,14 @@ DirectFunctionCall6(PGFunction func, Datum arg1, Datum arg2,
 }
 
 Datum
-DirectFunctionCall7(PGFunction func, Datum arg1, Datum arg2,
-					Datum arg3, Datum arg4, Datum arg5,
-					Datum arg6, Datum arg7)
+DirectFunctionCall7Coll(PGFunction func, Oid collation, Datum arg1, Datum arg2,
+						Datum arg3, Datum arg4, Datum arg5,
+						Datum arg6, Datum arg7)
 {
 	FunctionCallInfoData fcinfo;
 	Datum		result;
 
-	InitFunctionCallInfoData(fcinfo, NULL, 7, NULL, NULL);
+	InitFunctionCallInfoData(fcinfo, NULL, 7, collation, NULL, NULL);
 
 	fcinfo.arg[0] = arg1;
 	fcinfo.arg[1] = arg2;
@@ -1208,14 +1219,14 @@ DirectFunctionCall7(PGFunction func, Datum arg1, Datum arg2,
 }
 
 Datum
-DirectFunctionCall8(PGFunction func, Datum arg1, Datum arg2,
-					Datum arg3, Datum arg4, Datum arg5,
-					Datum arg6, Datum arg7, Datum arg8)
+DirectFunctionCall8Coll(PGFunction func, Oid collation, Datum arg1, Datum arg2,
+						Datum arg3, Datum arg4, Datum arg5,
+						Datum arg6, Datum arg7, Datum arg8)
 {
 	FunctionCallInfoData fcinfo;
 	Datum		result;
 
-	InitFunctionCallInfoData(fcinfo, NULL, 8, NULL, NULL);
+	InitFunctionCallInfoData(fcinfo, NULL, 8, collation, NULL, NULL);
 
 	fcinfo.arg[0] = arg1;
 	fcinfo.arg[1] = arg2;
@@ -1244,15 +1255,15 @@ DirectFunctionCall8(PGFunction func, Datum arg1, Datum arg2,
 }
 
 Datum
-DirectFunctionCall9(PGFunction func, Datum arg1, Datum arg2,
-					Datum arg3, Datum arg4, Datum arg5,
-					Datum arg6, Datum arg7, Datum arg8,
-					Datum arg9)
+DirectFunctionCall9Coll(PGFunction func, Oid collation, Datum arg1, Datum arg2,
+						Datum arg3, Datum arg4, Datum arg5,
+						Datum arg6, Datum arg7, Datum arg8,
+						Datum arg9)
 {
 	FunctionCallInfoData fcinfo;
 	Datum		result;
 
-	InitFunctionCallInfoData(fcinfo, NULL, 9, NULL, NULL);
+	InitFunctionCallInfoData(fcinfo, NULL, 9, collation, NULL, NULL);
 
 	fcinfo.arg[0] = arg1;
 	fcinfo.arg[1] = arg2;
@@ -1289,12 +1300,12 @@ DirectFunctionCall9(PGFunction func, Datum arg1, Datum arg2,
  * are allowed to be NULL.
  */
 Datum
-FunctionCall1(FmgrInfo *flinfo, Datum arg1)
+FunctionCall1Coll(FmgrInfo *flinfo, Oid collation, Datum arg1)
 {
 	FunctionCallInfoData fcinfo;
 	Datum		result;
 
-	InitFunctionCallInfoData(fcinfo, flinfo, 1, NULL, NULL);
+	InitFunctionCallInfoData(fcinfo, flinfo, 1, collation, NULL, NULL);
 
 	fcinfo.arg[0] = arg1;
 	fcinfo.argnull[0] = false;
@@ -1309,16 +1320,12 @@ FunctionCall1(FmgrInfo *flinfo, Datum arg1)
 }
 
 Datum
-FunctionCall2(FmgrInfo *flinfo, Datum arg1, Datum arg2)
+FunctionCall2Coll(FmgrInfo *flinfo, Oid collation, Datum arg1, Datum arg2)
 {
-	/*
-	 * XXX if you change this routine, see also the inlined version in
-	 * utils/sort/tuplesort.c!
-	 */
 	FunctionCallInfoData fcinfo;
 	Datum		result;
 
-	InitFunctionCallInfoData(fcinfo, flinfo, 2, NULL, NULL);
+	InitFunctionCallInfoData(fcinfo, flinfo, 2, collation, NULL, NULL);
 
 	fcinfo.arg[0] = arg1;
 	fcinfo.arg[1] = arg2;
@@ -1335,13 +1342,13 @@ FunctionCall2(FmgrInfo *flinfo, Datum arg1, Datum arg2)
 }
 
 Datum
-FunctionCall3(FmgrInfo *flinfo, Datum arg1, Datum arg2,
-			  Datum arg3)
+FunctionCall3Coll(FmgrInfo *flinfo, Oid collation, Datum arg1, Datum arg2,
+				  Datum arg3)
 {
 	FunctionCallInfoData fcinfo;
 	Datum		result;
 
-	InitFunctionCallInfoData(fcinfo, flinfo, 3, NULL, NULL);
+	InitFunctionCallInfoData(fcinfo, flinfo, 3, collation, NULL, NULL);
 
 	fcinfo.arg[0] = arg1;
 	fcinfo.arg[1] = arg2;
@@ -1360,13 +1367,13 @@ FunctionCall3(FmgrInfo *flinfo, Datum arg1, Datum arg2,
 }
 
 Datum
-FunctionCall4(FmgrInfo *flinfo, Datum arg1, Datum arg2,
-			  Datum arg3, Datum arg4)
+FunctionCall4Coll(FmgrInfo *flinfo, Oid collation, Datum arg1, Datum arg2,
+				  Datum arg3, Datum arg4)
 {
 	FunctionCallInfoData fcinfo;
 	Datum		result;
 
-	InitFunctionCallInfoData(fcinfo, flinfo, 4, NULL, NULL);
+	InitFunctionCallInfoData(fcinfo, flinfo, 4, collation, NULL, NULL);
 
 	fcinfo.arg[0] = arg1;
 	fcinfo.arg[1] = arg2;
@@ -1387,13 +1394,13 @@ FunctionCall4(FmgrInfo *flinfo, Datum arg1, Datum arg2,
 }
 
 Datum
-FunctionCall5(FmgrInfo *flinfo, Datum arg1, Datum arg2,
-			  Datum arg3, Datum arg4, Datum arg5)
+FunctionCall5Coll(FmgrInfo *flinfo, Oid collation, Datum arg1, Datum arg2,
+				  Datum arg3, Datum arg4, Datum arg5)
 {
 	FunctionCallInfoData fcinfo;
 	Datum		result;
 
-	InitFunctionCallInfoData(fcinfo, flinfo, 5, NULL, NULL);
+	InitFunctionCallInfoData(fcinfo, flinfo, 5, collation, NULL, NULL);
 
 	fcinfo.arg[0] = arg1;
 	fcinfo.arg[1] = arg2;
@@ -1416,14 +1423,14 @@ FunctionCall5(FmgrInfo *flinfo, Datum arg1, Datum arg2,
 }
 
 Datum
-FunctionCall6(FmgrInfo *flinfo, Datum arg1, Datum arg2,
-			  Datum arg3, Datum arg4, Datum arg5,
-			  Datum arg6)
+FunctionCall6Coll(FmgrInfo *flinfo, Oid collation, Datum arg1, Datum arg2,
+				  Datum arg3, Datum arg4, Datum arg5,
+				  Datum arg6)
 {
 	FunctionCallInfoData fcinfo;
 	Datum		result;
 
-	InitFunctionCallInfoData(fcinfo, flinfo, 6, NULL, NULL);
+	InitFunctionCallInfoData(fcinfo, flinfo, 6, collation, NULL, NULL);
 
 	fcinfo.arg[0] = arg1;
 	fcinfo.arg[1] = arg2;
@@ -1448,14 +1455,14 @@ FunctionCall6(FmgrInfo *flinfo, Datum arg1, Datum arg2,
 }
 
 Datum
-FunctionCall7(FmgrInfo *flinfo, Datum arg1, Datum arg2,
-			  Datum arg3, Datum arg4, Datum arg5,
-			  Datum arg6, Datum arg7)
+FunctionCall7Coll(FmgrInfo *flinfo, Oid collation, Datum arg1, Datum arg2,
+				  Datum arg3, Datum arg4, Datum arg5,
+				  Datum arg6, Datum arg7)
 {
 	FunctionCallInfoData fcinfo;
 	Datum		result;
 
-	InitFunctionCallInfoData(fcinfo, flinfo, 7, NULL, NULL);
+	InitFunctionCallInfoData(fcinfo, flinfo, 7, collation, NULL, NULL);
 
 	fcinfo.arg[0] = arg1;
 	fcinfo.arg[1] = arg2;
@@ -1482,14 +1489,14 @@ FunctionCall7(FmgrInfo *flinfo, Datum arg1, Datum arg2,
 }
 
 Datum
-FunctionCall8(FmgrInfo *flinfo, Datum arg1, Datum arg2,
-			  Datum arg3, Datum arg4, Datum arg5,
-			  Datum arg6, Datum arg7, Datum arg8)
+FunctionCall8Coll(FmgrInfo *flinfo, Oid collation, Datum arg1, Datum arg2,
+				  Datum arg3, Datum arg4, Datum arg5,
+				  Datum arg6, Datum arg7, Datum arg8)
 {
 	FunctionCallInfoData fcinfo;
 	Datum		result;
 
-	InitFunctionCallInfoData(fcinfo, flinfo, 8, NULL, NULL);
+	InitFunctionCallInfoData(fcinfo, flinfo, 8, collation, NULL, NULL);
 
 	fcinfo.arg[0] = arg1;
 	fcinfo.arg[1] = arg2;
@@ -1518,15 +1525,15 @@ FunctionCall8(FmgrInfo *flinfo, Datum arg1, Datum arg2,
 }
 
 Datum
-FunctionCall9(FmgrInfo *flinfo, Datum arg1, Datum arg2,
-			  Datum arg3, Datum arg4, Datum arg5,
-			  Datum arg6, Datum arg7, Datum arg8,
-			  Datum arg9)
+FunctionCall9Coll(FmgrInfo *flinfo, Oid collation, Datum arg1, Datum arg2,
+				  Datum arg3, Datum arg4, Datum arg5,
+				  Datum arg6, Datum arg7, Datum arg8,
+				  Datum arg9)
 {
 	FunctionCallInfoData fcinfo;
 	Datum		result;
 
-	InitFunctionCallInfoData(fcinfo, flinfo, 9, NULL, NULL);
+	InitFunctionCallInfoData(fcinfo, flinfo, 9, collation, NULL, NULL);
 
 	fcinfo.arg[0] = arg1;
 	fcinfo.arg[1] = arg2;
@@ -1560,12 +1567,12 @@ FunctionCall9(FmgrInfo *flinfo, Datum arg1, Datum arg2,
 /*
  * These are for invocation of a function identified by OID with a
  * directly-computed parameter list.  Note that neither arguments nor result
- * are allowed to be NULL.	These are essentially fmgr_info() followed
- * by FunctionCallN().	If the same function is to be invoked repeatedly,
+ * are allowed to be NULL.  These are essentially fmgr_info() followed
+ * by FunctionCallN().  If the same function is to be invoked repeatedly,
  * do the fmgr_info() once and then use FunctionCallN().
  */
 Datum
-OidFunctionCall1(Oid functionId, Datum arg1)
+OidFunctionCall0Coll(Oid functionId, Oid collation)
 {
 	FmgrInfo	flinfo;
 	FunctionCallInfoData fcinfo;
@@ -1573,7 +1580,27 @@ OidFunctionCall1(Oid functionId, Datum arg1)
 
 	fmgr_info(functionId, &flinfo);
 
-	InitFunctionCallInfoData(fcinfo, &flinfo, 1, NULL, NULL);
+	InitFunctionCallInfoData(fcinfo, &flinfo, 0, collation, NULL, NULL);
+
+	result = FunctionCallInvoke(&fcinfo);
+
+	/* Check for null result, since caller is clearly not expecting one */
+	if (fcinfo.isnull)
+		elog(ERROR, "function %u returned NULL", flinfo.fn_oid);
+
+	return result;
+}
+
+Datum
+OidFunctionCall1Coll(Oid functionId, Oid collation, Datum arg1)
+{
+	FmgrInfo	flinfo;
+	FunctionCallInfoData fcinfo;
+	Datum		result;
+
+	fmgr_info(functionId, &flinfo);
+
+	InitFunctionCallInfoData(fcinfo, &flinfo, 1, collation, NULL, NULL);
 
 	fcinfo.arg[0] = arg1;
 	fcinfo.argnull[0] = false;
@@ -1588,7 +1615,7 @@ OidFunctionCall1(Oid functionId, Datum arg1)
 }
 
 Datum
-OidFunctionCall2(Oid functionId, Datum arg1, Datum arg2)
+OidFunctionCall2Coll(Oid functionId, Oid collation, Datum arg1, Datum arg2)
 {
 	FmgrInfo	flinfo;
 	FunctionCallInfoData fcinfo;
@@ -1596,7 +1623,7 @@ OidFunctionCall2(Oid functionId, Datum arg1, Datum arg2)
 
 	fmgr_info(functionId, &flinfo);
 
-	InitFunctionCallInfoData(fcinfo, &flinfo, 2, NULL, NULL);
+	InitFunctionCallInfoData(fcinfo, &flinfo, 2, collation, NULL, NULL);
 
 	fcinfo.arg[0] = arg1;
 	fcinfo.arg[1] = arg2;
@@ -1613,8 +1640,8 @@ OidFunctionCall2(Oid functionId, Datum arg1, Datum arg2)
 }
 
 Datum
-OidFunctionCall3(Oid functionId, Datum arg1, Datum arg2,
-				 Datum arg3)
+OidFunctionCall3Coll(Oid functionId, Oid collation, Datum arg1, Datum arg2,
+					 Datum arg3)
 {
 	FmgrInfo	flinfo;
 	FunctionCallInfoData fcinfo;
@@ -1622,7 +1649,7 @@ OidFunctionCall3(Oid functionId, Datum arg1, Datum arg2,
 
 	fmgr_info(functionId, &flinfo);
 
-	InitFunctionCallInfoData(fcinfo, &flinfo, 3, NULL, NULL);
+	InitFunctionCallInfoData(fcinfo, &flinfo, 3, collation, NULL, NULL);
 
 	fcinfo.arg[0] = arg1;
 	fcinfo.arg[1] = arg2;
@@ -1641,8 +1668,8 @@ OidFunctionCall3(Oid functionId, Datum arg1, Datum arg2,
 }
 
 Datum
-OidFunctionCall4(Oid functionId, Datum arg1, Datum arg2,
-				 Datum arg3, Datum arg4)
+OidFunctionCall4Coll(Oid functionId, Oid collation, Datum arg1, Datum arg2,
+					 Datum arg3, Datum arg4)
 {
 	FmgrInfo	flinfo;
 	FunctionCallInfoData fcinfo;
@@ -1650,7 +1677,7 @@ OidFunctionCall4(Oid functionId, Datum arg1, Datum arg2,
 
 	fmgr_info(functionId, &flinfo);
 
-	InitFunctionCallInfoData(fcinfo, &flinfo, 4, NULL, NULL);
+	InitFunctionCallInfoData(fcinfo, &flinfo, 4, collation, NULL, NULL);
 
 	fcinfo.arg[0] = arg1;
 	fcinfo.arg[1] = arg2;
@@ -1671,8 +1698,8 @@ OidFunctionCall4(Oid functionId, Datum arg1, Datum arg2,
 }
 
 Datum
-OidFunctionCall5(Oid functionId, Datum arg1, Datum arg2,
-				 Datum arg3, Datum arg4, Datum arg5)
+OidFunctionCall5Coll(Oid functionId, Oid collation, Datum arg1, Datum arg2,
+					 Datum arg3, Datum arg4, Datum arg5)
 {
 	FmgrInfo	flinfo;
 	FunctionCallInfoData fcinfo;
@@ -1680,7 +1707,7 @@ OidFunctionCall5(Oid functionId, Datum arg1, Datum arg2,
 
 	fmgr_info(functionId, &flinfo);
 
-	InitFunctionCallInfoData(fcinfo, &flinfo, 5, NULL, NULL);
+	InitFunctionCallInfoData(fcinfo, &flinfo, 5, collation, NULL, NULL);
 
 	fcinfo.arg[0] = arg1;
 	fcinfo.arg[1] = arg2;
@@ -1703,9 +1730,9 @@ OidFunctionCall5(Oid functionId, Datum arg1, Datum arg2,
 }
 
 Datum
-OidFunctionCall6(Oid functionId, Datum arg1, Datum arg2,
-				 Datum arg3, Datum arg4, Datum arg5,
-				 Datum arg6)
+OidFunctionCall6Coll(Oid functionId, Oid collation, Datum arg1, Datum arg2,
+					 Datum arg3, Datum arg4, Datum arg5,
+					 Datum arg6)
 {
 	FmgrInfo	flinfo;
 	FunctionCallInfoData fcinfo;
@@ -1713,7 +1740,7 @@ OidFunctionCall6(Oid functionId, Datum arg1, Datum arg2,
 
 	fmgr_info(functionId, &flinfo);
 
-	InitFunctionCallInfoData(fcinfo, &flinfo, 6, NULL, NULL);
+	InitFunctionCallInfoData(fcinfo, &flinfo, 6, collation, NULL, NULL);
 
 	fcinfo.arg[0] = arg1;
 	fcinfo.arg[1] = arg2;
@@ -1738,9 +1765,9 @@ OidFunctionCall6(Oid functionId, Datum arg1, Datum arg2,
 }
 
 Datum
-OidFunctionCall7(Oid functionId, Datum arg1, Datum arg2,
-				 Datum arg3, Datum arg4, Datum arg5,
-				 Datum arg6, Datum arg7)
+OidFunctionCall7Coll(Oid functionId, Oid collation, Datum arg1, Datum arg2,
+					 Datum arg3, Datum arg4, Datum arg5,
+					 Datum arg6, Datum arg7)
 {
 	FmgrInfo	flinfo;
 	FunctionCallInfoData fcinfo;
@@ -1748,7 +1775,7 @@ OidFunctionCall7(Oid functionId, Datum arg1, Datum arg2,
 
 	fmgr_info(functionId, &flinfo);
 
-	InitFunctionCallInfoData(fcinfo, &flinfo, 7, NULL, NULL);
+	InitFunctionCallInfoData(fcinfo, &flinfo, 7, collation, NULL, NULL);
 
 	fcinfo.arg[0] = arg1;
 	fcinfo.arg[1] = arg2;
@@ -1775,9 +1802,9 @@ OidFunctionCall7(Oid functionId, Datum arg1, Datum arg2,
 }
 
 Datum
-OidFunctionCall8(Oid functionId, Datum arg1, Datum arg2,
-				 Datum arg3, Datum arg4, Datum arg5,
-				 Datum arg6, Datum arg7, Datum arg8)
+OidFunctionCall8Coll(Oid functionId, Oid collation, Datum arg1, Datum arg2,
+					 Datum arg3, Datum arg4, Datum arg5,
+					 Datum arg6, Datum arg7, Datum arg8)
 {
 	FmgrInfo	flinfo;
 	FunctionCallInfoData fcinfo;
@@ -1785,7 +1812,7 @@ OidFunctionCall8(Oid functionId, Datum arg1, Datum arg2,
 
 	fmgr_info(functionId, &flinfo);
 
-	InitFunctionCallInfoData(fcinfo, &flinfo, 8, NULL, NULL);
+	InitFunctionCallInfoData(fcinfo, &flinfo, 8, collation, NULL, NULL);
 
 	fcinfo.arg[0] = arg1;
 	fcinfo.arg[1] = arg2;
@@ -1814,10 +1841,10 @@ OidFunctionCall8(Oid functionId, Datum arg1, Datum arg2,
 }
 
 Datum
-OidFunctionCall9(Oid functionId, Datum arg1, Datum arg2,
-				 Datum arg3, Datum arg4, Datum arg5,
-				 Datum arg6, Datum arg7, Datum arg8,
-				 Datum arg9)
+OidFunctionCall9Coll(Oid functionId, Oid collation, Datum arg1, Datum arg2,
+					 Datum arg3, Datum arg4, Datum arg5,
+					 Datum arg6, Datum arg7, Datum arg8,
+					 Datum arg9)
 {
 	FmgrInfo	flinfo;
 	FunctionCallInfoData fcinfo;
@@ -1825,7 +1852,7 @@ OidFunctionCall9(Oid functionId, Datum arg1, Datum arg2,
 
 	fmgr_info(functionId, &flinfo);
 
-	InitFunctionCallInfoData(fcinfo, &flinfo, 9, NULL, NULL);
+	InitFunctionCallInfoData(fcinfo, &flinfo, 9, collation, NULL, NULL);
 
 	fcinfo.arg[0] = arg1;
 	fcinfo.arg[1] = arg2;
@@ -1886,7 +1913,7 @@ InputFunctionCall(FmgrInfo *flinfo, char *str, Oid typioparam, int32 typmod)
 
 	pushed = SPI_push_conditional();
 
-	InitFunctionCallInfoData(fcinfo, flinfo, 3, NULL, NULL);
+	InitFunctionCallInfoData(fcinfo, flinfo, 3, InvalidOid, NULL, NULL);
 
 	fcinfo.arg[0] = CStringGetDatum(str);
 	fcinfo.arg[1] = ObjectIdGetDatum(typioparam);
@@ -1961,7 +1988,7 @@ ReceiveFunctionCall(FmgrInfo *flinfo, StringInfo buf,
 
 	pushed = SPI_push_conditional();
 
-	InitFunctionCallInfoData(fcinfo, flinfo, 3, NULL, NULL);
+	InitFunctionCallInfoData(fcinfo, flinfo, 3, InvalidOid, NULL, NULL);
 
 	fcinfo.arg[0] = PointerGetDatum(buf);
 	fcinfo.arg[1] = ObjectIdGetDatum(typioparam);
@@ -2057,6 +2084,115 @@ OidSendFunctionCall(Oid functionId, Datum val)
 	return SendFunctionCall(&flinfo, val);
 }
 
+
+/*
+ * On GPDB, int64, float8 and float4 are always pass-by-value, and there are
+ * static inline functions in postgres.h to implement these.
+ */
+#if 0
+/*-------------------------------------------------------------------------
+ *		Support routines for standard maybe-pass-by-reference datatypes
+ *
+ * int8, float4, and float8 can be passed by value if Datum is wide enough.
+ * (For backwards-compatibility reasons, we allow pass-by-ref to be chosen
+ * at compile time even if pass-by-val is possible.)  For the float types,
+ * we need a support routine even if we are passing by value, because many
+ * machines pass int and float function parameters/results differently;
+ * so we need to play weird games with unions.
+ *
+ * Note: there is only one switch controlling the pass-by-value option for
+ * both int8 and float8; this is to avoid making things unduly complicated
+ * for the timestamp types, which might have either representation.
+ *-------------------------------------------------------------------------
+ */
+
+#ifndef USE_FLOAT8_BYVAL		/* controls int8 too */
+
+Datum
+Int64GetDatum(int64 X)
+{
+	int64	   *retval = (int64 *) palloc(sizeof(int64));
+
+	*retval = X;
+	return PointerGetDatum(retval);
+}
+#endif   /* USE_FLOAT8_BYVAL */
+
+Datum
+Float4GetDatum(float4 X)
+{
+#ifdef USE_FLOAT4_BYVAL
+	union
+	{
+		float4		value;
+		int32		retval;
+	}			myunion;
+
+	myunion.value = X;
+	return SET_4_BYTES(myunion.retval);
+#else
+	float4	   *retval = (float4 *) palloc(sizeof(float4));
+
+	*retval = X;
+	return PointerGetDatum(retval);
+#endif
+}
+
+#ifdef USE_FLOAT4_BYVAL
+
+float4
+DatumGetFloat4(Datum X)
+{
+	union
+	{
+		int32		value;
+		float4		retval;
+	}			myunion;
+
+	myunion.value = GET_4_BYTES(X);
+	return myunion.retval;
+}
+#endif   /* USE_FLOAT4_BYVAL */
+
+Datum
+Float8GetDatum(float8 X)
+{
+#ifdef USE_FLOAT8_BYVAL
+	union
+	{
+		float8		value;
+		int64		retval;
+	}			myunion;
+
+	myunion.value = X;
+	return SET_8_BYTES(myunion.retval);
+#else
+	float8	   *retval = (float8 *) palloc(sizeof(float8));
+
+	*retval = X;
+	return PointerGetDatum(retval);
+#endif
+}
+
+#ifdef USE_FLOAT8_BYVAL
+
+float8
+DatumGetFloat8(Datum X)
+{
+	union
+	{
+		int64		value;
+		float8		retval;
+	}			myunion;
+
+	myunion.value = GET_8_BYTES(X);
+	return myunion.retval;
+}
+#endif   /* USE_FLOAT8_BYVAL */
+
+#endif /* GPDB */
+
+
 /*-------------------------------------------------------------------------
  *		Support routines for toastable datatypes
  *-------------------------------------------------------------------------
@@ -2109,6 +2245,7 @@ pg_detoast_datum_packed(struct varlena * datum)
  * These are needed by polymorphic functions, which accept multiple possible
  * input types and need help from the parser to know what they've got.
  * Also, some functions might be interested in whether a parameter is constant.
+ * Functions taking VARIADIC ANY also need to know about the VARIADIC keyword.
  *-------------------------------------------------------------------------
  */
 
@@ -2179,6 +2316,8 @@ get_call_expr_argtype(Node *expr, int argnum)
 		args = list_make1(((ArrayCoerceExpr *) expr)->arg);
 	else if (IsA(expr, NullIfExpr))
 		args = ((NullIfExpr *) expr)->args;
+	else if (IsA(expr, WindowFunc))
+		args = ((WindowFunc *) expr)->args;
 	else
 		return InvalidOid;
 
@@ -2194,12 +2333,109 @@ get_call_expr_argtype(Node *expr, int argnum)
 	 */
 	if (IsA(expr, ScalarArrayOpExpr) &&
 		argnum == 1)
-		argtype = get_element_type(argtype);
+		argtype = get_base_element_type(argtype);
 	else if (IsA(expr, ArrayCoerceExpr) &&
 			 argnum == 0)
-		argtype = get_element_type(argtype);
+		argtype = get_base_element_type(argtype);
 
 	return argtype;
+}
+
+/*
+ * Find out whether a specific function argument is constant for the
+ * duration of a query
+ *
+ * Returns false if information is not available
+ */
+bool
+get_fn_expr_arg_stable(FmgrInfo *flinfo, int argnum)
+{
+	/*
+	 * can't return anything useful if we have no FmgrInfo or if its fn_expr
+	 * node has not been initialized
+	 */
+	if (!flinfo || !flinfo->fn_expr)
+		return false;
+
+	return get_call_expr_arg_stable(flinfo->fn_expr, argnum);
+}
+
+/*
+ * Find out whether a specific function argument is constant for the
+ * duration of a query, but working from the calling expression tree
+ *
+ * Returns false if information is not available
+ */
+bool
+get_call_expr_arg_stable(Node *expr, int argnum)
+{
+	List	   *args;
+	Node	   *arg;
+
+	if (expr == NULL)
+		return false;
+
+	if (IsA(expr, FuncExpr))
+		args = ((FuncExpr *) expr)->args;
+	else if (IsA(expr, OpExpr))
+		args = ((OpExpr *) expr)->args;
+	else if (IsA(expr, DistinctExpr))
+		args = ((DistinctExpr *) expr)->args;
+	else if (IsA(expr, ScalarArrayOpExpr))
+		args = ((ScalarArrayOpExpr *) expr)->args;
+	else if (IsA(expr, ArrayCoerceExpr))
+		args = list_make1(((ArrayCoerceExpr *) expr)->arg);
+	else if (IsA(expr, NullIfExpr))
+		args = ((NullIfExpr *) expr)->args;
+	else if (IsA(expr, WindowFunc))
+		args = ((WindowFunc *) expr)->args;
+	else
+		return false;
+
+	if (argnum < 0 || argnum >= list_length(args))
+		return false;
+
+	arg = (Node *) list_nth(args, argnum);
+
+	/*
+	 * Either a true Const or an external Param will have a value that doesn't
+	 * change during the execution of the query.  In future we might want to
+	 * consider other cases too, e.g. now().
+	 */
+	if (IsA(arg, Const))
+		return true;
+	if (IsA(arg, Param) &&
+		((Param *) arg)->paramkind == PARAM_EXTERN)
+		return true;
+
+	return false;
+}
+
+/*
+ * Get the VARIADIC flag from the function invocation
+ *
+ * Returns false (the default assumption) if information is not available
+ *
+ * Note this is generally only of interest to VARIADIC ANY functions
+ */
+bool
+get_fn_expr_variadic(FmgrInfo *flinfo)
+{
+	Node	   *expr;
+
+	/*
+	 * can't return anything useful if we have no FmgrInfo or if its fn_expr
+	 * node has not been initialized
+	 */
+	if (!flinfo || !flinfo->fn_expr)
+		return false;
+
+	expr = flinfo->fn_expr;
+
+	if (IsA(expr, FuncExpr))
+		return ((FuncExpr *) expr)->funcvariadic;
+	else
+		return false;
 }
 
 /*-------------------------------------------------------------------------
@@ -2242,7 +2478,7 @@ CheckFunctionValidatorAccess(Oid validatorOid, Oid functionOid)
 	AclResult	aclresult;
 
 	/* Get the function's pg_proc entry */
-	procTup = SearchSysCache(PROCOID, ObjectIdGetDatum(functionOid), 0, 0, 0);
+	procTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(functionOid));
 	if (!HeapTupleIsValid(procTup))
 		elog(ERROR, "cache lookup failed for function %u", functionOid);
 	procStruct = (Form_pg_proc) GETSTRUCT(procTup);
@@ -2251,8 +2487,7 @@ CheckFunctionValidatorAccess(Oid validatorOid, Oid functionOid)
 	 * Fetch pg_language entry to know if this is the correct validation
 	 * function for that pg_proc entry.
 	 */
-	langTup = SearchSysCache(LANGOID, ObjectIdGetDatum(procStruct->prolang),
-							 0, 0, 0);
+	langTup = SearchSysCache1(LANGOID, ObjectIdGetDatum(procStruct->prolang));
 	if (!HeapTupleIsValid(langTup))
 		elog(ERROR, "cache lookup failed for language %u", procStruct->prolang);
 	langStruct = (Form_pg_language) GETSTRUCT(langTup);

@@ -3,161 +3,131 @@
 ## ======================================================================
 
 resource_types:
-  - name: pull_request_with_submodule
-    type: docker-image
-    source:
-      repository: jtarchie/pr
+- name: pull-request
+  type: docker-image
+  source:
+    repository: teliaoss/github-pr-resource
+- name: gcs
+  type: docker-image
+  source:
+    repository: frodenas/gcs-resource
 
 resources:
-  - name: gpdb_pr
-    type: pull_request_with_submodule
-    source:
-      repo: greenplum-db/gpdb
-      access_token: {{gpdb-git-access-token}}
+- name: gpdb_pr
+  type: pull-request
+  source:
+    repository: greenplum-db/gpdb
+    base_branch: "master"
+    access_token: {{gpdb-git-access-token}}
+    ignore_paths:
+    - gpdb-doc/*
+    - README*
 
-  - name: centos-gpdb-dev-6
-    type: docker-image
-    source:
-      repository: pivotaldata/centos-gpdb-dev
-      tag: '6-gcc6.2-llvm3.7'
+- name: gpdb7-centos7-build
+  type: docker-image
+  source:
+    repository: pivotaldata/gpdb7-centos7-build
 
-  - name: pxf_src
-    type: git
-    source:
-      branch: {{pxf-git-branch}}
-      private_key: {{pxf-git-key}}
-      uri: {{pxf-git-remote}}
+- name: gpdb7-centos7-test
+  type: docker-image
+  source:
+    repository: pivotaldata/gpdb7-centos7-test
 
-  - name: gpaddon_src
-    type: git
-    source:
-      branch: {{gpaddon-git-branch}}
-      private_key: {{gpaddon-git-key}}
-      uri: {{gpaddon-git-remote}}
+- name: libquicklz-centos7
+  type: gcs
+  source:
+    bucket: ((gcs-bucket))
+    json_key: ((concourse-gcs-resources-service-account-key))
+    regexp: gp-internal-artifacts/centos7/libquicklz-(1\.5\.0-.*)-1.el7.x86_64.rpm
+
+- name: libquicklz-devel-centos7
+  type: gcs
+  source:
+    bucket: ((gcs-bucket))
+    json_key: ((concourse-gcs-resources-service-account-key))
+    regexp: gp-internal-artifacts/centos7/libquicklz-devel-(1\.5\.0-.*)-1.el7.x86_64.rpm
+
 
 jobs:
-  - name: compile_and_test_gpdb
-    public: true
-    max_in_flight: 4
-    plan:
-    - aggregate:
-      - get: gpdb_pr
-        trigger: true
-        version: every
-      - get: centos-gpdb-dev-6
-      - get: gpaddon_src
-      - get: pxf_src
+- name: compile_and_test_gpdb
+  public: true
+  max_in_flight: 10
+  plan:
+  - aggregate:
+    - get: gpdb_pr
+      trigger: true
+      version: every
+    - get: gpdb7-centos7-build
+    - get: gpdb7-centos7-test
+    - get: libquicklz-installer
+      resource: libquicklz-centos7
+    - get: libquicklz-devel-installer
+      resource: libquicklz-devel-centos7
 
-    - put: gpdb_pr
+  - put: gpdb_pr
+    params:
+      path: gpdb_pr
+      status: pending
+  - # "do" the remaining steps with these hooks:
+    on_failure:
+      put: gpdb_pr
       params:
         path: gpdb_pr
-        status: pending
+        status: failure
+    on_success:
+      put: report_pr_success
+      resource: gpdb_pr
+      params:
+        path: gpdb_pr
+        status: success
+    do:
+    - task: init gpdb_src  # Fetch tags and submodules, because the PR resource doesn't.
+      image: gpdb7-centos7-build
+      config:
+        platform: linux
+        run:
+          path: bash
+          args:
+          - -c
+          - |
+            git clone gpdb_pr gpdb_src &&
+            cd gpdb_src &&
+            git fetch https://github.com/greenplum-db/gpdb.git --tags &&
+            git submodule update --init --recursive
+        inputs: [{ name: gpdb_pr }]
+        outputs: [{ name: gpdb_src }]
+    - task: compile_gpdb_centos7
+      file: gpdb_pr/concourse/tasks/compile_gpdb.yml
+      image: gpdb7-centos7-build
+      params:
+        CONFIGURE_FLAGS: {{configure_flags_with_extensions}}
+        TARGET_OS: centos
+        TARGET_OS_VERSION: 7
+        BLD_TARGETS: "clients loaders"
+      timeout: 30m
+
 
     - aggregate:
-      - task: compile_gpdb_open_source_centos6
-        file: gpdb_pr/concourse/tasks/compile_gpdb_open_source.yml
-        image: centos-gpdb-dev-6
-        input_mapping:
-          gpdb_src: gpdb_pr
-        params:
-          CONFIGURE_FLAGS: {{configure_flags}}
-        on_failure: &pr_failure
-          put: gpdb_pr
-          params:
-            path: gpdb_pr
-            status: failure
-        timeout: 30m
-
-      - task: compile_gpdb_centos6
-        file: gpdb_pr/concourse/tasks/compile_gpdb.yml
-        image: centos-gpdb-dev-6
-        input_mapping:
-          gpdb_src: gpdb_pr
-        on_failure: *pr_failure
-        params:
-          IVYREPO_HOST: {{ivyrepo_host}}
-          IVYREPO_REALM: {{ivyrepo_realm}}
-          IVYREPO_USER: {{ivyrepo_user}}
-          IVYREPO_PASSWD: {{ivyrepo_passwd}}
-          CONFIGURE_FLAGS: {{configure_flags}}
-          TARGET_OS: centos
-          TARGET_OS_VERSION: 6
-          BLD_TARGETS: "clients loaders"
-
-      - task: validate_pipeline
-        file: gpdb_pr/concourse/tasks/validate_pipeline.yml
-        image: centos-gpdb-dev-6
-        input_mapping:
-          gpdb_src: gpdb_pr
-        on_failure: *pr_failure
-
-    - aggregate:
-      - task: icw_planner_centos6
+      - task: icw_planner_centos7
         file: gpdb_pr/concourse/tasks/ic_gpdb.yml
-        image: centos-gpdb-dev-6
+        image: gpdb7-centos7-test
         input_mapping:
           gpdb_src: gpdb_pr
           bin_gpdb: gpdb_artifacts
         params:
           MAKE_TEST_COMMAND: PGOPTIONS='-c optimizer=off' installcheck-world
-          BLDWRAP_POSTGRES_CONF_ADDONS: "fsync=off"
           TEST_OS: centos
           CONFIGURE_FLAGS: {{configure_flags}}
-        timeout: 1h
-        on_failure: *pr_failure
+        timeout: 3h
 
-      - task: icw_gporca_orca_centos6
+      - task: icw_gporca_centos7
         file: gpdb_pr/concourse/tasks/ic_gpdb.yml
-        image: centos-gpdb-dev-6
+        image: gpdb7-centos7-test
         input_mapping:
           gpdb_src: gpdb_pr
           bin_gpdb: gpdb_artifacts
         params:
           MAKE_TEST_COMMAND: PGOPTIONS='-c optimizer=on' installcheck-world
-          BLDWRAP_POSTGRES_CONF_ADDONS: "fsync=off"
           TEST_OS: centos
           CONFIGURE_FLAGS: {{configure_flags}}
-        timeout: 2h30m
-        on_failure: *pr_failure
-
-      - task: MU_check_centos
-        file: gpdb_pr/concourse/tasks/gpMgmt_check_gpdb.yml
-        image: centos-gpdb-dev-6
-        input_mapping:
-          gpdb_src: gpdb_pr
-          bin_gpdb: gpdb_artifacts
-        params:
-          TEST_OS: centos
-        timeout: 10m
-        on_failure: *pr_failure
-
-    - task: separate_qautils_files_for_rc
-      file: gpdb_pr/concourse/tasks/separate_qautils_files_for_rc.yml
-      image: centos-gpdb-dev-6
-      input_mapping:
-        gpdb_src: gpdb_pr
-        bin_gpdb: gpdb_artifacts
-      params:
-        QAUTILS_TARBALL: rc_bin_gpdb/QAUtils-rhel6-x86_64.tar.gz
-      on_failure: *pr_failure
-
-    - task: gpdb_rc_packaging_centos
-      file: gpdb_pr/concourse/tasks/gpdb_packaging.yml
-      image: centos-gpdb-dev-6
-      input_mapping:
-        bin_gpdb: rc_bin_gpdb
-        gpdb_src: gpdb_pr
-      output_mapping:
-        packaged_gpdb: packaged_gpdb_rc
-      params:
-        INSTALL_SCRIPT_SRC: gpdb_src/gpAux/addon/license/installer-header-rhel-gpdb.sh
-        INSTALLER_ZIP: packaged_gpdb/greenplum-db-@GP_VERSION@-build-1-rhel6-x86_64.zip
-        ADD_README_INSTALL: true
-      timeout: 15m
-      on_failure: *pr_failure
-
-    - put: report_pr_success
-      resource: gpdb_pr
-      params:
-        path: gpdb_pr
-        status: success
+        timeout: 5h

@@ -40,7 +40,7 @@ SEG_PREFIX=gpsne
 # started on a segment host. The base port number will be 
 # incremented by one for each segment instance started on a host. 
 
-PORT_BASE=40000
+PORT_BASE=6000
 
 
 # This specifies the data storage location(s) where the script will 
@@ -88,15 +88,6 @@ MASTER_PORT=5432
 # script. You can use gpssh-exkeys to do this.
 
 TRUSTED_SHELL=ssh
-
-
-# Maximum distance between automatic write ahead log (WAL) 
-# checkpoints, in log file segments (each segment is normally 16 
-# megabytes). This will set the checkpoint_segments parameter 
-# in the postgresql.conf file for each segment instance in the 
-# Greenplum Database system.
-
-CHECK_POINT_SEGMENTS=8
 
 
 # The character set encoding to use. Greenplum supports the 

@@ -4,10 +4,10 @@
  *	  port-specific prototypes for NetBSD
  *
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/backend/port/dynloader/netbsd.h,v 1.17 2008/01/01 19:45:51 momjian Exp $
+ * src/backend/port/dynloader/netbsd.h
  *
  *-------------------------------------------------------------------------
  */
@@ -19,7 +19,7 @@
 #include <link.h>
 #include <dlfcn.h>
 
-#include "utils/dynamic_loader.h"
+#include "utils/dynamic_loader.h"		/* pgrminclude ignore */
 
 /*
  * Dynamic Loader on NetBSD 1.0.

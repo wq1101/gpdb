@@ -1,11 +1,16 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/drop_language.sgml,v 1.26 2007/05/15 19:13:55 neilc Exp $
+doc/src/sgml/ref/drop_language.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-DROPLANGUAGE">
+ <indexterm zone="sql-droplanguage">
+  <primary>DROP LANGUAGE</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="SQL-DROPLANGUAGE-TITLE">DROP LANGUAGE</refentrytitle>
+  <refentrytitle>DROP LANGUAGE</refentrytitle>
+  <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
 
@@ -13,10 +18,6 @@ PostgreSQL documentation
   <refname>DROP LANGUAGE</refname>
   <refpurpose>remove a procedural language</refpurpose>
  </refnamediv>
-
- <indexterm zone="sql-droplanguage">
-  <primary>DROP LANGUAGE</primary>
- </indexterm>
 
  <refsynopsisdiv>
 <synopsis>
@@ -32,8 +33,17 @@ DROP [ PROCEDURAL ] LANGUAGE [ IF EXISTS ] <replaceable class="PARAMETER">name</
    previously registered procedural language.  You must be a superuser
    or the owner of the language to use <command>DROP LANGUAGE</>.
   </para>
+
+  <note>
+   <para>
+    As of <productname>PostgreSQL</productname> 9.1, most procedural
+    languages have been made into <quote>extensions</>, and should
+    therefore be removed with <xref linkend="sql-dropextension">
+    not <command>DROP LANGUAGE</command>.
+   </para>
+  </note>
  </refsect1>
-  
+
  <refsect1>
   <title>Parameters</title>
 
@@ -43,7 +53,7 @@ DROP [ PROCEDURAL ] LANGUAGE [ IF EXISTS ] <replaceable class="PARAMETER">name</
     <term><literal>IF EXISTS</literal></term>
     <listitem>
      <para>
-      Do not throw an error if the language does not exist. A notice is issued 
+      Do not throw an error if the language does not exist. A notice is issued
       in this case.
      </para>
     </listitem>
@@ -64,7 +74,9 @@ DROP [ PROCEDURAL ] LANGUAGE [ IF EXISTS ] <replaceable class="PARAMETER">name</
     <listitem>
      <para>
       Automatically drop objects that depend on the language (such as
-      functions in the language).
+      functions in the language),
+      and in turn all objects that depend on those objects
+      (see <xref linkend="ddl-depend">).
      </para>
     </listitem>
    </varlistentry>
@@ -80,7 +92,7 @@ DROP [ PROCEDURAL ] LANGUAGE [ IF EXISTS ] <replaceable class="PARAMETER">name</
    </varlistentry>
   </variablelist>
  </refsect1>
-  
+
  <refsect1>
   <title>Examples</title>
 
@@ -90,10 +102,9 @@ DROP [ PROCEDURAL ] LANGUAGE [ IF EXISTS ] <replaceable class="PARAMETER">name</
 
 <programlisting>
 DROP LANGUAGE plsample;
-</programlisting>
-  </para>
+</programlisting></para>
  </refsect1>
- 
+
  <refsect1>
   <title>Compatibility</title>
 
@@ -107,8 +118,8 @@ DROP LANGUAGE plsample;
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-alterlanguage" endterm="sql-alterlanguage-title"></member>
-   <member><xref linkend="sql-createlanguage" endterm="sql-createlanguage-title"></member>
+   <member><xref linkend="sql-alterlanguage"></member>
+   <member><xref linkend="sql-createlanguage"></member>
    <member><xref linkend="app-droplang"></member>
   </simplelist>
  </refsect1>

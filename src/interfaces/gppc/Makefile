@@ -8,7 +8,7 @@
 # GPPC needs (i.e. headers and makefiles) are installed along with pg_config.
 #-------------------------------------------------------------------------
 
-subdir = src/backend/gppc
+subdir = src/interfaces/gppc
 top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
@@ -22,7 +22,7 @@ NAME = gppc
 SO_MAJOR_VERSION = 1
 SO_MINOR_VERSION = 2
 
-override CPPFLAGS := -I$(includedir_server) -I$(includedir_internal) $(CPPFLAGS)
+override CPPFLAGS := $(CPPFLAGS) -I$(includedir_server) -I$(includedir_internal)
 OBJS = gppc.o
 
 all: all-lib
@@ -31,13 +31,17 @@ all: all-lib
 include $(top_srcdir)/src/Makefile.shlib
 
 install: install-lib
+	$(INSTALL_DATA) $(top_builddir)/src/include/gppc/gppc.h '$(DESTDIR)$(includedir)'
+	$(INSTALL_DATA) $(top_builddir)/src/include/gppc/gppc_config.h '$(DESTDIR)$(includedir)'
 
 installcheck: install
 	$(MAKE) -C test $@
 
 uninstall: uninstall-lib
+	rm -f '$(DESTDIR)$(includedir)/gppc.h'
+	rm -f '$(DESTDIR)$(includedir)/gppc_config.h'
 
 clean distclean: clean-lib
 	rm -f $(OBJS)
  
-maintainer-clean: distclean maintainer-clean-lib
+maintainer-clean: distclean

@@ -3,12 +3,12 @@
  * fastpath.c
  *	  routines to handle function requests from the frontend
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/tcop/fastpath.c,v 1.97.2.1 2010/06/30 18:10:51 heikki Exp $
+ *	  src/backend/tcop/fastpath.c
  *
  * NOTES
  *	  This cruft is the server side of PQfn.
@@ -20,7 +20,9 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+#include "access/htup_details.h"
 #include "access/xact.h"
+#include "catalog/objectaccess.h"
 #include "catalog/pg_proc.h"
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
@@ -29,8 +31,8 @@
 #include "tcop/fastpath.h"
 #include "tcop/tcopprot.h"
 #include "utils/acl.h"
-#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
+#include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
 
@@ -42,8 +44,8 @@
  * each fastpath call as a separate transaction command, and so the
  * cached data could never actually have been reused.  If it had worked
  * as intended, it would have had problems anyway with dangling references
- * in the FmgrInfo struct.	So, forget about caching and just repeat the
- * syscache fetches on each usage.	They're not *that* expensive.
+ * in the FmgrInfo struct.  So, forget about caching and just repeat the
+ * syscache fetches on each usage.  They're not *that* expensive.
  */
 struct fp_info
 {
@@ -73,7 +75,7 @@ static int16 parse_fcall_arguments_20(StringInfo msgBuf, struct fp_info * fip,
  * The caller should already have initialized buf to empty.
  * ----------------
  */
-static int
+int
 GetOldFunctionMessage(StringInfo buf)
 {
 	int32		ibuf;
@@ -203,7 +205,7 @@ fetch_fp_info(Oid func_id, struct fp_info * fip)
 
 	/*
 	 * Since the validity of this structure is determined by whether the
-	 * funcid is OK, we clear the funcid here.	It must not be set to the
+	 * funcid is OK, we clear the funcid here.  It must not be set to the
 	 * correct value until we are about to return with a good struct fp_info,
 	 * since we can be interrupted (i.e., with an ereport(ERROR, ...)) at any
 	 * time.  [No longer really an issue since we don't save the struct
@@ -214,9 +216,7 @@ fetch_fp_info(Oid func_id, struct fp_info * fip)
 
 	fmgr_info(func_id, &fip->flinfo);
 
-	func_htp = SearchSysCache(PROCOID,
-							  ObjectIdGetDatum(func_id),
-							  0, 0, 0);
+	func_htp = SearchSysCache1(PROCOID, ObjectIdGetDatum(func_id));
 	if (!HeapTupleIsValid(func_htp))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_FUNCTION),
@@ -249,24 +249,15 @@ fetch_fp_info(Oid func_id, struct fp_info * fip)
  * This corresponds to the libpq protocol symbol "F".
  *
  * INPUT:
- *		In protocol version 3, postgres.c has already read the message body
- *		and will pass it in msgBuf.
- *		In old protocol, the passed msgBuf is empty and we must read the
- *		message here.
- *
- * RETURNS:
- *		0 if successful completion, EOF if frontend connection lost.
- *
- * Note: All ordinary errors result in ereport(ERROR,...).	However,
- * if we lose the frontend connection there is no one to ereport to,
- * and no use in proceeding...
+ *		postgres.c has already read the message body and will pass it in
+ *		msgBuf.
  *
  * Note: palloc()s done here and in the called function do not need to be
  * cleaned up explicitly.  We are called from PostgresMain() in the
  * MessageContext memory context, which will be automatically reset when
  * control returns to PostgresMain.
  */
-int
+void
 HandleFunctionRequest(StringInfo msgBuf)
 {
 	Oid			fid;
@@ -281,23 +272,8 @@ HandleFunctionRequest(StringInfo msgBuf)
 	char		msec_str[32];
 
 	/*
-	 * Read message contents if not already done.
-	 */
-	if (PG_PROTOCOL_MAJOR(FrontendProtocol) < 3)
-	{
-		if (GetOldFunctionMessage(msgBuf))
-		{
-			ereport(COMMERROR,
-					(errcode(ERRCODE_PROTOCOL_VIOLATION),
-					 errmsg("unexpected EOF on client connection")));
-			return EOF;
-		}
-	}
-
-	/*
-	 * Now that we've eaten the input message, check to see if we actually
-	 * want to do the function call or not.  It's now safe to ereport(); we
-	 * won't lose sync with the frontend.
+	 * We only accept COMMIT/ABORT if we are in an aborted transaction, and
+	 * COMMIT/ABORT cannot be executed through the fastpath interface.
 	 */
 	if (IsAbortedTransactionBlockState())
 		ereport(ERROR,
@@ -309,7 +285,7 @@ HandleFunctionRequest(StringInfo msgBuf)
 	 * Now that we know we are in a valid transaction, set snapshot in case
 	 * needed by function itself or one of the datatype I/O routines.
 	 */
-	ActiveSnapshot = CopySnapshot(GetTransactionSnapshot());
+	PushActiveSnapshot(GetTransactionSnapshot());
 
 	/*
 	 * Begin parsing the buffer contents.
@@ -343,26 +319,22 @@ HandleFunctionRequest(StringInfo msgBuf)
 	if (aclresult != ACLCHECK_OK)
 		aclcheck_error(aclresult, ACL_KIND_NAMESPACE,
 					   get_namespace_name(fip->namespace));
+	InvokeNamespaceSearchHook(fip->namespace, true);
 
 	aclresult = pg_proc_aclcheck(fid, GetUserId(), ACL_EXECUTE);
 	if (aclresult != ACLCHECK_OK)
 		aclcheck_error(aclresult, ACL_KIND_PROC,
 					   get_func_name(fid));
-
-	/*
-	 * Restrict access to pg_get_expr(). This reflects the hack in
-	 * transformFuncCall() in parse_expr.c, see comments there for an
-	 * explanation.
-	 */
-	if ((fid == F_PG_GET_EXPR || fid == F_PG_GET_EXPR_EXT) && !superuser())
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("argument to pg_get_expr() must come from system catalogs")));
+	InvokeFunctionExecuteHook(fid);
 
 	/*
 	 * Prepare function call info block and insert arguments.
+	 *
+	 * Note: for now we pass collation = InvalidOid, so collation-sensitive
+	 * functions can't be called this way.  Perhaps we should pass
+	 * DEFAULT_COLLATION_OID, instead?
 	 */
-	InitFunctionCallInfoData(fcinfo, &fip->flinfo, 0, NULL, NULL);
+	InitFunctionCallInfoData(fcinfo, &fip->flinfo, 0, InvalidOid, NULL, NULL);
 
 	if (PG_PROTOCOL_MAJOR(FrontendProtocol) >= 3)
 		rformat = parse_fcall_arguments(msgBuf, fip, &fcinfo);
@@ -406,6 +378,9 @@ HandleFunctionRequest(StringInfo msgBuf)
 
 	SendFunctionResult(retval, fcinfo.isnull, fip->rettype, rformat);
 
+	/* We no longer need the snapshot */
+	PopActiveSnapshot();
+
 	/*
 	 * Emit duration logging if appropriate.
 	 */
@@ -421,8 +396,6 @@ HandleFunctionRequest(StringInfo msgBuf)
 							msec_str, fip->fname, fid)));
 			break;
 	}
-
-	return 0;
 }
 
 /*
@@ -514,7 +487,7 @@ parse_fcall_arguments(StringInfo msgBuf, struct fp_info * fip,
 
 			/*
 			 * Since stringinfo.c keeps a trailing null in place even for
-			 * binary data, the contents of abuf are a valid C string.	We
+			 * binary data, the contents of abuf are a valid C string.  We
 			 * have to do encoding conversion before calling the typinput
 			 * routine, though.
 			 */

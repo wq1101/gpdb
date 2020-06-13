@@ -1,4 +1,4 @@
-$PostgreSQL: pgsql/src/test/locale/README,v 1.6 2008/03/21 13:23:29 momjian Exp $
+src/test/locale/README
 
 Locales
 =======
@@ -9,9 +9,9 @@ locale data.  Then there are test-sort.pl and test-sort.py that test
 collating.
 
 To run a test for some locale run
-    gmake check-$locale
+    make check-$locale
 for example
-    gmake check-koi8-r
+    make check-koi8-r
 
 Currently, there are only tests for a few locales available.  The script
 'runall' calls test-ctype to test libc and locale data, test-sort.pl
@@ -24,5 +24,5 @@ a Makefile (and other files) similar to koi8-r/*.  Actually, the simplest
 the files.
 
 Oleg.
----- 
+----
     Oleg Broytmann     http://members.xoom.com/phd2/     phd2@earthling.net

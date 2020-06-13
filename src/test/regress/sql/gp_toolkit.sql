@@ -24,6 +24,9 @@ subpartition by range (n_regionkey) subpartition template (start('0') end('1') i
 partition p1 start('0') end('10') WITH (appendonly=true,checksum=true,compresslevel=9), partition p2 start('10') end('25') WITH (checksum=false,appendonly=true,compresslevel=7)
 );
 
+CREATE MATERIALIZED VIEW toolkit_matview AS SELECT * FROM toolkit_heap;
+CREATE MATERIALIZED VIEW toolkit_matview_nodata AS SELECT * FROM toolkit_heap WITH NO DATA;
+
 select count(iaotype),iaotype
 from gp_toolkit.__gp_is_append_only iao
 inner join pg_catalog.pg_class c on iao.iaooid = c.oid
@@ -101,7 +104,6 @@ create table toolkit_skew (a int);
 insert into toolkit_skew select i from generate_series(1,50000) i;
 select sifnamespace, sifrelname from gp_toolkit.gp_skew_idle_fractions where sifoid = 'toolkit_skew'::regclass;
 
------------------------------------
 -- Test gp_bloat_expected_pages and gp_bloat_diag views
 -- (re-using the toolkit_skew table)
 analyze toolkit_skew;
@@ -138,6 +140,58 @@ select btdrelpages > 0 as btdrelpages_over_0,
        btdexppages < 10 as btdexppages_below_10
 from gp_toolkit.gp_bloat_expected_pages where btdrelid = 'toolkit_skew'::regclass;
 select * from gp_toolkit.gp_bloat_diag where bdirelid = 'toolkit_skew'::regclass;
+
+-- Test that gp_toolkit.gp_skew* functions works for the replicated table.
+create table toolkit_skew_rpt (i int, j int) distributed replicated;
+insert into toolkit_skew_rpt select i, i from generate_series(1, 100) i;
+select segid, segtupcount FROM gp_toolkit.gp_skew_details('toolkit_skew_rpt'::regclass);
+select skccoeff from gp_toolkit.gp_skew_coefficient('toolkit_skew_rpt'::regclass);
+select siffraction from gp_toolkit.gp_skew_idle_fraction('toolkit_skew_rpt'::regclass);
+
+-- Make sure gp_toolkit.gp_bloat_expected_pages does not report partition roots
+create table do_not_report_partition_root (i int, j int) distributed by (i)
+partition by range(j)
+(start(1) end(2) every(1));
+insert into do_not_report_partition_root values (1,1);
+analyze do_not_report_partition_root;
+select count(*) from gp_toolkit.gp_bloat_expected_pages where btdrelid = 'do_not_report_partition_root'::regclass::oid;
+
+-- Check that gp_bloat_diag can deal with big numbers. (This used to provoke an
+-- integer overflow error, before the view was fixed to use numerics for all the
+-- calculations.)
+create table wide_width_test(
+  c01 text, c02 text, c03 text, c04 text, c05 text,
+  c06 text, c07 text, c08 text, c09 text, c10 text,
+  c11 text, c12 text, c13 text, c14 text, c15 text,
+  c16 text, c17 text, c18 text, c19 text, c20 text,
+  c21 text, c22 text, c23 text, c24 text, c25 text,
+  c26 text, c27 text, c28 text, c29 text, c30 text,
+  c31 text, c32 text, c33 text, c34 text, c35 text,
+  c36 text, c37 text, c38 text, c39 text, c40 text,
+  c41 text, c42 text, c43 text, c44 text, c45 text,
+  c46 text, c47 text, c48 text, c49 text, c50 text);
+
+insert into wide_width_test
+select 'foo01', 'foo02', 'foo03', 'foo04', 'foo05',
+       'foo06', 'foo07', 'foo08', 'foo09', 'foo10',
+       'foo11', 'foo12', 'foo13', 'foo14', 'foo15',
+       'foo16', 'foo17', 'foo18', 'foo19', 'foo20',
+       'foo21', 'foo22', 'foo23', 'foo24', 'foo25',
+       'foo26', 'foo27', 'foo28', 'foo29', 'foo30',
+       'foo31', 'foo32', 'foo33', 'foo34', 'foo35',
+       'foo36', 'foo37', 'foo38', 'foo39', 'foo40',
+       'foo41', 'foo42', 'foo43', 'foo44', 'foo45',
+       'foo46', 'foo47', 'foo48', 'foo49', 'foo50'
+from generate_series(1, 1000);
+
+analyze wide_width_test;
+
+set allow_system_table_mods=true;
+update pg_statistic set stawidth=2034567890 where starelid = 'wide_width_test'::regclass;
+
+select btdrelpages, btdexppages from gp_toolkit.gp_bloat_expected_pages where btdrelid='wide_width_test'::regclass;
+
+select * from gp_toolkit.gp_bloat_diag WHERE bdinspname <> 'pg_catalog';
 
 -- MPP-5871 : ERROR: GetSnapshotData timed out waiting for Writer to set the shared snapshot.
 set client_min_messages='warning';
@@ -209,7 +263,6 @@ select lorlocktype,lorrelname,lormode,lorgranted from gp_toolkit.gp_locks_on_rel
 -- gp_roles_assigned
 select rarolename,ramemberid,ramembername from gp_toolkit.gp_roles_assigned where rarolename like 'toolkit%';
 
------------------------------------
 -- Test size views.
 --
 -- We can't include the exact sizes in the output, as they differ slightly depending
@@ -301,16 +354,10 @@ select pg.relname,
 from pg_class pg,gp_toolkit.gp_size_of_partition_and_indexes_disk gsopai
 where pg.oid=gsopai.sopaidpartitionoid and pg.relname like 'gptoolkit_user_table_ao%';
 
--- Test __gp_localid and __gp_masterid functions. The output of __gp_localid
--- depends on the number of segments, so just check that it returns something.
-select count(*) > 0 from gp_toolkit.__gp_localid;
-select * from gp_toolkit.__gp_masterid;
-
 -- This also depends on the number of segments
 select count(*) > 0 from gp_toolkit.__gp_number_of_segments;
 
 
------------------------------------
 -- Test Resource Queue views
 
 

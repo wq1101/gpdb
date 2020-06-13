@@ -1,11 +1,16 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/drop_database.sgml,v 1.23 2006/09/16 00:30:18 momjian Exp $
+doc/src/sgml/ref/drop_database.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-DROPDATABASE">
+ <indexterm zone="sql-dropdatabase">
+  <primary>DROP DATABASE</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="SQL-DROPDATABASE-TITLE">DROP DATABASE</refentrytitle>
+  <refentrytitle>DROP DATABASE</refentrytitle>
+  <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
 
@@ -14,16 +19,12 @@ PostgreSQL documentation
   <refpurpose>remove a database</refpurpose>
  </refnamediv>
 
- <indexterm zone="sql-dropdatabase">
-  <primary>DROP DATABASE</primary>
- </indexterm>
-
  <refsynopsisdiv>
 <synopsis>
 DROP DATABASE [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable>
 </synopsis>
  </refsynopsisdiv>
- 
+
  <refsect1>
   <title>Description</title>
 
@@ -33,7 +34,7 @@ DROP DATABASE [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable>
    containing the data.  It can only be executed by the database owner.
    Also, it cannot be executed while you or anyone else are connected
    to the target database.  (Connect to <literal>postgres</literal> or any
-   other database to issue this command.) 
+   other database to issue this command.)
   </para>
 
   <para>
@@ -49,7 +50,7 @@ DROP DATABASE [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable>
     <term><literal>IF EXISTS</literal></term>
     <listitem>
      <para>
-      Do not throw an error if the database does not exist. A notice is issued 
+      Do not throw an error if the database does not exist. A notice is issued
       in this case.
      </para>
     </listitem>
@@ -77,7 +78,7 @@ DROP DATABASE [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable>
   <para>
    This command cannot be executed while connected to the target
    database. Thus, it might be more convenient to use the program
-   <xref linkend="app-dropdb" endterm="app-dropdb-title"> instead,
+   <xref linkend="app-dropdb"> instead,
    which is a wrapper around this command.
   </para>
  </refsect1>
@@ -94,7 +95,7 @@ DROP DATABASE [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable>
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-createdatabase" endterm="sql-createdatabase-title"></member>
+   <member><xref linkend="sql-createdatabase"></member>
   </simplelist>
  </refsect1>
 </refentry>

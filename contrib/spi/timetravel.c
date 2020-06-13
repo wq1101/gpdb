@@ -1,11 +1,11 @@
 /*
- * $PostgreSQL: pgsql/contrib/spi/timetravel.c,v 1.31 2009/06/11 14:48:52 momjian Exp $
+ * contrib/spi/timetravel.c
  *
  *
  * timetravel.c --	function to get time travel feature
  *		using general triggers.
  *
- * Modified by B�JTHE Zolt�n, Hungary, mailto:urdesobt@axelero.hu
+ * Modified by BÖJTHE Zoltán, Hungary, mailto:urdesobt@axelero.hu
  */
 #include "postgres.h"
 
@@ -17,13 +17,11 @@
 #include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/nabstime.h"
+#include "utils/rel.h"
 
 PG_MODULE_MAGIC;
 
 /* AbsoluteTime currabstime(void); */
-Datum		timetravel(PG_FUNCTION_ARGS);
-Datum		set_timetravel(PG_FUNCTION_ARGS);
-Datum		get_timetravel(PG_FUNCTION_ARGS);
 
 typedef struct
 {
@@ -37,27 +35,27 @@ static int	nPlans = 0;
 typedef struct _TTOffList
 {
 	struct _TTOffList *next;
-	char		name[1];
+	char		name[FLEXIBLE_ARRAY_MEMBER];
 } TTOffList;
 
-static TTOffList TTOff = {NULL, {0}};
+static TTOffList *TTOff = NULL;
 
 static int	findTTStatus(char *name);
 static EPlan *find_plan(char *ident, EPlan **eplan, int *nplans);
 
 /*
  * timetravel () --
- *		1.	IF an update affects tuple with stop_date eq INFINITY
+ *		1.  IF an update affects tuple with stop_date eq INFINITY
  *			then form (and return) new tuple with start_date eq current date
  *			and stop_date eq INFINITY [ and update_user eq current user ]
  *			and all other column values as in new tuple, and insert tuple
  *			with old data and stop_date eq current date
  *			ELSE - skip updation of tuple.
- *		2.	IF an delete affects tuple with stop_date eq INFINITY
+ *		2.  IF a delete affects tuple with stop_date eq INFINITY
  *			then insert the same tuple with stop_date eq current date
  *			[ and delete_user eq current user ]
  *			ELSE - skip deletion of tuple.
- *		3.	On INSERT, if start_date is NULL then current date will be
+ *		3.  On INSERT, if start_date is NULL then current date will be
  *			inserted, if stop_date is NULL then INFINITY will be inserted.
  *			[ and insert_user eq current user, update_user and delete_user
  *			eq NULL ]
@@ -118,11 +116,11 @@ timetravel(PG_FUNCTION_ARGS)
 		elog(ERROR, "timetravel: not fired by trigger manager");
 
 	/* Should be called for ROW trigger */
-	if (TRIGGER_FIRED_FOR_STATEMENT(trigdata->tg_event))
-		elog(ERROR, "timetravel: cannot process STATEMENT events");
+	if (!TRIGGER_FIRED_FOR_ROW(trigdata->tg_event))
+		elog(ERROR, "timetravel: must be fired for row");
 
 	/* Should be called BEFORE */
-	if (TRIGGER_FIRED_AFTER(trigdata->tg_event))
+	if (!TRIGGER_FIRED_BEFORE(trigdata->tg_event))
 		elog(ERROR, "timetravel: must be fired before event");
 
 	/* INSERT ? */
@@ -176,7 +174,7 @@ timetravel(PG_FUNCTION_ARGS)
 	}
 
 	/* create fields containing name */
-	newuser = CStringGetTextDatum(GetUserNameFromId(GetUserId()));
+	newuser = CStringGetTextDatum(GetUserNameFromId(GetUserId(), false));
 
 	nulltext = (Datum) NULL;
 
@@ -344,11 +342,10 @@ timetravel(PG_FUNCTION_ARGS)
 
 		/*
 		 * Remember that SPI_prepare places plan in current memory context -
-		 * so, we have to save plan in Top memory context for latter use.
+		 * so, we have to save plan in Top memory context for later use.
 		 */
-		pplan = SPI_saveplan(pplan);
-		if (pplan == NULL)
-			elog(ERROR, "timetravel (%s): SPI_saveplan returned %d", relname, SPI_result);
+		if (SPI_keepplan(pplan))
+			elog(ERROR, "timetravel (%s): SPI_keepplan failed", relname);
 
 		plan->splan = pplan;
 	}
@@ -431,10 +428,11 @@ set_timetravel(PG_FUNCTION_ARGS)
 	char	   *d;
 	char	   *s;
 	int32		ret;
-	TTOffList  *p,
+	TTOffList  *prev,
 			   *pp;
 
-	for (pp = (p = &TTOff)->next; pp; pp = (p = pp)->next)
+	prev = NULL;
+	for (pp = TTOff; pp; prev = pp, pp = pp->next)
 	{
 		if (namestrcmp(relname, pp->name) == 0)
 			break;
@@ -445,7 +443,10 @@ set_timetravel(PG_FUNCTION_ARGS)
 		if (on != 0)
 		{
 			/* turn ON */
-			p->next = pp->next;
+			if (prev)
+				prev->next = pp->next;
+			else
+				TTOff = pp->next;
 			free(pp);
 		}
 		ret = 0;
@@ -459,15 +460,18 @@ set_timetravel(PG_FUNCTION_ARGS)
 			s = rname = DatumGetCString(DirectFunctionCall1(nameout, NameGetDatum(relname)));
 			if (s)
 			{
-				pp = malloc(sizeof(TTOffList) + strlen(rname));
+				pp = malloc(offsetof(TTOffList, name) +strlen(rname) + 1);
 				if (pp)
 				{
 					pp->next = NULL;
-					p->next = pp;
 					d = pp->name;
 					while (*s)
 						*d++ = tolower((unsigned char) *s++);
 					*d = '\0';
+					if (prev)
+						prev->next = pp;
+					else
+						TTOff = pp;
 				}
 				pfree(rname);
 			}
@@ -489,7 +493,7 @@ get_timetravel(PG_FUNCTION_ARGS)
 	Name		relname = PG_GETARG_NAME(0);
 	TTOffList  *pp;
 
-	for (pp = TTOff.next; pp; pp = pp->next)
+	for (pp = TTOff; pp; pp = pp->next)
 	{
 		if (namestrcmp(relname, pp->name) == 0)
 			PG_RETURN_INT32(0);
@@ -502,7 +506,7 @@ findTTStatus(char *name)
 {
 	TTOffList  *pp;
 
-	for (pp = TTOff.next; pp; pp = pp->next)
+	for (pp = TTOff; pp; pp = pp->next)
 		if (pg_strcasecmp(name, pp->name) == 0)
 			return 0;
 	return 1;
@@ -540,8 +544,7 @@ find_plan(char *ident, EPlan **eplan, int *nplans)
 		(*nplans) = i = 0;
 	}
 
-	newp->ident = (char *) malloc(strlen(ident) + 1);
-	strcpy(newp->ident, ident);
+	newp->ident = strdup(ident);
 	newp->splan = NULL;
 	(*nplans)++;
 

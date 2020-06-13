@@ -20,19 +20,7 @@
 #include "commands/tablecmds.h"
 #include "executor/nodeAssertOp.h"
 #include "executor/instrument.h"
-
-/* Number of slots and memory used by node.*/
-#define ASSERTOP_NSLOTS 1
-#define ASSERTOP_MEM 	1
-
-/*
- * Estimated Memory Usage of AssertOp Node.
- * */
-void
-ExecAssertOpExplainEnd(PlanState *planstate, struct StringInfoData *buf)
-{
-	planstate->instrument->execmemused += ASSERTOP_MEM;
-}
+#include "utils/memutils.h"
 
 /*
  * Check for assert violations and error out, if any.
@@ -83,7 +71,7 @@ CheckForAssertViolations(AssertOpState* node, TupleTableSlot* slot)
 	{
 		ereport(ERROR,
 				(errcode(plannode->errcode),
-				 errmsg("One or more assertions failed"),
+				 errmsg("one or more assertions failed"),
 				 errdetail("%s", errorString.data)));
 
 	}
@@ -157,31 +145,25 @@ ExecInitAssertOp(AssertOp *node, EState *estate, int eflags)
 
 	ExecAssignProjectionInfo(planState, tupDesc);
 
-	if (estate->es_instrument)
+	if (estate->es_instrument && (estate->es_instrument & INSTRUMENT_CDB))
 	{
-	        assertOpState->ps.cdbexplainbuf = makeStringInfo();
-
-	        /* Request a callback at end of query. */
-	        assertOpState->ps.cdbexplainfun = ExecAssertOpExplainEnd;
+		assertOpState->ps.cdbexplainbuf = makeStringInfo();
 	}
-
-	initGpmonPktForAssertOp((Plan *)node, &assertOpState->ps.gpmon_pkt, estate);
 
 	return assertOpState;
 }
 
 /* Rescan AssertOp */
 void
-ExecReScanAssertOp(AssertOpState *node, ExprContext *exprCtxt)
+ExecReScanAssertOp(AssertOpState *node)
 {
 	/*
 	 * If chgParam of subnode is not null then plan will be re-scanned by
-	 * first ExecProcNode.  However, if caller is passing us an exprCtxt
-	 * then forcibly rescan the subnode now, so that we can pass the
-	 * exprCtxt down to the subnode (needed for gated indexscan).
+	 * first ExecProcNode.
 	 */
-	if (node->ps.lefttree->chgParam == NULL || exprCtxt != NULL)
-		ExecReScan(node->ps.lefttree, exprCtxt);
+	if (node->ps.lefttree &&
+		node->ps.lefttree->chgParam == NULL)
+		ExecReScan(node->ps.lefttree);
 }
 
 /* Release Resources Requested by AssertOp node. */
@@ -190,22 +172,4 @@ ExecEndAssertOp(AssertOpState *node)
 {
 	ExecFreeExprContext(&node->ps);
 	ExecEndNode(outerPlanState(node));
-	EndPlanStateGpmonPkt(&node->ps);
 }
-
-/* Return number of TupleTableSlots used by AssertOp node.*/
-int
-ExecCountSlotsAssertOp(AssertOp *node)
-{
-	return ExecCountSlotsNode(outerPlan(node)) + ASSERTOP_NSLOTS;
-}
-
-/* Tracing execution for GP Monitor. */
-void
-initGpmonPktForAssertOp(Plan *planNode, gpmon_packet_t *gpmon_pkt, EState *estate)
-{
-	Assert(planNode != NULL && gpmon_pkt != NULL && IsA(planNode, AssertOp));
-
-	InitPlanNodeGpmonPkt(planNode, gpmon_pkt, estate);
-}
-

@@ -3,6 +3,8 @@
 -- Expect: success
 -----------------------------------------------------------------------
 
+-- These tests ALTER the default encoding options of some built-in types.
+-- Run them in a separate database to avoid messing with other tests.
 create database column_compression;
 \c column_compression
 
@@ -139,6 +141,7 @@ drop table ccddl_co, ccddl;
 -----------------------------------------------------------------------
 
 -- only support CO tables
+create table ccddl (i int encoding (compresstype=RLE_TYPE));
 create table ccddl (i int encoding (compresstype=zlib));
 create table ccddl (i int encoding (compresstype=zlib))
 	with (appendonly = true);
@@ -177,13 +180,50 @@ with (appendonly=true, orientation=column);
 create table t1 (i int encoding (compresstype=zlib, ahhhh=boooooo))
 with (appendonly=true, orientation=column);
 
--- Inheritance: check that we don't support inheritance on tables using
--- column compression
-create table ccddlparent (i int encoding (compresstype=zlib))
+-- Invalid column references in COLUMN ENCODING clause
+create table t1 (i text,
+                 column non_existent encoding (compresstype=zlib))
+with (appendonly=true, orientation=column);
+
+-- Conflicting column references for the same column
+create table t1 (dupe text,
+                 column dupe encoding (compresstype=zlib),
+		 column dupe encoding (compresstype=zlib))
+with (appendonly=true, orientation=column);
+
+-- Inheritance. The ENCODING options are not inherited from the parent.
+create table ccddlparent (parentcol int encoding (compresstype=zlib))
 with (appendonly = true, orientation = column);
-create table ccddlchild (j int encoding (compresstype=zlib))
+create table ccddlchild (childcol int encoding (compresstype=zlib))
 inherits(ccddlparent) with (appendonly = true, orientation = column);
+
+-- but you can specify it explicitly
+create table ccddlchild2 (childcol int,
+			  parentcol int encoding (compresstype=zlib))
+inherits(ccddlparent) with (appendonly = true, orientation = column);
+
+execute ccddlcheck;
+
 drop table ccddlparent cascade;
+
+-- Multiple inheritance. Not particularly interesting because the
+-- encoding options are not copied from any parent, but let's test
+-- it anyway.
+create table ccddlparent1 (parentcol1 int encoding (compresstype=zlib),
+                           parentcol2 int)
+with (appendonly = true, orientation = column);
+
+create table ccddlparent2 (parentcol1 int,
+                           parentcol2 int encoding (compresstype=zlib))
+with (appendonly = true, orientation = column);
+
+create table ccddlchild (childcol int)
+inherits(ccddlparent1, ccddlparent2) with (appendonly = true, orientation = column);
+
+execute ccddlcheck;
+
+drop table ccddlparent1 cascade;
+drop table ccddlparent2 cascade;
 
 -- Conflict between default and with, in the LIKE case
 create table ccddl (i int);
@@ -506,7 +546,9 @@ create table a (i int, j int) with (appendonly=true, orientation=column)
                             start(10) end(20))
 (partition p1 start(1) end(10));
 
--- partition level mention of column encoding but the table isn't heap oriented
+-- Partition level mention of column encoding but the table is not column
+-- oriented. This used to throw an error, but we're more lenient now. The
+-- ENCODING clause is simply ignored.
 CREATE TABLE ccddl
 (a1 int,a2 char(5),a3 text,a4 timestamp ,a5 date) 
 partition by range(a1) 
@@ -514,6 +556,8 @@ partition by range(a1)
 		start(1) end(1000) every(500),
 		COLUMN a1 ENCODING (compresstype=zlib,compresslevel=4,blocksize=32768)
 	);
+execute ccddlcheck;
+drop table ccddl;
 
 -----------------------------------------------------------------------
 -- Type support
@@ -556,6 +600,10 @@ execute ccddlcheck;
 
 drop table ccddl;
 
+create table ccddl (i int42) with(appendonly = true, orientation=column);
+execute ccddlcheck;
+drop table ccddl;
+
 -- Shouldn't apply type default encoding in these cases
 create table ccddl (i int42);
 execute ccddlcheck;
@@ -567,6 +615,23 @@ drop table ccddl;
 
 create table ccddl (i int42) with (appendonly = true, orientation=column,
 compresstype=none);
+alter type int42 set default encoding (compresstype=RLE_TYPE);
+alter table ccddl add column j int42 default '1'::int42;
+execute ccddlcheck;
+
+drop table ccddl;
+
+create table ccddl (i int42) with(appendonly = true, orientation=row);
+alter type int42 set default encoding (compresstype=RLE_TYPE);
+alter table ccddl add column j int42 default '1'::int42;
+-- No results are returned from the attribute encoding check, as compression with rle is not supported for row tables
+execute ccddlcheck;
+drop table ccddl;
+
+create table ccddl (i int42) with(appendonly = true);
+alter type int42 set default encoding (compresstype=RLE_TYPE);
+alter table ccddl add column j int42 default '1'::int42;
+-- No results are returned from the attribute encoding check, as compression with rle is not supported for heap tables
 execute ccddlcheck;
 drop table ccddl;
 
@@ -767,3 +832,24 @@ WHERE id=1;
 -- Lets validate above insert worked.
 SELECT count(*) from col_large_content_block;
 SET enable_seqscan TO ON;
+
+------------------------------------------------------------------------------
+-- Test to validate insert into column oriented table works when in *single
+-- insert statement* first large content block is inserted followed by bulk
+-- dense content block.
+------------------------------------------------------------------------------
+-- dummy table to help create the scenario
+CREATE TABLE ao_from_table(a INT, arr DOUBLE PRECISION[]) WITH (appendonly=true);
+-- insert data to create large content header for CO table
+INSERT INTO ao_from_table
+SELECT 1,
+       array_fill(1234567890.12, ARRAY[1100])
+       FROM generate_series(1, 1);
+-- Bulk dense content header with RLE compression, need 16k rows for the same
+INSERT INTO ao_from_table SELECT 1,'{0.1}' FROM generate_series(1, 17000)i;
+CREATE TABLE co_large_and_bulk_content(a INT,
+                     arr DOUBLE PRECISION[] ENCODING (compresstype=RLE_TYPE,compresslevel=3,blocksize=8192))
+                     WITH (appendonly=true, orientation=column, compresstype=RLE_TYPE);
+INSERT INTO co_large_and_bulk_content SELECT * FROM ao_from_table;
+-- can't do count(*) as CO optimizes to read only first column
+SELECT * FROM co_large_and_bulk_content where a > 1;

@@ -20,7 +20,7 @@
  * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
  * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED.	IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
  * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
  * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
  * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
@@ -93,7 +93,7 @@ pg_mkdir_p(char *path, int omode)
 	/*
 	 * POSIX 1003.2: For each dir operand that does not name an existing
 	 * directory, effects equivalent to those caused by the following command
-	 * shall occcur:
+	 * shall occur:
 	 *
 	 * mkdir -p -m $(umask -S),u+wx $(dirname dir) && mkdir [-m mode] dir
 	 *
@@ -119,11 +119,22 @@ pg_mkdir_p(char *path, int omode)
 		if (last)
 			(void) umask(oumask);
 
-		/* check for pre-existing directory */
-		if (stat(path, &sb) == 0)
+		if (mkdir(path, last ? omode : S_IRWXU | S_IRWXG | S_IRWXO) == 0)
 		{
-			if (!S_ISDIR(sb.st_mode))
+			/* path does not pre-exist and is successfully created */
+		}
+		else if (errno == EEXIST)
+		{
+			/* path exists, double check it is a dir */
+
+			if (stat(path, &sb) < 0)
 			{
+				retval = -1;
+				break;
+			}
+			else if (!S_ISDIR(sb.st_mode))
+			{
+				/* path is not a dir at all */
 				if (last)
 					errno = EEXIST;
 				else
@@ -131,8 +142,10 @@ pg_mkdir_p(char *path, int omode)
 				retval = -1;
 				break;
 			}
+
+			/* now we know that path is a dir */
 		}
-		else if (mkdir(path, last ? omode : S_IRWXU | S_IRWXG | S_IRWXO) < 0)
+		else
 		{
 			retval = -1;
 			break;

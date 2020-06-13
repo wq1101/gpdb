@@ -179,4 +179,56 @@ update ao_t1 set b = b + 1;
 vacuum full ao_t1;
 drop table ao_t1;
 
-vacuum full gp_persistent_relation_node;
+-- superuser must be able to vacuum analyze the table
+CREATE ROLE r_priv_test;
+CREATE SCHEMA s_priv_test;
+CREATE TABLE s_priv_test.t_priv_table(a INT);
+INSERT INTO s_priv_test.t_priv_table SELECT i FROM generate_series(1, 10)i;
+ALTER TABLE s_priv_test.t_priv_table OWNER TO r_priv_test;
+VACUUM ANALYZE s_priv_test.t_priv_table;
+DROP SCHEMA s_priv_test CASCADE;
+DROP ROLE r_priv_test;
+
+-- Check how reltuples/relpages are updated on a partitioned table, on
+-- VACUUM and ANALYZE.
+set gp_autostats_mode='none';
+CREATE TABLE vacuum_gp_pt (a int, b int) DISTRIBUTED BY (a) PARTITION BY range (b) (END(5), START(5));
+INSERT INTO vacuum_gp_pt SELECT 0, 6 FROM generate_series(1, 12);
+SELECT relname, reltuples, relpages FROM pg_catalog.pg_class WHERE relname like 'vacuum_gp_pt%';
+ANALYZE vacuum_gp_pt;
+SELECT relname, reltuples, relpages FROM pg_catalog.pg_class WHERE relname like 'vacuum_gp_pt%';
+VACUUM vacuum_gp_pt;
+SELECT relname, reltuples, relpages FROM pg_catalog.pg_class WHERE relname like 'vacuum_gp_pt%';
+VACUUM ANALYZE vacuum_gp_pt;
+SELECT relname, reltuples, relpages FROM pg_catalog.pg_class WHERE relname like 'vacuum_gp_pt%';
+reset gp_autostats_mode;
+
+-- Check forbidden relkind for vacuum is correctly skipped
+CREATE SEQUENCE s_serial START 100;
+VACUUM (ANALYZE, VERBOSE) s_serial;
+DROP SEQUENCE s_serial;
+VACUUM gp_toolkit.__gp_log_master_ext;
+
+-- Vacuum related access control tests (Issue: https://github.com/greenplum-db/gpdb/issues/9001)
+-- Given a non-super-user role
+CREATE ROLE non_super_user_vacuum;
+-- And a heap table with auxiliary relations under the pg_toast namespace.
+CREATE TABLE vac_acl_heap(i int, j text);
+-- And an AO table with auxiliary relations under the pg_aoseg namespace.
+CREATE TABLE vac_acl_ao(i int, j text) with (appendonly=true);
+-- And an AOCS table with auxiliary relations under the pg_aocsseg namespace.
+CREATE TABLE vac_acl_aocs(i int, j text) with (appendonly=true, orientation=column);
+-- And all the tables belong to the non-super-user role.
+ALTER TABLE vac_acl_heap OWNER TO non_super_user_vacuum;
+ALTER TABLE vac_acl_ao OWNER TO non_super_user_vacuum;
+ALTER TABLE vac_acl_aocs OWNER TO non_super_user_vacuum;
+-- We can vacuum each table as the non-super-user
+SET ROLE TO non_super_user_vacuum;
+VACUUM vac_acl_heap;
+VACUUM vac_acl_ao;
+VACUUM vac_acl_aocs;
+\c
+DROP TABLE vac_acl_heap;
+DROP TABLE vac_acl_ao;
+DROP TABLE vac_acl_aocs;
+DROP ROLE non_super_user_vacuum;

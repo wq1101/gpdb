@@ -14,13 +14,17 @@
  */
 
 #include "postgres.h"
-#include "fmgr.h"
 
 #include "access/genam.h"
+#include "access/heapam.h"
+#include "access/htup_details.h"
 #include "access/reloptions.h"
+#include "access/xact.h"
+#include "catalog/indexing.h"
 #include "catalog/pg_attribute_encoding.h"
 #include "catalog/pg_compression.h"
 #include "catalog/dependency.h"
+#include "fmgr.h"
 #include "parser/analyze.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
@@ -30,6 +34,7 @@
 #include "utils/rel.h"
 #include "utils/relcache.h"
 #include "utils/syscache.h"
+#include "utils/tqual.h"
 
 /*
  * Add a single attribute encoding entry.
@@ -113,7 +118,7 @@ get_rel_attoptions(Oid relid, AttrNumber max_attno)
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(relid));
 	scan = systable_beginscan(pgae, AttributeEncodingAttrelidIndexId, true,
-							  SnapshotNow, 1, &skey);
+							  NULL, 1, &skey);
 
 	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
 	{
@@ -210,37 +215,6 @@ RelationGetAttributeOptions(Relation rel)
 }
 
 /*
- * Given a WITH(...) clause and no other column encoding directives -- such as
- * in the case of CREATE TABLE WITH () AS SELECT -- fill in the column encoding
- * catalog entries for that relation.
- */
-void
-AddDefaultRelationAttributeOptions(Relation rel, List *options)
-{
-	Datum opts;
-	AttrNumber attno;
-	List *ce;
-
-	/* only supported on AOCO at this stage */
-	if (!RelationIsAoCols(rel))
-		return;
-
- 	ce = form_default_storage_directive(options);
-	if (!ce)
-		ce = default_column_encoding_clause();
-
-	ce = transformStorageEncodingClause(ce);
-
-	opts = transformRelOptions(PointerGetDatum(NULL), ce, true, false);
-
-	for (attno = 1; attno <= RelationGetNumberOfAttributes(rel); attno++)
-		add_attribute_encoding_entry(RelationGetRelid(rel),
-									 attno,
-									 opts);
-	CommandCounterIncrement();
-}
-
-/*
  * Work horse underneath DefineRelation().
  *
  * Simply adds user specified ENCODING () clause information to
@@ -276,6 +250,8 @@ AddRelationAttributeEncodings(Relation rel, List *attr_encodings)
 
 		attoptions = transformRelOptions(PointerGetDatum(NULL),
 										 encoding,
+										 NULL,
+										 NULL,
 										 true,
 										 false);
 
@@ -298,7 +274,7 @@ RemoveAttributeEncodingsByRelid(Oid relid)
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(relid));
 	scan = systable_beginscan(rel, AttributeEncodingAttrelidIndexId, true,
-							  SnapshotNow, 1, &skey);
+							  NULL, 1, &skey);
 	while (HeapTupleIsValid(tup = systable_getnext(scan)))
 	{
 		simple_heap_delete(rel, &tup->t_self);

@@ -26,15 +26,15 @@ class CGPOptimizer
 
 		// optimize given query using GP optimizer
 		static
-		PlannedStmt *PplstmtOptimize
+		PlannedStmt *GPOPTOptimizedPlan
 			(
-			Query *pquery,
-			bool *pfUnexpectedFailure // output : set to true if optimizer unexpectedly failed to produce plan
+			Query *query,
+			bool *had_unexpected_failure // output : set to true if optimizer unexpectedly failed to produce plan
 			);
 
 		// serialize planned statement into DXL
 		static
-		char *SzDXLPlan(Query *pquery);
+		char *SerializeDXLPlan(Query *query);
 
     // gpopt initialize and terminate
     static
@@ -43,5 +43,15 @@ class CGPOptimizer
     static
     void TerminateGPOPT();
 };
+
+extern "C"
+{
+
+extern PlannedStmt *GPOPTOptimizedPlan(Query *query, bool *had_unexpected_failure);
+extern char *SerializeDXLPlan(Query *query);
+extern void InitGPOPT ();
+extern void TerminateGPOPT ();
+
+}
 
 #endif // CGPOptimizer_H

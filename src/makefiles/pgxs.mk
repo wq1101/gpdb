@@ -1,6 +1,6 @@
 # PGXS: PostgreSQL extensions makefile
 
-# $PostgreSQL: pgsql/src/makefiles/pgxs.mk,v 1.15 2008/10/03 08:00:16 petere Exp $ 
+# src/makefiles/pgxs.mk
 
 # This file contains generic rules to build many kinds of simple
 # extension modules.  You only need to set a few variables and include
@@ -9,11 +9,12 @@
 # Use the following layout for your Makefile:
 #
 #   [variable assignments, see below]
-#   [custom rules, rarely necessary]
 #
 #   PG_CONFIG = pg_config
 #   PGXS := $(shell $(PG_CONFIG) --pgxs)
 #   include $(PGXS)
+#
+#   [custom rules, rarely necessary]
 #
 # Set one of these three variables to specify what is built:
 #
@@ -38,10 +39,13 @@
 #   SCRIPTS_built -- script files (not binaries) to install into $PREFIX/bin,
 #     which need to be built first
 #   REGRESS -- list of regression test cases (without suffix)
+#   REGRESS_OPTS -- additional switches to pass to pg_regress
 #   EXTRA_CLEAN -- extra files to remove in 'make clean'
 #   PG_CPPFLAGS -- will be added to CPPFLAGS
 #   PG_LIBS -- will be added to PROGRAM link line
+#   PG_LIBS_INTERNAL -- same, for references to libraries within build tree
 #   SHLIB_LINK -- will be added to MODULE_big link line
+#   SHLIB_LINK_INTERNAL -- same, for references to libraries within build tree
 #   PG_CONFIG -- path to pg_config program for the PostgreSQL installation
 #     to build against (typically just "pg_config" to use the first one in
 #     your PATH)
@@ -60,9 +64,15 @@ ifdef PGXS
 top_builddir := $(dir $(PGXS))../..
 include $(top_builddir)/src/Makefile.global
 
-top_srcdir = $(top_builddir)
-srcdir = .
-VPATH =
+# These might be set in Makefile.global, but if they were not found
+# during the build of PostgreSQL, supply default values so that users
+# of pgxs can use the variables.
+ifeq ($(BISON),)
+BISON = bison
+endif
+ifeq ($(FLEX),)
+FLEX = flex
+endif
 endif
 
 
@@ -70,7 +80,19 @@ override CPPFLAGS := -I. -I$(srcdir) $(CPPFLAGS)
 
 ifdef MODULES
 override CFLAGS += $(CFLAGS_SL)
-SHLIB_LINK += $(BE_DLLLIBS)
+endif
+
+ifdef MODULEDIR
+datamoduledir := $(MODULEDIR)
+docmoduledir := $(MODULEDIR)
+else
+ifdef EXTENSION
+datamoduledir := extension
+docmoduledir := extension
+else
+datamoduledir := contrib
+docmoduledir := contrib
+endif
 endif
 
 ifdef MODULEDIR
@@ -145,7 +167,7 @@ endif
 ifneq (,$(DATA_TSEARCH))
 	$(MKDIR_P) '$(DESTDIR)$(datadir)/tsearch_data'
 endif
-ifneq (,$(MODULES)$(MODULE_big))
+ifneq (,$(MODULES))
 	$(MKDIR_P) '$(DESTDIR)$(pkglibdir)'
 endif
 ifdef DOCS
@@ -195,7 +217,7 @@ endif # MODULE_big
 
 clean:
 ifdef MODULES
-	rm -f $(addsuffix $(DLSUFFIX), $(MODULES)) $(addsuffix .o, $(MODULES))
+	rm -f $(addsuffix $(DLSUFFIX), $(MODULES)) $(addsuffix .o, $(MODULES)) $(if $(PGFILEDESC),$(WIN32RES))
 endif
 ifdef DATA_built
 	rm -f $(DATA_built)
@@ -210,12 +232,11 @@ ifdef OBJS
 	rm -f $(OBJS)
 endif
 ifdef EXTRA_CLEAN
-	rm -f $(EXTRA_CLEAN)
+	rm -rf $(EXTRA_CLEAN)
 endif
 ifdef REGRESS
 # things created by various check targets
-	rm -rf results tmp_check log
-	rm -f regression.diffs regression.out regress.out run_check.out
+	rm -rf $(pg_regress_clean_files)
 ifeq ($(PORTNAME), win)
 	rm -f regress.def
 endif
@@ -230,13 +251,12 @@ distclean maintainer-clean: clean
 
 ifdef REGRESS
 
-# Calling makefile can set REGRESS_OPTS, but this is the default:
-ifndef REGRESS_OPTS
-REGRESS_OPTS = --dbname=$(CONTRIB_TESTDB)
+# Select database to use for running the tests
+ifneq ($(USE_MODULE_DB),)
+  REGRESS_OPTS += --dbname=$(CONTRIB_TESTDB_MODULE)
+else
+  REGRESS_OPTS += --dbname=$(CONTRIB_TESTDB)
 endif
-
-# where to find psql for running the tests
-PSQLDIR = $(bindir)
 
 # When doing a VPATH build, must copy over the data files so that the
 # driver script can find them.  We have to use an absolute path for
@@ -252,6 +272,7 @@ test_files_build := $(patsubst $(srcdir)/%, $(abs_builddir)/%, $(test_files_src)
 
 all: $(test_files_build)
 $(test_files_build): $(abs_builddir)/%: $(srcdir)/%
+	$(MKDIR_P) $(dir $@)
 	ln -s $< $@
 endif # VPATH
 
@@ -262,16 +283,19 @@ ifndef PGXS
 endif
 
 # against installed postmaster
-installcheck: submake
-	$(top_builddir)/src/test/regress/pg_regress --psqldir="$(PSQLDIR)" $(REGRESS_OPTS) $(REGRESS)
+installcheck: submake $(REGRESS_PREP)
+	$(pg_regress_installcheck) $(REGRESS_OPTS) $(REGRESS)
 
-# in-tree test doesn't work yet (no way to install my shared library)
-#check: all submake
-#	$(top_builddir)/src/test/regress/pg_regress --temp-install \
-#	  --top-builddir=$(top_builddir) $(REGRESS_OPTS) $(REGRESS)
+ifdef PGXS
 check:
-	@echo "'make check' is not supported."
-	@echo "Do 'make install', then 'make installcheck' instead."
+	@echo '"$(MAKE) check" is not supported.'
+	@echo 'Do "$(MAKE) install", then "$(MAKE) installcheck" instead.'
+else
+check: submake $(REGRESS_PREP)
+	$(pg_regress_check) $(REGRESS_OPTS) $(REGRESS)
+
+temp-install: EXTRA_INSTALL+=$(subdir)
+endif
 endif # REGRESS
 
 
@@ -284,5 +308,5 @@ endif
 
 ifdef PROGRAM
 $(PROGRAM): $(OBJS)
-	$(CC) $(CFLAGS) $(OBJS) $(PG_LIBS) $(LDFLAGS) $(LIBS) -o $@$(X)
+	$(CC) $(CFLAGS) $(OBJS) $(PG_LIBS_INTERNAL) $(LDFLAGS) $(LDFLAGS_EX) $(PG_LIBS) $(LIBS) -o $@$(X)
 endif

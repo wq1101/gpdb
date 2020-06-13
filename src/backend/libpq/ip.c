@@ -3,12 +3,12 @@
  * ip.c
  *	  IPv6-aware network access.
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/libpq/ip.c,v 1.51 2010/02/26 02:00:43 momjian Exp $
+ *	  src/backend/libpq/ip.c
  *
  * This file and the IPV6 implementation were initially provided by
  * Nigel Kukard <nkukard@lbsd.net>, Linux Based Systems Design
@@ -77,112 +77,6 @@ pg_getaddrinfo_all(const char *hostname, const char *servname,
 	/* NULL has special meaning to getaddrinfo(). */
 	rc = getaddrinfo((!hostname || hostname[0] == '\0') ? NULL : hostname,
 					 servname, hintp, result);
-
-
-
-#if defined(__darwin__)
-	/*
-	 * Attempt to work around some issues on OSX.
-	 *
-	 * There are times when a process can be in a state where it can no longer call for name resolution services.
-	 * This can happen if the processes was forked into the background, and then the interactive session (or ssh session)
-	 * was logged off.  This is because the Mach kernel garbage collects the security context for the session.
-	 *
-	 * The real fix is to make sure we always start the postmasters with launchctl, so they get started in the
-	 * right security context.   pg_ctl has been updated to do this, which should solve the problem.
-	 *
-	 * But, there is always a chance I missed something in how that is supposed to work.
-	 * It really makes for strange errors if "localhost" can't be resolved to an IP address, and
-	 * if we can resolve "localhost" plus our own machine name, that's good enough for the
-	 * GPDB single-node-edition to run.
-	 *
-	 *
-	 * So to make life easier, let's do our own resolution if the hostname is our own machine's name,
-	 * or if the hostname is "localhost", and we got an error from getaddrinfo() trying to resolve them the
-	 * "normal" way.   This code really shouldn't ever get run, so in the future, when we have confidence
-	 * it isn't needed any more, we can take this hack out.
-	 *
-	 *
-	 */
-	if (hostname != NULL && (rc == EAI_AGAIN || rc == EAI_NONAME))
-	{
-		struct addrinfo *ai;
-		struct sockaddr_in *psin;
-		char myhostname[255];
-		myhostname[0] = '\0';
-
-		if (gethostname(myhostname, sizeof(myhostname)) == 0)
-		{
-			/*
-			 * If we got a valid hostname, and the name we are looking up is our own hostname,
-			 * we know we are really localhost, and can give back the loopback address.
-			 *
-			 * "localhost" should have resolved by getaddrinfo, but if not, it too is a safe
-			 * host name to convert to the loopback address.
-			 */
-			if (((strlen(myhostname) > 0) && (strncmp(myhostname,hostname,255) == 0)) ||
-					(strcmp("localhost",hostname) == 0))
-			{
-				/*
-				 * This is a little dangerous... If we later call freeaddrinfo(), there is no guarantee that
-				 * the memory getaddrinfo allocates was done this way, so freeaddrinfo might try some other
-				 * way to release the memory beside the two free() calls.
-				 * But it probably does, and we are only worried about one OS here:  OSX.
-				 * So testing should show up any issue.
-				 */
-				ai = malloc(sizeof(*ai));
-				if (!ai)
-					return EAI_MEMORY;
-
-				psin = malloc(sizeof(*psin));
-				if (!psin)
-				{
-					free(ai);
-					return EAI_MEMORY;
-				}
-
-				memset(psin, 0, sizeof(struct sockaddr_in));
-
-#ifdef HAVE_STRUCT_SOCKADDR_STORAGE_SS_LEN
-				psin->sin_len = sizeof(struct sockaddr_in);
-#endif
-				psin->sin_family = AF_INET;
-
-				/* This only fills in sin_port if servname was numeric.  If it was a name from /etc/services, it returns 0 */
-				if (servname)
-						psin->sin_port = htons((unsigned short) atoi(servname));
-				psin->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-
-				ai->ai_flags = 0;
-				ai->ai_family = AF_INET;
-				ai->ai_socktype = SOCK_STREAM;
-				ai->ai_protocol = 0;
-				ai->ai_addrlen = sizeof(*psin);
-				ai->ai_addr = (struct sockaddr *) psin;
-				ai->ai_canonname = NULL;
-				ai->ai_next = NULL;
-
-				*result = ai;
-				rc = 0;
-			}
-		}
-
-	}
-#endif
-
-	/*
-	 * If we get EAI_AGAIN, the error might be temporary.   Retry it to see.
-	 * Note:  Mac OSX Leopard seems to give this error for NXDOMAIN errors, which aren't
-	 * really temporary, but retrying doesn't cause any real issue.
-	 */
-	if (rc == EAI_AGAIN)
-	{
-#ifndef FRONTEND
-		pg_usleep(1000);
-#endif
-		rc = getaddrinfo((!hostname || hostname[0] == '\0') ? NULL : hostname,
-							 servname, hintp, result);
-	}
 
 	return rc;
 }
@@ -354,29 +248,24 @@ getnameinfo_unix(const struct sockaddr_un * sa, int salen,
 				 char *service, int servicelen,
 				 int flags)
 {
-	int			ret = -1;
+	int			ret;
 
 	/* Invalid arguments. */
 	if (sa == NULL || sa->sun_family != AF_UNIX ||
 		(node == NULL && service == NULL))
 		return EAI_FAIL;
 
-	/* We don't support those. */
-	if ((node && !(flags & NI_NUMERICHOST))
-		|| (service && !(flags & NI_NUMERICSERV)))
-		return EAI_FAIL;
-
 	if (node)
 	{
 		ret = snprintf(node, nodelen, "%s", "[local]");
-		if (ret == -1 || ret > nodelen)
+		if (ret < 0 || ret >= nodelen)
 			return EAI_MEMORY;
 	}
 
 	if (service)
 	{
 		ret = snprintf(service, servicelen, "%s", sa->sun_path);
-		if (ret == -1 || ret > servicelen)
+		if (ret < 0 || ret >= servicelen)
 			return EAI_MEMORY;
 	}
 
@@ -397,14 +286,14 @@ pg_range_sockaddr(const struct sockaddr_storage * addr,
 				  const struct sockaddr_storage * netmask)
 {
 	if (addr->ss_family == AF_INET)
-		return range_sockaddr_AF_INET((struct sockaddr_in *) addr,
-									  (struct sockaddr_in *) netaddr,
-									  (struct sockaddr_in *) netmask);
+		return range_sockaddr_AF_INET((const struct sockaddr_in *) addr,
+									  (const struct sockaddr_in *) netaddr,
+									  (const struct sockaddr_in *) netmask);
 #ifdef HAVE_IPV6
 	else if (addr->ss_family == AF_INET6)
-		return range_sockaddr_AF_INET6((struct sockaddr_in6 *) addr,
-									   (struct sockaddr_in6 *) netaddr,
-									   (struct sockaddr_in6 *) netmask);
+		return range_sockaddr_AF_INET6((const struct sockaddr_in6 *) addr,
+									   (const struct sockaddr_in6 *) netaddr,
+									   (const struct sockaddr_in6 *) netmask);
 #endif
 	else
 		return 0;
@@ -526,79 +415,6 @@ pg_sockaddr_cidr_mask(struct sockaddr_storage * mask, char *numbits, int family)
 }
 
 
-#ifdef HAVE_IPV6
-
-/*
- * pg_promote_v4_to_v6_addr --- convert an AF_INET addr to AF_INET6, using
- *		the standard convention for IPv4 addresses mapped into IPv6 world
- *
- * The passed addr is modified in place; be sure it is large enough to
- * hold the result!  Note that we only worry about setting the fields
- * that pg_range_sockaddr will look at.
- */
-void
-pg_promote_v4_to_v6_addr(struct sockaddr_storage * addr)
-{
-	struct sockaddr_in addr4;
-	struct sockaddr_in6 addr6;
-	uint32		ip4addr;
-
-	memcpy(&addr4, addr, sizeof(addr4));
-	ip4addr = ntohl(addr4.sin_addr.s_addr);
-
-	memset(&addr6, 0, sizeof(addr6));
-
-	addr6.sin6_family = AF_INET6;
-
-	addr6.sin6_addr.s6_addr[10] = 0xff;
-	addr6.sin6_addr.s6_addr[11] = 0xff;
-	addr6.sin6_addr.s6_addr[12] = (ip4addr >> 24) & 0xFF;
-	addr6.sin6_addr.s6_addr[13] = (ip4addr >> 16) & 0xFF;
-	addr6.sin6_addr.s6_addr[14] = (ip4addr >> 8) & 0xFF;
-	addr6.sin6_addr.s6_addr[15] = (ip4addr) & 0xFF;
-
-	memcpy(addr, &addr6, sizeof(addr6));
-}
-
-/*
- * pg_promote_v4_to_v6_mask --- convert an AF_INET netmask to AF_INET6, using
- *		the standard convention for IPv4 addresses mapped into IPv6 world
- *
- * This must be different from pg_promote_v4_to_v6_addr because we want to
- * set the high-order bits to 1's not 0's.
- *
- * The passed addr is modified in place; be sure it is large enough to
- * hold the result!  Note that we only worry about setting the fields
- * that pg_range_sockaddr will look at.
- */
-void
-pg_promote_v4_to_v6_mask(struct sockaddr_storage * addr)
-{
-	struct sockaddr_in addr4;
-	struct sockaddr_in6 addr6;
-	uint32		ip4addr;
-	int			i;
-
-	memcpy(&addr4, addr, sizeof(addr4));
-	ip4addr = ntohl(addr4.sin_addr.s_addr);
-
-	memset(&addr6, 0, sizeof(addr6));
-
-	addr6.sin6_family = AF_INET6;
-
-	for (i = 0; i < 12; i++)
-		addr6.sin6_addr.s6_addr[i] = 0xff;
-
-	addr6.sin6_addr.s6_addr[12] = (ip4addr >> 24) & 0xFF;
-	addr6.sin6_addr.s6_addr[13] = (ip4addr >> 16) & 0xFF;
-	addr6.sin6_addr.s6_addr[14] = (ip4addr >> 8) & 0xFF;
-	addr6.sin6_addr.s6_addr[15] = (ip4addr) & 0xFF;
-
-	memcpy(addr, &addr6, sizeof(addr6));
-}
-#endif   /* HAVE_IPV6 */
-
-
 /*
  * Run the callback function for the addr/mask, after making sure the
  * mask is sane for the addr.
@@ -666,7 +482,7 @@ pg_foreach_ifaddr(PgIfAddrCallback callback, void *cb_data)
 	int			error;
 
 	sock = WSASocket(AF_INET, SOCK_DGRAM, 0, 0, 0, 0);
-	if (sock == SOCKET_ERROR)
+	if (sock == INVALID_SOCKET)
 		return -1;
 
 	while (n_ii < 1024)
@@ -752,6 +568,12 @@ pg_foreach_ifaddr(PgIfAddrCallback callback, void *cb_data)
 /*
  * SIOCGIFCONF does not return IPv6 addresses on Solaris
  * and HP/UX. So we prefer SIOCGLIFCONF if it's available.
+ *
+ * On HP/UX, however, it *only* returns IPv6 addresses,
+ * and the structs are named slightly differently too.
+ * We'd have to do another call with SIOCGIFCONF to get the
+ * IPv4 addresses as well. We don't currently bother, just
+ * fall back to SIOCGIFCONF on HP/UX.
  */
 
 #if defined(SIOCGLIFCONF) && !defined(__hpux)
@@ -783,7 +605,7 @@ pg_foreach_ifaddr(PgIfAddrCallback callback, void *cb_data)
 				total;
 
 	sock = socket(AF_INET, SOCK_DGRAM, 0);
-	if (sock == -1)
+	if (sock == PGINVALID_SOCKET)
 		return -1;
 
 	while (n_buffer < 1024 * 100)
@@ -824,7 +646,7 @@ pg_foreach_ifaddr(PgIfAddrCallback callback, void *cb_data)
 #ifdef HAVE_IPV6
 	/* We'll need an IPv6 socket too for the SIOCGLIFNETMASK ioctls */
 	sock6 = socket(AF_INET6, SOCK_DGRAM, 0);
-	if (sock6 == -1)
+	if (sock6 == PGINVALID_SOCKET)
 	{
 		free(buffer);
 		close(sock);
@@ -901,10 +723,10 @@ pg_foreach_ifaddr(PgIfAddrCallback callback, void *cb_data)
 	char	   *ptr,
 			   *buffer = NULL;
 	size_t		n_buffer = 1024;
-	int			sock;
+	pgsocket	sock;
 
 	sock = socket(AF_INET, SOCK_DGRAM, 0);
-	if (sock == -1)
+	if (sock == PGINVALID_SOCKET)
 		return -1;
 
 	while (n_buffer < 1024 * 100)

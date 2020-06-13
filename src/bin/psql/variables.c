@@ -1,14 +1,44 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2010, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2016, PostgreSQL Global Development Group
  *
  * src/bin/psql/variables.c
  */
 #include "postgres_fe.h"
+
 #include "common.h"
 #include "variables.h"
 
+
+/*
+ * Check whether a variable's name is allowed.
+ *
+ * We allow any non-ASCII character, as well as ASCII letters, digits, and
+ * underscore.  Keep this in sync with the definition of variable_char in
+ * psqlscan.l and psqlscanslash.l.
+ */
+static bool
+valid_variable_name(const char *name)
+{
+	const unsigned char *ptr = (const unsigned char *) name;
+
+	/* Mustn't be zero-length */
+	if (*ptr == '\0')
+		return false;
+
+	while (*ptr)
+	{
+		if (IS_HIGHBIT_SET(*ptr) ||
+			strchr("ABCDEFGHIJKLMNOPQRSTUVWXYZ" "abcdefghijklmnopqrstuvwxyz"
+				   "_0123456789", *ptr) != NULL)
+			ptr++;
+		else
+			return false;
+	}
+
+	return true;
+}
 
 /*
  * A "variable space" is represented by an otherwise-unused struct _variable
@@ -49,11 +79,16 @@ GetVariable(VariableSpace space, const char *name)
 }
 
 /*
- * Try to interpret value as boolean value.  Valid values are: true,
- * false, yes, no, on, off, 1, 0; as well as unique prefixes thereof.
+ * Try to interpret "value" as boolean value.
+ *
+ * Valid values are: true, false, yes, no, on, off, 1, 0; as well as unique
+ * prefixes thereof.
+ *
+ * "name" is the name of the variable we're assigning to, to use in error
+ * report if any.  Pass name == NULL to suppress the error report.
  */
 bool
-ParseVariableBool(const char *value)
+ParseVariableBool(const char *value, const char *name)
 {
 	size_t		len;
 
@@ -82,11 +117,11 @@ ParseVariableBool(const char *value)
 	else
 	{
 		/* NULL is treated as false, so a non-matching value is 'true' */
-		psql_error("unrecognized boolean value; assuming \"on\".\n");
+		if (name)
+			psql_error("unrecognized value \"%s\" for \"%s\"; assuming \"%s\"\n",
+					   value, name, "on");
 		return true;
 	}
-	/* suppress compiler warning */
-	return true;
 }
 
 
@@ -158,7 +193,7 @@ SetVariable(VariableSpace space, const char *name, const char *value)
 	if (!space)
 		return false;
 
-	if (strspn(name, VALID_VARIABLE_CHARS) != strlen(name))
+	if (!valid_variable_name(name))
 		return false;
 
 	if (!value)
@@ -202,7 +237,7 @@ SetVariableAssignHook(VariableSpace space, const char *name, VariableAssignHook 
 	if (!space)
 		return false;
 
-	if (strspn(name, VALID_VARIABLE_CHARS) != strlen(name))
+	if (!valid_variable_name(name))
 		return false;
 
 	for (previous = space, current = space->next;

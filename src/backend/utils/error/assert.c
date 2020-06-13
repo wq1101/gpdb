@@ -5,12 +5,12 @@
  *
  * Portions Copyright (c) 2005-2009, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/error/assert.c,v 1.35 2008/01/01 19:45:53 momjian Exp $
+ *	  src/backend/utils/error/assert.c
  *
  * NOTE
  *	  This should eventually work with elog()
@@ -20,17 +20,14 @@
 #include "postgres.h"
 
 #include "libpq/pqsignal.h"
-#include "cdb/cdbvars.h"                /* currentSliceId */
+#include "cdb/cdbvars.h"                /* gp_reraise_signal */
 
 #include <unistd.h>
 
 /*
  * ExceptionalCondition - Handles the failure of an Assert()
- *
- * Note: this can't actually return, but we declare it as returning int
- * because the TrapMacro() macro might get wonky otherwise.
  */
-int
+void
 ExceptionalCondition(const char *conditionName,
 					 const char *errorType,
 					 const char *fileName,
@@ -67,5 +64,4 @@ ExceptionalCondition(const char *conditionName,
 #endif
 
 	abort();
-	return 0;
 }

@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2010, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2016, PostgreSQL Global Development Group
  *
  * src/bin/psql/describe.h
  */
@@ -11,6 +11,9 @@
 
 /* \da */
 extern bool describeAggregates(const char *pattern, bool verbose, bool showSystem);
+
+/* \dA */
+extern bool describeAccessMethods(const char *pattern, bool verbose);
 
 /* \db */
 extern bool describeTablespaces(const char *pattern, bool verbose);
@@ -22,10 +25,10 @@ extern bool describeFunctions(const char *functypes, const char *pattern, bool v
 extern bool describeTypes(const char *pattern, bool verbose, bool showSystem);
 
 /* \do */
-extern bool describeOperators(const char *pattern, bool showSystem);
+extern bool describeOperators(const char *pattern, bool verbose, bool showSystem);
 
 /* \du, \dg */
-extern bool describeRoles(const char *pattern, bool verbose);
+extern bool describeRoles(const char *pattern, bool verbose, bool showSystem);
 
 /* \drds */
 extern bool listDbRoleSettings(const char *pattern1, const char *pattern2);
@@ -67,27 +70,48 @@ extern bool listTSDictionaries(const char *pattern, bool verbose);
 extern bool listTSTemplates(const char *pattern, bool verbose);
 
 /* \l */
-extern bool listAllDbs(bool verbose);
+extern bool listAllDbs(const char *pattern, bool verbose);
 
 /* \dt, \di, \ds, \dS, etc. */
 extern bool listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSystem);
 
 /* \dD */
-extern bool listDomains(const char *pattern, bool showSystem);
+extern bool listDomains(const char *pattern, bool verbose, bool showSystem);
 
 /* \dc */
-extern bool listConversions(const char *pattern, bool showSystem);
+extern bool listConversions(const char *pattern, bool verbose, bool showSystem);
 
 /* \dC */
-extern bool listCasts(const char *pattern);
+extern bool listCasts(const char *pattern, bool verbose);
+
+/* \dO */
+extern bool listCollations(const char *pattern, bool verbose, bool showSystem);
 
 /* \dn */
-extern bool listSchemas(const char *pattern, bool verbose);
+extern bool listSchemas(const char *pattern, bool verbose, bool showSystem);
+
+/* \dew */
+extern bool listForeignDataWrappers(const char *pattern, bool verbose);
+
+/* \des */
+extern bool listForeignServers(const char *pattern, bool verbose);
+
+/* \deu */
+extern bool listUserMappings(const char *pattern, bool verbose);
+
+/* \det */
+extern bool listForeignTables(const char *pattern, bool verbose);
+
+/* \dL */
+extern bool listLanguages(const char *pattern, bool verbose, bool showSystem);
 
 /* \dx */
 extern bool listExtensions(const char *pattern);
 
 /* \dx+ */
 extern bool listExtensionContents(const char *pattern);
+
+/* \dy */
+extern bool listEventTriggers(const char *pattern, bool verbose);
 
 #endif   /* DESCRIBE_H */

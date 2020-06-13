@@ -1,11 +1,29 @@
 #!/bin/bash
+set -ex
+
+CWDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+source "${CWDIR}/common.bash"
 
 BEHAVE_FLAGS=$@
 
-source /usr/local/greenplum-db-devel/greenplum_path.sh
-export PGPORT=5432
-export MASTER_DATA_DIRECTORY=/data/gpdata/master/gpseg-1
-export PGDATABASE=gptest
-createdb gptest
+cat > ~/gpdb-env.sh <<'EOF'
+  source /usr/local/greenplum-db-devel/greenplum_path.sh
+  export PGPORT=5432
+  export MASTER_DATA_DIRECTORY=/data/gpdata/master/gpseg-1
+  export PGDATABASE=gptest
+
+  alias mdd='cd \$MASTER_DATA_DIRECTORY'
+  # pip installs are done using --user, so are in ~/.local/bin which
+  # is not in the default path over ssh
+  export PATH=~/.local/bin:${PATH}
+EOF
+source ~/gpdb-env.sh
+
+if gpstate > /dev/null 2>&1 ; then
+  createdb gptest
+  gpconfig --skipvalidation -c fsync -v off
+  gpstop -u
+fi
+
 cd /home/gpadmin/gpdb_src/gpMgmt
 make -f Makefile.behave behave flags="$BEHAVE_FLAGS"

@@ -1,11 +1,16 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/drop_table.sgml,v 1.27 2007/05/15 19:13:55 neilc Exp $
+doc/src/sgml/ref/drop_table.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-DROPTABLE">
+ <indexterm zone="sql-droptable">
+  <primary>DROP TABLE</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="SQL-DROPTABLE-TITLE">DROP TABLE</refentrytitle>
+  <refentrytitle>DROP TABLE</refentrytitle>
+  <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
 
@@ -14,25 +19,21 @@ PostgreSQL documentation
   <refpurpose>remove a table</refpurpose>
  </refnamediv>
 
- <indexterm zone="sql-droptable">
-  <primary>DROP TABLE</primary>
- </indexterm>
-
  <refsynopsisdiv>
 <synopsis>
 DROP TABLE [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> [, ...] [ CASCADE | RESTRICT ]
 </synopsis>
  </refsynopsisdiv>
- 
+
  <refsect1>
   <title>Description</title>
 
   <para>
    <command>DROP TABLE</command> removes tables from the database.
-   Only its owner can drop a table.  To empty a table of rows
-   without destroying the table, use <xref linkend="sql-delete"
-   endterm="sql-delete-title"> or <xref linkend="sql-truncate"
-   endterm="sql-truncate-title">.
+   Only the table owner, the schema owner, and superuser can drop a
+   table.  To empty a table of rows
+   without destroying the table, use <xref linkend="sql-delete">
+   or <xref linkend="sql-truncate">.
   </para>
 
   <para>
@@ -45,7 +46,7 @@ DROP TABLE [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> [, ..
    constraint, not the other table entirely.)
   </para>
  </refsect1>
-  
+
  <refsect1>
   <title>Parameters</title>
 
@@ -54,7 +55,7 @@ DROP TABLE [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> [, ..
     <term><literal>IF EXISTS</literal></term>
     <listitem>
      <para>
-      Do not throw an error if the table does not exist. A notice is issued 
+      Do not throw an error if the table does not exist. A notice is issued
       in this case.
      </para>
     </listitem>
@@ -74,7 +75,9 @@ DROP TABLE [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> [, ..
     <listitem>
      <para>
       Automatically drop objects that depend on the table (such as
-      views).
+      views),
+      and in turn all objects that depend on those objects
+      (see <xref linkend="ddl-depend">).
      </para>
     </listitem>
    </varlistentry>
@@ -95,22 +98,21 @@ DROP TABLE [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable> [, ..
   <title>Examples</title>
 
   <para>
-   To destroy two tables, <literal>films</literal> and 
+   To destroy two tables, <literal>films</literal> and
    <literal>distributors</literal>:
 
 <programlisting>
 DROP TABLE films, distributors;
-</programlisting>
-  </para>
+</programlisting></para>
  </refsect1>
- 
+
  <refsect1>
   <title>Compatibility</title>
 
   <para>
    This command conforms to the SQL standard, except that the standard only
-   allows one table to be dropped per command, and apart from the 
-   <literal>IF EXISTS</> option, which is a <productname>PostgreSQL</> 
+   allows one table to be dropped per command, and apart from the
+   <literal>IF EXISTS</> option, which is a <productname>PostgreSQL</>
    extension.
   </para>
  </refsect1>
@@ -119,8 +121,8 @@ DROP TABLE films, distributors;
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-altertable" endterm="sql-altertable-title"></member>
-   <member><xref linkend="sql-createtable" endterm="sql-createtable-title"></member>
+   <member><xref linkend="sql-altertable"></member>
+   <member><xref linkend="sql-createtable"></member>
   </simplelist>
  </refsect1>
 

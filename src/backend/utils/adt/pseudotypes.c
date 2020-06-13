@@ -6,17 +6,17 @@
  * A pseudo-type isn't really a type and never has any operations, but
  * we do need to supply input and output functions to satisfy the links
  * in the pseudo-type's entry in pg_type.  In most cases the functions
- * just throw an error if invoked.	(XXX the error messages here cover
+ * just throw an error if invoked.  (XXX the error messages here cover
  * the most common case, but might be confusing in some contexts.  Can
  * we do better?)
  *
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/adt/pseudotypes.c,v 1.21 2008/01/01 19:45:52 momjian Exp $
+ *	  src/backend/utils/adt/pseudotypes.c
  *
  *-------------------------------------------------------------------------
  */
@@ -25,6 +25,7 @@
 #include "libpq/pqformat.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/rangetypes.h"
 
 
 /*
@@ -138,7 +139,7 @@ anyarray_out(PG_FUNCTION_ARGS)
  * anyarray_recv		- binary input routine for pseudo-type ANYARRAY.
  *
  * XXX this could actually be made to work, since the incoming array
- * data will contain the element type OID.	Need to think through
+ * data will contain the element type OID.  Need to think through
  * type-safety issues before allowing it, however.
  */
 Datum
@@ -187,12 +188,35 @@ anyenum_out(PG_FUNCTION_ARGS)
 	return enum_out(fcinfo);
 }
 
+/*
+ * anyrange_in		- input routine for pseudo-type ANYRANGE.
+ */
+Datum
+anyrange_in(PG_FUNCTION_ARGS)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cannot accept a value of type anyrange")));
+
+	PG_RETURN_VOID();			/* keep compiler quiet */
+}
+
+/*
+ * anyrange_out		- output routine for pseudo-type ANYRANGE.
+ *
+ * We may as well allow this, since range_out will in fact work.
+ */
+Datum
+anyrange_out(PG_FUNCTION_ARGS)
+{
+	return range_out(fcinfo);
+}
 
 /*
  * void_in		- input routine for pseudo-type VOID.
  *
  * We allow this so that PL functions can return VOID without any special
- * hack in the PL handler.	Whatever value the PL thinks it's returning
+ * hack in the PL handler.  Whatever value the PL thinks it's returning
  * will just be ignored.
  */
 Datum
@@ -210,6 +234,34 @@ Datum
 void_out(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_CSTRING(pstrdup(""));
+}
+
+/*
+ * void_recv	- binary input routine for pseudo-type VOID.
+ *
+ * Note that since we consume no bytes, an attempt to send anything but
+ * an empty string will result in an "invalid message format" error.
+ */
+Datum
+void_recv(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_VOID();
+}
+
+/*
+ * void_send	- binary output routine for pseudo-type VOID.
+ *
+ * We allow this so that "SELECT function_returning_void(...)" works
+ * even when binary output is requested.
+ */
+Datum
+void_send(PG_FUNCTION_ARGS)
+{
+	StringInfoData buf;
+
+	/* send an empty string */
+	pq_begintypsend(&buf);
+	PG_RETURN_BYTEA_P(pq_endtypsend(&buf));
 }
 
 
@@ -241,6 +293,33 @@ trigger_out(PG_FUNCTION_ARGS)
 
 
 /*
+ * event_trigger_in - input routine for pseudo-type event_trigger.
+ */
+Datum
+event_trigger_in(PG_FUNCTION_ARGS)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cannot accept a value of type event_trigger")));
+
+	PG_RETURN_VOID();			/* keep compiler quiet */
+}
+
+/*
+ * event_trigger_out - output routine for pseudo-type event_trigger.
+ */
+Datum
+event_trigger_out(PG_FUNCTION_ARGS)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cannot display a value of type event_trigger")));
+
+	PG_RETURN_VOID();			/* keep compiler quiet */
+}
+
+
+/*
  * language_handler_in		- input routine for pseudo-type LANGUAGE_HANDLER.
  */
 Datum
@@ -262,6 +341,87 @@ language_handler_out(PG_FUNCTION_ARGS)
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("cannot display a value of type language_handler")));
+
+	PG_RETURN_VOID();			/* keep compiler quiet */
+}
+
+
+/*
+ * fdw_handler_in		- input routine for pseudo-type FDW_HANDLER.
+ */
+Datum
+fdw_handler_in(PG_FUNCTION_ARGS)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cannot accept a value of type fdw_handler")));
+
+	PG_RETURN_VOID();			/* keep compiler quiet */
+}
+
+/*
+ * fdw_handler_out		- output routine for pseudo-type FDW_HANDLER.
+ */
+Datum
+fdw_handler_out(PG_FUNCTION_ARGS)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cannot display a value of type fdw_handler")));
+
+	PG_RETURN_VOID();			/* keep compiler quiet */
+}
+
+
+/*
+ * index_am_handler_in		- input routine for pseudo-type INDEX_AM_HANDLER.
+ */
+Datum
+index_am_handler_in(PG_FUNCTION_ARGS)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cannot accept a value of type index_am_handler")));
+
+	PG_RETURN_VOID();			/* keep compiler quiet */
+}
+
+/*
+ * index_am_handler_out		- output routine for pseudo-type INDEX_AM_HANDLER.
+ */
+Datum
+index_am_handler_out(PG_FUNCTION_ARGS)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cannot display a value of type index_am_handler")));
+
+	PG_RETURN_VOID();			/* keep compiler quiet */
+}
+
+
+/*
+ * tsm_handler_in		- input routine for pseudo-type TSM_HANDLER.
+ */
+Datum
+tsm_handler_in(PG_FUNCTION_ARGS)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cannot accept a value of type tsm_handler")));
+
+	PG_RETURN_VOID();			/* keep compiler quiet */
+}
+
+/*
+ * tsm_handler_out		- output routine for pseudo-type TSM_HANDLER.
+ */
+Datum
+tsm_handler_out(PG_FUNCTION_ARGS)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cannot display a value of type tsm_handler")));
 
 	PG_RETURN_VOID();			/* keep compiler quiet */
 }
@@ -401,6 +561,61 @@ shell_out(PG_FUNCTION_ARGS)
 
 
 /*
+ * pg_node_tree_in		- input routine for type PG_NODE_TREE.
+ *
+ * pg_node_tree isn't really a pseudotype --- it's real enough to be a table
+ * column --- but it presently has no operations of its own, and disallows
+ * input too, so its I/O functions seem to fit here as much as anywhere.
+ */
+Datum
+pg_node_tree_in(PG_FUNCTION_ARGS)
+{
+	/*
+	 * We disallow input of pg_node_tree values because the SQL functions that
+	 * operate on the type are not secure against malformed input.
+	 */
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cannot accept a value of type %s", "pg_node_tree")));
+
+	PG_RETURN_VOID();			/* keep compiler quiet */
+}
+
+
+/*
+ * pg_node_tree_out		- output routine for type PG_NODE_TREE.
+ *
+ * The internal representation is the same as TEXT, so just pass it off.
+ */
+Datum
+pg_node_tree_out(PG_FUNCTION_ARGS)
+{
+	return textout(fcinfo);
+}
+
+/*
+ * pg_node_tree_recv		- binary input routine for type PG_NODE_TREE.
+ */
+Datum
+pg_node_tree_recv(PG_FUNCTION_ARGS)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cannot accept a value of type %s", "pg_node_tree")));
+
+	PG_RETURN_VOID();			/* keep compiler quiet */
+}
+
+/*
+ * pg_node_tree_send		- binary output routine for type PG_NODE_TREE.
+ */
+Datum
+pg_node_tree_send(PG_FUNCTION_ARGS)
+{
+	return textsend(fcinfo);
+}
+
+/*
  * anytable_in		- input routine for multiset pseudotype
  */
 Datum
@@ -414,7 +629,7 @@ anytable_in(PG_FUNCTION_ARGS)
 }
 
 /*
- * shell_out		- output routine for "shell" types.
+ * anytable_out		- output routine for multiset pseudotype.
  */
 Datum
 anytable_out(PG_FUNCTION_ARGS)
@@ -424,4 +639,64 @@ anytable_out(PG_FUNCTION_ARGS)
 			 errmsg("cannot display a value of type anytable")));
 
 	PG_RETURN_VOID();			/* keep compiler quiet */
+}
+
+/*
+ * pg_ddl_command_in	- input routine for type PG_DDL_COMMAND.
+ *
+ * Like pg_node_tree, pg_ddl_command isn't really a pseudotype; it's here for
+ * the same reasons as that one.
+ */
+Datum
+pg_ddl_command_in(PG_FUNCTION_ARGS)
+{
+	/*
+	 * Disallow input of pg_ddl_command value.
+	 */
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cannot accept a value of type %s", "pg_ddl_command")));
+
+	PG_RETURN_VOID();			/* keep compiler quiet */
+}
+
+/*
+ * pg_ddl_command_out		- output routine for type PG_DDL_COMMAND.
+ *
+ * We don't have any good way to output this type directly, so punt.
+ */
+Datum
+pg_ddl_command_out(PG_FUNCTION_ARGS)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cannot output a value of type %s", "pg_ddl_command")));
+
+	PG_RETURN_VOID();
+}
+
+/*
+ * pg_ddl_command_recv		- binary input routine for type PG_DDL_COMMAND.
+ */
+Datum
+pg_ddl_command_recv(PG_FUNCTION_ARGS)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cannot accept a value of type %s", "pg_ddl_command")));
+
+	PG_RETURN_VOID();
+}
+
+/*
+ * pg_ddl_command_send		- binary output routine for type PG_DDL_COMMAND.
+ */
+Datum
+pg_ddl_command_send(PG_FUNCTION_ARGS)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cannot output a value of type %s", "pg_ddl_command")));
+
+	PG_RETURN_VOID();
 }

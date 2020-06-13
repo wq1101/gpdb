@@ -16,15 +16,12 @@
 
 #include "nodes/execnodes.h"
 
-extern int ExecCountSlotsDynamicIndexScan(DynamicIndexScan *node);
 extern DynamicIndexScanState *ExecInitDynamicIndexScan(DynamicIndexScan *node, EState *estate, int eflags);
 extern TupleTableSlot *ExecDynamicIndexScan(DynamicIndexScanState *node);
 extern void ExecEndDynamicIndexScan(DynamicIndexScanState *node);
-extern void ExecDynamicIndexReScan(DynamicIndexScanState *node, ExprContext *exprCtxt);
+extern void ExecReScanDynamicIndex(DynamicIndexScanState *node);
 
-static inline gpmon_packet_t * GpmonPktFromDynamicIndexScanState(DynamicIndexScanState *node)
-{
-	return &node->indexScanState.ss.ps.gpmon_pkt;
-}
+extern bool IndexScan_MapLogicalIndexInfo(LogicalIndexInfo *logicalIndexInfo, AttrNumber *attMap, Index varno);
+extern AttrNumber *IndexScan_GetColumnMapping(Oid oldOid, Oid newOid);
+
 #endif
-

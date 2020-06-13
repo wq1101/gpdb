@@ -40,45 +40,45 @@ INSERT INTO SUBSELECT_TBL VALUES (3, 3, 3);
 INSERT INTO SUBSELECT_TBL VALUES (6, 7, 8);
 INSERT INTO SUBSELECT_TBL VALUES (8, 9, NULL);
 
-SELECT '' AS eight, * FROM SUBSELECT_TBL ORDER BY 2,3,4;
+SELECT '' AS eight, * FROM SUBSELECT_TBL;
 
 -- Uncorrelated subselects
 
 SELECT '' AS two, f1 AS "Constant Select" FROM SUBSELECT_TBL
-  WHERE f1 IN (SELECT 1) ORDER BY 2;
+  WHERE f1 IN (SELECT 1);
 
 SELECT '' AS six, f1 AS "Uncorrelated Field" FROM SUBSELECT_TBL
-  WHERE f1 IN (SELECT f2 FROM SUBSELECT_TBL) ORDER BY 2;
+  WHERE f1 IN (SELECT f2 FROM SUBSELECT_TBL);
 
 SELECT '' AS six, f1 AS "Uncorrelated Field" FROM SUBSELECT_TBL
   WHERE f1 IN (SELECT f2 FROM SUBSELECT_TBL WHERE
-    f2 IN (SELECT f1 FROM SUBSELECT_TBL)) ORDER BY 2;
+    f2 IN (SELECT f1 FROM SUBSELECT_TBL));
 
 SELECT '' AS three, f1, f2
   FROM SUBSELECT_TBL
   WHERE (f1, f2) NOT IN (SELECT f2, CAST(f3 AS int4) FROM SUBSELECT_TBL
-                         WHERE f3 IS NOT NULL) ORDER BY 2,3;
+                         WHERE f3 IS NOT NULL);
 
 -- Correlated subselects
 
 SELECT '' AS six, f1 AS "Correlated Field", f2 AS "Second Field"
   FROM SUBSELECT_TBL upper
-  WHERE f1 IN (SELECT f2 FROM SUBSELECT_TBL WHERE f1 = upper.f1) ORDER BY 2,3;
+  WHERE f1 IN (SELECT f2 FROM SUBSELECT_TBL WHERE f1 = upper.f1);
 
 SELECT '' AS six, f1 AS "Correlated Field", f3 AS "Second Field"
   FROM SUBSELECT_TBL upper
   WHERE f1 IN
-    (SELECT f2 FROM SUBSELECT_TBL WHERE CAST(upper.f2 AS float) = f3) ORDER BY 2,3;
+    (SELECT f2 FROM SUBSELECT_TBL WHERE CAST(upper.f2 AS float) = f3);
 
 SELECT '' AS six, f1 AS "Correlated Field", f3 AS "Second Field"
   FROM SUBSELECT_TBL upper
   WHERE f3 IN (SELECT upper.f1 + f2 FROM SUBSELECT_TBL
-               WHERE f2 = CAST(f3 AS integer)) ORDER BY 2,3;
+               WHERE f2 = CAST(f3 AS integer));
 
 SELECT '' AS five, f1 AS "Correlated Field"
   FROM SUBSELECT_TBL
   WHERE (f1, f2) IN (SELECT f2, CAST(f3 AS int4) FROM SUBSELECT_TBL
-                     WHERE f3 IS NOT NULL) ORDER BY 2;
+                     WHERE f3 IS NOT NULL);
 
 --
 -- Use some existing tables in the regression test
@@ -87,10 +87,23 @@ SELECT '' AS five, f1 AS "Correlated Field"
 SELECT '' AS eight, ss.f1 AS "Correlated Field", ss.f3 AS "Second Field"
   FROM SUBSELECT_TBL ss
   WHERE f1 NOT IN (SELECT f1+1 FROM INT4_TBL
-                   WHERE f1 != ss.f1 AND f1 < 2147483647) ORDER BY 2,3;
+                   WHERE f1 != ss.f1 AND f1 < 2147483647);
 
 select q1, float8(count(*)) / (select count(*) from int8_tbl)
 from int8_tbl group by q1 order by q1;
+
+--
+-- Check EXISTS simplification with LIMIT
+--
+explain (costs off)
+select * from int4_tbl o where exists
+  (select 1 from int4_tbl i where i.f1=o.f1 limit null);
+explain (costs off)
+select * from int4_tbl o where not exists
+  (select 1 from int4_tbl i where i.f1=o.f1 limit 1);
+explain (costs off)
+select * from int4_tbl o where exists
+  (select 1 from int4_tbl i where i.f1=o.f1 limit 0);
 
 --
 -- Test cases to catch unpleasant interactions between IN-join processing
@@ -127,21 +140,21 @@ INSERT INTO bar VALUES (3, 1);
 
 -- These cases require an extra level of distinct-ing above subquery s
 SELECT * FROM foo WHERE id IN
-    (SELECT id2 FROM (SELECT DISTINCT id1, id2 FROM bar) AS s) ORDER BY 1;
+    (SELECT id2 FROM (SELECT DISTINCT id1, id2 FROM bar) AS s);
 SELECT * FROM foo WHERE id IN
-    (SELECT id2 FROM (SELECT id1,id2 FROM bar GROUP BY id1,id2) AS s) ORDER BY 1;
+    (SELECT id2 FROM (SELECT id1,id2 FROM bar GROUP BY id1,id2) AS s);
 SELECT * FROM foo WHERE id IN
     (SELECT id2 FROM (SELECT id1, id2 FROM bar UNION
-                      SELECT id1, id2 FROM bar) AS s) ORDER BY 1;
+                      SELECT id1, id2 FROM bar) AS s);
 
 -- These cases do not
 SELECT * FROM foo WHERE id IN
-    (SELECT id2 FROM (SELECT DISTINCT ON (id2) id1, id2 FROM bar) AS s) ORDER BY 1;
+    (SELECT id2 FROM (SELECT DISTINCT ON (id2) id1, id2 FROM bar) AS s);
 SELECT * FROM foo WHERE id IN
-    (SELECT id2 FROM (SELECT id2 FROM bar GROUP BY id2) AS s) ORDER BY 1;
+    (SELECT id2 FROM (SELECT id2 FROM bar GROUP BY id2) AS s);
 SELECT * FROM foo WHERE id IN
     (SELECT id2 FROM (SELECT id2 FROM bar UNION
-                      SELECT id2 FROM bar) AS s) ORDER BY 1;
+                      SELECT id2 FROM bar) AS s);
 
 --
 -- Test case to catch problems with multiply nested sub-SELECTs not getting
@@ -151,7 +164,7 @@ SELECT * FROM foo WHERE id IN
 CREATE TABLE orderstest (
     approver_ref integer,
     po_ref integer,
-    ordercancelled boolean
+    ordercanceled boolean
 );
 
 INSERT INTO orderstest VALUES (1, 1, false);
@@ -172,8 +185,8 @@ SELECT *,
    WHEN ord.approver_ref=1 THEN '---' ELSE 'Approved'
  END) AS "Approved",
 (SELECT CASE
- WHEN ord.ordercancelled
- THEN 'Cancelled'
+ WHEN ord.ordercanceled
+ THEN 'Canceled'
  ELSE
   (SELECT CASE
 		WHEN ord.po_ref=1
@@ -184,11 +197,11 @@ SELECT *,
 				ELSE 'Approved'
 			END)
 		ELSE 'PO'
-	END) 
+	END)
 END) AS "Status",
 (CASE
- WHEN ord.ordercancelled
- THEN 'Cancelled'
+ WHEN ord.ordercanceled
+ THEN 'Canceled'
  ELSE
   (CASE
 		WHEN ord.po_ref=1
@@ -199,11 +212,11 @@ END) AS "Status",
 				ELSE 'Approved'
 			END)
 		ELSE 'PO'
-	END) 
+	END)
 END) AS "Status_OK"
 FROM orderstest ord;
 
-SELECT * FROM orders_view ORDER BY 1,2,5;
+SELECT * FROM orders_view;
 
 DROP TABLE orderstest cascade;
 
@@ -241,7 +254,12 @@ create rule shipped_view_update as on update to shipped_view do instead
     update shipped set partnum = new.partnum, value = new.value
         where ttype = new.ttype and ordnum = new.ordnum;
 
-select * from shipped_view ORDER BY 1,2;
+update shipped_view set value = 11
+    from int4_tbl a join int4_tbl b
+      on (a.f1 = (select f1 from int4_tbl c where c.f1=b.f1))
+    where ordnum = a.f1;
+
+select * from shipped_view;
 
 select f1, ss1 as relabel from
     (select *, (select sum(f1) from int4_tbl b where f1 >= a.f1) as ss1
@@ -321,18 +339,37 @@ select * from
 group by f1,f2,fs;
 
 --
+-- Test case for bug #5514 (mishandling of whole-row Vars in subselects)
+--
+
+create temp table table_a(id integer);
+insert into table_a values (42);
+
+create temp view view_a as select * from table_a;
+
+select view_a from view_a;
+select (select view_a) from view_a;
+select (select (select view_a)) from view_a;
+select (select (a.*)::text) from view_a a;
+
+--
 -- Check that whole-row Vars reading the result of a subselect don't include
 -- any junk columns therein
 --
-
-select q from (select max(f1) from int4_tbl group by f1 order by f1) q
-  order by max;
+-- In GPDB, the ORDER BY in the subquery or CTE doesn't force an ordering
+-- for the whole query. Mark these with the "order none" gpdiff directive,
+-- so that differences in result order are ignored.
+select q from (select max(f1) from int4_tbl group by f1 order by f1) q;  -- order none
 with q as (select max(f1) from int4_tbl group by f1 order by f1)
-  select q from q;
+  select q from q;  -- order none
 
 --
 -- Test case for sublinks pushed down into subselects via join alias expansion
 --
+-- Greenplum note: This query will only work with ORCA. This type of query
+-- was not supported in postgres versions prior to 8.4, and thus was never
+-- supported in the planner. After 8.4 versions, the planner works, but
+-- the plan it creates is not currently parallel safe.
 
 select
   (select sq1) as qq1
@@ -341,6 +378,20 @@ from
    from int8_tbl) sq0
   join
   int4_tbl i4 on dummy = i4.f1;
+
+--
+-- Test case for subselect within UPDATE of INSERT...ON CONFLICT DO UPDATE
+--
+create temp table upsert(key int4 primary key, val text);
+insert into upsert values(1, 'val') on conflict (key) do update set val = 'not seen';
+insert into upsert values(1, 'val') on conflict (key) do update set val = 'seen with subselect ' || (select f1 from int4_tbl where f1 != 0 order by f1 limit 1)::text;
+
+select * from upsert;
+
+with aa as (select 'int4_tbl' u from int4_tbl limit 1)
+insert into upsert values (1, 'x'), (999, 'y')
+on conflict (key) do update set val = (select u from aa)
+returning *;
 
 --
 -- Test case for cross-type partial matching in hashed subplan (bug #7597)
@@ -362,3 +413,109 @@ select * from outer_7597 where (f1, f2) not in (select * from inner_7597);
 --
 
 select '1'::text in (select '1'::name union all select '1'::name);
+
+--
+-- Test case for planner bug with nested EXISTS handling
+--
+select a.thousand from tenk1 a, tenk1 b
+-- GPDB_92_MERGE_FIXME: ORCA cannot decorrelate this query, and generates
+-- correct-but-slow plan that takes 45 minutes. Wedge in a hack to
+-- conditionally short-circuit it only when running under ORCA
+, (SELECT name, setting FROM pg_settings WHERE (name, setting) = ('optimizer', 'off')) AS FIXME
+where a.thousand = b.thousand
+  and exists ( select 1 from tenk1 c where b.hundred = c.hundred
+                   and not exists ( select 1 from tenk1 d
+                                    where a.thousand = d.thousand ) );
+
+--
+-- Check that nested sub-selects are not pulled up if they contain volatiles
+--
+explain (verbose, costs off)
+  select x, x from
+    (select (select current_database()) as x from (values(1),(2)) v(y)) ss;
+explain (verbose, costs off)
+  select x, x from
+    (select (select random()) as x from (values(1),(2)) v(y)) ss;
+explain (verbose, costs off)
+  select x, x from
+    (select (select current_database() where y=y) as x from (values(1),(2)) v(y)) ss;
+explain (verbose, costs off)
+  select x, x from
+    (select (select random() where y=y) as x from (values(1),(2)) v(y)) ss;
+
+--
+-- Check we behave sanely in corner case of empty SELECT list (bug #8648)
+--
+create temp table nocolumns();
+select exists(select * from nocolumns);
+
+--
+-- Check behavior with a SubPlan in VALUES (bug #14924)
+--
+select val.x
+  from generate_series(1,10) as s(i),
+  lateral (
+    values ((select s.i + 1)), (s.i + 101)
+  ) as val(x)
+where s.i < 10 and (select val.x) < 110;
+
+--
+-- Check sane behavior with nested IN SubLinks
+-- GPDB_94_MERGE_FIXME: ORCA plan is correct but very pricy. Should we fallback to planner?
+--
+explain (verbose, costs off)
+select * from int4_tbl where
+  (case when f1 in (select unique1 from tenk1 a) then f1 else null end) in
+  (select ten from tenk1 b);
+select * from int4_tbl where
+  (case when f1 in (select unique1 from tenk1 a) then f1 else null end) in
+  (select ten from tenk1 b);
+
+--
+-- Check for incorrect optimization when IN subquery contains a SRF
+--
+explain (verbose, costs off)
+select * from int4_tbl o where (f1, f1) in
+  (select f1, generate_series(1,2) / 10 g from int4_tbl i group by f1);
+select * from int4_tbl o where (f1, f1) in
+  (select f1, generate_series(1,2) / 10 g from int4_tbl i group by f1);
+
+--
+-- check for over-optimization of whole-row Var referencing an Append plan
+--
+select (select q from
+         (select 1,2,3 where f1 > 0
+          union all
+          select 4,5,6.0 where f1 <= 0
+         ) q )
+from int4_tbl;
+
+--
+-- Check that volatile quals aren't pushed down past a DISTINCT:
+-- nextval() should not be called more than the nominal number of times
+--
+create temp sequence ts1;
+
+select * from
+  (select distinct ten from tenk1) ss
+  where ten < 10 + nextval('ts1')
+  order by 1;
+
+select nextval('ts1');
+
+--
+-- Ensure that backward scan direction isn't propagated into
+-- expression subqueries (bug #15336)
+--
+--start_ignore
+begin;
+
+declare c1 scroll cursor for
+ select * from generate_series(1,4) i
+  where i <> all (values (2),(3));
+
+move forward all in c1;
+fetch backward all in c1;
+
+commit;
+--end_ignore

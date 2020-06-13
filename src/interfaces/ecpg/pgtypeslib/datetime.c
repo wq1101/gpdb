@@ -1,4 +1,4 @@
-/* $PostgreSQL: pgsql/src/interfaces/ecpg/pgtypeslib/datetime.c,v 1.38 2009/06/11 14:49:13 momjian Exp $ */
+/* src/interfaces/ecpg/pgtypeslib/datetime.c */
 
 #include "postgres_fe.h"
 
@@ -52,7 +52,6 @@ PGTYPESdate_from_timestamp(timestamp dt)
 date
 PGTYPESdate_from_asc(char *str, char **endptr)
 {
-
 	date		dDate;
 	fsec_t		fsec;
 	struct tm	tt,
@@ -173,7 +172,7 @@ PGTYPESdate_today(date * d)
 #define PGTYPES_FMTDATE_YEAR_DIGITS_LONG	6
 
 int
-PGTYPESdate_fmt_asc(date dDate, char *fmtstring, char *outbuf)
+PGTYPESdate_fmt_asc(date dDate, const char *fmtstring, char *outbuf)
 {
 	static struct
 	{
@@ -265,8 +264,8 @@ PGTYPESdate_fmt_asc(date dDate, char *fmtstring, char *outbuf)
 			{
 				case PGTYPES_TYPE_STRING_MALLOCED:
 				case PGTYPES_TYPE_STRING_CONSTANT:
-					strncpy(start_pattern, replace_val.str_val,
-							strlen(replace_val.str_val));
+					memcpy(start_pattern, replace_val.str_val,
+						   strlen(replace_val.str_val));
 					if (replace_type == PGTYPES_TYPE_STRING_MALLOCED)
 						free(replace_val.str_val);
 					break;
@@ -278,7 +277,7 @@ PGTYPESdate_fmt_asc(date dDate, char *fmtstring, char *outbuf)
 							return -1;
 						snprintf(t, PGTYPES_DATE_NUM_MAX_DIGITS,
 								 "%u", replace_val.uint_val);
-						strncpy(start_pattern, t, strlen(t));
+						memcpy(start_pattern, t, strlen(t));
 						free(t);
 					}
 					break;
@@ -290,7 +289,7 @@ PGTYPESdate_fmt_asc(date dDate, char *fmtstring, char *outbuf)
 							return -1;
 						snprintf(t, PGTYPES_DATE_NUM_MAX_DIGITS,
 								 "%02u", replace_val.uint_val);
-						strncpy(start_pattern, t, strlen(t));
+						memcpy(start_pattern, t, strlen(t));
 						free(t);
 					}
 					break;
@@ -302,7 +301,7 @@ PGTYPESdate_fmt_asc(date dDate, char *fmtstring, char *outbuf)
 							return -1;
 						snprintf(t, PGTYPES_DATE_NUM_MAX_DIGITS,
 								 "%04u", replace_val.uint_val);
-						strncpy(start_pattern, t, strlen(t));
+						memcpy(start_pattern, t, strlen(t));
 						free(t);
 					}
 					break;
@@ -324,8 +323,8 @@ PGTYPESdate_fmt_asc(date dDate, char *fmtstring, char *outbuf)
  * PGTYPESdate_defmt_asc
  *
  * function works as follows:
- *	 - first we analyze the paramters
- *	 - if this is a special case with no delimiters, add delimters
+ *	 - first we analyze the parameters
+ *	 - if this is a special case with no delimiters, add delimiters
  *	 - find the tokens. First we look for numerical values. If we have found
  *	   less than 3 tokens, we check for the months' names and thereafter for
  *	   the abbreviations of the months' names.
@@ -335,7 +334,7 @@ PGTYPESdate_fmt_asc(date dDate, char *fmtstring, char *outbuf)
 
 #define PGTYPES_DATE_MONTH_MAXLENGTH		20	/* probably even less  :-) */
 int
-PGTYPESdate_defmt_asc(date * d, char *fmt, char *str)
+PGTYPESdate_defmt_asc(date * d, const char *fmt, char *str)
 {
 	/*
 	 * token[2] = { 4,6 } means that token 2 starts at position 4 and ends at

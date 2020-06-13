@@ -4,11 +4,11 @@
  *	  Display type names "nicely".
  *
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/adt/format_type.c,v 1.49 2008/01/01 19:45:52 momjian Exp $
+ *	  src/backend/utils/adt/format_type.c
  *
  *-------------------------------------------------------------------------
  */
@@ -17,26 +17,21 @@
 
 #include <ctype.h>
 
+#include "access/htup_details.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
 #include "utils/builtins.h"
-#include "utils/datetime.h"
-#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/numeric.h"
 #include "utils/syscache.h"
 #include "mb/pg_wchar.h"
 
 #define MAX_INT32_LEN 11
-#define _textin(str) DirectFunctionCall1(textin, CStringGetDatum(str))
 
 static char *format_type_internal(Oid type_oid, int32 typemod,
-					 bool typemod_given, bool allow_invalid);
+					 bool typemod_given, bool allow_invalid,
+					 bool force_qualify);
 static char *printTypmod(const char *typname, int32 typmod, Oid typmodout);
-static char *
-psnprintf(size_t len, const char *fmt,...)
-/* This lets gcc check the format string for consistency. */
-__attribute__((format(printf, 2, 3)));
 
 
 /*
@@ -49,14 +44,14 @@ __attribute__((format(printf, 2, 3)));
  * double quoted if it contains funny characters or matches a keyword.
  *
  * If typemod is NULL then we are formatting a type name in a context where
- * no typemod is available, eg a function argument or result type.	This
+ * no typemod is available, eg a function argument or result type.  This
  * yields a slightly different result from specifying typemod = -1 in some
  * cases.  Given typemod = -1 we feel compelled to produce an output that
  * the parser will interpret as having typemod -1, so that pg_dump will
- * produce CREATE TABLE commands that recreate the original state.	But
+ * produce CREATE TABLE commands that recreate the original state.  But
  * given NULL typemod, we assume that the parser's interpretation of
  * typemod doesn't matter, and so we are willing to output a slightly
- * "prettier" representation of the same type.	For example, type = bpchar
+ * "prettier" representation of the same type.  For example, type = bpchar
  * and typemod = NULL gets you "character", whereas typemod = -1 gets you
  * "bpchar" --- the former will be interpreted as character(1) by the
  * parser, which does not yield typemod -1.
@@ -79,14 +74,14 @@ format_type(PG_FUNCTION_ARGS)
 	type_oid = PG_GETARG_OID(0);
 
 	if (PG_ARGISNULL(1))
-		result = format_type_internal(type_oid, -1, false, true);
+		result = format_type_internal(type_oid, -1, false, true, false);
 	else
 	{
 		typemod = PG_GETARG_INT32(1);
-		result = format_type_internal(type_oid, typemod, true, true);
+		result = format_type_internal(type_oid, typemod, true, true, false);
 	}
 
-	PG_RETURN_DATUM(_textin(result));
+	PG_RETURN_TEXT_P(cstring_to_text(result));
 }
 
 /*
@@ -98,7 +93,17 @@ format_type(PG_FUNCTION_ARGS)
 char *
 format_type_be(Oid type_oid)
 {
-	return format_type_internal(type_oid, -1, false, false);
+	return format_type_internal(type_oid, -1, false, false, false);
+}
+
+/*
+ * This version returns a name that is always qualified (unless it's one
+ * of the SQL-keyword type names, such as TIMESTAMP WITH TIME ZONE).
+ */
+char *
+format_type_be_qualified(Oid type_oid)
+{
+	return format_type_internal(type_oid, -1, false, false, true);
 }
 
 /*
@@ -107,14 +112,26 @@ format_type_be(Oid type_oid)
 char *
 format_type_with_typemod(Oid type_oid, int32 typemod)
 {
-	return format_type_internal(type_oid, typemod, true, false);
+	return format_type_internal(type_oid, typemod, true, false, false);
 }
 
+/*
+ * This version allows a nondefault typemod to be specified, and forces
+ * qualification of normal type names.
+ */
+char *
+format_type_with_typemod_qualified(Oid type_oid, int32 typemod)
+{
+	return format_type_internal(type_oid, typemod, true, false, true);
+}
 
-
+/*
+ * Common workhorse.
+ */
 static char *
 format_type_internal(Oid type_oid, int32 typemod,
-					 bool typemod_given, bool allow_invalid)
+					 bool typemod_given, bool allow_invalid,
+					 bool force_qualify)
 {
 	bool		with_typemod = typemod_given && (typemod >= 0);
 	HeapTuple	tuple;
@@ -126,9 +143,7 @@ format_type_internal(Oid type_oid, int32 typemod,
 	if (type_oid == InvalidOid && allow_invalid)
 		return pstrdup("-");
 
-	tuple = SearchSysCache(TYPEOID,
-						   ObjectIdGetDatum(type_oid),
-						   0, 0, 0);
+	tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type_oid));
 	if (!HeapTupleIsValid(tuple))
 	{
 		if (allow_invalid)
@@ -139,24 +154,20 @@ format_type_internal(Oid type_oid, int32 typemod,
 	typeform = (Form_pg_type) GETSTRUCT(tuple);
 
 	/*
-	 * Check if it's an array (and not a domain --- we don't want to show the
-	 * substructure of a domain type).	Fixed-length array types such as
-	 * "name" shouldn't get deconstructed either.  As of Postgres 8.1, rather
-	 * than checking typlen we check the toast property, and don't deconstruct
-	 * "plain storage" array types --- this is because we don't want to show
-	 * oidvector as oid[].
+	 * Check if it's a regular (variable length) array type.  Fixed-length
+	 * array types such as "name" shouldn't get deconstructed.  As of Postgres
+	 * 8.1, rather than checking typlen we check the toast property, and don't
+	 * deconstruct "plain storage" array types --- this is because we don't
+	 * want to show oidvector as oid[].
 	 */
 	array_base_type = typeform->typelem;
 
 	if (array_base_type != InvalidOid &&
-		typeform->typstorage != 'p' &&
-		typeform->typtype != TYPTYPE_DOMAIN)
+		typeform->typstorage != 'p')
 	{
 		/* Switch our attention to the array element type */
 		ReleaseSysCache(tuple);
-		tuple = SearchSysCache(TYPEOID,
-							   ObjectIdGetDatum(array_base_type),
-							   0, 0, 0);
+		tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(array_base_type));
 		if (!HeapTupleIsValid(tuple))
 		{
 			if (allow_invalid)
@@ -308,10 +319,10 @@ format_type_internal(Oid type_oid, int32 typemod,
 		char	   *nspname;
 		char	   *typname;
 
-		if (TypeIsVisible(type_oid))
+		if (!force_qualify && TypeIsVisible(type_oid))
 			nspname = NULL;
 		else
-			nspname = get_namespace_name(typeform->typnamespace);
+			nspname = get_namespace_name_or_temp(typeform->typnamespace);
 
 		typname = NameStr(typeform->typname);
 
@@ -322,7 +333,7 @@ format_type_internal(Oid type_oid, int32 typemod,
 	}
 
 	if (is_array)
-		buf = psnprintf(strlen(buf) + 3, "%s[]", buf);
+		buf = psprintf("%s[]", buf);
 
 	ReleaseSysCache(tuple);
 
@@ -344,8 +355,7 @@ printTypmod(const char *typname, int32 typmod, Oid typmodout)
 	if (typmodout == InvalidOid)
 	{
 		/* Default behavior: just print the integer typmod with parens */
-		res = psnprintf(strlen(typname) + MAX_INT32_LEN + 3, "%s(%d)",
-						typname, (int) typmod);
+		res = psprintf("%s(%d)", typname, (int) typmod);
 	}
 	else
 	{
@@ -354,8 +364,7 @@ printTypmod(const char *typname, int32 typmod, Oid typmodout)
 
 		tmstr = DatumGetCString(OidFunctionCall1(typmodout,
 												 Int32GetDatum(typmod)));
-		res = psnprintf(strlen(typname) + strlen(tmstr) + 1, "%s%s",
-						typname, tmstr);
+		res = psprintf("%s%s", typname, tmstr);
 	}
 
 	return res;
@@ -394,15 +403,7 @@ type_maximum_size(Oid type_oid, int32 typemod)
 				+ VARHDRSZ;
 
 		case NUMERICOID:
-			/* precision (ie, max # of digits) is in upper bits of typmod */
-			if (typemod > VARHDRSZ)
-			{
-				int			precision = ((typemod - VARHDRSZ) >> 16) & 0xffff;
-
-				/* Numeric stores 2 decimal digits/byte, plus header */
-				return (precision + 1) / 2 + NUMERIC_HDRSZ;
-			}
-			break;
+			return numeric_maximum_size(typemod);
 
 		case VARBITOID:
 		case BITOID:
@@ -437,7 +438,7 @@ oidvectortypes(PG_FUNCTION_ARGS)
 	for (num = 0; num < numargs; num++)
 	{
 		char	   *typename = format_type_internal(oidArray->values[num], -1,
-													false, true);
+													false, true, false);
 		size_t		slen = strlen(typename);
 
 		if (left < (slen + 2))
@@ -456,22 +457,5 @@ oidvectortypes(PG_FUNCTION_ARGS)
 		left -= slen;
 	}
 
-	PG_RETURN_DATUM(_textin(result));
-}
-
-
-/* snprintf into a palloc'd string */
-static char *
-psnprintf(size_t len, const char *fmt,...)
-{
-	va_list		ap;
-	char	   *buf;
-
-	buf = palloc(len);
-
-	va_start(ap, fmt);
-	vsnprintf(buf, len, fmt, ap);
-	va_end(ap);
-
-	return buf;
+	PG_RETURN_TEXT_P(cstring_to_text(result));
 }
